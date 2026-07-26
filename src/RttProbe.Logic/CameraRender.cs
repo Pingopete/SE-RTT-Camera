@@ -2579,8 +2579,26 @@ internal static class CameraRender
             var rtv = ViewOf(_ownExposureBorrow, "IRenderTargetView");
             if (rtv == null) { _clearExpState = -1; RttLog.Line("Exposure: no IRenderTargetView on our 1x1 target."); return; }
 
-            double want = FeedConfig.ExposureValue;
-            if (_clearColourCache == null || Math.Abs(want - _clearColourFor) > 1e-9)
+            // THE UNITS WERE WRONG, and that is why this knob has been inert all along.
+            //
+            //     PostProcess/ToneMapping/ToneMapping.hlsl
+            //     float GetExposure()
+            //     {
+            //         return Post_.EnableExposure == 1 ? exp2(AvgLuminance[uint2(0,0)].g) : 1;
+            //     }
+            //     color = MultiplyRGB(color, GetExposure());
+            //
+            // The shader takes the GREEN channel and raises TWO TO THAT POWER. So the
+            // texture holds a log2 EV offset, not a linear multiplier. Writing 0.25 asked
+            // for exp2(0.25) = 1.19x, and 0.02 asked for exp2(0.02) = 1.01x — which is why
+            // the famous "12x sweep with no visible difference" showed nothing. It was
+            // never a broken lever; it was a 1.19x-to-1.01x range being read as 12x.
+            //
+            // exposureValue stays a LINEAR multiplier because that is what anyone tuning
+            // it will expect, and we convert here. 0.5 now genuinely halves the image.
+            double linear = Math.Max(1e-6, DynamicExposure.Linear());
+            double want = Math.Log2(linear);
+            if (_clearColourCache == null || Math.Abs(want - _clearColourFor) > 1e-6)
             {
                 _clearColourCache = MakeClearColour(_miClearRtv.GetParameters()[1].ParameterType, (float)want);
                 _clearColourFor = want;
@@ -2591,7 +2609,9 @@ internal static class CameraRender
                                 $"{_miClearRtv.GetParameters()[1].ParameterType.Name}.");
                     return;
                 }
-                RttLog.Line($"Exposure: clearing our 1x1 target to {want} explicitly each pass.");
+                RttLog.Line($"Exposure: linear {linear:F3}x -> log2 EV {want:F3} in the .g channel (ToneMapping.hlsl does exp2 of it, so the texture is an EV offset, not a multiplier).");
+
+
             }
 
             _miClearRtv.Invoke(commandList, new[] { rtv, _clearColourCache });
