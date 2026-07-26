@@ -116,7 +116,7 @@ internal static class FeedConfig
     //
     // 1 = every pass (full cost, the original behaviour). Needs bloom = 1 and
     // cheapBloom = 0, since the cheap stand-in short-circuits before this.
-    public static int BloomEveryN { get; private set; } = 4;
+    public static int BloomEveryN { get; private set; } = 1;
 
     // Call CullingContext.UpdateRanges on the borrowed context each pass.
     //
@@ -172,7 +172,7 @@ internal static class FeedConfig
     // broken. Every layer here can be toggled while the game runs, so a layer that
     // kills the render names itself in one edit rather than one launch.
     public static bool Tonemap { get; private set; }   // exposure + tone response
-    public static bool Bloom { get; private set; }     // needs Tonemap
+    public static bool Bloom { get; private set; } = true;   // real ApplyBloom, amortised by BloomEveryN
     public static bool Sky { get; private set; }       // legacy flag; SkyMode is the real one
 
     // Which sky pass. IndirectPlanetEnvironmentJob (1) is the PROBE pipeline's sky and
@@ -200,7 +200,7 @@ internal static class FeedConfig
     // multi-pass downsample/upsample chain and accounts for the first halving of the
     // frame rate — and skipping it also removes one of the three main-view post
     // passes we borrow, which is a stability win as well as a speed one.
-    public static bool CheapBloom { get; private set; } = true;
+    public static bool CheapBloom { get; private set; }
 
     // Run the camera pass from the per-frame hook (DrawUnlit) instead of the probe
     // hook. The probe hook is inside the engine's own environment-probe work, which
