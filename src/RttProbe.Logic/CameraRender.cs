@@ -902,6 +902,65 @@ internal static class CameraRender
                 catch (Exception e) { _atmoBlocked = true; RttLog.Error("atmosphere (disabled, feed continues)", e); }
             }
 
+            // AtmosphereMultiplyJob — the OTHER half of atmosphere, and the half we have
+            // never had.
+            //
+            // What we run today (IndirectPlanetEnvironmentJob) is BlendState.Additive: it
+            // adds in-scatter and nothing else. Geometry never gets aerial-perspective
+            // EXTINCTION — the haze that desaturates and washes out distant surfaces — and
+            // there is no atmospheric sun disc. Multiply is that half, and it is a
+            // single-RTV job.
+            //
+            // Its inputs, read from the IL rather than guessed:
+            //     CommonResources.FrameSettings           camera-independent
+            //     CommonResources.JitteredCameraSettings  <- needs the camera CB swap
+            //     CommonResources.AllPlanetEnvSetups      the player's culled planet list
+            //     ScreenBuffers.DepthStencilBuffer        <- needs OUR depth
+            //     CommonResources.AtmosphereLUTTables     per-planet, camera-independent
+            //
+            // The depth is the subtle one. It must be the buffer our GEOMETRY pass just
+            // wrote — the per-pass "RttCameraDepth" — not the persistent "RttGBufferDepth"
+            // that the GBuffer swap installs, which only GBufferPassJob ever writes. Get
+            // that wrong and the job samples a depth our scene never touched, which would
+            // look exactly like "invokes cleanly, does nothing".
+            if (FeedConfig.AtmosphereMultiply && !_atmoMulBlocked)
+            {
+                object savedDepth = null;
+                try
+                {
+                    if (_miAtmoMul == null)
+                    {
+                        _atmoMulJob = _sceneDrawSystem?.GetType().GetField("_atmosphereMultiplyJob", Any)?.GetValue(_sceneDrawSystem);
+                        _miAtmoMul = _atmoMulJob?.GetType().GetMethods(Any)
+                            .FirstOrDefault(m => m.Name == "DoWork" && m.GetParameters().Length == 2);
+                        if (_miAtmoMul == null)
+                        {
+                            _atmoMulBlocked = true;
+                            RttLog.Line("Atmosphere multiply: _atmosphereMultiplyJob / DoWork(2 args) not found.");
+                        }
+                        else if (!FeedConfig.SwapCameraCb)
+                        {
+                            // Not fatal, but it would compute extinction along the PLAYER'S
+                            // rays and look like the pass is broken. Say so once rather
+                            // than let it be mistaken for a failed pass.
+                            RttLog.Line("Atmosphere multiply: swapCameraCb is OFF — this job reads the " +
+                                        "global camera CB, so it will compute along the PLAYER'S view rays. " +
+                                        "Turn swapCameraCb on before judging the result.");
+                        }
+                    }
+
+                    if (_miAtmoMul != null)
+                    {
+                        savedDepth = InstallPassDepth(depthBorrow);
+                        _miAtmoMul.Invoke(_atmoMulJob, new object[] { commandList, rtv });
+                        if (_atmoMulLogs++ == 0)
+                            RttLog.Line("=== ATMOSPHERE MULTIPLY: extinction / aerial perspective applied. ===");
+                    }
+                }
+                catch (Exception e) { _atmoMulBlocked = true; RttLog.Error("atmosphere multiply (disabled, feed continues)", e); }
+                finally { RestorePassDepth(savedDepth); }
+            }
+
             // Sky, on top of the geometry pass and using its depth so it fills only
             // what geometry did not cover.
             //
@@ -1912,7 +1971,10 @@ internal static class CameraRender
     // AmbientLightJob is the one that matters for the reported harshness: direct sun
     // plus clustered lights with no ambient term is exactly why lit faces blow out and
     // unlit faces go flat.
-    private static object _dirLightJob, _localLightsJob, _ambientJob, _atmoJob;
+    private static object _dirLightJob, _localLightsJob, _ambientJob, _atmoJob, _atmoMulJob;
+    private static MethodInfo _miAtmoMul;
+    private static bool _atmoMulBlocked;
+    private static int _atmoMulLogs;
     private static MethodInfo _miAtmo, _miExecLighting;
     private static bool _execLightBlocked;
     private static int _execLightLogs, _scratchLogs, _eyeJumpLogs;
@@ -2202,6 +2264,62 @@ internal static class CameraRender
     }
 
     // Property setter if the engine exposes one, backing field otherwise.
+    // Install THIS PASS'S depth — the one the geometry pass just wrote — into
+    // ScreenBuffers for the duration of a single job, and put the engine's back.
+    //
+    // Deliberately separate from InstallOurGBuffer's depth swap, which installs the
+    // persistent "RttGBufferDepth" that only GBufferPassJob writes. A pass that wants to
+    // read the depth of the scene we just rendered needs the per-pass borrow instead, and
+    // conflating the two would hand it a buffer full of nothing.
+    private static bool _passDepthBlocked, _passDepthLogged;
+
+    private static object InstallPassDepth(object depthBorrow)
+    {
+        if (_passDepthBlocked || depthBorrow == null) return null;
+        try
+        {
+            var screenBuffers = ScreenBuffersInstance();
+            if (screenBuffers == null) { _passDepthBlocked = true; return null; }
+
+            _dsProp ??= screenBuffers.GetType().GetProperty("DepthStencilBuffer", Any);
+            var tex = Prop2(depthBorrow, "Resource") ?? depthBorrow;
+            var want = _dsProp?.PropertyType;
+            if (tex == null || want == null || !want.IsInstanceOfType(tex))
+            {
+                _passDepthBlocked = true;
+                RttLog.Line($"Pass depth: cannot install — have {tex?.GetType().Name ?? "null"}, " +
+                            $"ScreenBuffers wants {want?.Name ?? "?"}.");
+                return null;
+            }
+
+            var saved = _dsProp.GetValue(screenBuffers);
+            SetDepthBuffer(screenBuffers, tex);
+            if (!_passDepthLogged)
+            {
+                _passDepthLogged = true;
+                RttLog.Line("Pass depth: our render's depth installed for the atmosphere pass " +
+                            "(the per-pass borrow, not the GBuffer one).");
+            }
+            return saved;
+        }
+        catch (Exception e) { _passDepthBlocked = true; RttLog.Error("install pass depth", e); return null; }
+    }
+
+    private static void RestorePassDepth(object saved)
+    {
+        if (saved == null) return;
+        try
+        {
+            var screenBuffers = ScreenBuffersInstance();
+            if (screenBuffers != null) SetDepthBuffer(screenBuffers, saved);
+        }
+        catch (Exception e)
+        {
+            _passDepthBlocked = true;
+            RttLog.Error("RESTORE PASS DEPTH FAILED — the engine is now pointed at our 512x512 depth", e);
+        }
+    }
+
     private static void SetDepthBuffer(object screenBuffers, object value)
     {
         if (_dsProp is { CanWrite: true }) _dsProp.SetValue(screenBuffers, value);
