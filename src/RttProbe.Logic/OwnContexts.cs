@@ -70,12 +70,21 @@ internal static class OwnContexts
         catch (Exception e) { _state = -1; RttLog.Error("resolve culling pool", e); }
     }
 
-    // rootEntityId -1 matches what the probe pass passes to DoCullingFirstPass:
-    // cull everything rather than a single entity's subtree.
+    // rootEntityId is very likely the POOL KEY, not just a culling filter.
+    //
+    // We passed -1 ("cull everything"), which is the same value the engine's own shadow
+    // cascade culling would use — so we were being handed the context it was actively
+    // refilling. Sharing EnvProbeCulling[0] gave an intermittent frame from the probe's
+    // viewpoint; sharing the cascade context instead gives objects popping in and out as
+    // our culling results are overwritten. Same bug, different pool.
+    //
+    // A distinct id should map to a context nobody else asks for. Configurable because
+    // this is a guess about the pool's keying, and the wrong guess is one edit away from
+    // the right one rather than a rebuild.
     public static object Borrow()
     {
         if (_state != 1) return null;
-        try { return _miBorrow.Invoke(_drawContexts, new object[] { -1 }); }
+        try { return _miBorrow.Invoke(_drawContexts, new object[] { FeedConfig.CullRootEntityId }); }
         catch (Exception e) { if (_errLogs++ < 3) RttLog.Error("borrow culling", e); return null; }
     }
 

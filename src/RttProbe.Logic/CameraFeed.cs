@@ -428,6 +428,12 @@ internal static class CameraFeed
         if (double.IsNaN(right.X)) right = new Vector3D(1, 0, 0);   // looking straight up/down
         var up = Cross(fwd, right);
 
+        // Roll 180 degrees about the view direction: the feed was upside down. Negating
+        // BOTH perpendicular axes is the roll — negating only one would mirror the image
+        // instead, which flips handedness and inverts the winding.
+        right = new Vector3D(-right.X, -right.Y, -right.Z);
+        up = new Vector3D(-up.X, -up.Y, -up.Z);
+
         // Camera world matrix: rows are the basis vectors, translation is the eye.
         var m = default(MatrixD);
         SetRow(ref m, 0, right, 0);

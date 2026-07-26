@@ -51,6 +51,13 @@ internal static class FeedConfig
     // answered by a file edit rather than a rebuild.
     public static bool UsePooledCulling { get; private set; } = true;
 
+    // rootEntityId handed to BorrowShadowCulling. Very likely the POOL KEY: we passed -1,
+    // which is what the engine's own cascade culling uses, so we were borrowing the very
+    // context it was refilling — objects popping in and out as our culling results were
+    // overwritten. A distinct id should map to a context nobody else asks for.
+    // -1 restores the old (colliding) behaviour for comparison.
+    public static int CullRootEntityId { get; private set; } = 0x52545443;   // "RTTC"
+
     // Explicit resource barriers around the handover copy, one switch per end.
     //
     // Adding the destination barrier killed the game on the first copy, ~0.5 s in —
@@ -80,7 +87,15 @@ internal static class FeedConfig
     // kills the render names itself in one edit rather than one launch.
     public static bool Tonemap { get; private set; }   // exposure + tone response
     public static bool Bloom { get; private set; }     // needs Tonemap
-    public static bool Sky { get; private set; }       // IndirectPlanetEnvironmentJob
+    public static bool Sky { get; private set; }       // legacy flag; SkyMode is the real one
+
+    // Which sky pass. IndirectPlanetEnvironmentJob (1) is the PROBE pipeline's sky and
+    // takes its orientation from cube-face state rather than the view we pass — the
+    // original spin, and now a sky that is too zoomed and rotates far faster than the
+    // orbit. DrawSkybox (2) takes only a command list and a target, so it uses the BOUND
+    // camera CB, which the env pass has already set to ours.
+    //   0 = no sky, 1 = IndirectPlanetEnvironmentJob, 2 = DrawSkybox
+    public static int SkyMode { get; private set; } = 1;
 
     // Exposure source. On: EnvironmentProbeExposureJob.Exposure — the engine's own
     // exposure for probe-style offscreen renders. Off: ComputeExposure, which drives
@@ -153,6 +168,20 @@ internal static class FeedConfig
     // which is pre-exposed and range-compressed and is why the feed looks flat).
     // Requires gbufferSwap + gbufferPass, and a resizable colour target.
     public static bool ExecuteLighting { get; private set; }
+
+    // Close SceneDrawSystem.IsRtxInitialized (a writable AtomicFlag) around
+    // ExecuteLighting so its GI work is skipped by the engine's OWN guard. Nulling
+    // _raytraceGiJob threw because ExecuteLighting never expects that field to be null;
+    // clearing a flag the engine tests is a supported state rather than a surprising one.
+    // GI is what polluted the player's temporal accumulator (flickering noise).
+    public static bool GateGi { get; private set; } = true;
+
+    // Render the env pass into a SCRATCH target when ExecuteLighting is producing the
+    // image. The env pass is needed for its side effect — it binds our camera constant
+    // buffer, which GBufferPassJob has no parameter for — but its pixels are fully-lit
+    // colour, so leaving them in our target means the scene is lit TWICE and highlights
+    // blow out instead of shadows filling. Keep the binding, discard the lighting.
+    public static bool EnvPassToScratch { get; private set; } = true;
 
     // Swap ScreenBuffers.PreUpscaleResolution to OUR render resolution for the pass.
     // ExecuteLighting sizes its dispatch from it, so with the engine's 3840x2160 and our
@@ -237,12 +266,14 @@ internal static class FeedConfig
             int interval = IntervalMs, panel = PanelMs, startup = StartupDelayMs;
             bool pooled = UsePooledCulling;
             bool src = SrcTransition, dst = DestTransition, retire = RetireTestPattern, copy = CopyEnabled;
+            int cullRoot = CullRootEntityId;
             bool tone = Tonemap, bloom = Bloom, sky = Sky, probeExp = ProbeExposure, cheapBloom = CheapBloom;
             bool frameHook = PassOnFrameHook, reuseExp = ReuseExposure;
             double expValue = ExposureValue;
             bool gbSwap = GBufferSwap, gbPass = GBufferPass, defer = Deferred, envP = EnvPass;
             bool defDir = DeferredDirectional, defLoc = DeferredLocal, defAmb = DeferredAmbient;
-            bool atmo = Atmosphere, execLight = ExecuteLighting, swapRes = SwapResolution, swapCam = SwapCamera, gbAfter = GBufferAfterEnv, supGi = SuppressGi;
+            bool atmo = Atmosphere, execLight = ExecuteLighting, swapRes = SwapResolution, swapCam = SwapCamera, gbAfter = GBufferAfterEnv, supGi = SuppressGi, gateGi = GateGi, envScratch = EnvPassToScratch;
+            int skyMode = SkyMode;
             double rScale = RenderScale;
             bool blitA = BlitAlpha, zeroMetal = ZeroMetalness;
             double farPlane = CullFarPlane;
@@ -320,6 +351,18 @@ internal static class FeedConfig
                     case "swapresolution":
                         swapRes = val is "1" or "true" or "yes";
                         break;
+                    case "cullrootentityid":
+                        if (int.TryParse(val, out var cre)) cullRoot = cre;
+                        break;
+                    case "skymode":
+                        if (int.TryParse(val, out var sm)) skyMode = Math.Clamp(sm, 0, 2);
+                        break;
+                    case "envpasstoscratch":
+                        envScratch = val is "1" or "true" or "yes";
+                        break;
+                    case "gategi":
+                        gateGi = val is "1" or "true" or "yes";
+                        break;
                     case "executelighting":
                         execLight = val is "1" or "true" or "yes";
                         break;
@@ -386,7 +429,7 @@ internal static class FeedConfig
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
-                        || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi;
+                        || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || gateGi != GateGi || envScratch != EnvPassToScratch || skyMode != SkyMode || cullRoot != CullRootEntityId;
             IntervalMs = interval; PanelMs = panel; StartupDelayMs = startup; UsePooledCulling = pooled; OrbitRadius = radius; OrbitPeriod = period; OrbitHeight = height;
             SrcTransition = src; DestTransition = dst; RetireTestPattern = retire; CopyEnabled = copy;
             OrbitClearance = clearance; OrbitGrid = orbitGrid;
@@ -394,7 +437,7 @@ internal static class FeedConfig
             CheapBloom = cheapBloom; CullFarPlane = farPlane; PassOnFrameHook = frameHook;
             ReuseExposure = reuseExp; ExposureValue = expValue; GBufferSwap = gbSwap; GBufferPass = gbPass; Deferred = defer; EnvPass = envP;
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
-            Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
+            Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
 
             if (changed)
                 RttLog.Line($"Config: intervalMs={IntervalMs} (~{1000.0 / IntervalMs:F0} fps) " +
@@ -404,7 +447,12 @@ internal static class FeedConfig
                             $"destTransition={DestTransition} retireTestPattern={RetireTestPattern} " +
                             $"| tonemap={Tonemap} bloom={Bloom} cheapBloom={CheapBloom} sky={Sky} " +
                             $"probeExposure={ProbeExposure} cullFarPlane={CullFarPlane} " +
-                            $"hook={(PassOnFrameHook ? "per-frame" : "probe")}");
+                            $"hook={(PassOnFrameHook ? "per-frame" : "probe")} " +
+                            // The rendering-path knobs, because chasing a symptom without
+                            // knowing which combination produced it has cost several cycles.
+                            $"| skyMode={SkyMode} gbufSwap={GBufferSwap} gbufPass={GBufferPass} " +
+                            $"execLight={ExecuteLighting} gateGi={GateGi} envScratch={EnvPassToScratch} " +
+                            $"swapRes={SwapResolution} swapCam={SwapCamera}");
         }
         catch { /* keep the last good values */ }
     }

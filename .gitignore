@@ -1,3 +1,5 @@
 bin/
 obj/
 output/
+tools/EngineQuery/bin/
+tools/EngineQuery/obj/

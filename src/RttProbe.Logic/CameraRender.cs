@@ -354,6 +354,7 @@ internal static class CameraRender
                       $"PlanetEnvJob={(_miPlanetEnvDoWork == null ? "NOT FOUND" : "ok")} --");
 
         CameraCarrierSurvey(sb);
+        GiSwitchSurvey(sds, sb);
         FidelitySurvey(sds, sb);
         GBufferSurvey(sds, sb);
         ShadowSurvey(sds, sb);
@@ -429,7 +430,7 @@ internal static class CameraRender
     private static void RenderOnce(object commandList)
     {
         object rtBorrow = null, depthBorrow = null, cameraCb = null, borrowedCulling = null;
-        object savedGBuffer = null, savedCamera = null;
+        object savedGBuffer = null, savedCamera = null, scratchBorrow = null;
         bool geomBorrowed = false;
         try
         {
@@ -618,6 +619,40 @@ internal static class CameraRender
                 }
             }
 
+            // The env pass has TWO jobs, and with deferred lighting we only want one of
+            // them.
+            //
+            // Its pixels are fully-lit colour, so leaving them in our target and then
+            // running ExecuteLighting composites light twice — which blows highlights out
+            // harder instead of filling shadows, and is why the range looked unchanged.
+            //
+            // Its SIDE EFFECT is binding our camera constant buffer, which GBufferPassJob
+            // depends on because it takes no camera of its own. Without it the GBuffer
+            // reverts to the player's viewpoint.
+            //
+            // So when deferred lighting is producing the image, render the env pass into a
+            // scratch target: keep the camera binding, discard the lighting. One extra
+            // 512x512 pass, which is cheap.
+            object envRtv = rtv;
+            bool deferredOwnsImage = FeedConfig.ExecuteLighting && FeedConfig.EnvPassToScratch;
+            if (deferredOwnsImage && FeedConfig.EnvPass)
+            {
+                try
+                {
+                    scratchBorrow = _miBorrowRt.Invoke(_texPool, new object[]
+                        { "RttCamScratch", colourFormat, colourFormat, res, 1, null, 128 });
+                    var sRtv = ViewOf(scratchBorrow, "IRenderTargetView");
+                    if (sRtv != null)
+                    {
+                        envRtv = sRtv;
+                        if (_scratchLogs++ == 0)
+                            RttLog.Line("Env pass -> scratch target: kept for the camera-CB binding only, " +
+                                        "its lighting discarded so ExecuteLighting is the single light source.");
+                    }
+                }
+                catch (Exception e) { if (_scratchLogs++ < 2) RttLog.Error("env scratch target", e); }
+            }
+
             // Forward path: one pass that writes fully-lit colour. Switchable, because
             // running it AND the deferred chain would light the scene twice.
             if (FeedConfig.EnvPass)
@@ -625,8 +660,14 @@ internal static class CameraRender
                 {
                     commandList, _geomBuffers, cameraCb, view,
                     Prop2(cullCtx, "FirstPass"), _clusterCtx, _shadowResources,
-                    rtv, dsv, true,
+                    envRtv, dsv, true,
                 });
+
+            // Our target was never cleared if the env pass went to scratch, so clear it
+            // here — otherwise ExecuteLighting composites onto whatever the pool left in
+            // the borrow.
+            if (deferredOwnsImage && !ReferenceEquals(envRtv, rtv))
+                ClearSlotToZero(commandList, rtv);
 
             // The GBuffer pass, now that the env pass above has bound OUR camera CB.
             if (FeedConfig.GBufferAfterEnv && FeedConfig.GBufferPass && !_gbPassBlocked
@@ -707,10 +748,19 @@ internal static class CameraRender
                         }
                         else
                         {
-                            _miExecLighting.Invoke(_sceneDrawSystem, new[] { lBuffer });
-                            if (_execLightLogs++ == 0)
-                                RttLog.Line("=== EXECUTE LIGHTING: the engine's full deferred lighting stage ran " +
-                                            "against OUR GBuffer. ===");
+                            // Close the engine's own RTX gate for the duration, so the GI
+                            // work inside ExecuteLighting is skipped by its guard rather
+                            // than by pulling a job out from under it. Restored in the
+                            // finally — not doing so costs the player ray tracing.
+                            bool giGated = FeedConfig.GateGi && SuppressGiViaRtxGate();
+                            try
+                            {
+                                _miExecLighting.Invoke(_sceneDrawSystem, new[] { lBuffer });
+                                if (_execLightLogs++ == 0)
+                                    RttLog.Line($"=== EXECUTE LIGHTING: the engine's full deferred lighting stage ran " +
+                                                $"against OUR GBuffer (GI gated={giGated}). ===");
+                            }
+                            finally { RestoreGiRtxGate(); }
                         }
                     }
                 }
@@ -756,7 +806,49 @@ internal static class CameraRender
             // Both target parameters get our one render target: the probe pipeline
             // splits near and far sky across two targets, and we have a single view
             // with no such split. Depth comes from the pass we just ran.
-            if (FeedConfig.Sky && !_skyBlocked && _miPlanetEnvDoWork != null)
+            // Alternative sky: DrawSkybox(cl, lBuffer).
+            //
+            // IndirectPlanetEnvironmentJob is the PROBE pipeline's sky, and it evidently
+            // takes its orientation from the engine's cube-face state rather than the view
+            // we hand it — which is the original "spinning sky", and now shows up as a sky
+            // that is too zoomed and rotates far faster than the orbit. Giving it separate
+            // near/far targets reduced the symptom without addressing the cause.
+            //
+            // DrawSkybox takes only a command list and a target, so it uses the camera
+            // constant buffer that is BOUND — and by this point that is ours, bound by the
+            // env pass. Two arguments, no probe state.
+            if (FeedConfig.SkyMode == 2 && !_skyBlocked)
+            {
+                try
+                {
+                    _miDrawSkybox ??= _sceneDrawSystem?.GetType().GetMethods(Any)
+                        .FirstOrDefault(m => m.Name == "DrawSkybox" && m.GetParameters().Length == 2);
+                    if (_miDrawSkybox == null)
+                    {
+                        _skyBlocked = true;
+                        RttLog.Line("Sky: DrawSkybox(2 args) not found.");
+                    }
+                    else
+                    {
+                        var want = _miDrawSkybox.GetParameters()[1].ParameterType;
+                        var lBuf = Prop2(rtBorrow, "Resource") ?? rtBorrow;
+                        if (!want.IsInstanceOfType(lBuf))
+                        {
+                            _skyBlocked = true;
+                            RttLog.Line($"Sky: DrawSkybox wants {want.Name}, our target is {lBuf?.GetType().Name} — " +
+                                        "enable tonemap or sky so the colour target is borrowed resizable.");
+                        }
+                        else
+                        {
+                            _miDrawSkybox.Invoke(_sceneDrawSystem, new[] { commandList, lBuf });
+                            if (_skyboxLogs++ == 0)
+                                RttLog.Line("=== SKY: DrawSkybox applied (uses the BOUND camera CB, not probe face state). ===");
+                        }
+                    }
+                }
+                catch (Exception e) { _skyBlocked = true; RttLog.Error("DrawSkybox (disabled)", e); }
+            }
+            else if (FeedConfig.SkyMode == 1 && !_skyBlocked && _miPlanetEnvDoWork != null)
             {
                 try
                 {
@@ -824,6 +916,7 @@ internal static class CameraRender
             try { if (geomBorrowed) Call(_geomBuffers, "Return"); } catch { }
             try { OwnContexts.Return(borrowedCulling); } catch { }
             try { if (depthBorrow != null) ReturnBorrowed(depthBorrow); } catch { }
+            try { if (scratchBorrow != null) ReturnBorrowed(scratchBorrow); } catch { }
             try { if (rtBorrow != null) ReturnBorrowed(rtBorrow); } catch { }
             try { (cameraCb as IDisposable)?.Dispose(); } catch { }
             try { File.Delete(LivePath); } catch { }
@@ -1473,6 +1566,176 @@ internal static class CameraRender
     // whole tier is blocked at once — so resolve the question by dumping the exact
     // parameter types and every Borrow* the pool offers, rather than by trying one
     // call and inferring from a crash.
+    // ------------------------------------------------- can GI be switched off cleanly?
+    // The ambient term is what the feed is missing, and ExecuteLighting supplies it
+    // properly — it is the orchestrator that sets up the constant buffer AmbientLightJob
+    // was missing when called directly. Its only defect was polluting the player's
+    // TEMPORAL ray-traced GI accumulator.
+    //
+    // Nulling the GI job objects threw NullReferenceException — ExecuteLighting does not
+    // null-check them. But emptying a LIST worked perfectly for local light shadows, and
+    // flipping a flag the engine ITSELF checks would be better still: it takes the
+    // engine's own non-RTX path rather than a path it never expects.
+    //
+    // So: find a writable RTX/GI switch. Read-only survey.
+    // ------------------------------------------- suppress GI via the engine's own gate
+    // ExecuteLighting is what the feed actually needs: it supplies the missing AMBIENT
+    // term, and it is the orchestrator that sets up the constant buffer AmbientLightJob
+    // lacked when called directly. Its only defect was polluting the player's temporal
+    // ray-traced GI accumulator — visible as flickering noise in the main view.
+    //
+    // Nulling _raytraceGiJob threw NullReferenceException: ExecuteLighting does not
+    // null-check it, because the engine never expects that field to be null. Clearing
+    // SceneDrawSystem.IsRtxInitialized instead uses the flag the engine ITSELF tests, so
+    // the GI work is skipped by its own guard rather than by removing something from
+    // under it. That is the difference between an unexpected state and a supported one.
+    //
+    // AtomicFlag is a value type, so a default instance is the "not set" state.
+    private static FieldInfo _rtxInitField, _rtxStartedField;
+    private static object _savedRtxInit;
+    private static bool _rtxSaved, _rtxGateBlocked, _rtxGateLogged;
+
+    private static bool SuppressGiViaRtxGate()
+    {
+        if (_rtxGateBlocked || _sceneDrawSystem == null) return false;
+        try
+        {
+            _rtxInitField ??= _sceneDrawSystem.GetType().GetField("IsRtxInitialized", Any);
+            if (_rtxInitField == null || _rtxInitField.IsInitOnly)
+            {
+                _rtxGateBlocked = true;
+                RttLog.Line("GI gate: IsRtxInitialized not writable — cannot suppress GI cleanly.");
+                return false;
+            }
+
+            _savedRtxInit = _rtxInitField.GetValue(_sceneDrawSystem);
+            _rtxInitField.SetValue(_sceneDrawSystem,
+                _rtxInitField.FieldType.IsValueType
+                    ? Activator.CreateInstance(_rtxInitField.FieldType)   // default = unset
+                    : null);
+            _rtxSaved = true;
+
+            if (!_rtxGateLogged)
+            {
+                _rtxGateLogged = true;
+                RttLog.Line($"GI gate: IsRtxInitialized cleared for our pass ({_rtxInitField.FieldType.Name} " +
+                            "default = unset) — ExecuteLighting should skip GI through its own guard, " +
+                            "leaving the player's temporal accumulator alone.");
+            }
+            return true;
+        }
+        catch (Exception e)
+        {
+            _rtxGateBlocked = true;
+            RttLog.Error("suppress GI via rtx gate", e);
+            RestoreGiRtxGate();
+            return false;
+        }
+    }
+
+    private static void RestoreGiRtxGate()
+    {
+        if (!_rtxSaved) return;
+        _rtxSaved = false;
+        try { _rtxInitField?.SetValue(_sceneDrawSystem, _savedRtxInit); }
+        catch (Exception e)
+        {
+            // Not restoring means the player loses ray tracing for the session.
+            _rtxGateBlocked = true;
+            RttLog.Error("RESTORE RTX GATE FAILED — the player may lose ray tracing", e);
+        }
+    }
+
+    private static void GiSwitchSurvey(object sds, StringBuilder outer)
+    {
+        try
+        {
+            var sb = new StringBuilder($"=== GI switch survey {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
+            sb.AppendLine();
+            sb.AppendLine();
+
+            sb.AppendLine("-- SceneDrawSystem RTX / GI state (writable = a candidate) --");
+            foreach (var f in sds.GetType().GetFields(Any).OrderBy(f => f.Name))
+            {
+                var n = f.Name;
+                if (!n.Contains("Rtx", StringComparison.OrdinalIgnoreCase)
+                    && !n.Contains("rtx", StringComparison.Ordinal)
+                    && !n.Contains("Gi", StringComparison.Ordinal)
+                    && !n.Contains("raytrace", StringComparison.OrdinalIgnoreCase)
+                    && !n.Contains("surfel", StringComparison.OrdinalIgnoreCase)) continue;
+                object v = null; try { v = f.GetValue(f.IsStatic ? null : sds); } catch { }
+                sb.AppendLine($"    {(f.IsInitOnly ? "readonly " : "WRITABLE ")}{f.FieldType.Name,-34} {Clean2(n),-36} = {Short(v)}");
+            }
+            sb.AppendLine();
+
+            sb.AppendLine("-- SceneDrawSystem RTX properties --");
+            foreach (var p in sds.GetType().GetProperties(Any))
+            {
+                if (!p.Name.Contains("Rtx", StringComparison.OrdinalIgnoreCase)
+                    && !p.Name.Contains("Raytrac", StringComparison.OrdinalIgnoreCase)) continue;
+                object v = null; try { v = p.GetValue(sds); } catch { }
+                sb.AppendLine($"    {p.PropertyType.Name,-34} {p.Name,-36} = {Short(v)}  " +
+                              $"{(p.CanWrite ? "[settable]" : "[read-only]")}");
+            }
+            sb.AppendLine();
+
+            // The settings object is the engine's own feature switchboard, so anything
+            // here is a path the engine's guards already respect.
+            sb.AppendLine("-- SettingsManager raytracing / GI --");
+            if (_settings == null) sb.AppendLine("  settings not held");
+            else
+            {
+                foreach (var p in _settings.GetType().GetProperties(Any).OrderBy(p => p.Name))
+                {
+                    if (p.GetIndexParameters().Length != 0) continue;
+                    if (!p.Name.Contains("Raytrac", StringComparison.OrdinalIgnoreCase)
+                        && !p.Name.Contains("RTX", StringComparison.OrdinalIgnoreCase)
+                        && !p.Name.Contains("GI", StringComparison.Ordinal)) continue;
+                    object v = null; try { v = p.GetValue(_settings); } catch { }
+                    sb.AppendLine($"    {p.PropertyType.Name,-30} {p.Name,-32} = {Short(v)}  " +
+                                  $"{(p.CanWrite ? "[settable]" : "[read-only]")}");
+                }
+                foreach (var f in _settings.GetType().GetFields(Any).OrderBy(f => f.Name))
+                {
+                    if (!f.Name.Contains("raytrac", StringComparison.OrdinalIgnoreCase)
+                        && !f.Name.Contains("rtx", StringComparison.OrdinalIgnoreCase)
+                        && !f.Name.Contains("gi", StringComparison.OrdinalIgnoreCase)) continue;
+                    object v = null; try { v = f.GetValue(f.IsStatic ? null : _settings); } catch { }
+                    sb.AppendLine($"    {(f.IsInitOnly ? "readonly " : "WRITABLE ")}{f.FieldType.Name,-30} {Clean2(f.Name),-32} = {Short(v)}");
+                }
+
+                // Nested settings groups (RTX, Environment, LOD...) are where the real
+                // toggles usually live.
+                sb.AppendLine();
+                sb.AppendLine("-- nested settings groups --");
+                foreach (var p in _settings.GetType().GetProperties(Any).OrderBy(p => p.Name))
+                {
+                    if (p.GetIndexParameters().Length != 0) continue;
+                    object grp = null; try { grp = p.GetValue(_settings); } catch { }
+                    if (grp == null || grp.GetType().IsPrimitive || grp is string) continue;
+                    var hits = grp.GetType().GetProperties(Any)
+                        .Where(x => x.Name.Contains("GI", StringComparison.Ordinal)
+                                 || x.Name.Contains("Raytrac", StringComparison.OrdinalIgnoreCase)
+                                 || x.Name.Contains("Enable", StringComparison.Ordinal)).ToArray();
+                    if (hits.Length == 0) continue;
+                    sb.AppendLine($"  {p.Name} ({grp.GetType().Name}):");
+                    foreach (var x in hits)
+                    {
+                        object v = null; try { v = x.GetValue(grp); } catch { }
+                        sb.AppendLine($"      {x.PropertyType.Name,-24} {x.Name,-30} = {Short(v)}  " +
+                                      $"{(x.CanWrite ? "[settable]" : "[read-only]")}");
+                    }
+                }
+            }
+
+            var path = Path.Combine(RttLog.OutDir, "gi-switch-survey.txt");
+            File.WriteAllText(path, sb.ToString());
+            outer.AppendLine($"-- GI switch survey -> {path} --");
+            RttLog.Line($"GI switch survey -> {path}");
+        }
+        catch (Exception e) { RttLog.Error("gi switch survey", e); }
+    }
+
     private static void FidelitySurvey(object sds, StringBuilder outer)
     {
         try
@@ -1545,7 +1808,11 @@ internal static class CameraRender
     private static object _dirLightJob, _localLightsJob, _ambientJob, _atmoJob;
     private static MethodInfo _miAtmo, _miExecLighting;
     private static bool _execLightBlocked;
-    private static int _execLightLogs;
+    private static int _execLightLogs, _scratchLogs, _eyeJumpLogs;
+    private static Keen.VRage.Library.Mathematics.Vector3D _lastEye;
+    private static bool _haveLastEye;
+    private static MethodInfo _miDrawSkybox;
+    private static int _skyboxLogs;
     private static bool _atmoBlocked;
     private static int _atmoLogs;
     private static MethodInfo _miDirLight, _miLocalLights, _miAmbient;
@@ -2826,6 +3093,30 @@ internal static class CameraRender
             t);
         var view = InvertMatrixD(camWorld);
         _lastCamWorld = camWorld; _lastViewD = view;   // for the global camera swap
+
+        // Flash detector. An intermittent single frame from the PLAYER's position means
+        // either our camera was wrong for one pass, or the panel received someone else's
+        // pixels. Those need completely different fixes, so measure rather than guess:
+        // log any eye position that jumps further than an orbit diameter from the last
+        // pass. Silence here means the camera was always right and the flash is content.
+        try
+        {
+            if (Prop2(camWorld, "Translation") is Keen.VRage.Library.Mathematics.Vector3D eye)
+            {
+                if (_haveLastEye)
+                {
+                    double dx = eye.X - _lastEye.X, dy = eye.Y - _lastEye.Y, dz = eye.Z - _lastEye.Z;
+                    double jump = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+                    double limit = Math.Max(50.0, FeedConfig.OrbitRadius * 2.0);
+                    if (jump > limit && _eyeJumpLogs++ < 8)
+                        RttLog.Line($"CAMERA JUMP: eye moved {jump:F0} m in one pass (limit {limit:F0}) — " +
+                                    $"{_lastEye.X:F0},{_lastEye.Y:F0},{_lastEye.Z:F0} -> {eye.X:F0},{eye.Y:F0},{eye.Z:F0}. " +
+                                    "This is a flash frame.");
+                }
+                _lastEye = eye; _haveLastEye = true;
+            }
+        }
+        catch { }
         if (view == null) { _orbitNull = "view matrix inversion failed"; return null; }
 
         // RenderViewSlim is internal but its fields are public; mutate a boxed copy
