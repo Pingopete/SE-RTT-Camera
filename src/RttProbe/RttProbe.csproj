@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 2.4.x required: 2.3.3 fails on .NET 9 ("LocalBuilder abstract class"). -->
+    <PackageReference Include="Lib.Harmony" Version="2.4.2" />
+  </ItemGroup>
+
+  <!-- The bootstrap loads once at game start, so the running copy is moved aside
+       rather than overwritten while the process holds it. -->
+  <Target Name="DeployProbe" AfterTargets="Build">
+    <Delete Files="$(DeployDir)\RttProbe.old.dll" ContinueOnError="true" />
+    <Move SourceFiles="$(DeployDir)\RttProbe.dll" DestinationFiles="$(DeployDir)\RttProbe.old.dll" Condition="Exists('$(DeployDir)\RttProbe.dll')" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(DeployDir)" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(DeployDir)" ContinueOnError="true" />
+    <!-- The running game holds 0Harmony.dll open. It never changes between builds,
+         so copy it only when the deploy directory has not got it yet. -->
+    <Copy SourceFiles="$(TargetDir)0Harmony.dll" DestinationFolder="$(DeployDir)"
+          Condition="Exists('$(TargetDir)0Harmony.dll') AND !Exists('$(DeployDir)\0Harmony.dll')"
+          ContinueOnError="true" />
+  </Target>
+
+  <ItemGroup>
+    <Reference Include="VRage.Library"><HintPath>$(SE2Dir)\VRage.Library.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VRage.Core"><HintPath>$(SE2Dir)\VRage.Core.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VRage.Core.Game"><HintPath>$(SE2Dir)\VRage.Core.Game.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VRage.DCS"><HintPath>$(SE2Dir)\VRage.DCS.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Game2.Simulation"><HintPath>$(SE2Dir)\Game2.Simulation.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Game2.Game"><HintPath>$(SE2Dir)\Game2.Game.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>

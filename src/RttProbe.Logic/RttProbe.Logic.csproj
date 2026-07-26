@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <!-- Loaded into a collectible AssemblyLoadContext by the bootstrap so it can
+         be swapped while the game runs. -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <AssemblyName>RttProbe.Logic</AssemblyName>
+    <RootNamespace>RttProbe</RootNamespace>
+  </PropertyGroup>
+
+  <!-- Hot reload: the bootstrap watches DeployDir and reloads within ~2s. -->
+  <Target Name="DeployLogic" AfterTargets="Build">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(DeployDir)" ContinueOnError="true" />
+    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(DeployDir)" ContinueOnError="true" />
+  </Target>
+
+  <ItemGroup>
+    <Reference Include="VRage.Library"><HintPath>$(SE2Dir)\VRage.Library.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VRage.Core"><HintPath>$(SE2Dir)\VRage.Core.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VRage.Core.Game"><HintPath>$(SE2Dir)\VRage.Core.Game.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VRage.DCS"><HintPath>$(SE2Dir)\VRage.DCS.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VRage.Render"><HintPath>$(SE2Dir)\VRage.Render.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Game2.Simulation"><HintPath>$(SE2Dir)\Game2.Simulation.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Game2.Client"><HintPath>$(SE2Dir)\Game2.Client.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Game2.Game"><HintPath>$(SE2Dir)\Game2.Game.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VRage.Game"><HintPath>$(SE2Dir)\VRage.Game.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+</Project>
