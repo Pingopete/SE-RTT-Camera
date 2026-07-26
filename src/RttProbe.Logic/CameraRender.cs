@@ -1931,13 +1931,18 @@ internal static class CameraRender
 
     private static MethodInfo _miScenePrep, _miDrawAll;
     private static bool _sceneRenderBlocked;
-    private static int _sceneRenderLogs;
+    private static int _sceneRenderLogs, _sceneRenderMode = -1;
 
     private static bool TryWholeSceneRender(object commandList, object res, object ldrTarget)
     {
-        if (_sceneRenderBlocked || _inNestedRender) return false;
+        if (_inNestedRender) return false;
         var mode = FeedConfig.WholeSceneRender;
         if (mode <= 0) return false;
+
+        // Changing mode clears the block. A latched flag meant switching from 1 to 2
+        // silently did nothing until a reload, which would read as "mode 2 is broken too".
+        if (mode != _sceneRenderMode) { _sceneRenderMode = mode; _sceneRenderBlocked = false; _sceneRenderLogs = 0; }
+        if (_sceneRenderBlocked) return false;
 
         try
         {
