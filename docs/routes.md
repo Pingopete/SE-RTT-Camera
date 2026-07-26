@@ -21,27 +21,42 @@ than inferable. The assemblies remain the only source for what a pass is **bound
 Settings are on disk too, at
 `GameData\Engine\Assets\Core\DefaultFrameSettingsConfiguration.def`.
 
-## Discovery 2: the probe path cannot draw 59% of the world's opaque materials
+## Discovery 2: RETRACTED — there is no material-state ceiling
 
-**[verified here]** Of 98 shipped material-state definitions, 49 declare `PassGBuffer`.
-Only **20** of those also declare `PassIndirect` — the pass our feed renders. The other
-**29 have no shader variant for our path at all**:
+**This section originally claimed the probe path could not draw 59% of the world's
+opaque materials, that voxel terrain was among them, and that frame interleaving was the
+only way to reach it. All three were wrong.** Recorded rather than deleted because the
+way it was wrong is worth not repeating.
 
-- all 13 `Triplanar*` / `SphericalTriplanar*` — **every voxel and planet surface**
-- all 4 skinned PBR variants — **characters**
-- 6 `PBRAlpha*` / `AlphaCutout` — foliage, glass, grating
-- 4 `PBRParallax*`, plus `PBRTilingArmorNoShadow`, `ProgressIndicator`, `MapPlanet`, …
+The count filtered on `PassGBuffer` and *then* asked which of those also had
+`PassIndirect`. That excluded exactly the states the engine authors **for** the indirect
+path — which declare `PassIndirect` and no `PassGBuffer` at all:
 
-`TriplanarSingleGlobal` additionally carries `DeferredTexturing`, a pass pair the probe
-path never runs — so planet ground is doubly absent.
+```
+TriplanarGIGlobal.def
+  "Flags": "StateBackfaceCulling, StateZWriteEnabled, PassIndirect, RayTracing, MarkVoxelStencil"
+```
 
-This is a **hard ceiling**. No camera fix, resolution fix, LOD change, streaming change
-or lighting pass can make a draw appear that is never issued. It reframes the user's
-"missing textures" complaint as *missing geometry*, and it means "no planetary
-atmosphere" is compounded: the planet's **surface** does not draw either.
+`TriplanarGIGlobal` and `SphericalTriplanarGIGlobal` are the voxel-terrain indirect
+variants; `PBRBlendedFlora` and `PBRBlendedFloraInstanced` are the flora ones. The engine
+maintains simplified indirect variants on purpose — environment probes need terrain in
+them too. The count also read only the root directory, 98 of 153 files.
 
-Everything in tiers 0–2 below makes the 20 drawable material states look dramatically
-better. Only tier 3 lifts the ceiling.
+Correct numbers, over all 153 shipped material states: **39 declare `PassIndirect`,
+71 declare `PassGBuffer`.** Asteroids, planet surfaces and voxel terrain draw in the feed
+today, which is the observation that exposed the error.
+
+What *is* genuinely absent from the indirect path — `PassGBuffer` with no indirect
+sibling — is a much narrower list: plain skinned characters (armor-skinned has
+`PassIndirect`, so ship and player armor is fine), alpha-blended glass, non-cutout
+parallax, tessellated terrain detail, water particles. **All of those carry
+`PassGBuffer`, so they are reachable through the deferred path — not only through frame
+interleaving.**
+
+**The lesson:** a set-difference over a filtered subset answers a different question from
+the one asked, and it answers it confidently. The claim survived an adversarial verify
+pass and two hand-checks because every individual number in it was correct. What was
+wrong was the population.
 
 ---
 
@@ -271,9 +286,16 @@ not per-pixel HDR.
 
 ---
 
-## Tier 3 — lifting the ceiling
+## Tier 3 — completeness at zero marginal cost
 
-Only one route reaches the 29 missing material states, and it is not a second render.
+**Ruled out by the user, and Discovery 2's retraction removes most of its motivation.**
+Kept for the mechanism, which is sound and well-evidenced.
+
+What this buys is no longer "the only route to a complete world" — it is completeness at
+zero marginal GPU cost. Every specific feature it would deliver is reachable another way:
+the material states it would unlock all carry `PassGBuffer`, so the deferred path reaches
+them, and the temporal effects (TAA/FSR, SSR, adaptive exposure) would need per-view
+history built either way.
 
 ### 3.1 Frame interleaving through the game-thread camera
 
@@ -416,8 +438,9 @@ Two consequences worth internalising:
 6. **1.1** camera-CB swap, proven inert first against `IndirectPlanetEnvironmentJob`.
 7. **1.2** `AtmosphereMultiplyJob`, then HBAO.
 8. **2.2** own `ExtensionsTexture` for per-pixel HDR.
-9. **3.1** frame interleaving — only if the ceiling in Discovery 2 turns out to matter for
-   the intended scenes, and only with the user's agreement to halve the player's framerate.
+9. ~~**3.1** frame interleaving~~ — ruled out by the user, and Discovery 2's retraction
+   removed the argument for it. Everything it would have unlocked is reachable through
+   the deferred path or by building per-view history.
 
 Steps 1–5 are all inside code we already own and none mutates engine state beyond a
 set-and-restore of a settings field.
