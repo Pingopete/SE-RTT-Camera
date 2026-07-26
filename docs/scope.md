@@ -21,8 +21,34 @@ shipping.
 | 3 | Stable — hours, not minutes; no CTD, no progressive slowdown | **done** |
 | 4 | **30 fps sustained** | **done at 26–29 fps** with the current pass set |
 | 5 | 512×512 is sufficient resolution | accepted; not a goal to exceed |
-| 6 | **Visually resembles the full-screen world render** | **not done** — the gap |
+| 6 | **Visually resembles the full-screen world render** | **partly** — see the baseline below |
 | 7 | Does not degrade the player's own view | **conditionally** — see below |
+
+## The known-good baseline (2026-07-26)
+
+Five fixes went in one at a time and all five held. They are now **code defaults**, not
+config-file entries, because `output\feed-config.txt` is gitignored and a clean checkout
+has to reproduce this build. Setting any of them in the config still wins, so each stays
+a one-line bisect.
+
+| Fix | What it corrected |
+|---|---|
+| `lodMainView` | we passed `Settings.LOD.EnvironmentProbe` to our own culling call — `MinLOD 8`, the coarsest mesh for everything. `MainView` is `MinLOD 0`. |
+| `fixScreenRes` | the camera CB carried the player's 3840×2160 in `Screen.Resolution` while rasterising 512×512 — a 7.5× error on every `rcp(Screen_.Resolution)` view-ray reconstruction, in the sky *and* the geometry pass. |
+| `fullCameraCb` | the `RenderViewSlim` conversion left `ViewTransform`/`InvViewTransform`/`TanFOV`/`FOVScaleFactor` at zero and stamped the *player's* position into `MainViewCameraPos`. Also fixed an unnoticed aspect-ratio squash: the slim path copied the player's 16:9 projection into a square target. |
+| `recursiveReflections` | ships `false`, binding a flat default cubemap instead of the real `CloseIBL`/`FarIBL` — the ambient term was a constant. |
+| `emissivity = 50` | display side. The panel's emissive term reaches the main view's HDR buffer ahead of its own bloom, so it is the only axis on which the feed can exceed white. |
+
+Plus one regression fix that had to land first: **`rangeCulling`**. A `CullingContext`
+borrowed from `BorrowShadowCulling` is ranged for `RangeStats.Default` — one draw per
+category — and the engine only grows the contexts its own pending-work queues name.
+Nothing names ours, so most of the scene's draw commands were silently dropped. That was
+the missing asteroids and the flickering structure, and it appeared the moment we stopped
+sharing `EnvProbeCulling[0]` (which the engine ranges every frame).
+
+Still open on requirement 6: no screen-space AO, atmosphere is in-scatter only (the
+multiply half is missing), no real anti-aliasing, shadows still come from the player's
+cascades rather than our frustum.
 
 Raw pixel resolution is explicitly **not** a goal. Ray tracing is explicitly **out of
 scope**. Requirement 6 is the whole remaining project.

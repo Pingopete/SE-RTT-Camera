@@ -260,20 +260,25 @@ internal static class FeedConfig
     public static bool ZeroMetalness { get; private set; } = true;
 
     // ---- the five fidelity fixes from docs/routes.md ----
-    // All default OFF so each can be flipped alone, live, against a running feed.
+    //
+    // All five are now ON by default: they were flipped one at a time against a running
+    // feed, all five held, and the result is the stable baseline. Defaults rather than
+    // config-file entries because output\feed-config.txt is gitignored — a clean checkout
+    // has to reproduce this build, not the pre-fix one. Setting any of them in the config
+    // file still wins, so each remains a one-line bisect.
 
     // 1. Which LOD profile our own culling call asks for. We copied the probe recipe,
     //    which passes Settings.LOD.EnvironmentProbe — and the shipped config gives that
     //    profile MinLOD 8 / FloraMinLOD 8 where MainView uses 0. So the feed has always
     //    drawn every mesh at its coarsest LOD. One argument, no global touched.
-    public static bool LodMainView { get; private set; }
+    public static bool LodMainView { get; private set; } = true;
 
     // 2. Stamp OUR render resolution into the camera CB's Screen.Resolution.
     //    CameraSettings -> TrackedCameraSettings copies ScreenBuffers.PreUpscaleResolution
     //    (the player's 3840x2160) while we rasterise 512x512, and shaders reconstruct view
     //    rays with rcp(Screen_.Resolution) — a 7.5x error on every one of them. That is
     //    the over-zoomed sky, and also wrong view vectors and specular in the geometry pass.
-    public static bool FixScreenRes { get; private set; }
+    public static bool FixScreenRes { get; private set; } = true;
 
     // 3. Build the camera CB from a real RenderView via
     //    CameraSettings.CreateNonjitteredCameraSettings instead of the RenderViewSlim
@@ -281,21 +286,21 @@ internal static class FeedConfig
     //    and CameraFlags at zero — so shaders believe the camera is at the world origin —
     //    and stamps the PLAYER's position into MainViewCameraPos, which is what planet
     //    curvature and triplanar (voxel) texturing read.
-    public static bool FullCameraCb { get; private set; }
+    public static bool FullCameraCb { get; private set; } = true;
 
     // 4. LCD material EmissivityMultiplier. 0 leaves the base material's value alone
     //    (10 on LCDScreen_On). The panel's emissive term is added to the MAIN view's HDR
     //    buffer before its bloom and tonemap, so this is the display-side gain — the one
     //    axis that can put the feed above white. Live-tunable: change it and the material
     //    is updated in place, so a sweep costs a file save.
-    public static double Emissivity { get; private set; }
+    public static double Emissivity { get; private set; } = 50.0;
 
     // 5a. EnvironmentProbeSettings.EnableRecursiveReflections ships FALSE, which makes
     //     IndirectEnvironmentPassJob bind a flat default cubemap instead of the real
     //     CloseIBL/FarIBL — our ambient term is a constant. Read LIVE inside DoWork, so a
     //     scoped set/restore around our pass is enough and the player keeps their own.
     //     -1 leaves it alone, 0 forces off, 1 forces on.
-    public static int RecursiveReflections { get; private set; } = -1;
+    public static int RecursiveReflections { get; private set; } = 1;
 
     // 5b. EnvironmentProbeSettings.DimDistance. Pass_Pixel_Indirect.hlsli multiplies all
     //     shaded output by clamp(ZDepth/DimDistance, 0, 1) SQUARED, and it ships as 5 m —
