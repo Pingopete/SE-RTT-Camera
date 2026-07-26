@@ -1427,29 +1427,67 @@ internal static class CameraRender
                                         RttLog.Line("=== BLOOM: cheap stand-in (ApplyBloom skipped). ===");
                                 }
 
+                                // Real bloom, amortised.
+                                //
+                                // ApplyBloom is a multi-pass downsample/upsample chain and
+                                // it is what halved the frame rate when this was first
+                                // tried. But bloom is inherently LOW FREQUENCY — a blurred
+                                // copy of the bright parts — so recomputing it 28 times a
+                                // second buys almost nothing on a camera that orbits once
+                                // every 30 s. bloomEveryN computes it on one pass in N and
+                                // reuses the result in between, which is the standard trade
+                                // and turns the cost into cost/N.
+                                //
+                                // The safety question is settled rather than assumed:
+                                // ApplyBloom reads Settings.PostProcess.Bloom (a bool),
+                                // DebugViewHelper.GetCurrentEngineDebugView(), and calls
+                                // BloomJob.DoWork(cl, source, exposure) with both inputs as
+                                // parameters. No ScreenBuffers, no camera CB, no temporal
+                                // state. It was ComputeExposure that corrupted the player's
+                                // view, not this.
+                                //
+                                // Holding the Borrowed<T> across passes is the part that
+                                // needs care — that is a pool loan, and the pool asserts on
+                                // shutdown if it is never handed back. ReleaseHeldBorrows
+                                // returns it.
                                 if (bloom == null && FeedConfig.Bloom && !_bloomBlocked && _miApplyBloom != null)
                                 {
                                     try
                                     {
-                                        // ApplyBloom(cl, toneMappingInput, exposure, out bloom)
-                                        //
-                                        // That out parameter is a Borrowed<T>, so it is a
-                                        // pool loan and not a gift. Dropping it would leak
-                                        // one texture per frame — 30 a second — which is
-                                        // precisely the "grinds to a halt" shape we already
-                                        // spent a night chasing. Returned below, after the
-                                        // tonemap has consumed it.
-                                        var bArgs = new object[] { commandList, hdrTex, exposure, null };
-                                        _miApplyBloom.Invoke(_sceneDrawSystem, bArgs);
-                                        bloomBorrow = bArgs[3];
-                                        bloom = Prop2(bloomBorrow, "Resource") ?? bloomBorrow;
+                                        int everyN = Math.Max(1, FeedConfig.BloomEveryN);
+                                        bool recompute = _bloomHeld == null || (_renders % everyN) == 0;
+
+                                        if (recompute)
+                                        {
+                                            // Return the previous loan BEFORE taking a new
+                                            // one, or we accumulate one texture per recompute.
+                                            if (_bloomHeld != null)
+                                            {
+                                                try { ReturnBorrowed(_bloomHeld); } catch { }
+                                                _bloomHeld = null;
+                                            }
+
+                                            // ApplyBloom(cl, toneMappingInput, exposure, out bloom)
+                                            var bArgs = new object[] { commandList, hdrTex, exposure, null };
+                                            _miApplyBloom.Invoke(_sceneDrawSystem, bArgs);
+                                            _bloomHeld = bArgs[3];
+                                            _bloomRecomputes++;
+                                        }
+
+                                        // NOT returned in the finally below — it is reused
+                                        // until the next recompute. bloomBorrow stays null
+                                        // so that path cannot take it back from under us.
+                                        bloom = Prop2(_bloomHeld, "Resource") ?? _bloomHeld;
+
                                         if (_bloomLogs++ == 0)
-                                            RttLog.Line($"=== BLOOM: applied (bloom={(bloom == null ? "null" : bloom.GetType().Name)}). ===");
+                                            RttLog.Line($"=== BLOOM: real ApplyBloom, recomputed every {everyN} pass(es) " +
+                                                        $"and reused in between (bloom={(bloom == null ? "null" : bloom.GetType().Name)}). ===");
                                     }
                                     catch (Exception e)
                                     {
                                         _bloomBlocked = true;
                                         bloom = null;
+                                        if (_bloomHeld != null) { try { ReturnBorrowed(_bloomHeld); } catch { } _bloomHeld = null; }
                                         RttLog.Error("bloom (disabled, tonemap continues)", e);
                                     }
                                 }
@@ -2065,6 +2103,11 @@ internal static class CameraRender
     // contribution — but ambient itself is computed from the GBuffer and sky, and that
     // is the term the feed is missing.
     private static object _giDiffuse, _giSpecular;
+
+    // The real bloom result, held between recomputes. A pool loan, returned by
+    // ReleaseHeldBorrows — never dropped, or the pool asserts at shutdown.
+    private static object _bloomHeld;
+    private static long _bloomRecomputes;
     private static bool _ambientPrereqLogged;
 
     private static bool EnsureGiBuffers(object res)
@@ -3800,12 +3843,13 @@ internal static class CameraRender
     // happened while chasing the black screen.
     private static void ReleaseHeldBorrows()
     {
-        foreach (var b in new[] { _giDiffuse, _giSpecular, _ourDepthBorrow })
+        foreach (var b in new[] { _giDiffuse, _giSpecular, _ourDepthBorrow, _bloomHeld })
         {
             if (b == null) continue;
             try { ReturnBorrowed(b); } catch { }
         }
-        _giDiffuse = _giSpecular = _ourDepthBorrow = null;
+        _giDiffuse = _giSpecular = _ourDepthBorrow = _bloomHeld = null;
+        _bloomRecomputes = 0;
         _ourDepthTex = null;
     }
 
