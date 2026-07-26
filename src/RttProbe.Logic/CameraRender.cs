@@ -489,6 +489,7 @@ internal static class CameraRender
     {
         object rtBorrow = null, depthBorrow = null, cameraCb = null, borrowedCulling = null;
         object savedGBuffer = null, savedCamera = null, scratchBorrow = null, savedProbeSettings = null;
+        object[] savedCameraCb = null;
         bool geomBorrowed = false;
 
         // Captured ONCE for the whole pass. The config is polled between passes, so
@@ -556,6 +557,18 @@ internal static class CameraRender
 
             cameraCb = BuildCameraCb(view, res);
             if (cameraCb == null) { RttLog.Line("Camera pass: camera conversion failed."); _armed = false; return; }
+
+            // Point the ENGINE'S two camera constant buffers at ours for the pass.
+            //
+            // Passes that take a cameraCb parameter already get ours. Everything else —
+            // ~92 methods, including ClusteringJob.DoWork which runs right below — reads
+            // these two fields off the global. So our cluster grid is currently built
+            // from the PLAYER'S frustum while we rasterise from ours, which mis-bins
+            // every clustered local light in the feed.
+            //
+            // Restored in the finally. It must be restored inside this same OnBeginDraw
+            // bracket: OnEndDraw disposes whatever is in the field.
+            savedCameraCb = CameraCbSwap.Install(cameraCb);
 
             // The colour target is borrowed RESIZABLE when any fidelity layer is on.
             //
@@ -1002,6 +1015,7 @@ internal static class CameraRender
         {
             // FIRST, before anything else can throw: the engine must not be left
             // pointing at our 512x512 array.
+            CameraCbSwap.Restore(savedCameraCb);
             RestoreProbeSettings(savedProbeSettings);
             RestoreCamera(savedCamera);
             RestoreGBuffer(savedGBuffer);
