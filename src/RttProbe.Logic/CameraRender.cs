@@ -46,7 +46,7 @@ internal static class CameraRender
     private static MethodInfo _miDoCullingFirstPass, _miClusterDoWork, _miEnvPassDoWork;
     private static MethodInfo _miBorrowRt, _miBorrowDepth, _miCreateCb;
     private static Type _tRenderViewSlim, _tTrackedCam, _tCamSettings;
-    private static object _hdrFormat, _srvFormat, _depthFormat;
+    private static object _hdrFormat, _srvFormat, _depthFormat, _ldrFormat;
 
     public static void Reset()
     {
@@ -270,6 +270,13 @@ internal static class CameraRender
 
         var sbType = Type.GetType("Keen.VRage.Render12.Core.Systems.ScreenBuffers, VRage.Render12");
         _hdrFormat = sbType?.GetField("HDR_FORMAT", Any)?.GetValue(null);
+
+        // LDR_FORMAT is a static constant on ScreenBuffers (R8G8B8A8_UNorm_SRgb), so it
+        // is available here. _feedFormat is only populated during the COPY stage, which
+        // runs after the render — using that for the whole-scene target meant the first
+        // pass saw null and latched the path off.
+        _ldrFormat = sbType?.GetField("LDR_FORMAT", Any)?.GetValue(null);
+        sb.AppendLine($"  LDR_FORMAT                      {_ldrFormat}");
         _srvFormat = _hdrFormat;
         sb.AppendLine($"  HDR_FORMAT                      {_hdrFormat ?? (object)"NOT FOUND"}");
         if (_hdrFormat == null) ok = false;
@@ -353,6 +360,7 @@ internal static class CameraRender
                       $"ApplyBloom={(_miApplyBloom == null ? "NOT FOUND" : "ok")} " +
                       $"PlanetEnvJob={(_miPlanetEnvDoWork == null ? "NOT FOUND" : "ok")} --");
 
+        LocalLightShadowSurvey(sds, sb);
         CameraCarrierSurvey(sb);
         FidelitySurvey(sds, sb);
         GBufferSurvey(sds, sb);
@@ -621,7 +629,17 @@ internal static class CameraRender
             // Whole-scene render: the real pipeline for our view, in place of the probe
             // pass. Our camera is already installed above, and these entry points re-run
             // preparation so they pick it up.
+            _nestedRenderFailedThisFrame = false;
             bool wholeScene = TryWholeSceneRender(commandList, res, Prop2(rtBorrow, "Resource") ?? rtBorrow);
+
+            // Abandon the frame if the nested render died part-way. Anything else issued
+            // on this command list now is issued on corrupted state.
+            if (_nestedRenderFailedThisFrame)
+            {
+                RttLog.Line("Camera pass: abandoning this frame — the nested render failed mid-pass, " +
+                            "so the command list is not safe to keep using.");
+                return;
+            }
 
             // Forward path: one pass that writes fully-lit colour. Switchable, because
             // running it AND the deferred chain would light the scene twice.
@@ -913,7 +931,13 @@ internal static class CameraRender
                 Array.Clear(_ldrRing, 0, _ldrRing.Length); _ldrReady = null; _ringIndex = -1;
             }
 
-            if (_feedState == 0) ResolveFeedTexture();
+            // Throttled: the resolve now retries rather than latching, so without a gate
+            // it would run (and log) 29 times a second while the target is pending.
+            if (_feedState == 0 && Clock.Ms - _lastResolveAttempt >= 250)
+            {
+                _lastResolveAttempt = Clock.Ms;
+                ResolveFeedTexture();
+            }
             if (_feedState != 1 || _feedTexture == null) return;
 
             // CopyResource cannot convert formats, and the scene renders HDR float
@@ -1232,7 +1256,23 @@ internal static class CameraRender
                     // postProcess stays null — PostProcess.Normalize crashes, it needs
                     // resources this call site does not set up.
                     var blitSrc = srcSrv;
-                    if (toneMapped)
+
+                    // When Draw produced the image it is already fully post-processed and
+                    // tonemapped — it IS the final LDR. Read it directly and skip our own
+                    // tone pass, which would otherwise map an already-mapped image.
+                    if (_wholeSceneOutput != null)
+                    {
+                        var wsSrv = ViewOf(_wholeSceneOutput, "ITexture2DView");
+                        if (wsSrv != null)
+                        {
+                            blitSrc = wsSrv;
+                            if (_wholeSceneBlitLogs++ == 0)
+                                RttLog.Line("Whole-scene render: blitting Draw's output to the panel " +
+                                            "(already tonemapped — our tone pass is bypassed).");
+                        }
+                        _wholeSceneOutput = null;
+                    }
+                    else if (toneMapped)
                     {
                         var toneSrv = ViewOf(_ldrResizable, "ITexture2DView");
                         if (toneSrv != null) blitSrc = toneSrv;
@@ -1909,6 +1949,206 @@ internal static class CameraRender
         _depthSwapOk = false;
     }
 
+    // ----------------------------------- suppress local light shadows for our render
+    // RenderLocalLightShadows is the one pass that kills a nested Draw:
+    //
+    //   Nullable.get_Value -> BindableBufferManager.CreateTransientConstantBuffer
+    //   -> GeometryPassJob.TryBindRootParameters -> DepthPassJob -> RenderLocalLightShadows
+    //
+    // And there is no defensive recovery: abandoning our frame afterwards still lost the
+    // game, because a half-executed Draw corrupts the ENGINE's frame, not just our
+    // command list. So this has to not throw, or Draw cannot be used.
+    //
+    // CoreSystems.LocalLights holds five shadow-specific PooledLists. The fields are
+    // readonly but the lists are mutable, so they can be emptied for the nested render
+    // and refilled after. Only the SHADOW lists — _singleLights and _cubeLights are left
+    // alone, so local lights still light our scene, they just cast no shadows in the
+    // feed. An acceptable trade for a camera view.
+    //
+    // All-or-nothing on purpose: partial suppression means the crash still happens and
+    // still takes the process, so a failure here must prevent Draw entirely.
+    private static readonly string[] ShadowListFields =
+    {
+        "_cubeShadowMapLights", "_cubeShadowMaskLights", "_singleShadowMapLights",
+        "_singleShadowMapLightsWithForcedShadow", "_singleLightsWithForcedShadow",
+    };
+
+    private static object _localLightsMgr;
+    private static FieldInfo[] _shadowListFields;
+    private static object[][] _savedShadowLists;
+    private static bool _shadowSuppressBlocked, _shadowSuppressLogged;
+
+    private static object LocalLightsManager()
+    {
+        if (_localLightsMgr != null) return _localLightsMgr;
+        try
+        {
+            var cs = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            foreach (var f in cs?.GetFields(BindingFlags.Public | BindingFlags.Static) ?? Array.Empty<FieldInfo>())
+                if (f.FieldType.Name == "LocalLightsManager")
+                { _localLightsMgr = f.GetValue(null); break; }
+        }
+        catch { }
+        return _localLightsMgr;
+    }
+
+    private static bool SuppressLocalLightShadows()
+    {
+        if (_shadowSuppressBlocked) return false;
+        try
+        {
+            var mgr = LocalLightsManager();
+            if (mgr == null) { _shadowSuppressBlocked = true; RttLog.Line("Local shadows: manager not reachable."); return false; }
+
+            _shadowListFields ??= ShadowListFields
+                .Select(n => mgr.GetType().GetField(n, Any)).Where(f => f != null).ToArray();
+            if (_shadowListFields.Length == 0)
+            {
+                _shadowSuppressBlocked = true;
+                RttLog.Line("Local shadows: no shadow list fields found.");
+                return false;
+            }
+
+            _savedShadowLists = new object[_shadowListFields.Length][];
+            for (int i = 0; i < _shadowListFields.Length; i++)
+            {
+                if (_shadowListFields[i].GetValue(mgr) is not System.Collections.IList list)
+                {
+                    _shadowSuppressBlocked = true;
+                    RttLog.Line($"Local shadows: {_shadowListFields[i].Name} is not an IList — " +
+                                "cannot suppress safely, so Draw stays off.");
+                    RestoreLocalLightShadows();
+                    return false;
+                }
+
+                var snapshot = new object[list.Count];
+                for (int j = 0; j < list.Count; j++) snapshot[j] = list[j];
+                _savedShadowLists[i] = snapshot;
+                list.Clear();
+            }
+
+            if (!_shadowSuppressLogged)
+            {
+                _shadowSuppressLogged = true;
+                RttLog.Line($"Local shadows suppressed for the nested render: " +
+                            $"{string.Join(", ", _shadowListFields.Select((f, i) => $"{Clean2(f.Name)}={_savedShadowLists[i].Length}"))} " +
+                            "— local lights still light the feed, they just cast no shadows in it.");
+            }
+            return true;
+        }
+        catch (Exception e)
+        {
+            _shadowSuppressBlocked = true;
+            RttLog.Error("suppress local shadows", e);
+            RestoreLocalLightShadows();
+            return false;
+        }
+    }
+
+    private static void RestoreLocalLightShadows()
+    {
+        if (_savedShadowLists == null || _shadowListFields == null) return;
+        var mgr = _localLightsMgr;
+        try
+        {
+            for (int i = 0; i < _shadowListFields.Length; i++)
+            {
+                var saved = _savedShadowLists[i];
+                if (saved == null || mgr == null) continue;
+                if (_shadowListFields[i].GetValue(mgr) is not System.Collections.IList list) continue;
+                list.Clear();
+                foreach (var item in saved) list.Add(item);
+            }
+        }
+        catch (Exception e)
+        {
+            // Failing to restore means the player loses local light shadows entirely.
+            _shadowSuppressBlocked = true;
+            RttLog.Error("RESTORE LOCAL SHADOWS FAILED — the player's local lights may stop casting", e);
+        }
+        finally { _savedShadowLists = null; }
+    }
+
+    // --------------------------------- local light shadow requests (read only survey)
+    // The nested Draw dies in RenderLocalLightShadows:
+    //
+    //   Draw -> ExecuteScenePreparationAndRender -> RenderShadows
+    //        -> RenderLocalLightShadows -> DepthPassJob.DoWork
+    //        -> GeometryPassJob.TryBindRootParameters  ->  Nullable has no value
+    //
+    // That path drains queued ShadowMaskUpdateRequests (the recon shows
+    // LocalLightsManager/ShadowMaskUpdateRequest.BaseRenderView). They are queued AND
+    // consumed inside the engine's own frame, so a second pass over them finds state
+    // already spent — a nullable that was populated is now empty. It only bites when a
+    // local light actually requests a shadow update, which is why it took ~4 s.
+    //
+    // If the pending queue can be emptied for the duration of our nested render and put
+    // back afterwards, RenderLocalLightShadows finds nothing to do and the player's own
+    // requests survive. Same save/clear/restore shape already working for the GBuffer
+    // array, depth buffer, three resolution fields and the camera.
+    private static void LocalLightShadowSurvey(object sds, StringBuilder outer)
+    {
+        try
+        {
+            var sb = new StringBuilder($"=== Local light shadow survey {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
+            sb.AppendLine();
+            sb.AppendLine();
+
+            // Find the manager, wherever it lives.
+            var asm = sds.GetType().Assembly;
+            var mgrType = asm.GetTypes().FirstOrDefault(t => t.Name == "LocalLightsManager");
+            sb.AppendLine($"LocalLightsManager type: {mgrType?.FullName ?? "NOT FOUND"}");
+
+            object mgr = null;
+            foreach (var f in sds.GetType().GetFields(Any))
+            {
+                if (mgrType == null || !mgrType.IsAssignableFrom(f.FieldType)) continue;
+                try { mgr = f.GetValue(sds); } catch { }
+                sb.AppendLine($"  held by SceneDrawSystem.{f.Name} = {(mgr == null ? "null" : "set")}");
+                break;
+            }
+            if (mgr == null && mgrType != null)
+            {
+                var cs = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+                foreach (var f in cs?.GetFields(BindingFlags.Public | BindingFlags.Static) ?? Array.Empty<FieldInfo>())
+                    if (mgrType.IsAssignableFrom(f.FieldType))
+                    {
+                        try { mgr = f.GetValue(null); } catch { }
+                        sb.AppendLine($"  held by CoreSystems.{f.Name} = {(mgr == null ? "null" : "set")}");
+                        break;
+                    }
+            }
+            sb.AppendLine();
+
+            // Every collection on it — the request queue is what we need to empty.
+            sb.AppendLine("-- collections on the manager (the request queue is the target) --");
+            if (mgr == null) sb.AppendLine("  manager not reachable");
+            else
+                foreach (var f in mgr.GetType().GetFields(Any).OrderBy(f => f.Name))
+                {
+                    object v = null; try { v = f.GetValue(mgr); } catch { }
+                    bool isColl = v is System.Collections.ICollection;
+                    int count = isColl ? ((System.Collections.ICollection)v).Count : -1;
+                    var mark = f.Name.Contains("equest", StringComparison.Ordinal)
+                            || f.FieldType.Name.Contains("Request") ? "   <-- REQUESTS?" : "";
+                    sb.AppendLine($"    {(f.IsInitOnly ? "readonly " : "         ")}{f.FieldType.Name,-40} " +
+                                  $"{Clean2(f.Name),-34} {(isColl ? $"count={count}" : Short(v))}{mark}");
+                }
+            sb.AppendLine();
+
+            sb.AppendLine("-- RenderLocalLightShadows / shadow-mask methods --");
+            foreach (var m in sds.GetType().GetMethods(Any)
+                         .Where(m => m.Name.Contains("LocalLightShadow") || m.Name.Contains("ShadowMask")))
+                sb.AppendLine($"  {m.ReturnType.Name} {m.Name}({string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name))})");
+
+            var path = Path.Combine(RttLog.OutDir, "local-light-shadow-survey.txt");
+            File.WriteAllText(path, sb.ToString());
+            outer.AppendLine($"-- local light shadow survey -> {path} --");
+            RttLog.Line($"Local light shadow survey -> {path}");
+        }
+        catch (Exception e) { RttLog.Error("local light shadow survey", e); }
+    }
+
     // ------------------------------------------ whole-scene render (alternate branch)
     // The feed has always used IndirectEnvironmentPassJob — the environment-PROBE
     // shading path, deliberately the cheapest and flattest in the engine, because probes
@@ -1927,11 +2167,44 @@ internal static class CameraRender
     // for GBufferPassJob because the camera constant buffer had already been written for
     // the frame, but preparation rebuilds it.
     private static volatile bool _inNestedRender;
+    private static bool _nestedRenderFailedThisFrame;
     public static bool InNestedRender => _inNestedRender;
 
     private static MethodInfo _miScenePrep, _miDrawAll;
+    private static object _wholeSceneLdrBorrow;
+    private static string _wholeSceneLdrRes;
+    public static object WholeSceneOutput => _wholeSceneOutput;
+    private static object _wholeSceneOutput;
     private static bool _sceneRenderBlocked;
-    private static int _sceneRenderLogs, _sceneRenderMode = -1;
+
+    // A resizable target in the PANEL's LDR format for Draw to write into. Re-borrowed
+    // if the resolution moves, the same self-correcting shape the GBuffer needed after
+    // the first pass allocated at the pre-resolve size.
+    private static bool EnsureWholeSceneLdr(object res)
+    {
+        var wantRes = res?.ToString();
+        if (_wholeSceneLdrBorrow != null && wantRes == _wholeSceneLdrRes) return true;
+        try
+        {
+            var fmt = _ldrFormat ?? _feedFormat;
+            if (_miBorrowResizableRt == null || fmt == null)
+            {
+                RttLog.Line($"Whole-scene render: cannot allocate an LDR target " +
+                            $"(resizableBorrow={_miBorrowResizableRt != null}, format={fmt}).");
+                return false;
+            }
+            if (_wholeSceneLdrBorrow != null) try { ReturnBorrowed(_wholeSceneLdrBorrow); } catch { }
+
+            // (debugName, srvFormat, maxResolution, uavFormat, mipMaps, clearColor, lifetime)
+            _wholeSceneLdrBorrow = _miBorrowResizableRt.Invoke(_texPool, new object[]
+                { "RttWholeSceneLdr", fmt, res, null, 1, null, 128 });
+            _wholeSceneLdrRes = wantRes;
+            RttLog.Line($"Whole-scene render: LDR target allocated {res} {fmt}.");
+            return _wholeSceneLdrBorrow != null;
+        }
+        catch (Exception e) { RttLog.Error("whole-scene ldr target", e); return false; }
+    }
+    private static int _sceneRenderLogs, _sceneRenderMode = -1, _wholeSceneBlitLogs;
 
     private static bool TryWholeSceneRender(object commandList, object res, object ldrTarget)
     {
@@ -1958,6 +2231,17 @@ internal static class CameraRender
                 RttLog.Line($"Whole-scene render: ScenePreparationAndRender={(_miScenePrep == null ? "NOT FOUND" : "ok")} " +
                             $"Draw={(_miDrawAll == null ? "NOT FOUND" : "ok")} mode={mode}");
 
+            // Local light shadows must be out of the way BEFORE we call, and if they
+            // cannot be, we must not call at all — a Draw that throws part-way takes the
+            // engine's frame with it, and no amount of cleanup on our side recovers it.
+            if (FeedConfig.SuppressLocalShadows && !SuppressLocalLightShadows())
+            {
+                _sceneRenderBlocked = true;
+                RttLog.Line("Whole-scene render: local light shadows could not be suppressed — " +
+                            "refusing to call, since a partial Draw is fatal.");
+                return false;
+            }
+
             // The guard must be set BEFORE the call and cleared however it exits —
             // leaving it set would silently kill the feed for the rest of the session.
             _inNestedRender = true;
@@ -1973,21 +2257,32 @@ internal static class CameraRender
 
                 if (mode == 2 && _miDrawAll != null)
                 {
+                    // Draw's parameter is finalLDRBuffer, and it means it: passing our
+                    // HDR target threw
+                    //   KeyNotFoundException: the given key 'R11G11B10_Float' was not
+                    //   present in the dictionary
+                    // so it looks resources up BY FORMAT and only knows the LDR one.
+                    // Give it a dedicated resizable target in the panel's format.
+                    if (!EnsureWholeSceneLdr(res)) { _sceneRenderBlocked = true; return false; }
+                    var target = Prop2(_wholeSceneLdrBorrow, "Resource") ?? _wholeSceneLdrBorrow;
+
                     var want = _miDrawAll.GetParameters()[0].ParameterType;
-                    if (!want.IsInstanceOfType(ldrTarget))
+                    if (!want.IsInstanceOfType(target))
                     {
                         _sceneRenderBlocked = true;
-                        RttLog.Line($"Whole-scene render: Draw wants {want.Name}, we have " +
-                                    $"{ldrTarget?.GetType().Name} — enable tonemap so the LDR target is resizable.");
+                        RttLog.Line($"Whole-scene render: Draw wants {want.Name}, our LDR target is " +
+                                    $"{target?.GetType().Name}.");
                         return false;
                     }
-                    _miDrawAll.Invoke(_sceneDrawSystem, new[] { ldrTarget });
+
+                    _miDrawAll.Invoke(_sceneDrawSystem, new[] { target });
+                    _wholeSceneOutput = target;
                     if (_sceneRenderLogs++ == 0)
-                        RttLog.Line("=== WHOLE SCENE: Draw ran the full main-view pipeline for our view. ===");
+                        RttLog.Line("=== WHOLE SCENE: Draw ran the full main-view pipeline into our LDR target. ===");
                     return true;
                 }
             }
-            finally { _inNestedRender = false; }
+            finally { _inNestedRender = false; RestoreLocalLightShadows(); }
 
             _sceneRenderBlocked = true;
             RttLog.Line($"Whole-scene render: mode {mode} has no usable entry point.");
@@ -1995,9 +2290,17 @@ internal static class CameraRender
         }
         catch (Exception e)
         {
-            _inNestedRender = false;
+            _inNestedRender = false; RestoreLocalLightShadows();
             _sceneRenderBlocked = true;
-            RttLog.Error("whole-scene render (disabled, feed continues)", e);
+            _nestedRenderFailedThisFrame = true;
+            RttLog.Error("whole-scene render (disabled)", e);
+
+            // Do NOT let the caller carry on with the rest of the pass. A whole-frame
+            // render that throws part-way leaves the command list mid-pass with root
+            // parameters unbound — the previous attempt fell through to the fallback env
+            // pass on that command list, IndirectEnvironmentPassJob threw as well, and
+            // THAT second failure is what took the game down. One bad pass should cost a
+            // frame, not the process.
             return false;
         }
     }
@@ -2637,6 +2940,8 @@ internal static class CameraRender
         return string.Join(" <- ", parts);
     }
     private static string _resolvedPanelId;   // panel target the feed is currently sized for
+    private static long _lastResolveAttempt, _lastResolveFailLog;
+    private static int _resolveFailLogs;
     private static int _toneLogs;
 
     // Force a resource into COPY_SOURCE or COPY_DEST. ExplicitStateTransition takes an
@@ -2801,13 +3106,32 @@ internal static class CameraRender
                     // does not match means writing into somebody else's offscreen
                     // texture — another panel's, or the game UI's. That is a crash,
                     // and a confusing one. Better to render nothing.
+                    // RETRY, do not latch. ResolveFeedTexture sets _feedState = -1 on
+                    // entry and the call site only re-resolves at 0, so leaving it at -1
+                    // here turned a startup-ordering condition into a permanent disable:
+                    // the camera pass goes live ~2 s after load, but our offscreen target
+                    // is not created until the first LCD tick, so the very first resolve
+                    // legitimately sees an EMPTY registry. Observed exactly that —
+                    // "registered offscreen textures: 0" — and the feed never recovered.
                     if (_feedState != 1)
-                        sb.AppendLine($"  NO MATCH for id {wantId} — feed disabled rather than writing to an unknown target.");
+                    {
+                        _feedState = 0;
+                        sb.AppendLine($"  no match for id {wantId} yet ({(dict?.Count ?? 0)} registered) — " +
+                                      "will retry; refusing to write to an unknown target meanwhile.");
+                    }
                 }
                 else sb.AppendLine("  _registeredTextures is not a dictionary");
             }
             sb.AppendLine(_feedState == 1 ? "  FEED TEXTURE RESOLVED" : "  feed texture unavailable");
-            RttLog.Line(sb.ToString().TrimEnd());
+
+            // Success always logs. Failure logs the first time and then at most every
+            // 5 s, so a pending target does not bury the log while it waits.
+            bool ok = _feedState == 1;
+            if (ok || _resolveFailLogs == 0 || Clock.Ms - _lastResolveFailLog >= 5000)
+            {
+                if (!ok) { _resolveFailLogs++; _lastResolveFailLog = Clock.Ms; }
+                RttLog.Line(sb.ToString().TrimEnd());
+            }
         }
         catch (Exception e) { RttLog.Error("feed resolve", e); }
     }

@@ -191,6 +191,12 @@ internal static class FeedConfig
     // wall that stopped ExecuteLighting — expect to have to save and restore more.
     public static int WholeSceneRender { get; private set; }
 
+    // Empty the LocalLightsManager shadow lists around a nested whole-scene render.
+    // RenderLocalLightShadows is the one pass that throws inside Draw, and a Draw that
+    // throws part-way corrupts the ENGINE's frame — abandoning ours afterwards did not
+    // save it. Local lights still light the feed; they just cast no shadows in it.
+    public static bool SuppressLocalShadows { get; private set; } = true;
+
     // Supersampling multiplier on the panel resolution for the SCENE render only.
     // The feed has always rendered at exactly 512x512 with no anti-aliasing, which is
     // the blockiness and starfield smearing — not a lighting problem. Rendering larger
@@ -255,6 +261,7 @@ internal static class FeedConfig
             bool defDir = DeferredDirectional, defLoc = DeferredLocal, defAmb = DeferredAmbient;
             bool atmo = Atmosphere, execLight = ExecuteLighting, swapRes = SwapResolution, swapCam = SwapCamera, gbAfter = GBufferAfterEnv, supGi = SuppressGi;
             int wholeScene = WholeSceneRender;
+            bool supLocalSh = SuppressLocalShadows;
             double rScale = RenderScale;
             bool blitA = BlitAlpha, zeroMetal = ZeroMetalness;
             double farPlane = CullFarPlane;
@@ -319,6 +326,9 @@ internal static class FeedConfig
                         break;
                     case "renderscale":
                         if (double.TryParse(val, out var rs) && rs >= 1.0) rScale = rs;
+                        break;
+                    case "suppresslocalshadows":
+                        supLocalSh = val is "1" or "true" or "yes";
                         break;
                     case "wholescenerender":
                         if (int.TryParse(val, out var ws)) wholeScene = Math.Clamp(ws, 0, 2);
@@ -401,7 +411,7 @@ internal static class FeedConfig
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
-                        || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || wholeScene != WholeSceneRender;
+                        || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || wholeScene != WholeSceneRender || supLocalSh != SuppressLocalShadows;
             IntervalMs = interval; PanelMs = panel; StartupDelayMs = startup; UsePooledCulling = pooled; OrbitRadius = radius; OrbitPeriod = period; OrbitHeight = height;
             SrcTransition = src; DestTransition = dst; RetireTestPattern = retire; CopyEnabled = copy;
             OrbitClearance = clearance; OrbitGrid = orbitGrid;
@@ -409,7 +419,7 @@ internal static class FeedConfig
             CheapBloom = cheapBloom; CullFarPlane = farPlane; PassOnFrameHook = frameHook;
             ReuseExposure = reuseExp; ExposureValue = expValue; GBufferSwap = gbSwap; GBufferPass = gbPass; Deferred = defer; EnvPass = envP;
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
-            Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; WholeSceneRender = wholeScene; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
+            Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; WholeSceneRender = wholeScene; SuppressLocalShadows = supLocalSh; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
 
             if (changed)
                 RttLog.Line($"Config: intervalMs={IntervalMs} (~{1000.0 / IntervalMs:F0} fps) " +
