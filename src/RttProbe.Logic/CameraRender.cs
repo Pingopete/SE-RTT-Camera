@@ -78,6 +78,8 @@ internal static class CameraRender
         // most time on this project.
         ReleaseHeldBorrows();
         _sunBlocked = _sunSettingsLogged = false; _sunLogs = 0;
+        _dtBlocked = false; _dtLogs = 0; _deferredTexturingJob = null; _miDeferredTexturing = null;
+        _debugGbLog = null;
         _lodProbe = _lodMainView = _lastLodUsed = null;
         _screenResLog = null;
         _cbRenderView = null; _miCreateNonjittered = _miRvSetCamera = _miRvSetResolution = null;
@@ -715,6 +717,7 @@ internal static class CameraRender
                     {
                         _miGBufferPass.Invoke(_gBufferPassJob, new object[]
                             { commandList, Prop2(cullCtx, "FirstPass"), geomBuffers, true, null });
+                        RunDeferredTexturing(commandList, cullCtx, geomBuffers);
                         if (_gbPassLogs++ == 0)
                             RttLog.Line("=== GBUFFER PASS: surface data written into our own GBuffer. ===");
                     }
@@ -798,6 +801,7 @@ internal static class CameraRender
                     {
                         _miGBufferPass.Invoke(_gBufferPassJob, new object[]
                             { commandList, Prop2(cullCtx, "FirstPass"), geomBuffers, true, null });
+                        RunDeferredTexturing(commandList, cullCtx, geomBuffers);
                         if (_gbPassLogs++ == 0)
                             RttLog.Line("=== GBUFFER PASS: written AFTER the env pass, so our camera CB is bound. ===");
                     }
@@ -2122,6 +2126,65 @@ internal static class CameraRender
     private static int _execLightLogs, _scratchLogs, _eyeJumpLogs;
     private static Keen.VRage.Library.Mathematics.Vector3D _lastEye;
     private static bool _haveLastEye;
+    // DeferredTexturingJob — how the main view actually textures voxel surfaces.
+    //
+    // This is the missing half of the voxel-fidelity problem, and it is a distinct pass
+    // PAIR rather than a shader option: PassType.DeferredTexturingGeometry = 23 and
+    // DeferredTexturingMaterial = 24. The material states the main view uses for terrain
+    // (TriplanarSingleGlobal, TriplanarTessellationSingleGlobal, ...) all declare
+    // DeferredTexturing in their flags; the variant OUR path draws through,
+    // TriplanarGIGlobal, does not — it is described in its own definition as
+    // "Low quality master terrain material used for GI. Uses Far3 colors."
+    //
+    // So running this is what turns a coarse Far3-coloured voxel surface into a properly
+    // textured one. It reads a GBuffer written by GBufferPassJob, so it belongs
+    // immediately after it and is gated on the same prerequisites.
+    //
+    //     DoWork(DirectCommandList, GeometryContext, OutputGeometryBufferContext,
+    //            Nullable<(IRenderTargetView, IRenderTargetView)> fsrMasks)
+    //
+    // Every input is a parameter and we already hold all of them, so by the test that has
+    // decided every other pass this is the safe family. fsrMasks is nullable and we have
+    // no FSR, so null.
+    private static object _deferredTexturingJob;
+    private static MethodInfo _miDeferredTexturing;
+    private static bool _dtBlocked;
+    private static int _dtLogs;
+
+    private static void RunDeferredTexturing(object commandList, object cullCtx, object geomBuffers)
+    {
+        if (!FeedConfig.DeferredTexturing || _dtBlocked) return;
+        try
+        {
+            if (_miDeferredTexturing == null)
+            {
+                _deferredTexturingJob = _sceneDrawSystem?.GetType()
+                    .GetField("_deferredTexturingPass", Any)?.GetValue(_sceneDrawSystem);
+                _miDeferredTexturing = _deferredTexturingJob?.GetType().GetMethods(Any)
+                    .FirstOrDefault(m => m.Name == "DoWork" && m.GetParameters().Length == 4);
+                if (_miDeferredTexturing == null)
+                {
+                    _dtBlocked = true;
+                    RttLog.Line($"Deferred texturing: job={(_deferredTexturingJob == null ? "NOT FOUND" : "ok")} " +
+                                "DoWork(4 args) NOT FOUND — voxel surfaces stay Far3-coloured.");
+                    return;
+                }
+            }
+
+            _miDeferredTexturing.Invoke(_deferredTexturingJob, new object[]
+                { commandList, Prop2(cullCtx, "FirstPass"), geomBuffers, null });
+
+            if (_dtLogs++ == 0)
+                RttLog.Line("=== DEFERRED TEXTURING: voxel surfaces textured through PassType 23/24 " +
+                            "(the pass TriplanarGIGlobal does not declare). ===");
+        }
+        catch (Exception e)
+        {
+            _dtBlocked = true;
+            RttLog.Error("deferred texturing (disabled, feed continues)", e);
+        }
+    }
+
     // An SRV onto one of OUR GBuffer slots, for the debug blit. Reads the array we
     // installed rather than ScreenBuffers, so it reports what WE wrote even if the
     // swap were somehow not in effect — which is itself part of what is being tested.
