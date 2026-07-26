@@ -236,10 +236,39 @@ With 1.1 in place, in order of value:
 
 ### 1.3 Corrections to closed doors
 
-- **`DrawSkybox` will never produce sky.** Its entire body is
-  `_skyboxMotionVectorsJob.DoWork(cl, lBuffer)` — it writes **motion vectors**. Sky colour
-  comes from `AmbientLightJob` sampling `EnvironmentProbeManager.FarIBL` under
-  `SetStencilRef(8)`.
+- ~~**`DrawSkybox` will never produce sky.**~~ **WRONG — retracted.** The claim was made
+  from the job's name and its profiler label. The shipped pixel shader has **two**
+  outputs:
+
+  ```hlsl
+  // PostProcess/SkyboxMotionVectorsPixel.hlsl
+  struct PS_OUTPUT {
+      float3 SkyLight      : SV_Target0;   // skybox stars AND the sun disc
+      float4 MotionVectors : SV_Target1;
+  };
+  ```
+
+  `GetSkyLight` computes `SkyboxColor(...) * SkyboxBrightness`, then composites the sun:
+  `GetSunAlpha` / `GetSunColor` with `Environment_.SunDisc{Color,Intensity,InnerDot,OuterDot}`.
+  It is the **only** pass in the shipped tree that draws the sun disc in space —
+  `grep -rl "GetSunColor\|GetSunAlpha"` returns just `SkyboxSampling.hlsli` (the
+  definitions) and this file (the only caller).
+
+  It was inert when we drove it because it binds `CommonResources.JitteredCameraSettings`
+  — the **player's** camera — plus `ScreenBuffers.GBuffer[Motion]` and
+  `DepthStencilReadOnly`. Those are exactly what `swapCameraCb` and the GBuffer/depth
+  swaps now provide, so `skyMode = 2` is worth retrying rather than abandoned.
+
+  **Why the feed has no sun:** our sky comes from `IndirectPlanetEnvironmentJob`
+  (`Lighting/IndirectAtmosphere.hlsl`), which includes `SkyboxSampling.hlsli` and draws
+  `SkyboxColor` — the stars — but never calls `GetSunColor`. That is deliberate: an
+  environment probe is the *input* to ambient lighting, and baking a blazing sun disc into
+  the ambient cube would double-count a sun that is already applied as a directional
+  light. The probe path is not missing the sun by accident.
+
+  Separately, the **glare** around the sun is not the disc: that is `RenderFlares` (a
+  distinct pass reading `MainOutputGeometryBuffers`) plus real bloom, and the feed
+  currently runs `cheapBloom`, a flat 64×64 stand-in that cannot bloom anything.
 - **`AtmosphereAdditiveJob` is not atmosphere.** It is gated on `EnableGodRays` — it is
   the god-ray/light-shaft term. With god rays off it is a guaranteed no-op regardless of
   arguments. "Invokes cleanly, adds nothing" is fully explained.
