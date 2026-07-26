@@ -76,6 +76,7 @@ internal static class CameraRender
         // once" latch, and a hot reload that left them set would silently skip the log
         // line that proves the fix took — which is the failure mode that has wasted the
         // most time on this project.
+        ReleaseHeldBorrows();
         _lodProbe = _lodMainView = _lastLodUsed = null;
         _screenResLog = null;
         _cbRenderView = null; _miCreateNonjittered = _miRvSetCamera = _miRvSetResolution = null;
@@ -3781,6 +3782,31 @@ internal static class CameraRender
             try { var v = f.GetValue(resource); if (v != null) return v; } catch { }
         }
         return null;
+    }
+
+    // Give the pool back everything we hold across passes.
+    //
+    // These are borrowed once and cached for the session, which is correct for
+    // performance and wrong for lifetime: nothing ever returned them. The engine
+    // notices at shutdown —
+    //
+    //     Assertion Failure: '_cpuBorrowedObjects == 0'  GPUResourcePool.cs:52
+    //     Assertion Failure: '_gpuBorrowedObjects == 0'  GPUResourcePool.cs:53
+    //
+    // and because asserts are DEFERRED-FATAL in a release build (DiagnosticReporter
+    // throws FirstAssertionException from VRageCore.Dispose), a leak here turns every
+    // quit into a crash report. Worse, it drowns the assert summary in known noise, so
+    // a NEW assert from an experiment is invisible in the pile — which is exactly what
+    // happened while chasing the black screen.
+    private static void ReleaseHeldBorrows()
+    {
+        foreach (var b in new[] { _giDiffuse, _giSpecular, _ourDepthBorrow })
+        {
+            if (b == null) continue;
+            try { ReturnBorrowed(b); } catch { }
+        }
+        _giDiffuse = _giSpecular = _ourDepthBorrow = null;
+        _ourDepthTex = null;
     }
 
     private static void ReturnBorrowed(object borrowed)

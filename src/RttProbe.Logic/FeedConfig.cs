@@ -316,7 +316,7 @@ internal static class FeedConfig
     //    buffer before its bloom and tonemap, so this is the display-side gain — the one
     //    axis that can put the feed above white. Live-tunable: change it and the material
     //    is updated in place, so a sweep costs a file save.
-    public static double Emissivity { get; private set; } = 50.0;
+    public static double Emissivity { get; private set; } = 500.0;
 
     // 5a. EnvironmentProbeSettings.EnableRecursiveReflections ships FALSE, which makes
     //     IndirectEnvironmentPassJob bind a flat default cubemap instead of the real
