@@ -1033,7 +1033,21 @@ internal static class CameraRender
                         else
                         {
                             LogSunSettings();
-                            savedSunDepth = InstallPassDepth(depthBorrow);
+
+                            // Whether to hand the skybox OUR depth.
+                            //
+                            // It binds ScreenBuffers.DepthStencilBuffer.DepthStencilReadOnly
+                            // and depth/stencil-tests against it, so in principle it should
+                            // be ours — the sky must fill only where geometry did not draw.
+                            //
+                            // In practice installing it produced patches of sky rather than
+                            // a full one, while leaving the engine's in place drew the whole
+                            // skybox. Partial rejection means the buffer is bound but its
+                            // stencil is not what the pass expects: nothing has written our
+                            // stencil, because GBufferPassJob is what marks it and that is
+                            // gated on gbufferPass. Switchable rather than argued about.
+                            if (FeedConfig.SunPassDepth)
+                                savedSunDepth = InstallPassDepth(depthBorrow);
                             _miDrawSkybox.Invoke(_sceneDrawSystem, new[] { commandList, lBuf });
                             if (_sunLogs++ == 0)
                                 RttLog.Line("=== SUN: DrawSkybox applied as a layer (sun disc + starfield); " +

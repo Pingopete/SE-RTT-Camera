@@ -106,6 +106,14 @@ internal static class FeedConfig
     // Stars will read brighter than in the main view.
     public static bool SunPass { get; private set; }
 
+    // Hand the sun/skybox pass OUR depth instead of the engine's.
+    //
+    // Correct in principle — the sky must fill only where geometry did not draw — but
+    // it produced PATCHES of sky rather than a full one, which is partial depth/stencil
+    // rejection. Nothing writes our stencil unless GBufferPassJob runs, and that is gated
+    // on gbufferPass. Off until the stencil is actually populated.
+    public static bool SunPassDepth { get; private set; }
+
     // Recompute the real bloom on one pass in N and reuse it in between.
     //
     // ApplyBloom is a multi-pass downsample/upsample chain — it is what halved the
@@ -425,7 +433,7 @@ internal static class FeedConfig
             bool orbitGrid = OrbitGrid;
             bool lodMain = LodMainView, fixScreen = FixScreenRes, fullCam = FullCameraCb, effectGeom = EffectGeomBuffers, rangeCull = RangeCulling, swapCb = SwapCameraCb, atmoMul = AtmosphereMultiply;
             int bloomN = BloomEveryN;
-            bool sunPass = SunPass;
+            bool sunPass = SunPass, sunDepth = SunPassDepth;
             double emissive = Emissivity, dimDist = DimDistance;
             int recursive = RecursiveReflections;
 
@@ -572,6 +580,9 @@ internal static class FeedConfig
                     case "swapcameracb":
                         swapCb = val is "1" or "true" or "yes";
                         break;
+                    case "sunpassdepth":
+                        sunDepth = val is "1" or "true" or "yes";
+                        break;
                     case "sunpass":
                         sunPass = val is "1" or "true" or "yes";
                         break;
@@ -613,7 +624,7 @@ internal static class FeedConfig
                         || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
-                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass
+                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
                         || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || gateGi != GateGi || envScratch != EnvPassToScratch || skyMode != SkyMode || cullRoot != CullRootEntityId;
@@ -625,7 +636,7 @@ internal static class FeedConfig
             ReuseExposure = reuseExp; ExposureValue = expValue; GBufferSwap = gbSwap; GBufferPass = gbPass; Deferred = defer; EnvPass = envP;
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
-            LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass;
+            LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass; SunPassDepth = sunDepth;
             Emissivity = emissive; RecursiveReflections = recursive; DimDistance = dimDist;
 
             if (changed)
@@ -647,7 +658,7 @@ internal static class FeedConfig
                             $"| lodMainView={LodMainView} fixScreenRes={FixScreenRes} " +
                             $"fullCameraCb={FullCameraCb} emissivity={Emissivity} " +
                             $"recursiveReflections={RecursiveReflections} dimDistance={DimDistance} " +
-                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass}");
+                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass} sunPassDepth={SunPassDepth}");
         }
         catch { /* keep the last good values */ }
     }
