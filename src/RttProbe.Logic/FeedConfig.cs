@@ -180,6 +180,17 @@ internal static class FeedConfig
     // is what the feed needs; GI contributes least at 512x512. Restored unconditionally.
     public static bool SuppressGi { get; private set; } = true;
 
+    // Whole-scene render, replacing the environment-probe pass that has produced every
+    // image so far and is the root cause of the primitive lighting.
+    //   0 = off (probe pass, the stable path)
+    //   1 = ScenePreparationAndRender(cl, resolution) — explicit command list, stops
+    //       before the final post chain. The surgical option, try first.
+    //   2 = Draw(finalLDRBuffer) — the ENTIRE main-view pipeline including post and AA.
+    // Both re-run preparation, so they read our swapped RenderView. Both also advance
+    // the engine's temporal state (GI, eye adaptation, motion vectors), which is the
+    // wall that stopped ExecuteLighting — expect to have to save and restore more.
+    public static int WholeSceneRender { get; private set; }
+
     // Supersampling multiplier on the panel resolution for the SCENE render only.
     // The feed has always rendered at exactly 512x512 with no anti-aliasing, which is
     // the blockiness and starfield smearing — not a lighting problem. Rendering larger
@@ -243,6 +254,7 @@ internal static class FeedConfig
             bool gbSwap = GBufferSwap, gbPass = GBufferPass, defer = Deferred, envP = EnvPass;
             bool defDir = DeferredDirectional, defLoc = DeferredLocal, defAmb = DeferredAmbient;
             bool atmo = Atmosphere, execLight = ExecuteLighting, swapRes = SwapResolution, swapCam = SwapCamera, gbAfter = GBufferAfterEnv, supGi = SuppressGi;
+            int wholeScene = WholeSceneRender;
             double rScale = RenderScale;
             bool blitA = BlitAlpha, zeroMetal = ZeroMetalness;
             double farPlane = CullFarPlane;
@@ -307,6 +319,9 @@ internal static class FeedConfig
                         break;
                     case "renderscale":
                         if (double.TryParse(val, out var rs) && rs >= 1.0) rScale = rs;
+                        break;
+                    case "wholescenerender":
+                        if (int.TryParse(val, out var ws)) wholeScene = Math.Clamp(ws, 0, 2);
                         break;
                     case "suppressgi":
                         supGi = val is "1" or "true" or "yes";
@@ -386,7 +401,7 @@ internal static class FeedConfig
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
-                        || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi;
+                        || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || wholeScene != WholeSceneRender;
             IntervalMs = interval; PanelMs = panel; StartupDelayMs = startup; UsePooledCulling = pooled; OrbitRadius = radius; OrbitPeriod = period; OrbitHeight = height;
             SrcTransition = src; DestTransition = dst; RetireTestPattern = retire; CopyEnabled = copy;
             OrbitClearance = clearance; OrbitGrid = orbitGrid;
@@ -394,7 +409,7 @@ internal static class FeedConfig
             CheapBloom = cheapBloom; CullFarPlane = farPlane; PassOnFrameHook = frameHook;
             ReuseExposure = reuseExp; ExposureValue = expValue; GBufferSwap = gbSwap; GBufferPass = gbPass; Deferred = defer; EnvPass = envP;
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
-            Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
+            Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; WholeSceneRender = wholeScene; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
 
             if (changed)
                 RttLog.Line($"Config: intervalMs={IntervalMs} (~{1000.0 / IntervalMs:F0} fps) " +

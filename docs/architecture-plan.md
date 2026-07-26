@@ -632,6 +632,71 @@ Reachable work that does not fight this:
    pixelation in the feed is resolution, not lighting.
 3. **`AtmosphereAdditiveJob(cl, rtView)`** — 2 arguments, no GBuffer. Untried.
 
+## Branch `alternate-rendering`: there is a whole-view render entry point
+
+The feed has used `IndirectEnvironmentPassJob` since the first spike — the
+**environment-probe** shading path. That was the right choice for proving the plumbing
+and it is the reason the lighting is primitive: probes are the *input* to the engine's
+ambient lighting, so the pass deliberately renders without ambient, pre-exposed and
+range-compressed for cube-map storage. Every fidelity attempt so far has been trying to
+bolt main-view quality onto a pass designed to be the cheapest in the engine.
+
+There is a better door, and it was hiding in plain sight:
+
+```
+pub Void Draw(ResizableRWRenderTargetTexture finalLDRBuffer)                    <- everything
+int Void ScenePreparationAndRender(DirectCommandList commandList, Vector2I finalResolution)
+int Void ExecuteScenePreparationAndRender(Vector2I finalResolution)
+int Void ExecuteForwardAndPostProcess(lBuffer, out screenshotTexture, finalLDRBuffer)
+```
+
+`SceneDrawSystem.Draw` is the **complete main-view pipeline** — preparation, shadow
+cascades, GBuffer, full deferred lighting, forward passes, volumetrics, post, exposure,
+bloom, tonemap, AA — into one target supplied by the caller. It is public, and its lone
+parameter is the type our resizable LDR target already is.
+
+### Why this changes the camera problem too
+
+Swapping `SettingsManager._renderView` did nothing when the target was
+`GBufferPassJob`, because by our postfix the camera constant buffer had already been
+written for the frame — `_renderView` is the CPU-side *source* of that conversion, not
+the binding. `Draw` re-runs the preparation stage, which reads `RenderView` fresh. So
+the swap we already built becomes the mechanism rather than a dead end:
+
+```
+swap _renderView -> our orbit camera
+Draw(our LDR target)
+restore _renderView
+```
+
+### The risks, stated before trying
+
+1. **Re-entrancy.** Our hook fires from inside the frame that `Draw` itself drives.
+   Calling `Draw` from within `ExecuteEnvironmentProbeUpdate` risks recursion or
+   half-finished state. It needs a hard re-entrancy guard, and it belongs on the
+   per-frame hook rather than the probe hook.
+2. **It writes everything.** `Draw` owns the GBuffer, ScreenBuffers, shadow atlases and
+   post chain. Running it twice per frame means the player's frame is clobbered unless
+   every global it touches is saved and restored — far more than the five we currently
+   swap. The GBuffer/depth/resolution/camera swaps already built are the start of that
+   list, not the whole of it.
+3. **Temporal state, again.** GI, eye adaptation, motion vectors and TAA all accumulate.
+   `Draw` advances all of them. This is the same wall that stopped `ExecuteLighting`,
+   and `Draw` hits it harder because it includes more temporal passes.
+4. **Cost.** It is the full pipeline at whatever resolution it is told. Even at 512x512
+   this is a second complete frame render, not a cheap probe pass.
+
+Risk 3 is the one that decides it. If `Draw` cannot be made to leave the player's
+temporal state alone, the honest outcome is the same as `ExecuteLighting`: it works,
+looks correct, and degrades the main view. `ScenePreparationAndRender(cl, resolution)`
+is the more surgical option — it takes an explicit command list and stops before the
+final post chain, so it may avoid the worst of the temporal passes while still giving
+real deferred lighting.
+
+**Recommended order on this branch:** try `ScenePreparationAndRender(cl, res)` first
+(explicit command list, less post, fewer temporal passes), and keep `Draw` as the
+fallback if the more surgical call turns out to need state we cannot supply.
+
 ## The clamped lighting range: the panel is ALBEDO, not a display
 
 Chasing exposure was the wrong end of the pipe. Sweeping `exposureValue` from 0.25 to

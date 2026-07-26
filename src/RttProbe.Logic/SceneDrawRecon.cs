@@ -33,6 +33,13 @@ internal static class SceneDrawRecon
 
     public static void OnSceneDraw(object sceneDrawSystem, object commandList, int which)
     {
+        // Hard re-entrancy guard. The whole-scene render paths
+        // (ScenePreparationAndRender / Draw) drive the very passes we are hooked into,
+        // so without this our hook fires again from inside our own nested render and
+        // recurses until the stack or the device gives out. Cheapest single choke point:
+        // every hook enters through here.
+        if (CameraRender.InNestedRender) return;
+
         if (which == 0) System.Threading.Interlocked.Increment(ref _probeCalls);
         else System.Threading.Interlocked.Increment(ref _framePasses);
 

@@ -618,9 +618,14 @@ internal static class CameraRender
                 }
             }
 
+            // Whole-scene render: the real pipeline for our view, in place of the probe
+            // pass. Our camera is already installed above, and these entry points re-run
+            // preparation so they pick it up.
+            bool wholeScene = TryWholeSceneRender(commandList, res, Prop2(rtBorrow, "Resource") ?? rtBorrow);
+
             // Forward path: one pass that writes fully-lit colour. Switchable, because
             // running it AND the deferred chain would light the scene twice.
-            if (FeedConfig.EnvPass)
+            if (FeedConfig.EnvPass && !wholeScene)
                 _miEnvPassDoWork.Invoke(_envPass, new object[]
                 {
                     commandList, _geomBuffers, cameraCb, view,
@@ -1902,6 +1907,94 @@ internal static class CameraRender
         _ourGBufferRes = null;
         _ourDepthBorrow = _ourDepthTex = null;
         _depthSwapOk = false;
+    }
+
+    // ------------------------------------------ whole-scene render (alternate branch)
+    // The feed has always used IndirectEnvironmentPassJob — the environment-PROBE
+    // shading path, deliberately the cheapest and flattest in the engine, because probes
+    // are the INPUT to ambient lighting. That is the root cause of the primitive look,
+    // and no amount of bolting post passes onto it changes what it renders.
+    //
+    // These are whole-view entry points instead:
+    //
+    //   ScenePreparationAndRender(DirectCommandList cl, Vector2I finalResolution)
+    //       explicit command list, stops before the final post chain — the surgical one
+    //   Draw(ResizableRWRenderTargetTexture finalLDRBuffer)
+    //       the ENTIRE main-view pipeline, post and AA included
+    //
+    // Both re-run the preparation stage, which reads SettingsManager.RenderView fresh.
+    // That is what finally makes the _renderView swap meaningful: swapping it did nothing
+    // for GBufferPassJob because the camera constant buffer had already been written for
+    // the frame, but preparation rebuilds it.
+    private static volatile bool _inNestedRender;
+    public static bool InNestedRender => _inNestedRender;
+
+    private static MethodInfo _miScenePrep, _miDrawAll;
+    private static bool _sceneRenderBlocked;
+    private static int _sceneRenderLogs;
+
+    private static bool TryWholeSceneRender(object commandList, object res, object ldrTarget)
+    {
+        if (_sceneRenderBlocked || _inNestedRender) return false;
+        var mode = FeedConfig.WholeSceneRender;
+        if (mode <= 0) return false;
+
+        try
+        {
+            var t = _sceneDrawSystem?.GetType();
+            if (t == null) return false;
+
+            _miScenePrep ??= t.GetMethods(Any).FirstOrDefault(m =>
+                m.Name == "ScenePreparationAndRender" && m.GetParameters().Length == 2);
+            _miDrawAll ??= t.GetMethods(Any).FirstOrDefault(m =>
+                m.Name == "Draw" && m.GetParameters().Length == 1);
+
+            if (_sceneRenderLogs == 0)
+                RttLog.Line($"Whole-scene render: ScenePreparationAndRender={(_miScenePrep == null ? "NOT FOUND" : "ok")} " +
+                            $"Draw={(_miDrawAll == null ? "NOT FOUND" : "ok")} mode={mode}");
+
+            // The guard must be set BEFORE the call and cleared however it exits —
+            // leaving it set would silently kill the feed for the rest of the session.
+            _inNestedRender = true;
+            try
+            {
+                if (mode == 1 && _miScenePrep != null)
+                {
+                    _miScenePrep.Invoke(_sceneDrawSystem, new[] { commandList, res });
+                    if (_sceneRenderLogs++ == 0)
+                        RttLog.Line("=== WHOLE SCENE: ScenePreparationAndRender ran for our view. ===");
+                    return true;
+                }
+
+                if (mode == 2 && _miDrawAll != null)
+                {
+                    var want = _miDrawAll.GetParameters()[0].ParameterType;
+                    if (!want.IsInstanceOfType(ldrTarget))
+                    {
+                        _sceneRenderBlocked = true;
+                        RttLog.Line($"Whole-scene render: Draw wants {want.Name}, we have " +
+                                    $"{ldrTarget?.GetType().Name} — enable tonemap so the LDR target is resizable.");
+                        return false;
+                    }
+                    _miDrawAll.Invoke(_sceneDrawSystem, new[] { ldrTarget });
+                    if (_sceneRenderLogs++ == 0)
+                        RttLog.Line("=== WHOLE SCENE: Draw ran the full main-view pipeline for our view. ===");
+                    return true;
+                }
+            }
+            finally { _inNestedRender = false; }
+
+            _sceneRenderBlocked = true;
+            RttLog.Line($"Whole-scene render: mode {mode} has no usable entry point.");
+            return false;
+        }
+        catch (Exception e)
+        {
+            _inNestedRender = false;
+            _sceneRenderBlocked = true;
+            RttLog.Error("whole-scene render (disabled, feed continues)", e);
+            return false;
+        }
     }
 
     // ------------------------------------------- where the rasterising camera lives
