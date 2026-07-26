@@ -908,7 +908,13 @@ internal static class CameraRender
                 Array.Clear(_ldrRing, 0, _ldrRing.Length); _ldrReady = null; _ringIndex = -1;
             }
 
-            if (_feedState == 0) ResolveFeedTexture();
+            // Throttled: the resolve now retries rather than latching, so without a gate
+            // it would run — and log — every pass while the target is still pending.
+            if (_feedState == 0 && Clock.Ms - _lastResolveAttempt >= 250)
+            {
+                _lastResolveAttempt = Clock.Ms;
+                ResolveFeedTexture();
+            }
             if (_feedState != 1 || _feedTexture == null) return;
 
             // CopyResource cannot convert formats, and the scene renders HDR float
@@ -2539,6 +2545,8 @@ internal static class CameraRender
         return string.Join(" <- ", parts);
     }
     private static string _resolvedPanelId;   // panel target the feed is currently sized for
+    private static long _lastResolveAttempt, _lastResolveFailLog;
+    private static int _resolveFailLogs;
     private static int _toneLogs;
 
     // Force a resource into COPY_SOURCE or COPY_DEST. ExplicitStateTransition takes an
@@ -2703,13 +2711,33 @@ internal static class CameraRender
                     // does not match means writing into somebody else's offscreen
                     // texture — another panel's, or the game UI's. That is a crash,
                     // and a confusing one. Better to render nothing.
+                    // RETRY, do not latch. ResolveFeedTexture sets _feedState = -1 on
+                    // entry and the call site only re-resolves at 0, so leaving it at -1
+                    // here turned a startup-ordering race into a permanent disable: the
+                    // camera pass goes live ~2 s after load, but our offscreen target is
+                    // not registered until the first LCD tick, so the very first resolve
+                    // legitimately sees an EMPTY registry. Observed exactly that —
+                    // "registered offscreen textures: 0" — and the feed never recovered
+                    // for the rest of the session.
                     if (_feedState != 1)
-                        sb.AppendLine($"  NO MATCH for id {wantId} — feed disabled rather than writing to an unknown target.");
+                    {
+                        _feedState = 0;
+                        sb.AppendLine($"  no match for id {wantId} yet ({dict.Count} registered) — " +
+                                      "will retry; refusing to write to an unknown target meanwhile.");
+                    }
                 }
                 else sb.AppendLine("  _registeredTextures is not a dictionary");
             }
             sb.AppendLine(_feedState == 1 ? "  FEED TEXTURE RESOLVED" : "  feed texture unavailable");
-            RttLog.Line(sb.ToString().TrimEnd());
+
+            // Success always logs. Failure logs the first time and then at most every
+            // 5 s, so a target that is merely pending cannot bury the log while it waits.
+            bool resolved = _feedState == 1;
+            if (resolved || _resolveFailLogs == 0 || Clock.Ms - _lastResolveFailLog >= 5000)
+            {
+                if (!resolved) { _resolveFailLogs++; _lastResolveFailLog = Clock.Ms; }
+                RttLog.Line(sb.ToString().TrimEnd());
+            }
         }
         catch (Exception e) { RttLog.Error("feed resolve", e); }
     }
