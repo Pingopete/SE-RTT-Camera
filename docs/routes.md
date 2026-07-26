@@ -354,6 +354,43 @@ before 3.1.
 - **`LocalViewToMainViewClip` being wrong for an off-axis camera.** Real, but the field is
   referenced by **zero** shaders in the 660-file tree. Do not spend a build on it.
 
+## The flicker: one coupling, two symptoms (2026-07-26)
+
+Objects popping in and out at certain angles was introduced by the fix for the
+single-frame flash to the player's position. Both are the same coupling.
+
+`DrawContextManager.BorrowShadowCulling(int rootEntityId)` is a plain LIFO free-list —
+`TryPop`, else construct, then `context.RootEntityId = rootEntityId`. **The id is not a
+pool key**, so the earlier "borrow with a distinct id" fix was a no-op for contention,
+which is why the flicker survived it. `RootEntityId` *is* a real culling parameter with
+one consumer, `GeometryContext.UpdateRanges`, so a bogus entity id was itself a suspect
+for geometry going missing. Back to `-1`, what the engine's own paths pass.
+
+The real cause is the other half of the pair. `Borrow()` on an
+`OutputGeometryBufferContext` is an `_isBorrowed` mutex flag, not an allocation — the
+same physical draw-command buffers come back every time — and we write our draw commands
+into `MainOutputGeometryBuffers`, which **eighteen** engine methods read and rewrite
+across the frame (`MainViewCulling`, `ExecuteForwardPasses`, `DrawUnlit`,
+`RenderTransparent`, `RenderHolograms`, `RenderFlares`, `DrawWater`, `SceneFinalize`,
+`DrawUI`, …).
+
+Sharing *both* the culling context and the geometry buffer was self-consistent: the pass
+drew the engine's probe-view data, which is the flash. Taking a private culling context
+fixed the viewpoint but **split the pair** — culling results in our context, draw commands
+in a buffer the engine rewrites around us.
+
+**`MainOutputEffectGeometryBuffers` is not a usable spare.** It is a real second instance
+read by one pass, so it looked like a free vehicle for the fix. Instant CTD: the log ends
+18 ms after the switch, one pass, no managed exception. Its buffers are evidently ranged
+for the handful of highlight / transparent-unlit draws it normally carries, and a full
+scene cull overruns them — a GPU-side overrun is device removal with nothing to catch.
+
+So the fix is a privately **constructed** `OutputGeometryBufferContext` with
+`EnsureRanges(in RangeStats, in ComputeCommandList)` called for our own workload;
+`SceneDrawSystem.EnsureRangesOutputGeometryBuffers` is the engine's wrapper to copy.
+Note the precedent that a hand-built `CullingContext` constructed fine and then died
+within seconds — replicate the engine's `EnsureRanges` call, not just the constructor.
+
 ## Asserts are deferred-fatal, which changes how to read a failed experiment
 
 `DiagnosticHandlerBase..ctor` sets `AutoIgnoreMessages = true`, so a tripped `Assert.True`
