@@ -2064,16 +2064,45 @@ internal static class CameraRender
     // contribution — but ambient itself is computed from the GBuffer and sky, and that
     // is the term the feed is missing.
     private static object _giDiffuse, _giSpecular;
+    private static bool _ambientPrereqLogged;
 
     private static bool EnsureGiBuffers(object res)
     {
         if (_giDiffuse != null) return true;
         try
         {
-            if (_miBorrowRt == null) return false;
-            _giDiffuse  = _miBorrowRt.Invoke(_texPool, new object[] { "RttGiDiffuse",  _hdrFormat, _hdrFormat, res, 1, null, 128 });
-            _giSpecular = _miBorrowRt.Invoke(_texPool, new object[] { "RttGiSpecular", _hdrFormat, _hdrFormat, res, 1, null, 128 });
-            RttLog.Line("Deferred: allocated empty GI buffers for AmbientLightJob (no GI contribution, ambient still applies).");
+            // These were borrowed with BorrowRWRenderTargetTexture — the WRONG sibling,
+            // and the likely source of the InvalidCastException that has blocked
+            // AmbientLightJob since it was first tried.
+            //
+            // ResizableRWRenderTargetTexture and RWRenderTargetTexture share interfaces
+            // but are unrelated classes, and the engine's own recipe is unambiguous.
+            // SceneDrawSystem.ComputeGI — the only caller of AmbientLightJob.DoWork —
+            // does exactly this:
+            //
+            //     BorrowResizableRWRenderTargetTexture(name, format, res, uav, mips, clear, lifetime)
+            //       -> Borrowed.Resource
+            //       -> ResizableRWRenderTargetTexture.Resize(commandList, resolution)
+            //
+            // so the GI buffers are RESIZABLE render-target textures, and we were handing
+            // the job a different class family that happens to satisfy the parameter type.
+            if (_miBorrowResizableRt == null)
+            {
+                RttLog.Line("Deferred: BorrowResizableRWRenderTargetTexture unavailable — " +
+                            "GI buffers cannot be allocated in the shape AmbientLightJob wants.");
+                return false;
+            }
+
+            _giDiffuse  = _miBorrowResizableRt.Invoke(_texPool, new object[]
+                { "RttGiDiffuse",  _hdrFormat, res, null, 1, null, 128 });
+            _giSpecular = _miBorrowResizableRt.Invoke(_texPool, new object[]
+                { "RttGiSpecular", _hdrFormat, res, null, 1, null, 128 });
+
+            RttLog.Line($"Deferred: GI buffers allocated as RESIZABLE render targets " +
+                        $"({Prop2(Prop2(_giDiffuse, "Resource") ?? _giDiffuse, "Resolution")}) — " +
+                        "matching SceneDrawSystem.ComputeGI. They stay empty: no GI contribution, " +
+                        "but AmbientLightJob needs both parameters non-null and it is the ambient " +
+                        "term we are after, not the GI.");
             return true;
         }
         catch (Exception e) { RttLog.Error("gi buffers", e); return false; }
@@ -2124,6 +2153,32 @@ internal static class CameraRender
         }
 
         // Ambient. THE fix for the harshness — the missing indirect term.
+        //
+        // AmbientLightJob.DoWork hands off to LightJobSnapshot.Draw, whose binding list
+        // names every prerequisite explicitly:
+        //
+        //     CommonResources.JitteredCameraSettings          <- swapCameraCb
+        //     ScreenBuffers.DepthStencilBuffer.DepthTexture   <- our depth (SRV)
+        //     ScreenBuffers.GBuffer                           <- our GBuffer (SRV)
+        //     ScreenBuffers...DepthStencilReadOnly            <- our depth (DSV)
+        //     SetStencilRef(n)                                <- written by our GBuffer pass
+        //
+        // Missing any of them does not throw; it produces a wrong or empty result, which
+        // is the failure mode this project keeps mistaking for "the pass is unusable".
+        // Say so once, up front, instead.
+        if (FeedConfig.DeferredAmbient && !_ambientPrereqLogged)
+        {
+            _ambientPrereqLogged = true;
+            var missing = new List<string>();
+            if (!FeedConfig.SwapCameraCb) missing.Add("swapCameraCb (it would light from the PLAYER'S camera)");
+            if (!FeedConfig.GBufferSwap) missing.Add("gbufferSwap (it would read the player's 4K GBuffer)");
+            if (!FeedConfig.GBufferPass) missing.Add("gbufferPass (nothing would have written our GBuffer or its stencil)");
+            if (missing.Count > 0)
+                RttLog.Line("Ambient: PREREQUISITES MISSING — " + string.Join("; ", missing) +
+                            ". The job will run without throwing and produce a wrong or empty " +
+                            "result, which is not the same as being unusable.");
+        }
+
         if (FeedConfig.DeferredAmbient && !_ambientBlocked && _miAmbient != null)
         {
             try
