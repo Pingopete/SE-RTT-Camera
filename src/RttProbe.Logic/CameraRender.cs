@@ -77,6 +77,7 @@ internal static class CameraRender
         // line that proves the fix took — which is the failure mode that has wasted the
         // most time on this project.
         ReleaseHeldBorrows();
+        _sunBlocked = _sunSettingsLogged = false; _sunLogs = 0;
         _lodProbe = _lodMainView = _lastLodUsed = null;
         _screenResLog = null;
         _cbRenderView = null; _miCreateNonjittered = _miRvSetCamera = _miRvSetResolution = null;
@@ -982,6 +983,68 @@ internal static class CameraRender
             // DrawSkybox takes only a command list and a target, so it uses the camera
             // constant buffer that is BOUND — and by this point that is ours, bound by the
             // env pass. Two arguments, no probe state.
+            // The SUN, as a layer rather than a mode.
+            //
+            // skyMode is a CHOICE — 0/1/2 — so setting it to 2 did not add the sun, it
+            // replaced IndirectPlanetEnvironmentJob, which is the pass supplying the
+            // starfield AND the planetary atmosphere. That is why the sun arrived and
+            // the stars and atmosphere left together.
+            //
+            // They compose in one order only. DrawSkybox WRITES SkyLight to SV_Target0;
+            // IndirectPlanetEnvironmentJob's PSO is BlendState.Additive. So the sun goes
+            // down first and the atmosphere adds on top. The reverse loses the atmosphere.
+            //
+            // Two hard requirements, both from the IL rather than from a guess:
+            //
+            //   * ScreenBuffers.DepthStencilBuffer must be OUR pass depth. The shader
+            //     depth-tests so the sky only fills where geometry did not draw; against
+            //     the player's 4K depth it fills the wrong pixels entirely.
+            //   * gbufferSwap MUST be on. The shader declares TWO outputs — SkyLight to
+            //     SV_Target0 and MotionVectors to SV_Target1 — and target 1 is
+            //     ScreenBuffers.GBuffer[Motion]. Without the swap we write our motion
+            //     vectors into the PLAYER'S GBuffer, which is their FSR input. That is a
+            //     corruption of their view, not ours, and it would be easy to blame on
+            //     something else.
+            if (FeedConfig.SunPass && !_sunBlocked)
+            {
+                object savedSunDepth = null;
+                try
+                {
+                    if (!FeedConfig.GBufferSwap)
+                    {
+                        _sunBlocked = true;
+                        RttLog.Line("Sun: REFUSING to run — gbufferSwap is off, and DrawSkybox writes motion " +
+                                    "vectors to SV_Target1 = ScreenBuffers.GBuffer[Motion]. Without the swap " +
+                                    "that is the PLAYER'S motion-vector buffer and would corrupt their FSR.");
+                    }
+                    else
+                    {
+                        _miDrawSkybox ??= _sceneDrawSystem?.GetType().GetMethods(Any)
+                            .FirstOrDefault(m => m.Name == "DrawSkybox" && m.GetParameters().Length == 2);
+                        var want = _miDrawSkybox?.GetParameters()[1].ParameterType;
+                        var lBuf = Prop2(rtBorrow, "Resource") ?? rtBorrow;
+
+                        if (_miDrawSkybox == null || want == null || !want.IsInstanceOfType(lBuf))
+                        {
+                            _sunBlocked = true;
+                            RttLog.Line($"Sun: unavailable — DrawSkybox={(_miDrawSkybox == null ? "NOT FOUND" : "ok")}, " +
+                                        $"target is {lBuf?.GetType().Name} and it wants {want?.Name}.");
+                        }
+                        else
+                        {
+                            LogSunSettings();
+                            savedSunDepth = InstallPassDepth(depthBorrow);
+                            _miDrawSkybox.Invoke(_sceneDrawSystem, new[] { commandList, lBuf });
+                            if (_sunLogs++ == 0)
+                                RttLog.Line("=== SUN: DrawSkybox applied as a layer (sun disc + starfield); " +
+                                            "the atmosphere pass adds on top. ===");
+                        }
+                    }
+                }
+                catch (Exception e) { _sunBlocked = true; RttLog.Error("sun layer (disabled, sky continues)", e); }
+                finally { RestorePassDepth(savedSunDepth); }
+            }
+
             if (FeedConfig.SkyMode == 2 && !_skyBlocked)
             {
                 try
@@ -2020,6 +2083,43 @@ internal static class CameraRender
     private static Keen.VRage.Library.Mathematics.Vector3D _lastEye;
     private static bool _haveLastEye;
     private static MethodInfo _miDrawSkybox;
+    private static bool _sunBlocked, _sunSettingsLogged;
+    private static int _sunLogs;
+
+    // Why the sun came out as a BLACK CIRCLE last time, and how to tell in one line.
+    //
+    // SkyboxMotionVectorsPixel.hlsl composites it as:
+    //
+    //     sunOpacity = smoothstep(outerDot, innerDot, dot(L, -V));
+    //     sunDisc    = SunDiscColor * SunDiscIntensity * <that same factor>;
+    //     result     = result * (1 - sunOpacity) + sunDisc;
+    //
+    // The mask and the colour share one factor, so the disc PUNCHES THE SKYBOX OUT and
+    // replaces it with SunDiscColor x SunDiscIntensity. A black circle therefore means
+    // the mask worked — the sun is in the right place and the right size — and the
+    // colour arrived as zero. It is not a missing pass or a wrong camera.
+    //
+    // The shipped values are healthy (SunDisc true, SunDiscIntensity 570, disc about a
+    // degree across), so if the live values differ, something is zeroing them. Print
+    // them once rather than guess, because "read it from the config file" already
+    // proved nothing about what the shader is actually handed.
+    private static void LogSunSettings()
+    {
+        if (_sunSettingsLogged || _settings == null) return;
+        _sunSettingsLogged = true;
+        try
+        {
+            var env = Prop2(_settings, "Environment");
+            if (env == null) { RttLog.Line("Sun: SettingsManager.Environment unreadable."); return; }
+            RttLog.Line($"Sun settings: SunDisc={Prop2(env, "SunDisc")} " +
+                        $"Intensity={Prop2(env, "SunDiscIntensity")} " +
+                        $"Color={Prop2(env, "SunDiscColor")} " +
+                        $"InnerDot={Prop2(env, "SunDiscInnerDot")} OuterDot={Prop2(env, "SunDiscOuterDot")}. " +
+                        "A BLACK disc means Color x Intensity reached the shader as zero — " +
+                        "the mask punches out the skybox and substitutes that product.");
+        }
+        catch (Exception e) { RttLog.Error("sun settings", e); }
+    }
     private static int _skyboxLogs;
     private static bool _atmoBlocked;
     private static int _atmoLogs;
