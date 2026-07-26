@@ -76,6 +76,8 @@ internal static class CameraRender
         // once" latch, and a hot reload that left them set would silently skip the log
         // line that proves the fix took — which is the failure mode that has wasted the
         // most time on this project.
+        ReleaseHeldBorrows();
+        _sunBlocked = _sunSettingsLogged = false; _sunLogs = 0;
         _lodProbe = _lodMainView = _lastLodUsed = null;
         _screenResLog = null;
         _cbRenderView = null; _miCreateNonjittered = _miRvSetCamera = _miRvSetResolution = null;
@@ -489,6 +491,7 @@ internal static class CameraRender
     {
         object rtBorrow = null, depthBorrow = null, cameraCb = null, borrowedCulling = null;
         object savedGBuffer = null, savedCamera = null, scratchBorrow = null, savedProbeSettings = null;
+        object[] savedCameraCb = null;
         bool geomBorrowed = false;
 
         // Captured ONCE for the whole pass. The config is polled between passes, so
@@ -556,6 +559,18 @@ internal static class CameraRender
 
             cameraCb = BuildCameraCb(view, res);
             if (cameraCb == null) { RttLog.Line("Camera pass: camera conversion failed."); _armed = false; return; }
+
+            // Point the ENGINE'S two camera constant buffers at ours for the pass.
+            //
+            // Passes that take a cameraCb parameter already get ours. Everything else —
+            // ~92 methods, including ClusteringJob.DoWork which runs right below — reads
+            // these two fields off the global. So our cluster grid is currently built
+            // from the PLAYER'S frustum while we rasterise from ours, which mis-bins
+            // every clustered local light in the feed.
+            //
+            // Restored in the finally. It must be restored inside this same OnBeginDraw
+            // bracket: OnEndDraw disposes whatever is in the field.
+            savedCameraCb = CameraCbSwap.Install(cameraCb);
 
             // The colour target is borrowed RESIZABLE when any fidelity layer is on.
             //
@@ -889,6 +904,65 @@ internal static class CameraRender
                 catch (Exception e) { _atmoBlocked = true; RttLog.Error("atmosphere (disabled, feed continues)", e); }
             }
 
+            // AtmosphereMultiplyJob — the OTHER half of atmosphere, and the half we have
+            // never had.
+            //
+            // What we run today (IndirectPlanetEnvironmentJob) is BlendState.Additive: it
+            // adds in-scatter and nothing else. Geometry never gets aerial-perspective
+            // EXTINCTION — the haze that desaturates and washes out distant surfaces — and
+            // there is no atmospheric sun disc. Multiply is that half, and it is a
+            // single-RTV job.
+            //
+            // Its inputs, read from the IL rather than guessed:
+            //     CommonResources.FrameSettings           camera-independent
+            //     CommonResources.JitteredCameraSettings  <- needs the camera CB swap
+            //     CommonResources.AllPlanetEnvSetups      the player's culled planet list
+            //     ScreenBuffers.DepthStencilBuffer        <- needs OUR depth
+            //     CommonResources.AtmosphereLUTTables     per-planet, camera-independent
+            //
+            // The depth is the subtle one. It must be the buffer our GEOMETRY pass just
+            // wrote — the per-pass "RttCameraDepth" — not the persistent "RttGBufferDepth"
+            // that the GBuffer swap installs, which only GBufferPassJob ever writes. Get
+            // that wrong and the job samples a depth our scene never touched, which would
+            // look exactly like "invokes cleanly, does nothing".
+            if (FeedConfig.AtmosphereMultiply && !_atmoMulBlocked)
+            {
+                object savedDepth = null;
+                try
+                {
+                    if (_miAtmoMul == null)
+                    {
+                        _atmoMulJob = _sceneDrawSystem?.GetType().GetField("_atmosphereMultiplyJob", Any)?.GetValue(_sceneDrawSystem);
+                        _miAtmoMul = _atmoMulJob?.GetType().GetMethods(Any)
+                            .FirstOrDefault(m => m.Name == "DoWork" && m.GetParameters().Length == 2);
+                        if (_miAtmoMul == null)
+                        {
+                            _atmoMulBlocked = true;
+                            RttLog.Line("Atmosphere multiply: _atmosphereMultiplyJob / DoWork(2 args) not found.");
+                        }
+                        else if (!FeedConfig.SwapCameraCb)
+                        {
+                            // Not fatal, but it would compute extinction along the PLAYER'S
+                            // rays and look like the pass is broken. Say so once rather
+                            // than let it be mistaken for a failed pass.
+                            RttLog.Line("Atmosphere multiply: swapCameraCb is OFF — this job reads the " +
+                                        "global camera CB, so it will compute along the PLAYER'S view rays. " +
+                                        "Turn swapCameraCb on before judging the result.");
+                        }
+                    }
+
+                    if (_miAtmoMul != null)
+                    {
+                        savedDepth = InstallPassDepth(depthBorrow);
+                        _miAtmoMul.Invoke(_atmoMulJob, new object[] { commandList, rtv });
+                        if (_atmoMulLogs++ == 0)
+                            RttLog.Line("=== ATMOSPHERE MULTIPLY: extinction / aerial perspective applied. ===");
+                    }
+                }
+                catch (Exception e) { _atmoMulBlocked = true; RttLog.Error("atmosphere multiply (disabled, feed continues)", e); }
+                finally { RestorePassDepth(savedDepth); }
+            }
+
             // Sky, on top of the geometry pass and using its depth so it fills only
             // what geometry did not cover.
             //
@@ -909,6 +983,68 @@ internal static class CameraRender
             // DrawSkybox takes only a command list and a target, so it uses the camera
             // constant buffer that is BOUND — and by this point that is ours, bound by the
             // env pass. Two arguments, no probe state.
+            // The SUN, as a layer rather than a mode.
+            //
+            // skyMode is a CHOICE — 0/1/2 — so setting it to 2 did not add the sun, it
+            // replaced IndirectPlanetEnvironmentJob, which is the pass supplying the
+            // starfield AND the planetary atmosphere. That is why the sun arrived and
+            // the stars and atmosphere left together.
+            //
+            // They compose in one order only. DrawSkybox WRITES SkyLight to SV_Target0;
+            // IndirectPlanetEnvironmentJob's PSO is BlendState.Additive. So the sun goes
+            // down first and the atmosphere adds on top. The reverse loses the atmosphere.
+            //
+            // Two hard requirements, both from the IL rather than from a guess:
+            //
+            //   * ScreenBuffers.DepthStencilBuffer must be OUR pass depth. The shader
+            //     depth-tests so the sky only fills where geometry did not draw; against
+            //     the player's 4K depth it fills the wrong pixels entirely.
+            //   * gbufferSwap MUST be on. The shader declares TWO outputs — SkyLight to
+            //     SV_Target0 and MotionVectors to SV_Target1 — and target 1 is
+            //     ScreenBuffers.GBuffer[Motion]. Without the swap we write our motion
+            //     vectors into the PLAYER'S GBuffer, which is their FSR input. That is a
+            //     corruption of their view, not ours, and it would be easy to blame on
+            //     something else.
+            if (FeedConfig.SunPass && !_sunBlocked)
+            {
+                object savedSunDepth = null;
+                try
+                {
+                    if (!FeedConfig.GBufferSwap)
+                    {
+                        _sunBlocked = true;
+                        RttLog.Line("Sun: REFUSING to run — gbufferSwap is off, and DrawSkybox writes motion " +
+                                    "vectors to SV_Target1 = ScreenBuffers.GBuffer[Motion]. Without the swap " +
+                                    "that is the PLAYER'S motion-vector buffer and would corrupt their FSR.");
+                    }
+                    else
+                    {
+                        _miDrawSkybox ??= _sceneDrawSystem?.GetType().GetMethods(Any)
+                            .FirstOrDefault(m => m.Name == "DrawSkybox" && m.GetParameters().Length == 2);
+                        var want = _miDrawSkybox?.GetParameters()[1].ParameterType;
+                        var lBuf = Prop2(rtBorrow, "Resource") ?? rtBorrow;
+
+                        if (_miDrawSkybox == null || want == null || !want.IsInstanceOfType(lBuf))
+                        {
+                            _sunBlocked = true;
+                            RttLog.Line($"Sun: unavailable — DrawSkybox={(_miDrawSkybox == null ? "NOT FOUND" : "ok")}, " +
+                                        $"target is {lBuf?.GetType().Name} and it wants {want?.Name}.");
+                        }
+                        else
+                        {
+                            LogSunSettings();
+                            savedSunDepth = InstallPassDepth(depthBorrow);
+                            _miDrawSkybox.Invoke(_sceneDrawSystem, new[] { commandList, lBuf });
+                            if (_sunLogs++ == 0)
+                                RttLog.Line("=== SUN: DrawSkybox applied as a layer (sun disc + starfield); " +
+                                            "the atmosphere pass adds on top. ===");
+                        }
+                    }
+                }
+                catch (Exception e) { _sunBlocked = true; RttLog.Error("sun layer (disabled, sky continues)", e); }
+                finally { RestorePassDepth(savedSunDepth); }
+            }
+
             if (FeedConfig.SkyMode == 2 && !_skyBlocked)
             {
                 try
@@ -1002,6 +1138,7 @@ internal static class CameraRender
         {
             // FIRST, before anything else can throw: the engine must not be left
             // pointing at our 512x512 array.
+            CameraCbSwap.Restore(savedCameraCb);
             RestoreProbeSettings(savedProbeSettings);
             RestoreCamera(savedCamera);
             RestoreGBuffer(savedGBuffer);
@@ -1353,29 +1490,67 @@ internal static class CameraRender
                                         RttLog.Line("=== BLOOM: cheap stand-in (ApplyBloom skipped). ===");
                                 }
 
+                                // Real bloom, amortised.
+                                //
+                                // ApplyBloom is a multi-pass downsample/upsample chain and
+                                // it is what halved the frame rate when this was first
+                                // tried. But bloom is inherently LOW FREQUENCY — a blurred
+                                // copy of the bright parts — so recomputing it 28 times a
+                                // second buys almost nothing on a camera that orbits once
+                                // every 30 s. bloomEveryN computes it on one pass in N and
+                                // reuses the result in between, which is the standard trade
+                                // and turns the cost into cost/N.
+                                //
+                                // The safety question is settled rather than assumed:
+                                // ApplyBloom reads Settings.PostProcess.Bloom (a bool),
+                                // DebugViewHelper.GetCurrentEngineDebugView(), and calls
+                                // BloomJob.DoWork(cl, source, exposure) with both inputs as
+                                // parameters. No ScreenBuffers, no camera CB, no temporal
+                                // state. It was ComputeExposure that corrupted the player's
+                                // view, not this.
+                                //
+                                // Holding the Borrowed<T> across passes is the part that
+                                // needs care — that is a pool loan, and the pool asserts on
+                                // shutdown if it is never handed back. ReleaseHeldBorrows
+                                // returns it.
                                 if (bloom == null && FeedConfig.Bloom && !_bloomBlocked && _miApplyBloom != null)
                                 {
                                     try
                                     {
-                                        // ApplyBloom(cl, toneMappingInput, exposure, out bloom)
-                                        //
-                                        // That out parameter is a Borrowed<T>, so it is a
-                                        // pool loan and not a gift. Dropping it would leak
-                                        // one texture per frame — 30 a second — which is
-                                        // precisely the "grinds to a halt" shape we already
-                                        // spent a night chasing. Returned below, after the
-                                        // tonemap has consumed it.
-                                        var bArgs = new object[] { commandList, hdrTex, exposure, null };
-                                        _miApplyBloom.Invoke(_sceneDrawSystem, bArgs);
-                                        bloomBorrow = bArgs[3];
-                                        bloom = Prop2(bloomBorrow, "Resource") ?? bloomBorrow;
+                                        int everyN = Math.Max(1, FeedConfig.BloomEveryN);
+                                        bool recompute = _bloomHeld == null || (_renders % everyN) == 0;
+
+                                        if (recompute)
+                                        {
+                                            // Return the previous loan BEFORE taking a new
+                                            // one, or we accumulate one texture per recompute.
+                                            if (_bloomHeld != null)
+                                            {
+                                                try { ReturnBorrowed(_bloomHeld); } catch { }
+                                                _bloomHeld = null;
+                                            }
+
+                                            // ApplyBloom(cl, toneMappingInput, exposure, out bloom)
+                                            var bArgs = new object[] { commandList, hdrTex, exposure, null };
+                                            _miApplyBloom.Invoke(_sceneDrawSystem, bArgs);
+                                            _bloomHeld = bArgs[3];
+                                            _bloomRecomputes++;
+                                        }
+
+                                        // NOT returned in the finally below — it is reused
+                                        // until the next recompute. bloomBorrow stays null
+                                        // so that path cannot take it back from under us.
+                                        bloom = Prop2(_bloomHeld, "Resource") ?? _bloomHeld;
+
                                         if (_bloomLogs++ == 0)
-                                            RttLog.Line($"=== BLOOM: applied (bloom={(bloom == null ? "null" : bloom.GetType().Name)}). ===");
+                                            RttLog.Line($"=== BLOOM: real ApplyBloom, recomputed every {everyN} pass(es) " +
+                                                        $"and reused in between (bloom={(bloom == null ? "null" : bloom.GetType().Name)}). ===");
                                     }
                                     catch (Exception e)
                                     {
                                         _bloomBlocked = true;
                                         bloom = null;
+                                        if (_bloomHeld != null) { try { ReturnBorrowed(_bloomHeld); } catch { } _bloomHeld = null; }
                                         RttLog.Error("bloom (disabled, tonemap continues)", e);
                                     }
                                 }
@@ -1898,13 +2073,53 @@ internal static class CameraRender
     // AmbientLightJob is the one that matters for the reported harshness: direct sun
     // plus clustered lights with no ambient term is exactly why lit faces blow out and
     // unlit faces go flat.
-    private static object _dirLightJob, _localLightsJob, _ambientJob, _atmoJob;
+    private static object _dirLightJob, _localLightsJob, _ambientJob, _atmoJob, _atmoMulJob;
+    private static MethodInfo _miAtmoMul;
+    private static bool _atmoMulBlocked;
+    private static int _atmoMulLogs;
     private static MethodInfo _miAtmo, _miExecLighting;
     private static bool _execLightBlocked;
     private static int _execLightLogs, _scratchLogs, _eyeJumpLogs;
     private static Keen.VRage.Library.Mathematics.Vector3D _lastEye;
     private static bool _haveLastEye;
     private static MethodInfo _miDrawSkybox;
+    private static bool _sunBlocked, _sunSettingsLogged;
+    private static int _sunLogs;
+
+    // Why the sun came out as a BLACK CIRCLE last time, and how to tell in one line.
+    //
+    // SkyboxMotionVectorsPixel.hlsl composites it as:
+    //
+    //     sunOpacity = smoothstep(outerDot, innerDot, dot(L, -V));
+    //     sunDisc    = SunDiscColor * SunDiscIntensity * <that same factor>;
+    //     result     = result * (1 - sunOpacity) + sunDisc;
+    //
+    // The mask and the colour share one factor, so the disc PUNCHES THE SKYBOX OUT and
+    // replaces it with SunDiscColor x SunDiscIntensity. A black circle therefore means
+    // the mask worked — the sun is in the right place and the right size — and the
+    // colour arrived as zero. It is not a missing pass or a wrong camera.
+    //
+    // The shipped values are healthy (SunDisc true, SunDiscIntensity 570, disc about a
+    // degree across), so if the live values differ, something is zeroing them. Print
+    // them once rather than guess, because "read it from the config file" already
+    // proved nothing about what the shader is actually handed.
+    private static void LogSunSettings()
+    {
+        if (_sunSettingsLogged || _settings == null) return;
+        _sunSettingsLogged = true;
+        try
+        {
+            var env = Prop2(_settings, "Environment");
+            if (env == null) { RttLog.Line("Sun: SettingsManager.Environment unreadable."); return; }
+            RttLog.Line($"Sun settings: SunDisc={Prop2(env, "SunDisc")} " +
+                        $"Intensity={Prop2(env, "SunDiscIntensity")} " +
+                        $"Color={Prop2(env, "SunDiscColor")} " +
+                        $"InnerDot={Prop2(env, "SunDiscInnerDot")} OuterDot={Prop2(env, "SunDiscOuterDot")}. " +
+                        "A BLACK disc means Color x Intensity reached the shader as zero — " +
+                        "the mask punches out the skybox and substitutes that product.");
+        }
+        catch (Exception e) { RttLog.Error("sun settings", e); }
+    }
     private static int _skyboxLogs;
     private static bool _atmoBlocked;
     private static int _atmoLogs;
@@ -1989,15 +2204,49 @@ internal static class CameraRender
     // is the term the feed is missing.
     private static object _giDiffuse, _giSpecular;
 
+    // The real bloom result, held between recomputes. A pool loan, returned by
+    // ReleaseHeldBorrows — never dropped, or the pool asserts at shutdown.
+    private static object _bloomHeld;
+    private static long _bloomRecomputes;
+    private static bool _ambientPrereqLogged;
+
     private static bool EnsureGiBuffers(object res)
     {
         if (_giDiffuse != null) return true;
         try
         {
-            if (_miBorrowRt == null) return false;
-            _giDiffuse  = _miBorrowRt.Invoke(_texPool, new object[] { "RttGiDiffuse",  _hdrFormat, _hdrFormat, res, 1, null, 128 });
-            _giSpecular = _miBorrowRt.Invoke(_texPool, new object[] { "RttGiSpecular", _hdrFormat, _hdrFormat, res, 1, null, 128 });
-            RttLog.Line("Deferred: allocated empty GI buffers for AmbientLightJob (no GI contribution, ambient still applies).");
+            // These were borrowed with BorrowRWRenderTargetTexture — the WRONG sibling,
+            // and the likely source of the InvalidCastException that has blocked
+            // AmbientLightJob since it was first tried.
+            //
+            // ResizableRWRenderTargetTexture and RWRenderTargetTexture share interfaces
+            // but are unrelated classes, and the engine's own recipe is unambiguous.
+            // SceneDrawSystem.ComputeGI — the only caller of AmbientLightJob.DoWork —
+            // does exactly this:
+            //
+            //     BorrowResizableRWRenderTargetTexture(name, format, res, uav, mips, clear, lifetime)
+            //       -> Borrowed.Resource
+            //       -> ResizableRWRenderTargetTexture.Resize(commandList, resolution)
+            //
+            // so the GI buffers are RESIZABLE render-target textures, and we were handing
+            // the job a different class family that happens to satisfy the parameter type.
+            if (_miBorrowResizableRt == null)
+            {
+                RttLog.Line("Deferred: BorrowResizableRWRenderTargetTexture unavailable — " +
+                            "GI buffers cannot be allocated in the shape AmbientLightJob wants.");
+                return false;
+            }
+
+            _giDiffuse  = _miBorrowResizableRt.Invoke(_texPool, new object[]
+                { "RttGiDiffuse",  _hdrFormat, res, null, 1, null, 128 });
+            _giSpecular = _miBorrowResizableRt.Invoke(_texPool, new object[]
+                { "RttGiSpecular", _hdrFormat, res, null, 1, null, 128 });
+
+            RttLog.Line($"Deferred: GI buffers allocated as RESIZABLE render targets " +
+                        $"({Prop2(Prop2(_giDiffuse, "Resource") ?? _giDiffuse, "Resolution")}) — " +
+                        "matching SceneDrawSystem.ComputeGI. They stay empty: no GI contribution, " +
+                        "but AmbientLightJob needs both parameters non-null and it is the ambient " +
+                        "term we are after, not the GI.");
             return true;
         }
         catch (Exception e) { RttLog.Error("gi buffers", e); return false; }
@@ -2048,6 +2297,32 @@ internal static class CameraRender
         }
 
         // Ambient. THE fix for the harshness — the missing indirect term.
+        //
+        // AmbientLightJob.DoWork hands off to LightJobSnapshot.Draw, whose binding list
+        // names every prerequisite explicitly:
+        //
+        //     CommonResources.JitteredCameraSettings          <- swapCameraCb
+        //     ScreenBuffers.DepthStencilBuffer.DepthTexture   <- our depth (SRV)
+        //     ScreenBuffers.GBuffer                           <- our GBuffer (SRV)
+        //     ScreenBuffers...DepthStencilReadOnly            <- our depth (DSV)
+        //     SetStencilRef(n)                                <- written by our GBuffer pass
+        //
+        // Missing any of them does not throw; it produces a wrong or empty result, which
+        // is the failure mode this project keeps mistaking for "the pass is unusable".
+        // Say so once, up front, instead.
+        if (FeedConfig.DeferredAmbient && !_ambientPrereqLogged)
+        {
+            _ambientPrereqLogged = true;
+            var missing = new List<string>();
+            if (!FeedConfig.SwapCameraCb) missing.Add("swapCameraCb (it would light from the PLAYER'S camera)");
+            if (!FeedConfig.GBufferSwap) missing.Add("gbufferSwap (it would read the player's 4K GBuffer)");
+            if (!FeedConfig.GBufferPass) missing.Add("gbufferPass (nothing would have written our GBuffer or its stencil)");
+            if (missing.Count > 0)
+                RttLog.Line("Ambient: PREREQUISITES MISSING — " + string.Join("; ", missing) +
+                            ". The job will run without throwing and produce a wrong or empty " +
+                            "result, which is not the same as being unusable.");
+        }
+
         if (FeedConfig.DeferredAmbient && !_ambientBlocked && _miAmbient != null)
         {
             try
@@ -2188,6 +2463,62 @@ internal static class CameraRender
     }
 
     // Property setter if the engine exposes one, backing field otherwise.
+    // Install THIS PASS'S depth — the one the geometry pass just wrote — into
+    // ScreenBuffers for the duration of a single job, and put the engine's back.
+    //
+    // Deliberately separate from InstallOurGBuffer's depth swap, which installs the
+    // persistent "RttGBufferDepth" that only GBufferPassJob writes. A pass that wants to
+    // read the depth of the scene we just rendered needs the per-pass borrow instead, and
+    // conflating the two would hand it a buffer full of nothing.
+    private static bool _passDepthBlocked, _passDepthLogged;
+
+    private static object InstallPassDepth(object depthBorrow)
+    {
+        if (_passDepthBlocked || depthBorrow == null) return null;
+        try
+        {
+            var screenBuffers = ScreenBuffersInstance();
+            if (screenBuffers == null) { _passDepthBlocked = true; return null; }
+
+            _dsProp ??= screenBuffers.GetType().GetProperty("DepthStencilBuffer", Any);
+            var tex = Prop2(depthBorrow, "Resource") ?? depthBorrow;
+            var want = _dsProp?.PropertyType;
+            if (tex == null || want == null || !want.IsInstanceOfType(tex))
+            {
+                _passDepthBlocked = true;
+                RttLog.Line($"Pass depth: cannot install — have {tex?.GetType().Name ?? "null"}, " +
+                            $"ScreenBuffers wants {want?.Name ?? "?"}.");
+                return null;
+            }
+
+            var saved = _dsProp.GetValue(screenBuffers);
+            SetDepthBuffer(screenBuffers, tex);
+            if (!_passDepthLogged)
+            {
+                _passDepthLogged = true;
+                RttLog.Line("Pass depth: our render's depth installed for the atmosphere pass " +
+                            "(the per-pass borrow, not the GBuffer one).");
+            }
+            return saved;
+        }
+        catch (Exception e) { _passDepthBlocked = true; RttLog.Error("install pass depth", e); return null; }
+    }
+
+    private static void RestorePassDepth(object saved)
+    {
+        if (saved == null) return;
+        try
+        {
+            var screenBuffers = ScreenBuffersInstance();
+            if (screenBuffers != null) SetDepthBuffer(screenBuffers, saved);
+        }
+        catch (Exception e)
+        {
+            _passDepthBlocked = true;
+            RttLog.Error("RESTORE PASS DEPTH FAILED — the engine is now pointed at our 512x512 depth", e);
+        }
+    }
+
     private static void SetDepthBuffer(object screenBuffers, object value)
     {
         if (_dsProp is { CanWrite: true }) _dsProp.SetValue(screenBuffers, value);
@@ -3594,6 +3925,32 @@ internal static class CameraRender
             try { var v = f.GetValue(resource); if (v != null) return v; } catch { }
         }
         return null;
+    }
+
+    // Give the pool back everything we hold across passes.
+    //
+    // These are borrowed once and cached for the session, which is correct for
+    // performance and wrong for lifetime: nothing ever returned them. The engine
+    // notices at shutdown —
+    //
+    //     Assertion Failure: '_cpuBorrowedObjects == 0'  GPUResourcePool.cs:52
+    //     Assertion Failure: '_gpuBorrowedObjects == 0'  GPUResourcePool.cs:53
+    //
+    // and because asserts are DEFERRED-FATAL in a release build (DiagnosticReporter
+    // throws FirstAssertionException from VRageCore.Dispose), a leak here turns every
+    // quit into a crash report. Worse, it drowns the assert summary in known noise, so
+    // a NEW assert from an experiment is invisible in the pile — which is exactly what
+    // happened while chasing the black screen.
+    private static void ReleaseHeldBorrows()
+    {
+        foreach (var b in new[] { _giDiffuse, _giSpecular, _ourDepthBorrow, _bloomHeld })
+        {
+            if (b == null) continue;
+            try { ReturnBorrowed(b); } catch { }
+        }
+        _giDiffuse = _giSpecular = _ourDepthBorrow = _bloomHeld = null;
+        _bloomRecomputes = 0;
+        _ourDepthTex = null;
     }
 
     private static void ReturnBorrowed(object borrowed)

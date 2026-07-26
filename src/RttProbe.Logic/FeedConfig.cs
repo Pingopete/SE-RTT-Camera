@@ -67,6 +67,57 @@ internal static class FeedConfig
     // -1 is what the engine's own probe and cascade paths pass, and is the default again.
     public static int CullRootEntityId { get; private set; } = -1;
 
+    // Point the engine's two per-frame camera constant buffers at ours for the pass.
+    //
+    // SettingsGroup._jitteredCameraSettings / _nonjitteredCameraSettings are read by ~92
+    // methods. Passes that take a cameraCb parameter already use ours; everything else
+    // reads these. The immediate defect it fixes is ClusteringJob.DoWork, which builds
+    // our cluster grid from the PLAYER'S frustum and therefore bins every clustered local
+    // light into the wrong screen-space cluster.
+    //
+    // It is also the prerequisite for AtmosphereMultiplyJob, AmbientLightJob and HBAOJob.
+    // Off by default until proven: if the restore is ever skipped, the engine's remaining
+    // passes render the player's screen from our 512x512 orbit camera.
+    public static bool SwapCameraCb { get; private set; }
+
+    // AtmosphereMultiplyJob.DoWork(cl, rtView) — the extinction half of atmosphere.
+    //
+    // IndirectPlanetEnvironmentJob, which we already run, is BlendState.Additive: it adds
+    // in-scatter and nothing else, so geometry never receives aerial-perspective
+    // extinction and there is no atmospheric sun disc. This is that half.
+    //
+    // Needs swapCameraCb (it reads the global camera CB) and our own render's depth,
+    // which the pass installs and restores around the single call.
+    public static bool AtmosphereMultiply { get; private set; }
+
+    // Draw the sun as a LAYER on top of the sky, rather than as a sky MODE.
+    //
+    // skyMode is a choice, so setting it to 2 replaced IndirectPlanetEnvironmentJob —
+    // the pass supplying the starfield and the planetary atmosphere — which is why the
+    // sun arrived and both of those left. DrawSkybox WRITES SkyLight; the planet pass is
+    // BlendState.Additive. So the sun goes down first and the atmosphere adds on top.
+    //
+    // REQUIRES gbufferSwap: the shader writes motion vectors to SV_Target1 =
+    // ScreenBuffers.GBuffer[Motion], and without the swap that is the PLAYER'S FSR input.
+    // The pass refuses to run rather than corrupt their view.
+    //
+    // Note the starfield ends up drawn twice — once here, once additively by the planet
+    // pass, which ignores HideSkybox by design ("environment probe use skybox always").
+    // Stars will read brighter than in the main view.
+    public static bool SunPass { get; private set; }
+
+    // Recompute the real bloom on one pass in N and reuse it in between.
+    //
+    // ApplyBloom is a multi-pass downsample/upsample chain — it is what halved the
+    // frame rate when bloom was first tried. But bloom is inherently LOW FREQUENCY, a
+    // blurred copy of the bright parts, so recomputing it 28 times a second buys almost
+    // nothing on a camera that orbits once every 30 seconds. This turns its cost into
+    // cost/N for a result that is at most N frames stale.
+    //
+    // 1 = every pass (full cost, the original behaviour). Needs bloom = 1 and
+    // cheapBloom = 0, since the cheap stand-in short-circuits before this.
+    public static int BloomEveryN { get; private set; } = 1;
+
     // Call CullingContext.UpdateRanges on the borrowed context each pass.
     //
     // A context from BorrowShadowCulling is ranged for RangeStats.Default — ONE draw per
@@ -121,7 +172,7 @@ internal static class FeedConfig
     // broken. Every layer here can be toggled while the game runs, so a layer that
     // kills the render names itself in one edit rather than one launch.
     public static bool Tonemap { get; private set; }   // exposure + tone response
-    public static bool Bloom { get; private set; }     // needs Tonemap
+    public static bool Bloom { get; private set; } = true;   // real ApplyBloom, amortised by BloomEveryN
     public static bool Sky { get; private set; }       // legacy flag; SkyMode is the real one
 
     // Which sky pass. IndirectPlanetEnvironmentJob (1) is the PROBE pipeline's sky and
@@ -149,7 +200,7 @@ internal static class FeedConfig
     // multi-pass downsample/upsample chain and accounts for the first halving of the
     // frame rate — and skipping it also removes one of the three main-view post
     // passes we borrow, which is a stability win as well as a speed one.
-    public static bool CheapBloom { get; private set; } = true;
+    public static bool CheapBloom { get; private set; }
 
     // Run the camera pass from the per-frame hook (DrawUnlit) instead of the probe
     // hook. The probe hook is inside the engine's own environment-probe work, which
@@ -293,7 +344,7 @@ internal static class FeedConfig
     //    buffer before its bloom and tonemap, so this is the display-side gain — the one
     //    axis that can put the feed above white. Live-tunable: change it and the material
     //    is updated in place, so a sweep costs a file save.
-    public static double Emissivity { get; private set; } = 50.0;
+    public static double Emissivity { get; private set; } = 500.0;
 
     // 5a. EnvironmentProbeSettings.EnableRecursiveReflections ships FALSE, which makes
     //     IndirectEnvironmentPassJob bind a flat default cubemap instead of the real
@@ -372,7 +423,9 @@ internal static class FeedConfig
             double farPlane = CullFarPlane;
             double radius = OrbitRadius, period = OrbitPeriod, height = OrbitHeight, clearance = OrbitClearance;
             bool orbitGrid = OrbitGrid;
-            bool lodMain = LodMainView, fixScreen = FixScreenRes, fullCam = FullCameraCb, effectGeom = EffectGeomBuffers, rangeCull = RangeCulling;
+            bool lodMain = LodMainView, fixScreen = FixScreenRes, fullCam = FullCameraCb, effectGeom = EffectGeomBuffers, rangeCull = RangeCulling, swapCb = SwapCameraCb, atmoMul = AtmosphereMultiply;
+            int bloomN = BloomEveryN;
+            bool sunPass = SunPass;
             double emissive = Emissivity, dimDist = DimDistance;
             int recursive = RecursiveReflections;
 
@@ -513,6 +566,18 @@ internal static class FeedConfig
                     case "orbitgrid":
                         orbitGrid = val is "1" or "true" or "yes";
                         break;
+                    case "atmospheremultiply":
+                        atmoMul = val is "1" or "true" or "yes";
+                        break;
+                    case "swapcameracb":
+                        swapCb = val is "1" or "true" or "yes";
+                        break;
+                    case "sunpass":
+                        sunPass = val is "1" or "true" or "yes";
+                        break;
+                    case "bloomeveryn":
+                        if (int.TryParse(val, out var bn)) bloomN = Math.Clamp(bn, 1, 60);
+                        break;
                     case "rangeculling":
                         rangeCull = val is "1" or "true" or "yes";
                         break;
@@ -548,7 +613,7 @@ internal static class FeedConfig
                         || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
-                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling
+                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
                         || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || gateGi != GateGi || envScratch != EnvPassToScratch || skyMode != SkyMode || cullRoot != CullRootEntityId;
@@ -560,7 +625,7 @@ internal static class FeedConfig
             ReuseExposure = reuseExp; ExposureValue = expValue; GBufferSwap = gbSwap; GBufferPass = gbPass; Deferred = defer; EnvPass = envP;
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
-            LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull;
+            LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass;
             Emissivity = emissive; RecursiveReflections = recursive; DimDistance = dimDist;
 
             if (changed)
@@ -582,7 +647,7 @@ internal static class FeedConfig
                             $"| lodMainView={LodMainView} fixScreenRes={FixScreenRes} " +
                             $"fullCameraCb={FullCameraCb} emissivity={Emissivity} " +
                             $"recursiveReflections={RecursiveReflections} dimDistance={DimDistance} " +
-                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling}");
+                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass}");
         }
         catch { /* keep the last good values */ }
     }

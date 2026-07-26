@@ -15,6 +15,7 @@ public static class LogicEntry
             CameraRender.Reset();
             CameraFeed.Reset();
             OwnContexts.Reset();
+            CameraCbSwap.Reset();
             FeedHandover.Reset();
             PanelBinding.Reset();
 

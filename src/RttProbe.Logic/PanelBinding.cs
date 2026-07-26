@@ -64,13 +64,19 @@ internal static class PanelBinding
         {
             if (!_surveyed) { _surveyed = true; Survey(renderer, ctx); }
 
-            // Runs whether or not the bind has happened: the emissive gain is a property
-            // of the panel's material, not of our feed, so it is worth being able to
-            // sweep it against the stock test pattern too.
+            if (_disarmed) return;
+            if (!File.Exists(ArmPath)) return;
+
+            // Deliberately AFTER the disarm and arm-marker checks.
+            //
+            // This originally ran before them, so that the emissive gain could be swept
+            // against the stock test pattern. That was wrong: it mutates a game material,
+            // and the arm markers exist precisely so that a disarmed plugin changes
+            // nothing. "Disarmed" has to mean disarmed, or the safety model is worthless
+            // the one time it matters.
             ApplyEmissivity(ctx);
 
-            if (_disarmed || _bound) return;
-            if (!File.Exists(ArmPath)) return;
+            if (_bound) return;
 
             TryBind(renderer, ctx);
         }
