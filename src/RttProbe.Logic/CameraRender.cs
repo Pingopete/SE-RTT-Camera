@@ -42,7 +42,8 @@ internal static class CameraRender
     // Resolved once by the dry run.
     private static object _drawContexts, _settings, _texPool, _bufMgr;
     private static object _cullJob, _clusterJob, _envPass;
-    private static object _cullCtx, _clusterCtx, _geomBuffers, _shadowResources, _lodSettings;
+    private static object _cullCtx, _clusterCtx, _geomBuffers, _shadowResources;
+    private static object _lodProbe, _lodMainView;
     private static MethodInfo _miDoCullingFirstPass, _miClusterDoWork, _miEnvPassDoWork;
     private static MethodInfo _miBorrowRt, _miBorrowDepth, _miCreateCb;
     private static Type _tRenderViewSlim, _tTrackedCam, _tCamSettings;
@@ -59,6 +60,17 @@ internal static class CameraRender
         _toneBlocked = _bloomBlocked = _skyBlocked = false; _bloomLogs = _skyLogs = 0;
         _ldrResizable = null; _lastResizableRes = null; _toneInputsLogged = _logProbeExp = false; _exposureSource = _loggedExposureSource = "";
         _firstPassAt = 0; _startupLogged = _startupDoneLogged = false;
+
+        // The five routes-doc fixes. Every one of these is a "logged once" or "applied
+        // once" latch, and a hot reload that left them set would silently skip the log
+        // line that proves the fix took — which is the failure mode that has wasted the
+        // most time on this project.
+        _lodProbe = _lodMainView = _lastLodUsed = null;
+        _screenResLog = null;
+        _cbRenderView = null; _miCreateNonjittered = _miRvSetCamera = _miRvSetResolution = null;
+        _fullCbBlocked = _fullCbLogged = false;
+        _environmentField = null; _probeSettingsBlocked = _probeSettingsLogged = false;
+        _dimApplied = double.NaN;
 
         // A live marker left from last session means we issued GPU work and never
         // came back. Refuse to repeat it until a human clears it.
@@ -241,15 +253,28 @@ internal static class CameraRender
         _shadowResources = Prop(_drawContexts, "DirectionalLightShadowResources", sb, ref ok);
         sb.AppendLine();
 
-        // ---- LOD settings: Settings.LOD.EnvironmentProbe ----
+        // ---- LOD settings: Settings.LOD.EnvironmentProbe and .MainView ----
+        //
+        // We copied the probe recipe wholesale, including which LOD profile it asks for.
+        // The shipped DefaultFrameSettingsConfiguration.def gives them very different
+        // floors:
+        //
+        //     "MainView":         { "MinLOD": 0, "FloraMinLOD": 0 }
+        //     "EnvironmentProbe": { "MinLOD": 8, "FloraMinLOD": 8 }
+        //
+        // MinLOD 8 clamps EVERY mesh to its coarsest level — a whole-mesh swap, not a
+        // subtle tweak — which is a large part of what reads as "missing detail" in the
+        // feed. Both profiles are resolved so the choice is a config flip, and the
+        // numbers are logged so the difference is visible rather than asserted.
         sb.AppendLine("-- lod settings --");
         var lod = Prop(_settings, "LOD", sb, ref ok);
         if (lod != null)
         {
-            var f = lod.GetType().GetField("EnvironmentProbe", Any);
-            _lodSettings = f?.GetValue(lod);
-            sb.AppendLine($"  LOD.EnvironmentProbe            {(_lodSettings == null ? "NULL" : _lodSettings.GetType().Name)}");
-            if (_lodSettings == null) ok = false;
+            _lodProbe    = lod.GetType().GetField("EnvironmentProbe", Any)?.GetValue(lod);
+            _lodMainView = lod.GetType().GetField("MainView", Any)?.GetValue(lod);
+            sb.AppendLine($"  LOD.EnvironmentProbe            {DescribeLod(_lodProbe)}");
+            sb.AppendLine($"  LOD.MainView                    {DescribeLod(_lodMainView)}");
+            if (_lodProbe == null) ok = false;
         }
         sb.AppendLine();
 
@@ -430,11 +455,15 @@ internal static class CameraRender
     private static void RenderOnce(object commandList)
     {
         object rtBorrow = null, depthBorrow = null, cameraCb = null, borrowedCulling = null;
-        object savedGBuffer = null, savedCamera = null, scratchBorrow = null;
+        object savedGBuffer = null, savedCamera = null, scratchBorrow = null, savedProbeSettings = null;
         bool geomBorrowed = false;
         try
         {
             File.WriteAllText(LivePath, $"camera pass entered {DateTime.Now:O}\n");
+
+            // Persistent, self-gating on change. Not part of the scoped swap below —
+            // see the comment on ApplyDimDistance for why it cannot be.
+            ApplyDimDistance();
 
             // The scene pass's PSOs are compiled for the HDR format. Binding a
             // render target of any other format is a pipeline-state mismatch, which
@@ -479,12 +508,8 @@ internal static class CameraRender
             if (_renders == 0)
                 RttLog.Line($"Camera pass view source: {(CameraFeed.Current != null ? "ORBIT — " + CameraFeed.Describe() : "main view (no [RTC] panel yet)")}");
 
-            // camera constant buffer: RenderViewSlim -> CameraSettings -> TrackedCameraSettings
-            var cam = Convert(_tCamSettings, view, _tRenderViewSlim);
-            var tracked = Convert(_tTrackedCam, cam, _tCamSettings);
-            if (tracked == null) { RttLog.Line("Camera pass: camera conversion failed."); _armed = false; return; }
-            cameraCb = _miCreateCb.MakeGenericMethod(_tTrackedCam)
-                .Invoke(_bufMgr, new object[] { "rttCameraSettings", tracked });
+            cameraCb = BuildCameraCb(view, res);
+            if (cameraCb == null) { RttLog.Line("Camera pass: camera conversion failed."); _armed = false; return; }
 
             // The colour target is borrowed RESIZABLE when any fidelity layer is on.
             //
@@ -545,15 +570,29 @@ internal static class CameraRender
             // And the camera the GBuffer pass rasterises from.
             savedCamera = InstallOurCamera(_lastCamWorld, _lastViewD);
 
+            // Swap the real IBL cubes in for the flat default, for our pass only.
+            savedProbeSettings = InstallProbeSettings();
+
             // cull -> cluster -> draw, exactly as the probe pass sequences them
             // Prefer a pooled culling context over the engine's probe one — sharing
             // that is what capped the frame rate. Returned in the finally below.
             borrowedCulling = FeedConfig.UsePooledCulling ? OwnContexts.Borrow() : null;
             var cullCtx = borrowedCulling ?? _cullCtx;
 
+            // MainView unclamps MinLOD from 8 to 0 — see the resolve-time comment. Falls
+            // back to the probe profile if MainView could not be resolved, so a missing
+            // field degrades to today's behaviour rather than a null argument.
+            var lodSettings = (FeedConfig.LodMainView && _lodMainView != null) ? _lodMainView : _lodProbe;
+            if (!ReferenceEquals(lodSettings, _lastLodUsed))
+            {
+                _lastLodUsed = lodSettings;
+                RttLog.Line($"LOD profile: {(ReferenceEquals(lodSettings, _lodMainView) ? "MainView" : "EnvironmentProbe")} " +
+                            $"— {DescribeLod(lodSettings)}");
+            }
+
             _miDoCullingFirstPass.Invoke(_cullJob, new object[]
             {
-                commandList, view, _lodSettings, cullCtx, _geomBuffers,
+                commandList, view, lodSettings, cullCtx, _geomBuffers,
                 null, null, null, null, -1, 0, -1,
             });
 
@@ -910,6 +949,7 @@ internal static class CameraRender
         {
             // FIRST, before anything else can throw: the engine must not be left
             // pointing at our 512x512 array.
+            RestoreProbeSettings(savedProbeSettings);
             RestoreCamera(savedCamera);
             RestoreGBuffer(savedGBuffer);
 
@@ -2337,6 +2377,311 @@ internal static class CameraRender
             _camSwapBlocked = true;
             RttLog.Error("RESTORE CAMERA FAILED — the main view is now using our camera", e);
         }
+    }
+
+    // ---------------------------------------------------------------- camera CB
+
+    // The camera constant buffer, and the two independent defects that live in it.
+    // Both fixes are separately switchable because they fail in different ways and
+    // batching them would make an ambiguous result.
+    private static object BuildCameraCb(object view, object res)
+    {
+        object cam = null;
+
+        if (FeedConfig.FullCameraCb)
+            cam = FullCameraSettings(res);
+
+        // The cheap path, and the fallback if the full build is unavailable: it is what
+        // the engine's own probe pass uses, so it is never wrong, only incomplete.
+        cam ??= Convert(_tCamSettings, view, _tRenderViewSlim);
+
+        var tracked = Convert(_tTrackedCam, cam, _tCamSettings);
+        if (tracked == null) return null;
+
+        if (FeedConfig.FixScreenRes) StampScreenResolution(tracked, res);
+
+        return _miCreateCb.MakeGenericMethod(_tTrackedCam)
+            .Invoke(_bufMgr, new object[] { "rttCameraSettings", tracked });
+    }
+
+    // CameraSettings -> TrackedCameraSettings (op_Explicit) stamps
+    // CoreSystems.ScreenBuffers.PreUpscaleResolution into Screen.Resolution — the
+    // PLAYER'S 3840x2160 — while we rasterise 512x512. Shaders reconstruct their view
+    // ray with ScreenToUV() = rcp(Screen_.Resolution), so every one of them is out by
+    // 3840/512 = 7.5x. That is the sky being far too zoomed and rotating far too fast,
+    // and it is not only the sky: Pass_Pixel_Indirect.hlsli uses the same ScreenToUV, so
+    // view vectors, specular response and the depth-based dimming in the geometry pass
+    // are all mis-scaled too.
+    //
+    // The engine's own probe path never hits this because ExecuteEnvironmentProbeUpdate
+    // hand-builds the struct with Screen.Resolution = the cube face's own resolution.
+    // This does the same thing to the boxed copy before the CB is created; nothing
+    // global is touched.
+    private static void StampScreenResolution(object tracked, object res)
+    {
+        try
+        {
+            var fScreen = _tTrackedCam.GetField("Screen", Any);
+            if (fScreen == null) { LogScreenResOnce("TrackedCameraSettings.Screen not found"); return; }
+
+            var screen = fScreen.GetValue(tracked);
+            var fRes = screen?.GetType().GetField("Resolution", Any);
+            if (fRes == null) { LogScreenResOnce("ScreenSettings.Resolution not found"); return; }
+
+            var was = fRes.GetValue(screen);
+            int x = System.Convert.ToInt32(Prop2(res, "X") ?? 0);
+            int y = System.Convert.ToInt32(Prop2(res, "Y") ?? 0);
+            var want = MakeVector2(x, y);
+            if (want == null) { LogScreenResOnce("could not construct Vector2"); return; }
+
+            fRes.SetValue(screen, want);
+            fScreen.SetValue(tracked, screen);
+            LogScreenResOnce($"Screen.Resolution {was} -> {want} " +
+                             "(the engine's value is the player's screen; every ScreenToUV was scaled by the ratio)");
+        }
+        catch (Exception e) { LogScreenResOnce("threw: " + e.Message); }
+    }
+
+    private static string _screenResLog;
+
+    private static void LogScreenResOnce(string what)
+    {
+        if (what == _screenResLog) return;   // change-detection, not one-shot: a one-shot
+        _screenResLog = what;                // log here would print the pre-resolve value
+        RttLog.Line("Camera CB: " + what);
+    }
+
+    // Build the camera as a full RenderView and run it through the engine's own
+    // CameraSettings.CreateNonjitteredCameraSettings, instead of the RenderViewSlim
+    // conversion.
+    //
+    // RenderViewSlim -> CameraSettings writes 7 of CameraSettings' 14 fields and leaves
+    // these at ZERO: ViewTransform, InvViewTransform (the double-precision camera world
+    // transform), TanFOV, FOVScaleFactor, CameraFlags, PositionDelta, CameraSpeed. Any
+    // shader reconstructing a world position from the camera therefore believes the
+    // camera sits at the world origin.
+    //
+    // It is also not self-contained — it reads CoreSystems.Settings.RenderView and stamps
+    // the PLAYER's camera position into MainViewCameraPos, which SpherizationCommon.hlsli
+    // (planet horizon curvature) and TriplanarSingle/MultiVertex.hlsl (voxel surface
+    // texturing) both sample. CreateNonjitteredCameraSettings sets it to zero.
+    private static object _cbRenderView;
+    private static MethodInfo _miCreateNonjittered, _miRvSetCamera, _miRvSetResolution;
+    private static bool _fullCbBlocked, _fullCbLogged;
+
+    private static object FullCameraSettings(object res)
+    {
+        if (_fullCbBlocked || _settings == null || _lastCamWorld == null) return null;
+        try
+        {
+            var theirs = _renderViewField?.GetValue(_settings)
+                      ?? ResolveRenderViewField()?.GetValue(_settings);
+            if (theirs == null) { BlockFullCb("SettingsManager._renderView not readable"); return null; }
+            var rvType = theirs.GetType();
+
+            _miCreateNonjittered ??= _tCamSettings?.GetMethod("CreateNonjitteredCameraSettings",
+                BindingFlags.Public | BindingFlags.Static);
+            _miRvSetCamera ??= rvType.GetMethod("SetCameraParameters", Any);
+            _miRvSetResolution ??= rvType.GetMethod("SetResolution", Any);
+            if (_miCreateNonjittered == null || _miRvSetCamera == null || _miRvSetResolution == null)
+            {
+                BlockFullCb($"missing entry point (create={_miCreateNonjittered != null} " +
+                            $"setCam={_miRvSetCamera != null} setRes={_miRvSetResolution != null})");
+                return null;
+            }
+
+            // Start from a copy of the engine's view so projection conventions, clipping
+            // planes and FOV are the engine's rather than guessed at.
+            _rvFields ??= rvType.GetFields(Any).Where(f => !f.IsStatic).ToArray();
+            _cbRenderView ??= System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(rvType);
+            foreach (var f in _rvFields)
+                try { f.SetValue(_cbRenderView, f.GetValue(theirs)); } catch { }
+
+            // RenderView is a struct whose ONE reference field is Queue<double>
+            // _cameraSpeedBuffer, so every copy — ours included — aliases the same queue.
+            // SetCameraParameters -> Update() -> ResetContext() calls Clear() on it, which
+            // would wipe the PLAYER's camera-speed history through our copy. ResetContext
+            // null-guards the field, so nulling it on ours makes that path inert. We also
+            // pass smooth: true, which should stop Update() reaching ResetContext at all —
+            // belt and braces, because the failure is silent and lands on the player.
+            foreach (var f in _rvFields)
+                if (f.Name == "_cameraSpeedBuffer")
+                    try { f.SetValue(_cbRenderView, null); } catch { }
+
+            // Resolution FIRST. Update() derives FovV from _resolution, so setting the
+            // camera before the resolution computes our FOV from the player's screen.
+            _miRvSetResolution.Invoke(_cbRenderView, new[] { res });
+
+            float fovH      = System.Convert.ToSingle(Prop2(_cbRenderView, "FovH") ?? 0f);
+            float near      = System.Convert.ToSingle(Prop2(_cbRenderView, "NearClipping") ?? 0f);
+            float far       = System.Convert.ToSingle(Prop2(_cbRenderView, "FarClipping") ?? 0f);
+            float veryFar   = System.Convert.ToSingle(Prop2(_cbRenderView, "VeryFarClipping") ?? 0f);
+            var projOffset  = Prop2(_cbRenderView, "ProjectionOffset");
+            bool ortho      = System.Convert.ToBoolean(Prop2(_cbRenderView, "IsOrthographic") ?? false);
+
+            _miRvSetCamera.Invoke(_cbRenderView, new object[]
+            {
+                _lastCamWorld, fovH, near, far, veryFar, projOffset, /* smooth */ true, ortho,
+            });
+
+            var cam = _miCreateNonjittered.Invoke(null, new[] { _cbRenderView });
+
+            if (!_fullCbLogged)
+            {
+                _fullCbLogged = true;
+                // Reflection on a BOXED struct only mutates the box if Invoke passes the
+                // box's interior as `this`. It does — but that is exactly the kind of
+                // assumption that has cost this project a session, so it is measured.
+                RttLog.Line($"Camera CB: FULL build — camera position {Prop2(_cbRenderView, "CameraPosition")}, " +
+                            $"TanFOV={Prop2(cam, "TanFOV")} FOVScaleFactor={Prop2(cam, "FOVScaleFactor")} " +
+                            $"MainViewCameraPos={Prop2(cam, "MainViewCameraPos")}. " +
+                            "Position at the origin or TanFOV zero means the boxed-struct mutation did not take.");
+            }
+            return cam;
+        }
+        catch (Exception e) { BlockFullCb("threw: " + e.Message); RttLog.Error("full camera cb", e); return null; }
+    }
+
+    private static void BlockFullCb(string why)
+    {
+        if (_fullCbBlocked) return;
+        _fullCbBlocked = true;
+        RttLog.Line($"Camera CB: full build unavailable ({why}) — falling back to the slim conversion.");
+    }
+
+    private static FieldInfo ResolveRenderViewField()
+    {
+        _renderViewField ??= _settings?.GetType().GetFields(Any)
+            .FirstOrDefault(f => f.Name.Contains("renderView", StringComparison.OrdinalIgnoreCase)
+                              && !f.Name.Contains("previous", StringComparison.OrdinalIgnoreCase)
+                              && !f.Name.Contains("freez", StringComparison.OrdinalIgnoreCase));
+        return _renderViewField;
+    }
+
+    // ------------------------------------------------------- probe settings
+
+    // EnvironmentProbeSettings.EnableRecursiveReflections is read LIVE inside
+    // IndirectEnvironmentPassJob.DoWork — it picks between the job's own _defaultTexture
+    // (a flat cube) and EnvironmentProbeManager.CloseIBL/FarIBL. It ships FALSE, so the
+    // ambient term in our feed is a constant colour rather than the real environment.
+    //
+    // Because it is read live, a scoped set/restore around our pass is enough: the
+    // player's own probe updates keep the shipped value.
+    //
+    // DimDistance is NOT here, and the difference matters. It reaches the shader through
+    // CommonResources.SettingsGroup.CreateFrameSettings, which builds the frame's
+    // GlobalSettings constant buffer once in OnBeginDraw — long before our hook runs — so
+    // a scoped swap would be a silent no-op. See ApplyDimDistance.
+    private static FieldInfo _environmentField;
+    private static bool _probeSettingsBlocked, _probeSettingsLogged;
+
+    private static object InstallProbeSettings()
+    {
+        if (_probeSettingsBlocked || FeedConfig.RecursiveReflections < 0 || _settings == null) return null;
+        try
+        {
+            _environmentField ??= _settings.GetType().GetField("_environment", Any);
+            if (_environmentField == null)
+            {
+                _probeSettingsBlocked = true;
+                RttLog.Line("Probe settings: SettingsManager._environment not found — recursiveReflections ignored.");
+                return null;
+            }
+
+            // GetValue on a struct field boxes a fresh copy each call, so `saved` and
+            // `ours` are genuinely independent.
+            var saved = _environmentField.GetValue(_settings);
+            var ours = _environmentField.GetValue(_settings);
+
+            var fProbe = ours.GetType().GetField("ProbeSettings", Any);
+            var probe = fProbe?.GetValue(ours);
+            var fRecursive = probe?.GetType().GetField("EnableRecursiveReflections", Any);
+            if (fRecursive == null)
+            {
+                _probeSettingsBlocked = true;
+                RttLog.Line("Probe settings: ProbeSettings.EnableRecursiveReflections not found.");
+                return null;
+            }
+
+            bool want = FeedConfig.RecursiveReflections == 1;
+            if (!_probeSettingsLogged)
+            {
+                _probeSettingsLogged = true;
+                RttLog.Line($"Probe settings: EnableRecursiveReflections {fRecursive.GetValue(probe)} -> {want} " +
+                            "for our pass only (read live inside IndirectEnvironmentPassJob.DoWork).");
+            }
+            fRecursive.SetValue(probe, want);
+            fProbe.SetValue(ours, probe);
+            _environmentField.SetValue(_settings, ours);
+            return saved;
+        }
+        catch (Exception e) { _probeSettingsBlocked = true; RttLog.Error("install probe settings", e); return null; }
+    }
+
+    private static void RestoreProbeSettings(object saved)
+    {
+        if (saved == null || _environmentField == null || _settings == null) return;
+        try { _environmentField.SetValue(_settings, saved); }
+        catch (Exception e)
+        {
+            _probeSettingsBlocked = true;
+            RttLog.Error("RESTORE PROBE SETTINGS FAILED — the engine's own probes now use our value", e);
+        }
+    }
+
+    // DimDistance, applied PERSISTENTLY rather than scoped.
+    //
+    // Pass_Pixel_Indirect.hlsli multiplies all shaded output by
+    // clamp(surface.ZDepth / Environment_.DimDistance, 0, 1) SQUARED, and the shipped
+    // value is 5 metres — so geometry 1 m from the camera comes out at 4% brightness.
+    // It exists so an environment probe does not contaminate itself with the hull it is
+    // sitting inside.
+    //
+    // Environment_ is part of the per-frame GlobalSettings CB, built once per frame in
+    // SettingsGroup.OnBeginDraw, so this cannot be a scoped swap the way
+    // EnableRecursiveReflections can — it has to be set and left. That also means it
+    // applies to the engine's OWN probes, which will read slightly brighter near the
+    // player's hull. Applied only when the configured value changes.
+    private static double _dimApplied = double.NaN;
+
+    private static void ApplyDimDistance()
+    {
+        double want = FeedConfig.DimDistance;
+        if (want < 0.0 || want == _dimApplied || _settings == null) return;
+        try
+        {
+            _environmentField ??= _settings.GetType().GetField("_environment", Any);
+            var ours = _environmentField?.GetValue(_settings);
+            var fProbe = ours?.GetType().GetField("ProbeSettings", Any);
+            var probe = fProbe?.GetValue(ours);
+            var fDim = probe?.GetType().GetField("DimDistance", Any);
+            if (fDim == null) { _dimApplied = want; RttLog.Line("Probe settings: DimDistance not found."); return; }
+
+            var was = fDim.GetValue(probe);
+            fDim.SetValue(probe, (float)want);
+            fProbe.SetValue(ours, probe);
+            _environmentField.SetValue(_settings, ours);
+            _dimApplied = want;
+            RttLog.Line($"Probe settings: DimDistance {was} -> {want} (PERSISTENT — it reaches the shader " +
+                        "through the per-frame GlobalSettings CB, so a scoped swap would do nothing. " +
+                        "This also affects the engine's own probes.)");
+        }
+        catch (Exception e) { _dimApplied = want; RttLog.Error("apply dim distance", e); }
+    }
+
+    private static object _lastLodUsed;
+
+    private static string DescribeLod(object lod)
+    {
+        if (lod == null) return "NULL";
+        return $"MinLOD={Prop2(lod, "MinLOD")} FloraMinLOD={Prop2(lod, "FloraMinLOD")} " +
+               $"LODShift={Prop2(lod, "LODShift")} LODShiftVisible={Prop2(lod, "LODShiftVisible")}";
+    }
+
+    private static object MakeVector2(float x, float y)
+    {
+        var t = Type.GetType("Keen.VRage.Library.Mathematics.Vector2, VRage.Library");
+        return t == null ? null : Activator.CreateInstance(t, x, y);
     }
 
     private static object ScreenBuffersInstance()

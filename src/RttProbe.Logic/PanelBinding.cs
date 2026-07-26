@@ -45,6 +45,8 @@ internal static class PanelBinding
     {
         _surveyed = _bound = false;
         _errLogs = 0;
+        _emissivityApplied = double.NaN;
+        _emissivityBlocked = false;
 
 
         if (File.Exists(LivePath))
@@ -62,12 +64,69 @@ internal static class PanelBinding
         {
             if (!_surveyed) { _surveyed = true; Survey(renderer, ctx); }
 
+            // Runs whether or not the bind has happened: the emissive gain is a property
+            // of the panel's material, not of our feed, so it is worth being able to
+            // sweep it against the stock test pattern too.
+            ApplyEmissivity(ctx);
+
             if (_disarmed || _bound) return;
             if (!File.Exists(ArmPath)) return;
 
             TryBind(renderer, ctx);
         }
         catch (Exception e) { if (_errLogs++ < 3) RttLog.Error("panel binding", e); }
+    }
+
+    // The display side of the tonal-range problem.
+    //
+    // LCDPixel.hlsl computes
+    //
+    //     output.Emissivity = saturate(ext.Values.y - 1/255.) * materialInstance.EmissivityMultiplier
+    //
+    // and that emissivity is added into the MAIN view's HDR light buffer
+    // (specular += basecolor * Emissivity * Post_.BloomEmissiveness) before the engine's
+    // own bloom and Hable tonemap. So the panel genuinely can exceed white and glow —
+    // the emissive path is real, and it is the only axis on which our feed can produce
+    // light rather than reflectance.
+    //
+    // What it is NOT is per-pixel. SetNewScreenMaterialHandle overrides only
+    // ColorMetalTexture; the emissive MASK comes from the base material's
+    // ExtensionsTexture green channel, which we do not write. So this is a uniform gain
+    // over an image already clamped to 1.0 by GBuffer0.rgb. Per-pixel range needs our own
+    // ExtensionsTexture bound as well — a separate step, and only worth building if this
+    // one proves the path is live.
+    //
+    // Two outcomes, both decisive: the panel gets dramatically brighter and starts
+    // blooming (the path works, and the gain is the knob), or nothing changes at all
+    // (the stock extensions green is ~0 for LCDScreen_On, the shipped x10 was never doing
+    // anything, and binding our own extensions texture is mandatory rather than optional).
+    private static double _emissivityApplied = double.NaN;
+    private static bool _emissivityBlocked;
+
+    private static void ApplyEmissivity(object ctx)
+    {
+        double want = FeedConfig.Emissivity;
+        if (_emissivityBlocked || want <= 0.0 || want == _emissivityApplied) return;
+        try
+        {
+            var material = Prop(ctx, "ScreenMaterial");
+            var p = material?.GetType().GetProperty("EmissivityMultiplier", Any);
+            if (p == null || !p.CanWrite)
+            {
+                _emissivityBlocked = true;
+                RttLog.Line($"Emissivity: EmissivityMultiplier not settable on " +
+                            $"{material?.GetType().Name ?? "<no ScreenMaterial>"} — display gain unavailable.");
+                return;
+            }
+
+            var was = p.GetValue(material);
+            p.SetValue(material, (float)want);
+            _emissivityApplied = want;
+            RttLog.Line($"Emissivity: {material.GetType().Name}.EmissivityMultiplier {was} -> {want}. " +
+                        "No visible change means the base material's extensions green is ~0 and the " +
+                        "multiplier has nothing to scale.");
+        }
+        catch (Exception e) { _emissivityBlocked = true; RttLog.Error("apply emissivity", e); }
     }
 
     // What is reachable, and where does a PBRMaterialDefinition come from?

@@ -224,6 +224,59 @@ internal static class FeedConfig
     public static bool BlitAlpha { get; private set; }
     public static bool ZeroMetalness { get; private set; } = true;
 
+    // ---- the five fidelity fixes from docs/routes.md ----
+    // All default OFF so each can be flipped alone, live, against a running feed.
+
+    // 1. Which LOD profile our own culling call asks for. We copied the probe recipe,
+    //    which passes Settings.LOD.EnvironmentProbe — and the shipped config gives that
+    //    profile MinLOD 8 / FloraMinLOD 8 where MainView uses 0. So the feed has always
+    //    drawn every mesh at its coarsest LOD. One argument, no global touched.
+    public static bool LodMainView { get; private set; }
+
+    // 2. Stamp OUR render resolution into the camera CB's Screen.Resolution.
+    //    CameraSettings -> TrackedCameraSettings copies ScreenBuffers.PreUpscaleResolution
+    //    (the player's 3840x2160) while we rasterise 512x512, and shaders reconstruct view
+    //    rays with rcp(Screen_.Resolution) — a 7.5x error on every one of them. That is
+    //    the over-zoomed sky, and also wrong view vectors and specular in the geometry pass.
+    public static bool FixScreenRes { get; private set; }
+
+    // 3. Build the camera CB from a real RenderView via
+    //    CameraSettings.CreateNonjitteredCameraSettings instead of the RenderViewSlim
+    //    conversion, which leaves ViewTransform, InvViewTransform, TanFOV, FOVScaleFactor
+    //    and CameraFlags at zero — so shaders believe the camera is at the world origin —
+    //    and stamps the PLAYER's position into MainViewCameraPos, which is what planet
+    //    curvature and triplanar (voxel) texturing read.
+    public static bool FullCameraCb { get; private set; }
+
+    // 4. LCD material EmissivityMultiplier. 0 leaves the base material's value alone
+    //    (10 on LCDScreen_On). The panel's emissive term is added to the MAIN view's HDR
+    //    buffer before its bloom and tonemap, so this is the display-side gain — the one
+    //    axis that can put the feed above white. Live-tunable: change it and the material
+    //    is updated in place, so a sweep costs a file save.
+    public static double Emissivity { get; private set; }
+
+    // 5a. EnvironmentProbeSettings.EnableRecursiveReflections ships FALSE, which makes
+    //     IndirectEnvironmentPassJob bind a flat default cubemap instead of the real
+    //     CloseIBL/FarIBL — our ambient term is a constant. Read LIVE inside DoWork, so a
+    //     scoped set/restore around our pass is enough and the player keeps their own.
+    //     -1 leaves it alone, 0 forces off, 1 forces on.
+    public static int RecursiveReflections { get; private set; } = -1;
+
+    // 5b. EnvironmentProbeSettings.DimDistance. Pass_Pixel_Indirect.hlsli multiplies all
+    //     shaded output by clamp(ZDepth/DimDistance, 0, 1) SQUARED, and it ships as 5 m —
+    //     so geometry 1 m from the camera is multiplied by 0.04. It exists so a probe does
+    //     not contaminate itself with the hull it sits inside.
+    //
+    //     Unlike 5a this canNOT be a scoped swap: DimDistance reaches the shader through
+    //     CommonResources.SettingsGroup.CreateFrameSettings, which builds the frame's
+    //     GlobalSettings CB once in OnBeginDraw — long before our hook runs. It has to be
+    //     set persistently, which also affects the engine's OWN probes (slightly brighter
+    //     ambient for the player). -1 leaves it alone.
+    //
+    //     Note this does nothing at the default 100 m orbit — everything is already past
+    //     5 m. It matters for a camera mounted close to structure.
+    public static double DimDistance { get; private set; } = -1.0;
+
     // Orbit radius is a FLOOR, not a fixed distance: the effective radius is
     // max(orbitRadius, gridExtent * orbitClearance). Orbiting a fixed 100 m around a
     // ship whose half-diagonal is 80 m flies the camera through the hull, which is
@@ -279,6 +332,9 @@ internal static class FeedConfig
             double farPlane = CullFarPlane;
             double radius = OrbitRadius, period = OrbitPeriod, height = OrbitHeight, clearance = OrbitClearance;
             bool orbitGrid = OrbitGrid;
+            bool lodMain = LodMainView, fixScreen = FixScreenRes, fullCam = FullCameraCb;
+            double emissive = Emissivity, dimDist = DimDistance;
+            int recursive = RecursiveReflections;
 
             foreach (var raw in File.ReadAllLines(Path_))
             {
@@ -417,6 +473,24 @@ internal static class FeedConfig
                     case "orbitgrid":
                         orbitGrid = val is "1" or "true" or "yes";
                         break;
+                    case "lodmainview":
+                        lodMain = val is "1" or "true" or "yes";
+                        break;
+                    case "fixscreenres":
+                        fixScreen = val is "1" or "true" or "yes";
+                        break;
+                    case "fullcameracb":
+                        fullCam = val is "1" or "true" or "yes";
+                        break;
+                    case "emissivity":
+                        if (double.TryParse(val, out var em) && em >= 0.0) emissive = em;
+                        break;
+                    case "recursivereflections":
+                        if (int.TryParse(val, out var rr)) recursive = Math.Clamp(rr, -1, 1);
+                        break;
+                    case "dimdistance":
+                        if (double.TryParse(val, out var dd)) dimDist = dd;
+                        break;
                 }
             }
 
@@ -428,6 +502,8 @@ internal static class FeedConfig
                         || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
+                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb
+                        || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
                         || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || gateGi != GateGi || envScratch != EnvPassToScratch || skyMode != SkyMode || cullRoot != CullRootEntityId;
             IntervalMs = interval; PanelMs = panel; StartupDelayMs = startup; UsePooledCulling = pooled; OrbitRadius = radius; OrbitPeriod = period; OrbitHeight = height;
@@ -438,6 +514,8 @@ internal static class FeedConfig
             ReuseExposure = reuseExp; ExposureValue = expValue; GBufferSwap = gbSwap; GBufferPass = gbPass; Deferred = defer; EnvPass = envP;
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
+            LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam;
+            Emissivity = emissive; RecursiveReflections = recursive; DimDistance = dimDist;
 
             if (changed)
                 RttLog.Line($"Config: intervalMs={IntervalMs} (~{1000.0 / IntervalMs:F0} fps) " +
@@ -452,7 +530,12 @@ internal static class FeedConfig
                             // knowing which combination produced it has cost several cycles.
                             $"| skyMode={SkyMode} gbufSwap={GBufferSwap} gbufPass={GBufferPass} " +
                             $"execLight={ExecuteLighting} gateGi={GateGi} envScratch={EnvPassToScratch} " +
-                            $"swapRes={SwapResolution} swapCam={SwapCamera}");
+                            $"swapRes={SwapResolution} swapCam={SwapCamera} " +
+                            // The five routes-doc fixes, printed together so a screenshot
+                            // of the log says which combination produced the image.
+                            $"| lodMainView={LodMainView} fixScreenRes={FixScreenRes} " +
+                            $"fullCameraCb={FullCameraCb} emissivity={Emissivity} " +
+                            $"recursiveReflections={RecursiveReflections} dimDistance={DimDistance}");
         }
         catch { /* keep the last good values */ }
     }
