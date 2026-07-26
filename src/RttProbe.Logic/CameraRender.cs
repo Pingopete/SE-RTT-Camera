@@ -625,6 +625,13 @@ internal static class CameraRender
             borrowedCulling = FeedConfig.UsePooledCulling ? OwnContexts.Borrow() : null;
             var cullCtx = borrowedCulling ?? _cullCtx;
 
+            // A pooled context arrives ranged for ONE draw per category, because the
+            // engine only ranges the contexts its own pending-work queues name and
+            // nothing names ours. Everything past that floor is silently dropped —
+            // which is the missing asteroids and the flickering structure.
+            // EnvProbeCulling[0] never needed this: the engine ranges it every frame.
+            if (borrowedCulling != null) OwnContexts.EnsureRanges(borrowedCulling, commandList);
+
             // MainView unclamps MinLOD from 8 to 0 — see the resolve-time comment. Falls
             // back to the probe profile if MainView could not be resolved, so a missing
             // field degrades to today's behaviour rather than a null argument.

@@ -67,6 +67,18 @@ internal static class FeedConfig
     // -1 is what the engine's own probe and cascade paths pass, and is the default again.
     public static int CullRootEntityId { get; private set; } = -1;
 
+    // Call CullingContext.UpdateRanges on the borrowed context each pass.
+    //
+    // A context from BorrowShadowCulling is ranged for RangeStats.Default — ONE draw per
+    // category — until something grows it, and the engine only grows the contexts named
+    // by its own pending-work queues (CascadesToUpdate, CharacterCascadesToUpdate,
+    // EnvProbesToUpdate, LocalLightsToUpdate). Nothing names ours.
+    //
+    // That is why geometry went missing the moment we stopped sharing EnvProbeCulling[0],
+    // which the engine ranges every frame for a full probe scene cull. Default ON: the
+    // alternative is a knowingly under-ranged context. 0 reproduces the broken behaviour.
+    public static bool RangeCulling { get; private set; } = true;
+
     // Which OutputGeometryBufferContext the pass writes its draw commands into.
     //
     // Borrow() on one of these is an `_isBorrowed` mutex flag, not an allocation — the
@@ -355,7 +367,7 @@ internal static class FeedConfig
             double farPlane = CullFarPlane;
             double radius = OrbitRadius, period = OrbitPeriod, height = OrbitHeight, clearance = OrbitClearance;
             bool orbitGrid = OrbitGrid;
-            bool lodMain = LodMainView, fixScreen = FixScreenRes, fullCam = FullCameraCb, effectGeom = EffectGeomBuffers;
+            bool lodMain = LodMainView, fixScreen = FixScreenRes, fullCam = FullCameraCb, effectGeom = EffectGeomBuffers, rangeCull = RangeCulling;
             double emissive = Emissivity, dimDist = DimDistance;
             int recursive = RecursiveReflections;
 
@@ -496,6 +508,9 @@ internal static class FeedConfig
                     case "orbitgrid":
                         orbitGrid = val is "1" or "true" or "yes";
                         break;
+                    case "rangeculling":
+                        rangeCull = val is "1" or "true" or "yes";
+                        break;
                     case "effectgeombuffers":
                         effectGeom = val is "1" or "true" or "yes";
                         break;
@@ -528,7 +543,7 @@ internal static class FeedConfig
                         || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
-                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers
+                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
                         || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || gateGi != GateGi || envScratch != EnvPassToScratch || skyMode != SkyMode || cullRoot != CullRootEntityId;
@@ -540,7 +555,7 @@ internal static class FeedConfig
             ReuseExposure = reuseExp; ExposureValue = expValue; GBufferSwap = gbSwap; GBufferPass = gbPass; Deferred = defer; EnvPass = envP;
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
-            LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom;
+            LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull;
             Emissivity = emissive; RecursiveReflections = recursive; DimDistance = dimDist;
 
             if (changed)
@@ -562,7 +577,7 @@ internal static class FeedConfig
                             $"| lodMainView={LodMainView} fixScreenRes={FixScreenRes} " +
                             $"fullCameraCb={FullCameraCb} emissivity={Emissivity} " +
                             $"recursiveReflections={RecursiveReflections} dimDistance={DimDistance} " +
-                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers}");
+                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling}");
         }
         catch { /* keep the last good values */ }
     }
