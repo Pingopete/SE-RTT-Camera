@@ -560,21 +560,428 @@ Still worth trying, in order:
 no evidence yet that it needs a freshly *computed* one — and bloom is a multi-pass
 downsample/upsample chain, so it is the obvious suspect for the first halving.
 
+## GBuffer and deferred lighting: steps 1–3 work, step 4 is blocked (2026-07-26)
+
+Done carefully, one step per build, each independently switchable.
+
+| Step | Result |
+|---|---|
+| 1. survey, read-only | `ScreenBuffers.GBuffer` is a public settable `ResizableRWRenderTargetTexture[5]` |
+| 2. swap array in/out | **works** — ~630 swaps, 29 fps, player's view clean |
+| 3. `GBufferPassJob` | **works** — real surface data in our own GBuffer, 27 fps, view clean |
+| 4. lighting jobs | **1 of 3.** `LocalLightsJob` runs; directional and ambient are blocked |
+
+Two things step 2/3 needed that were not obvious:
+
+**The depth buffer must be swapped too.** `GBufferPassJob` takes no depth parameter,
+so it writes through `ScreenBuffers.DepthStencilBuffer` — the player's 4K one. That
+property is `CanWrite=False`, and the backing field is `_depthStencilBuffer`,
+**lowercase after the underscore**, so a case-sensitive `Contains("DepthStencilBuffer")`
+reported "no backing field" while the storage sat in plain sight. The pass is gated on
+owning the depth buffer and correctly refused to run until it did.
+
+**Our GBuffer is 512×512 where the engine's is 3840×2160** — 56× cheaper, which is
+why the added pass costs almost nothing.
+
+### Why step 4 stops, and it is the same wall as the post passes
+
+`LocalLightsJob(cl, rtView, rtViewDiffuseOnly, clusteringResult, outputGeometryBuffers)`
+works because every input is a parameter — it even takes *our* clustering context.
+(Note: `rtViewDiffuseOnly` may not be null; the job throws. Sharing our target works.)
+
+The other two reach past their parameters:
+
+```
+DirectionalLightJob(cl, shadowRtView, shadowResources, rtView)   -> NullReferenceException
+    DirectionalLightShadowResources exposes DepthMaps (Texture2DTable) and
+    SetupConstantBuffer — no ITexture2DView anywhere. shadowRtView is the
+    SCREEN-SPACE shadow mask (SHADOW_PASS_FORMAT = R16_UNorm) produced by the
+    shadow pass we do not run.
+
+AmbientLightJob(cl, rtView, giBufferDiffuse, giBufferSpecular)
+    -> null GI buffers: NullReferenceException
+    -> real empty GI buffers: InvalidCastException,
+       ResizableRWBuffer -> IConstantBufferView, thrown INSIDE the job
+```
+
+That cast failure is decisive: ambient reads a constant buffer from state the main
+view's frame sets up, and no argument we can pass changes it. **Same wall as
+`ComputeExposure`** — not types, not resolution, not hooks, but per-frame singleton
+state that only exists for the frame the engine is actually rendering.
+
+**Symptom worth recording:** with only `LocalLightsJob` running, geometry rendered as
+**black silhouettes against a visible sky**. That is the correct output of a partial
+deferred chain — local lights composite nothing in open space, and the sky pass runs
+afterward filling wherever depth is empty. Not a bug; a complete deferred chain minus
+its two main light sources.
+
+### What this means
+
+Deferred lighting through the engine's own jobs is not reachable from a second view
+without replicating the frame setup those jobs assume. The forward
+`IndirectEnvironmentPassJob` — sun, clustered lights, shadows, no ambient term —
+stands as the fidelity ceiling for now, and the harshness is the missing ambient.
+
+Reachable work that does not fight this:
+
+1. **Our own shadow cascades / shadow mask.** Would fix the forward pass's shadows
+   (currently the player's cascades, fitted to their frustum) *and* is the missing
+   `shadowRtView` for `DirectionalLightJob`. One piece of work unblocking two things —
+   the best remaining lead.
+2. **Render resolution and AA.** Our target is 512×512 and the panel is 512×512; the
+   pixelation in the feed is resolution, not lighting.
+3. **`AtmosphereAdditiveJob(cl, rtView)`** — 2 arguments, no GBuffer. Untried.
+
+## The clamped lighting range: the panel is ALBEDO, not a display
+
+Chasing exposure was the wrong end of the pipe. Sweeping `exposureValue` from 0.25 to
+**0.02 — a 12× change — produced no visible difference at all**, and neither did adding
+an explicit `ClearRenderTargetView` to guarantee the value reached the texture. A lever
+that does nothing across 12× is not a lever that needs tuning.
+
+The reason is what the feed is bound *as*:
+
+```
+SetNewScreenMaterialHandle(renderer, PBRMaterialDefinition, aspect, orientation,
+                           colorMetalOverride)   ->  PBRMaterialDefinition.ColorMetalTexture
+```
+
+`ColorMetalTexture` is the PBR **base colour / albedo** input. Albedo is a
+*reflectance*: physically it lives in [0,1], and the surface is then **lit by the
+scene** like any other block face. So what reaches the eye is
+
+```
+displayed = our_pixel  x  light_falling_on_the_LCD
+```
+
+Two consequences, and together they are the whole complaint:
+
+* **Nothing can exceed white.** There is no headroom, because albedo has none. Bright
+  parts of the feed cannot bloom or read as light sources.
+* **The feed is at the mercy of the room.** The panel sits inside a dim ship interior,
+  so everything is multiplied down and compressed into a narrow band.
+
+No exposure value, tonemap curve or render format on our side can beat this, which is
+exactly why the sweep was inert. `_hdrFormat` is `R11G11B10_Float` — a genuine HDR
+float target — so the range exists right up until the material stage flattens it.
+
+### The route to an actual HDR look: make the panel EMIT
+
+A real LCD in this game glows in the dark, so the emissive path exists. The survey
+points at where:
+
+```
+ctx.ScreenMaterial          LCDMaterialDefinition
+ctx.ScreenMaterial.DefaultState    MaterialStateDefinition   <- inspect this
+ctx.Definition.DefaultScreenMaterial   ...\LCDScreen_On.def
+```
+
+We have only ever touched `DefaultScreenMaterial` (a raw `PBRMaterialDefinition`,
+whose only exposed setter is `set_ColorMetalTexture`). `LCDMaterialDefinition` with its
+`MaterialStateDefinition` is the richer object and is where an emissivity multiplier
+or emissive texture slot would live. Drive that from our feed and bright pixels become
+*emitted light*: they exceed 1.0, survive into the main view's HDR buffer, and get
+picked up by the engine's own bloom and tonemapping. That is the HDR look, and it comes
+from the main view's post chain — the one place we are allowed to produce HDR values.
+
+A second, cheaper lead supports it. `GBufferIndex` reports **`BaseColor=0,
+Emissivity=0` — the same slot**, so emissivity is almost certainly packed into
+GBuffer0's **alpha**. Our feed is `R8G8B8A8_UNorm_SRgb` and we blit it with
+`_channelAll`, so there is an alpha channel we have never thought about. If the LCD
+shader derives emissive strength from it, writing a high alpha may light the feed up
+with no material work at all — worth testing before the deeper route.
+
+### Ranked solutions
+
+1. **Emissive material binding.** Dump `MaterialStateDefinition` and look for an
+   emissivity multiplier / emissive texture. The real fix.
+2. **Alpha as emissivity.** Cheap to test given `BaseColor` and `Emissivity` share
+   GBuffer slot 0. Try before (1).
+3. **The inert exposure is a separate, real bug.** Even as albedo, 12× should have been
+   visible, so the value is not reaching `ApplyToneMapping`'s shader. Likely the two
+   channels of that `R32G32_Float` exposure texture are not both "exposure" — clearing
+   both to the same number may be meaningless. Needs the channel semantics, read from
+   what the engine's own exposure texture actually contains.
+4. **Probe pre-exposure at the source.** `EnvironmentProbeExposureJob.Exposure` is a
+   scalar in the probe pipeline; if `IndirectEnvironmentPassJob` pre-exposes for
+   cube-map storage, range is being compressed before we ever see it. Log its value.
+
+Note also `DisplayHDRIntensity.DoWork(cl, destination, source, viewport)` — four
+explicit parameters, safe family, a purpose-built HDR-magnitude visualiser. Blitting
+that to the panel instead of the normal copy would show directly whether the HDR buffer
+has range, settling (4) without guesswork. No `SceneDrawSystem` field holds it, so it
+would need constructing.
+
+## Atmosphere: invokes cleanly, produces nothing (2026-07-26)
+
+`AtmosphereAdditiveJob.DoWork(cl, rtView)` — two arguments, no GBuffer — runs without
+error at 27 fps and shows **no scattering on planet atmospheres** in the feed.
+
+So the parameter test predicts *safety*, not *usefulness*. The job is additive over a
+target we own and evidently reads its atmosphere setup — LUTs, planet parameters,
+camera-relative scattering — from state prepared earlier in the frame by
+`UpdateAtmosphere` / `AtmosphereLUTJob` for the **main view**. Nothing throws because
+nothing is missing from its arguments; it simply has nothing to add from our
+viewpoint.
+
+Left enabled: it costs nothing measurable and is harmless. **Re-test close to a planet
+with a real atmosphere before concluding** — the current test position is deep space
+looking at a bare moon, which is not a fair trial. If it stays blank there too, it
+belongs with `ComputeExposure` and `AmbientLightJob` on the wrong side of the wall.
+
+### Supersampling: attempted twice, reverted. It needs a design, not a parameter.
+
+`renderScale` scales the scene targets and leaves the LDR ring at the panel's exact
+size. Two attempts, both wrong, both reverted to `renderScale = 1`:
+
+1. **Scale the render, leave the blit alone** → the feed showed the **top-left
+   quadrant**. `CopyJob`'s `cropRect` (a `Nullable<System.Drawing.Rectangle>`) is the
+   SOURCE region, and with it null the job reads a rect the size of the DESTINATION.
+   1024 source into a 512 destination therefore copies the top-left 512×512 one-to-one.
+2. **Pass the full source rect** → top-left quadrant *plus* heavy streaking, i.e.
+   sampling past the end of valid data.
+
+The second failure names the real problem. With tonemapping on, the chain is four
+stages and they do not all agree on size:
+
+```
+HDR (scaled, 1024)  ->  ApplyToneMapping  ->  _ldrResizable (panel res, 512)
+                    ->  CopyJob  ->  LDR ring (512)  ->  CopyTextureSubresource  ->  panel (512)
+```
+
+The crop rect was computed from the **HDR** target (1024) while the blit's actual
+source is `_ldrResizable` (512) — so it read a 1024 rect out of a 512 texture. And
+`ApplyToneMapping` was already crossing 1024→512 with no stated intent.
+
+So supersampling is not a one-line change. Every stage needs an explicit, consistent
+resolution, and the decision to make is **where the downsample happens**:
+
+* downsample first (HDR 1024 → HDR 512 via `CopyJob` with a correct crop rect), then
+  tonemap at 512 — one extra blit, all later stages unchanged; or
+* keep everything at the scaled resolution including `_ldrResizable`, and downsample
+  only in the final `CopyJob` into the ring — fewer passes, but `ApplyToneMapping` then
+  runs at 4× the pixels.
+
+The first is the safer build. Either way the fix is to make each stage's resolution
+explicit rather than inferring it, which is what both attempts got wrong.
+
+### Note on perceived fidelity
+
+The visible blockiness and smeared starfield in the feed is **512×512 render
+resolution**, not lighting. The panel is 512×512 and the camera target matches it.
+Raising render resolution and downsampling is likely to buy more apparent quality than
+any remaining lighting pass, and it is a one-line change to `RenderW`/`RenderH` with a
+known cost curve.
+
+## Shadows: the route in, and the shortcut
+
+```
+DepthPassJob _shadowsDepthPass
+  DoWork(cl, TrackedCameraSettings& view, GeometryContext, OutputGeometryBufferContext,
+         IDepthStencilView depthStencil, clear, DepthJobType, allowTessellation, isFarCascade)
+```
+
+Every input is a parameter — **including the view and the depth target** — so a shadow
+map can be rendered from the sun's viewpoint into a depth texture we own. Safe family.
+
+`DirectionalLightShadowResources` has a **public parameterless constructor** and only
+three fields:
+
+```
+Texture2DTable   _depthMaps
+Int32            _depthTableLength
+Nullable`1       _setupConstantBuffer     <- the cascade view-projection matrices
+```
+
+**The shortcut:** `IndirectEnvironmentPassJob` — the forward pass already producing
+every image — takes `DirectionalLightShadowResources` **as a parameter**. So the
+shadow mask and `DirectionalLightJob` are not needed at all. Construct our own
+resources with cascades fitted to *our* frustum, hand them to the pass we already
+run, and the feed's shadows become correct. Same core work, and the payoff lands in
+the path that works rather than the one that is blocked.
+
+Next concrete step: survey `_setupConstantBuffer`'s layout (it is a
+`Nullable<TransientConstantBuffer>`, so the struct behind it needs dumping) and the
+`Texture2DTable` construction. Then: build per-cascade light views, cull each with
+`CullingJob.DoCullingFirstPass(..., cascadeIndex)`, render each with `DepthPassJob`,
+assemble the table, and pass the bundle to the forward pass.
+
+## HDR to the panel is not available
+
+`RenderContracts.CreateOffscreenTarget(String name, Vector2I resolution)` is the only
+overload — **no format parameter** — and every offscreen texture registered at runtime
+is `R8G8B8A8_UNorm_SRgb`. The panel path is LDR by construction. An
+`OffscreenRenderTarget` is also the only resource offering both a `ResourceHandle`
+(needed to bind the panel material) and a writable texture, so there is no alternative
+resource to point the material at.
+
+The scene *is* rendered HDR (`R11G11B10_Float`) and tonemapped down, so the dynamic
+range is being used — it is only the final handoff that is 8-bit sRGB. What HDR would
+buy is highlight headroom for the main view's bloom to pick up, and that would need
+the panel material treated as emissive as well as an HDR source.
+
+## Correction: the culprit was `ComputeExposure` alone (2026-07-26)
+
+The "unsafe family" rule below was drawn from a test that never separated
+`ComputeExposure` from `ApplyToneMapping` — they ran together, the main view
+corrupted, and the conclusion was written about the pair. Bisected properly by
+reusing an exposure texture the engine had already computed (a passive read) instead
+of calling `ComputeExposure` (which writes the histogram, `_autoExposures`, and the
+temporal adaptation the main view depends on):
+
+**`ApplyToneMapping` is safe.** Running for an extended session with the player's
+view confirmed clean. Tonemapping is available today, without Phase 3.
+
+So the rule needs sharpening. "Is it a job class?" was the wrong test —
+`AmbientLightJob` is a job class whose `DoWork(cl, rtView)` overload clearly reads
+normals it was never handed. The real test is narrower:
+
+> **Does the pass read anything it was not passed as a parameter?** If yes, it needs
+> that state to be ours before it can run. If it only writes what it is given, it is
+> safe.
+
+`ComputeExposure` fails because it *writes* shared temporal state. `AmbientLightJob`
+fails because it *reads* a shared GBuffer. `ApplyToneMapping` passes because input,
+output, exposure and bloom are all arguments.
+
+### Exposure is now owned outright
+
+`EnvironmentProbeExposureJob.Exposure` is a scalar `Single`, so it cannot drive
+`ApplyToneMapping` directly — but the texture pool clears a borrowed target to a
+colour we supply, which means **a 1×1 target cleared to `x` IS a constant-exposure
+texture**. Owned, no shared state, format matched to the engine's own
+(`R32G32_Float`), re-borrowed only when the value changes, and live-tunable via
+`exposureValue`. No `ComputeExposure`, no `EyeAdaptationJob.ConstantExposure` needed.
+
+## Why the feed looks harsh: there is no GBuffer
+
+Tonemapping and exposure turned out not to be the problem. The feed renders via
+`IndirectEnvironmentPassJob`, which writes **colour and depth only** — no normals, no
+roughness, no motion vectors. And essentially every pass that would soften the
+lighting needs exactly those:
+
+| Want | Pass | Needs |
+|---|---|---|
+| ambient / indirect fill | `AmbientLightJob` | GBuffer normals |
+| ambient occlusion | `HBAOJob(cl, settings, rtView, depth, **normal**)` | GBuffer normals |
+| local lights, properly | `LocalLightsJob(cl, rtView, rtViewDiffuseOnly, clusters, buffers)` | GBuffer |
+| reflections | `ScreenSpaceReflections(cl, cb, dest, depth, **roughness**, **normal**, motion)` | GBuffer |
+| GI | `RaytraceGIJob`, `SurfelGenerationJob` | GBuffer |
+
+**And this is by design, not a defect.** Environment probes are the *input* to the
+engine's ambient lighting, so the probe path deliberately renders without indirect
+light to avoid feeding itself. We adopted the cheapest, flattest shading path in the
+engine — which was the right call for proving the plumbing, and is now the ceiling.
+
+Direct sun plus clustered lights with no ambient term is precisely the "harsh" look:
+lit faces blow out, unlit faces go flat. No exposure value fixes that, because the
+dynamic range in the image is genuinely wrong, not merely mis-mapped.
+
+### Phase 3 is smaller than previously assumed
+
+The earlier note said a whole second `ScreenBuffers` instance was needed. It is not:
+
+```
+ScreenBuffers.GBuffer          prop ResizableRWRenderTargetTexture[]   // settable
+ScreenBuffers.set_GBuffer(ResizableRWRenderTargetTexture[] value)
+ScreenBuffers.GetGBuffer(GBufferIndex)   GBufferFormats
+```
+
+The array is a **public settable property**, so the shape is a swap around our pass:
+
+1. Allocate our own array matching `GBufferFormats` at our render resolution.
+2. Save `ScreenBuffers.GBuffer`, set ours.
+3. `GBufferPassJob.DoWork(cl, geometryContext, outputGeometryBuffers, clear, fsrMasks)`
+   — no render-target parameters, so it writes whatever the global points at, which
+   is now ours.
+4. Lighting: `DirectionalLightJob`, `LocalLightsJob`, `AmbientLightJob` — several take
+   explicit render targets and our own clustering context.
+5. Restore the saved array.
+
+Two things make this tractable that were not known before: `ScreenSpaceReflections`
+and `HBAOJob` take every GBuffer component as an explicit parameter, so those need no
+swapping at all once a GBuffer exists; and `LocalLightsJob` already accepts our
+`ClusteringContext` and `OutputGeometryBufferContext`.
+
+The risk is unchanged in kind: swapping a global mid-frame while the engine's own
+work may be in flight. The probe hook is inside probe work rather than main-view
+GBuffer work, which is the reason to expect it to survive — and the reason to verify
+it with the player's view rather than the panel.
+
+## The rule that decides what is addable: two families of pass
+
+The per-frame-hook experiment settled this, and it reorganises the whole roadmap.
+What matters is not *when* in the frame a pass runs — it is **whether the pass takes
+its state as parameters or owns it as a singleton**.
+
+**Safe family — reusable job objects, all state explicit.** These live on their own
+job classes and receive every context they touch as an argument. The probe pipeline
+itself calls them repeatedly with different contexts, so a second caller is expected
+by design:
+
+```
+CullingJob.DoCullingFirstPass(cl, view, lodSettings, cullingContext, buffers, …, cascadeIndex)
+ClusteringJob.DoWork(cl, entityProxies, buffers, clustersContext, resolution, farPlane)
+IndirectEnvironmentPassJob.DoWork(cl, buffers, cameraCb, view, …, rt, depthStencil, clear)
+IndirectPlanetEnvironmentJob.DoWork(cl, cameraCb, closeTarget, farTarget, depthTex, view)
+MipMapJobExtensions.DoWork(job, cl, target, mipsCount)
+```
+
+Three of these already run in the feed, for hours, at 29 fps.
+
+**Unsafe family — `SceneDrawSystem` methods shaped `(commandList, lBuffer)`.** They
+*look* self-contained because a texture is the only obvious input, but the texture is
+the only thing they take as a parameter; everything else — histograms, eye-adaptation
+buffers, internal scratch, `ScreenBuffers` — is per-frame singleton state belonging to
+the frame the engine is already rendering:
+
+```
+ComputeExposure(cl, lBuffer, out exposure, out histogram)
+ApplyBloom(cl, input, exposure, out bloom)
+ApplyToneMapping(cl, input, output, exposure, bloom)
+DrawSkybox(cl, lBuffer)      ApplyAtmosphere(cl, lBuffer)     ComputeSSR(cl, lBuffer)
+ExecuteVolumetricPasses(cl, lBuffer, oit, fsr)                ExecuteLighting(lBuffer)
+```
+
+Driving the first three corrupted the player's render from **both** hooks — a hard
+stitch plus `0xc0000005` from the probe hook, flickering lights and black lines from
+the per-frame hook. Less acute, same defect. There is no safe moment, only a less
+frequent one. `ExecuteLighting` takes no command list at all, which is the same
+signal in its purest form.
+
+**The distinguishing test, for anything not yet tried:** does the method belong to a
+job class and receive its contexts as arguments? Then it is a candidate. Is it a
+`SceneDrawSystem` method whose only parameter is a buffer? Then it needs Phase 3
+first, and trying it costs a launch and possibly the player's frame.
+
 ## Recommended order
 
-Rate is solved; everything left is fidelity or hardening.
+Rate is solved. Everything left is fidelity, and it splits cleanly along the rule
+above.
 
-1. **Tonemapping** — cheap, self-disabling, biggest visual win per unit of risk.
-   Already wired behind `tonemap-armed.marker` and still untested. Fixes the clamped
-   highlights, which is now the most visible defect.
-2. **Mips 1–9 of the destination** — the subresource copy writes mip 0 only, so the
-   rest hold whatever `DrawOne`'s mip generation left. Check whether the panel looks
-   wrong at distance before deciding this matters. `MipMapJobExtensions.DoWork(job,
-   cl, RWRenderTargetTexture, mipsCount)` takes an RW texture, so it would have to run
-   on our LDR source before the copy, with the source allocated with a full chain.
-3. **Phase 3** — own `ScreenBuffers` for real deferred lighting. The fidelity project.
-4. **Phase 1** — owned culling/clustering contexts. No longer needed for rate; revisit
-   only if extra render layers reintroduce contention.
+1. **Sky — fix `IndirectPlanetEnvironmentJob`.** Safe family, fully explicit
+   parameters, already resolved and invoked. It spun rapidly, which is a *calling*
+   bug and not corruption: both `closeTarget` and `farTarget` were handed the same
+   render target, so the near and far sky layers overwrite each other with different
+   projections. The largest visible gap in the feed — there is no sky at all today.
+2. **Own shadow cascades.** Today `IndirectEnvironmentPassJob` gets the engine's
+   `DirectionalLightShadowResources` — cascades fitted to the *player's* frustum,
+   which is why shadows in the feed are partial and unreliable. `CullingJob
+   .DoCullingFirstPass` takes a `cascadeIndex`, so culling per cascade is available in
+   the safe family. Real lighting fidelity without Phase 3.
+3. **Mips 1–9.** The subresource copy writes mip 0 only; the rest hold whatever
+   `DrawOne`'s own mip generation left. `MipMapJobExtensions.DoWork` is safe family.
+   Check whether the panel actually looks wrong at distance before spending on it.
+4. **Phase 3 — own `ScreenBuffers` and owned post state.** The only route to
+   tonemapping, SSR, atmosphere, volumetrics and transparency. No longer an optional
+   escalation; it is the price of admission for the unsafe family, and that is now a
+   measured result rather than a prediction.
+
+Preserved from the abandoned cheap-tier attempt, all still valid:
+`BorrowResizableRWRenderTargetTexture` is the type key to every post pass;
+`ApplyToneMapping`'s `bloom` argument must be non-null but need not be computed
+(cheap stand-in bought 14 → 24 fps); `EnvironmentProbeExposureJob.Exposure` is a
+scalar `Single`, so `EyeAdaptationJob.ConstantExposure` is the exposure route.
 
 ~~Phase 1 — the only thing standing between here and 15–30 fps.~~ Superseded: 29 fps
 runs today while still sharing the probe context.

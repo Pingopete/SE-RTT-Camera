@@ -107,6 +107,94 @@ internal static class FeedConfig
     // Off by default: the probe hook is the one with hours of proven runtime.
     public static bool PassOnFrameHook { get; private set; }
 
+    // Take an exposure texture the engine already computed instead of calling
+    // ComputeExposure. Passive read versus a write to the histogram, _autoExposures
+    // and the temporal adaptation the main view depends on. This is the bisect that
+    // separates ApplyToneMapping (possibly a pure blit) from ComputeExposure (a
+    // certain mutator of shared state) — they were only ever tested together.
+    public static bool ReuseExposure { get; private set; } = true;
+
+    // Constant exposure for the feed, as a live-tunable number. 0 disables it and
+    // falls back to reusing the engine's (player-adapted, wrong) exposure texture.
+    // Lower = darker. Start low and raise it: the failure mode we are fixing is
+    // blown highlights, so overshooting downward is the safe direction.
+    public static double ExposureValue { get; private set; } = 0.25;
+
+    // Step 2 of the GBuffer work: swap ScreenBuffers.GBuffer to our own array for the
+    // duration of the camera pass, and restore it immediately. Drives NO passes on its
+    // own — it exists to prove the swap mechanism in isolation before lighting goes on
+    // top, so a failure names the mechanism rather than the mechanism plus a pass.
+    public static bool GBufferSwap { get; private set; }
+
+    // Step 3: drive GBufferPassJob into our swapped-in GBuffer. Additive — the
+    // forward-ish environment pass still produces the visible image, so this changes
+    // nothing on the panel. It proves the GBuffer is WRITTEN, which step 4 needs.
+    // Requires owning the depth buffer too; the code refuses to run otherwise.
+    public static bool GBufferPass { get; private set; }
+
+    // Step 4: the deferred lighting chain, reading the GBuffer instead of relying on
+    // the probe path's single-pass shading. Deferred REPLACES the forward pass, so
+    // envPass must go off when this comes on or the scene is lit twice. Each job is
+    // separately switchable: ambient is the one that should fix the harshness.
+    public static bool Deferred { get; private set; }
+    public static bool DeferredDirectional { get; private set; } = true;
+    public static bool DeferredLocal { get; private set; } = true;
+    public static bool DeferredAmbient { get; private set; } = true;
+    public static bool EnvPass { get; private set; } = true;
+
+    // AtmosphereAdditiveJob.DoWork(cl, rtView) — two arguments, no GBuffer, so by the
+    // parameter test it should be reachable where the deferred lighting jobs were not.
+    public static bool Atmosphere { get; private set; }
+
+    // The engine's ENTIRE deferred lighting stage: ExecuteLighting(lBuffer). One
+    // parameter, everything else global — but the GBuffer and depth globals are ours
+    // during our pass, and it is the orchestrator that sets up the state the individual
+    // light jobs were missing. Replaces IndirectEnvironmentPassJob (the probe path,
+    // which is pre-exposed and range-compressed and is why the feed looks flat).
+    // Requires gbufferSwap + gbufferPass, and a resizable colour target.
+    public static bool ExecuteLighting { get; private set; }
+
+    // Swap ScreenBuffers.PreUpscaleResolution to OUR render resolution for the pass.
+    // ExecuteLighting sizes its dispatch from it, so with the engine's 3840x2160 and our
+    // 512x512 GBuffer only a small top-left corner of the lighting landed on the target.
+    // Restored unconditionally — leaving the engine thinking its viewport is 512x512
+    // would wreck the player's view.
+    public static bool SwapResolution { get; private set; } = true;
+
+    // Swap SettingsManager._renderView to OUR camera for the pass. GBufferPassJob and
+    // ExecuteLighting take no camera parameter, so without this they rasterise and light
+    // from the player's viewpoint — the feed showed the inside of the ship.
+    public static bool SwapCamera { get; private set; } = true;
+
+    // Run GBufferPassJob AFTER IndirectEnvironmentPassJob. The camera is a constant
+    // buffer bound to the command list, and the env pass is the only thing we drive that
+    // binds OURS (it takes cameraCb explicitly). Running the GBuffer pass first meant it
+    // inherited the player's camera — the "viewpoint stuck inside the ship" symptom.
+    // Requires envPass = 1 so that binding actually happens.
+    public static bool GBufferAfterEnv { get; private set; } = true;
+
+    // Null the GI jobs for the duration of our pass. ExecuteLighting includes ray-traced
+    // GI, which is TEMPORAL — it accumulates across frames — so running it twice a frame
+    // against a different camera pollutes the accumulator, which is the flickering noise
+    // in the player's view. Suppressing it keeps ambient, directional and local, which
+    // is what the feed needs; GI contributes least at 512x512. Restored unconditionally.
+    public static bool SuppressGi { get; private set; } = true;
+
+    // Supersampling multiplier on the panel resolution for the SCENE render only.
+    // The feed has always rendered at exactly 512x512 with no anti-aliasing, which is
+    // the blockiness and starfield smearing — not a lighting problem. Rendering larger
+    // and letting the existing CopyJob blit downsample gives real AA with no new pass.
+    // Cost scales with area: x2 is 4x the pixels, x4 is 16x.
+    public static double RenderScale { get; private set; } = 1.0;
+
+    // The panel binds our feed as ColorMetalTexture: RGB is colour, ALPHA IS METALNESS.
+    // Our HDR source has no alpha channel, so blitting all four channels wrote ~1.0
+    // into metalness — a fully metallic panel, which has almost no diffuse response and
+    // flattens the range regardless of exposure. Default: RGB only, slot pre-cleared so
+    // alpha reads 0 (non-metal). Flip blitAlpha to 1 to reproduce the old behaviour.
+    public static bool BlitAlpha { get; private set; }
+    public static bool ZeroMetalness { get; private set; } = true;
+
     // Orbit radius is a FLOOR, not a fixed distance: the effective radius is
     // max(orbitRadius, gridExtent * orbitClearance). Orbiting a fixed 100 m around a
     // ship whose half-diagonal is 80 m flies the camera through the hull, which is
@@ -150,7 +238,13 @@ internal static class FeedConfig
             bool pooled = UsePooledCulling;
             bool src = SrcTransition, dst = DestTransition, retire = RetireTestPattern, copy = CopyEnabled;
             bool tone = Tonemap, bloom = Bloom, sky = Sky, probeExp = ProbeExposure, cheapBloom = CheapBloom;
-            bool frameHook = PassOnFrameHook;
+            bool frameHook = PassOnFrameHook, reuseExp = ReuseExposure;
+            double expValue = ExposureValue;
+            bool gbSwap = GBufferSwap, gbPass = GBufferPass, defer = Deferred, envP = EnvPass;
+            bool defDir = DeferredDirectional, defLoc = DeferredLocal, defAmb = DeferredAmbient;
+            bool atmo = Atmosphere, execLight = ExecuteLighting, swapRes = SwapResolution, swapCam = SwapCamera, gbAfter = GBufferAfterEnv, supGi = SuppressGi;
+            double rScale = RenderScale;
+            bool blitA = BlitAlpha, zeroMetal = ZeroMetalness;
             double farPlane = CullFarPlane;
             double radius = OrbitRadius, period = OrbitPeriod, height = OrbitHeight, clearance = OrbitClearance;
             bool orbitGrid = OrbitGrid;
@@ -205,6 +299,60 @@ internal static class FeedConfig
                     case "cheapbloom":
                         cheapBloom = val is "1" or "true" or "yes";
                         break;
+                    case "blitalpha":
+                        blitA = val is "1" or "true" or "yes";
+                        break;
+                    case "zerometalness":
+                        zeroMetal = val is "1" or "true" or "yes";
+                        break;
+                    case "renderscale":
+                        if (double.TryParse(val, out var rs) && rs >= 1.0) rScale = rs;
+                        break;
+                    case "suppressgi":
+                        supGi = val is "1" or "true" or "yes";
+                        break;
+                    case "gbufferafterenv":
+                        gbAfter = val is "1" or "true" or "yes";
+                        break;
+                    case "swapcamera":
+                        swapCam = val is "1" or "true" or "yes";
+                        break;
+                    case "swapresolution":
+                        swapRes = val is "1" or "true" or "yes";
+                        break;
+                    case "executelighting":
+                        execLight = val is "1" or "true" or "yes";
+                        break;
+                    case "atmosphere":
+                        atmo = val is "1" or "true" or "yes";
+                        break;
+                    case "deferred":
+                        defer = val is "1" or "true" or "yes";
+                        break;
+                    case "envpass":
+                        envP = val is "1" or "true" or "yes";
+                        break;
+                    case "deferreddirectional":
+                        defDir = val is "1" or "true" or "yes";
+                        break;
+                    case "deferredlocal":
+                        defLoc = val is "1" or "true" or "yes";
+                        break;
+                    case "deferredambient":
+                        defAmb = val is "1" or "true" or "yes";
+                        break;
+                    case "gbufferpass":
+                        gbPass = val is "1" or "true" or "yes";
+                        break;
+                    case "gbufferswap":
+                        gbSwap = val is "1" or "true" or "yes";
+                        break;
+                    case "exposurevalue":
+                        if (double.TryParse(val, out var ev) && ev >= 0.0) expValue = ev;
+                        break;
+                    case "reuseexposure":
+                        reuseExp = val is "1" or "true" or "yes";
+                        break;
                     case "passonframehook":
                         frameHook = val is "1" or "true" or "yes";
                         break;
@@ -234,12 +382,19 @@ internal static class FeedConfig
                         || src != SrcTransition || dst != DestTransition || retire != RetireTestPattern
                         || copy != CopyEnabled || clearance != OrbitClearance || orbitGrid != OrbitGrid
                         || tone != Tonemap || bloom != Bloom || sky != Sky || probeExp != ProbeExposure
-                        || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook;
+                        || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
+                        || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
+                        || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
+                        || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
+                        || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi;
             IntervalMs = interval; PanelMs = panel; StartupDelayMs = startup; UsePooledCulling = pooled; OrbitRadius = radius; OrbitPeriod = period; OrbitHeight = height;
             SrcTransition = src; DestTransition = dst; RetireTestPattern = retire; CopyEnabled = copy;
             OrbitClearance = clearance; OrbitGrid = orbitGrid;
             Tonemap = tone; Bloom = bloom; Sky = sky; ProbeExposure = probeExp;
             CheapBloom = cheapBloom; CullFarPlane = farPlane; PassOnFrameHook = frameHook;
+            ReuseExposure = reuseExp; ExposureValue = expValue; GBufferSwap = gbSwap; GBufferPass = gbPass; Deferred = defer; EnvPass = envP;
+            DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
+            Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
 
             if (changed)
                 RttLog.Line($"Config: intervalMs={IntervalMs} (~{1000.0 / IntervalMs:F0} fps) " +

@@ -418,7 +418,11 @@ internal static class CameraFeed
             target.Y + height + extent * 0.35,   // rise with the subject, not a flat 15 m
             target.Z + radius * Math.Sin(a));
 
-        var fwd = Normalize(target - eye);
+        // Row 2 of the camera's world matrix points AWAY from the subject in this
+        // engine's convention, not along the view direction. Building it as
+        // (target - eye) — the intuitive "look at" vector — aimed the camera outward
+        // from the orbit centre, so the feed showed everything except the ship.
+        var fwd = Normalize(eye - target);
         var worldUp = new Vector3D(0, 1, 0);
         var right = Normalize(Cross(worldUp, fwd));
         if (double.IsNaN(right.X)) right = new Vector3D(1, 0, 0);   // looking straight up/down

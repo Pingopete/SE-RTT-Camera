@@ -34,7 +34,7 @@ internal static class CameraRender
     private static bool _armed;
     private static bool _disarmed;
     private static long _lastRender;
-    private static long _lastArmCheck;
+    private static long _lastArmCheck, _lastDisarmCheck;
     private const long ArmPollMs = 2000;
     private static int _renders, _errors;
     private static bool _survivedLogged;
@@ -51,13 +51,13 @@ internal static class CameraRender
     public static void Reset()
     {
         _dryRunDone = _resolvedOk = _armed = _disarmed = _survivedLogged = false;
-        _lastRender = _lastArmCheck = 0; _renders = _errors = 0;
+        _lastRender = _lastArmCheck = _lastDisarmCheck = 0; _renders = _errors = 0;
         Array.Clear(_ldrRing, 0, _ldrRing.Length); _ldrReady = null; _ringIndex = -1;
         _toneLogs = _skipLogs = _transLogs = 0; _resolvedPanelId = null; _blitLogged = false;
         _baseViewSnapshot = null; _baseViewMismatches = 0; _mismatchLogged = false;
         _viewSkips = _viewSkipLogs = 0;
         _toneBlocked = _bloomBlocked = _skyBlocked = false; _bloomLogs = _skyLogs = 0;
-        _ldrResizable = null; _lastResizableRes = null; _toneInputsLogged = false; _exposureSrcLogs = 0;
+        _ldrResizable = null; _lastResizableRes = null; _toneInputsLogged = _logProbeExp = false; _exposureSource = _loggedExposureSource = "";
         _firstPassAt = 0; _startupLogged = _startupDoneLogged = false;
 
         // A live marker left from last session means we issued GPU work and never
@@ -84,11 +84,30 @@ internal static class CameraRender
                 _dryRunDone = true;
                 _resolvedOk = DryRun(sds);
             }
-            if (!_resolvedOk || _disarmed) return;
+            if (!_resolvedOk) return;
 
             // High-resolution: this drives the frame gate, and TickCount64's ~15.6 ms
             // quantum was silently capping the feed at 20 fps when 30 was asked for.
             var now = Clock.Ms;
+
+            // Re-check the crash latch BEFORE honouring it. A hot reload that lands
+            // mid-pass leaves camera-live.marker behind, Reset() reads that as "died
+            // mid-render", and then the in-flight pass's finally deletes the file — so
+            // the pass ends up disabled with nothing left to delete and no way back.
+            // This check sat after the early-out, which made the latch permanent for
+            // the session. Exactly the deadlock the handover had, fixed there and not
+            // here.
+            if (_disarmed && now - _lastDisarmCheck >= ArmPollMs)
+            {
+                _lastDisarmCheck = now;
+                if (!File.Exists(LivePath))
+                {
+                    _disarmed = false;
+                    RttLog.Line("Camera pass re-enabled — the mid-render marker is gone " +
+                                "(it was a hot reload landing mid-pass, not a death).");
+                }
+            }
+            if (_disarmed) return;
 
             // Arming is a runtime switch, so the marker is polled rather than read
             // once at load. Creating or deleting it takes effect within ~2 s with no
@@ -316,6 +335,14 @@ internal static class CameraRender
         // the adaptation the main view depends on.
         _probeExposureJob = sds?.GetType().GetField("_environmentProbeExposureJob", Any)?.GetValue(sds);
 
+        // The eye-adaptation job holds already-computed exposure textures in
+        // _autoExposures. READING one is passive; ComputeExposure is what writes them,
+        // drives the histogram, and advances the temporal adaptation the main view
+        // depends on. Reusing an existing texture lets ApplyToneMapping be tested
+        // WITHOUT ComputeExposure — which last night's test never separated.
+        _eyeAdaptationJob = sds?.GetType().GetField("_eyeAdaptationJob", Any)?.GetValue(sds);
+        _autoExposuresField = _eyeAdaptationJob?.GetType().GetField("_autoExposures", Any);
+
         _planetEnvJob = sds?.GetType().GetField("_indirectPlanetEnvironmentJob", Any)?.GetValue(sds);
         _miPlanetEnvDoWork = _planetEnvJob?.GetType().GetMethods(Any)
             .FirstOrDefault(m => m.Name == "DoWork" && m.GetParameters().Length == 6);
@@ -326,7 +353,10 @@ internal static class CameraRender
                       $"ApplyBloom={(_miApplyBloom == null ? "NOT FOUND" : "ok")} " +
                       $"PlanetEnvJob={(_miPlanetEnvDoWork == null ? "NOT FOUND" : "ok")} --");
 
+        CameraCarrierSurvey(sb);
         FidelitySurvey(sds, sb);
+        GBufferSurvey(sds, sb);
+        ShadowSurvey(sds, sb);
 
         // CopyJob is the converting blit that bridges the scene's HDR output to the
         // LCD's sRGB target.
@@ -338,10 +368,28 @@ internal static class CameraRender
             var chParam = _miCopyDoWork?.GetParameters()[5].ParameterType;
             if (chParam != null && chParam.IsEnum)
             {
-                foreach (var n in new[] { "All", "RGBA", "RGB" })
+                // RGB, deliberately NOT alpha.
+                //
+                // The panel binds our feed as ColorMetalTexture — RGB is colour and
+                // ALPHA IS METALNESS. Our HDR source is R11G11B10_Float, which has no
+                // alpha channel at all, so blitting with Channel.All wrote whatever the
+                // shader produced for alpha (effectively 1.0) straight into metalness.
+                // A fully metallic surface has almost no diffuse response, so the colour
+                // we were feeding barely contributed — which flattens the range no
+                // matter what exposure is chosen, and is why a 12x exposure sweep did
+                // nothing.
+                long rgb = 0;
+                foreach (var n in new[] { "R", "G", "B" })
+                    if (Enum.GetNames(chParam).Contains(n))
+                        rgb |= System.Convert.ToInt64(Enum.Parse(chParam, n));
+
+                _channelRgb = rgb != 0 ? Enum.ToObject(chParam, rgb) : null;
+                foreach (var n in new[] { "All", "RGBA" })
                     if (Enum.GetNames(chParam).Contains(n)) { _channelAll = Enum.Parse(chParam, n); break; }
                 _channelAll ??= Enum.ToObject(chParam, Enum.GetValues(chParam).Cast<object>()
                     .Select(v => System.Convert.ToInt64(v)).Max());
+                sb.AppendLine($"  blit channels: RGB={_channelRgb} All={_channelAll} " +
+                              "(alpha is METALNESS on ColorMetalTexture)");
             }
 
             // Nullable<PostProcess>; its only member is Normalize.
@@ -381,6 +429,7 @@ internal static class CameraRender
     private static void RenderOnce(object commandList)
     {
         object rtBorrow = null, depthBorrow = null, cameraCb = null, borrowedCulling = null;
+        object savedGBuffer = null, savedCamera = null;
         bool geomBorrowed = false;
         try
         {
@@ -390,7 +439,17 @@ internal static class CameraRender
             // render target of any other format is a pipeline-state mismatch, which
             // D3D12 answers with device removal — so the format is NOT negotiable,
             // whatever the copy destination would prefer.
-            var res = _feedRes ?? MakeVector2I(RenderW, RenderH);
+            // Supersample. The scene has always rendered at exactly the panel's
+            // resolution, which is why the feed looks blocky and the starfield smears:
+            // 512x512 with no anti-aliasing of any kind. Rendering larger and letting
+            // the existing CopyJob blit downsample gives real AA for the cost of the
+            // extra pixels, and needs no new pass — CopyJob is a shader blit, so it
+            // rescales for free.
+            //
+            // Only the SCENE targets scale. The LDR ring stays at the panel's exact
+            // resolution because it is the source for CopyTextureSubresource, and
+            // subresource copies require matching dimensions.
+            var res = ScaledRenderRes();
             var colourFormat = _hdrFormat;
 
             // Orbit the tagged panel once one has been found; fall back to the main
@@ -477,6 +536,14 @@ internal static class CameraRender
 
             Call(_geomBuffers, "Borrow"); geomBorrowed = true;
 
+            // Step 2: own the GBuffer for the duration of this pass. Restored in the
+            // finally below, unconditionally — leaving the engine pointed at our
+            // 512x512 array would wreck the player's view.
+            savedGBuffer = InstallOurGBuffer(res);
+
+            // And the camera the GBuffer pass rasterises from.
+            savedCamera = InstallOurCamera(_lastCamWorld, _lastViewD);
+
             // cull -> cluster -> draw, exactly as the probe pass sequences them
             // Prefer a pooled culling context over the engine's probe one — sharing
             // that is what capped the frame rate. Returned in the finally below.
@@ -500,12 +567,185 @@ internal static class CameraRender
                 (float)FeedConfig.CullFarPlane,
             });
 
-            _miEnvPassDoWork.Invoke(_envPass, new object[]
+            // Step 3: fill our GBuffer with real surface data. Additive for now — the
+            // forward-ish environment pass below still produces what the panel shows,
+            // so this changes nothing visible. It proves the GBuffer gets WRITTEN,
+            // which is the prerequisite for the lighting jobs in step 4.
+            //
+            //   GBufferPassJob.DoWork(cl, GeometryContext, OutputGeometryBufferContext,
+            //                         clearRenderTargets, fsrMasks)
+            //
+            // Gated on owning the depth buffer: this job writes depth through the
+            // ScreenBuffers global, so without that swap it would write the engine's.
+            // Ordering matters more than swapping here. The camera is a CONSTANT BUFFER
+            // bound to the command list, not an object on any global we can replace —
+            // the carrier survey found no camera on OutputGeometryBufferContext, no
+            // Frame type, nothing on CoreSystems. IndirectEnvironmentPassJob takes
+            // cameraCb and BINDS ours; GBufferPassJob takes none and inherits whatever
+            // is currently bound. So the GBuffer pass has to run AFTER something that
+            // binds our camera, or it rasterises from the player's — which is exactly
+            // what the feed showed.
+            if (FeedConfig.GBufferAfterEnv) { /* runs below, after the env pass */ }
+            else if (FeedConfig.GBufferPass && !_gbPassBlocked && savedGBuffer != null && _depthSwapOk)
             {
-                commandList, _geomBuffers, cameraCb, view,
-                Prop2(cullCtx, "FirstPass"), _clusterCtx, _shadowResources,
-                rtv, dsv, true,
-            });
+                if (_miGBufferPass == null)
+                {
+                    var job = _sceneDrawSystem?.GetType().GetField("_gBufferPass", Any)?.GetValue(_sceneDrawSystem);
+                    _gBufferPassJob = job;
+                    _miGBufferPass = job?.GetType().GetMethods(Any)
+                        .FirstOrDefault(m => m.Name == "DoWork" && m.GetParameters().Length == 5);
+                    if (_miGBufferPass == null)
+                    {
+                        _gbPassBlocked = true;
+                        RttLog.Line("GBuffer pass: DoWork(5 args) not found — step 3 disabled.");
+                    }
+                }
+
+                if (_miGBufferPass != null)
+                {
+                    try
+                    {
+                        _miGBufferPass.Invoke(_gBufferPassJob, new object[]
+                            { commandList, Prop2(cullCtx, "FirstPass"), _geomBuffers, true, null });
+                        if (_gbPassLogs++ == 0)
+                            RttLog.Line("=== GBUFFER PASS: surface data written into our own GBuffer. ===");
+                    }
+                    catch (Exception e)
+                    {
+                        _gbPassBlocked = true;
+                        RttLog.Error("gbuffer pass (disabled, feed continues)", e);
+                    }
+                }
+            }
+
+            // Forward path: one pass that writes fully-lit colour. Switchable, because
+            // running it AND the deferred chain would light the scene twice.
+            if (FeedConfig.EnvPass)
+                _miEnvPassDoWork.Invoke(_envPass, new object[]
+                {
+                    commandList, _geomBuffers, cameraCb, view,
+                    Prop2(cullCtx, "FirstPass"), _clusterCtx, _shadowResources,
+                    rtv, dsv, true,
+                });
+
+            // The GBuffer pass, now that the env pass above has bound OUR camera CB.
+            if (FeedConfig.GBufferAfterEnv && FeedConfig.GBufferPass && !_gbPassBlocked
+                && savedGBuffer != null && _depthSwapOk)
+            {
+                if (_miGBufferPass == null)
+                {
+                    var job = _sceneDrawSystem?.GetType().GetField("_gBufferPass", Any)?.GetValue(_sceneDrawSystem);
+                    _gBufferPassJob = job;
+                    _miGBufferPass = job?.GetType().GetMethods(Any)
+                        .FirstOrDefault(m => m.Name == "DoWork" && m.GetParameters().Length == 5);
+                    if (_miGBufferPass == null)
+                    {
+                        _gbPassBlocked = true;
+                        RttLog.Line("GBuffer pass: DoWork(5 args) not found.");
+                    }
+                }
+                if (_miGBufferPass != null)
+                {
+                    try
+                    {
+                        _miGBufferPass.Invoke(_gBufferPassJob, new object[]
+                            { commandList, Prop2(cullCtx, "FirstPass"), _geomBuffers, true, null });
+                        if (_gbPassLogs++ == 0)
+                            RttLog.Line("=== GBUFFER PASS: written AFTER the env pass, so our camera CB is bound. ===");
+                    }
+                    catch (Exception e)
+                    {
+                        _gbPassBlocked = true;
+                        RttLog.Error("gbuffer pass after env (disabled)", e);
+                    }
+                }
+            }
+
+            // THE fundamental one: the engine's whole deferred lighting stage.
+            //
+            //   ExecuteLighting(ResizableRWRenderTargetTexture lBuffer)
+            //
+            // Its single parameter made this look unreachable — everything else comes
+            // from globals. But the GBuffer and depth globals ARE OURS for the duration
+            // of this pass, which is the entire point of the swap.
+            //
+            // It is also the ORCHESTRATOR: it sets up the constant buffers and state the
+            // individual light jobs need, then runs them in order. Calling AmbientLightJob
+            // directly skipped that setup, which is precisely why it threw
+            // InvalidCastException on a ResizableRWBuffer -> IConstantBufferView. Going in
+            // at the top instead of the middle may be the difference.
+            //
+            // This is what replaces IndirectEnvironmentPassJob — the probe path, which is
+            // pre-exposed and range-compressed for cube-map storage, and is the reason the
+            // feed's lighting range is so limited.
+            if (FeedConfig.ExecuteLighting && !_execLightBlocked && savedGBuffer != null && _depthSwapOk)
+            {
+                try
+                {
+                    if (_miExecLighting == null)
+                    {
+                        _miExecLighting = _sceneDrawSystem?.GetType().GetMethods(Any)
+                            .FirstOrDefault(m => m.Name == "ExecuteLighting" && m.GetParameters().Length == 1);
+                        if (_miExecLighting == null)
+                        {
+                            _execLightBlocked = true;
+                            RttLog.Line("ExecuteLighting: not found.");
+                        }
+                    }
+
+                    if (_miExecLighting != null)
+                    {
+                        // Must be the resizable flavour — the same type gate as the post
+                        // passes. rtBorrow is resizable whenever a fidelity layer is on.
+                        var lBuffer = Prop2(rtBorrow, "Resource") ?? rtBorrow;
+                        var want = _miExecLighting.GetParameters()[0].ParameterType;
+                        if (!want.IsInstanceOfType(lBuffer))
+                        {
+                            _execLightBlocked = true;
+                            RttLog.Line($"ExecuteLighting: lBuffer is {lBuffer?.GetType().Name}, needs {want.Name} — " +
+                                        "enable tonemap or sky so the colour target is borrowed resizable.");
+                        }
+                        else
+                        {
+                            _miExecLighting.Invoke(_sceneDrawSystem, new[] { lBuffer });
+                            if (_execLightLogs++ == 0)
+                                RttLog.Line("=== EXECUTE LIGHTING: the engine's full deferred lighting stage ran " +
+                                            "against OUR GBuffer. ===");
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    _execLightBlocked = true;
+                    RttLog.Error("ExecuteLighting (disabled, feed continues)", e);
+                }
+            }
+
+            // Deferred path: composite lighting by reading the GBuffer we just wrote.
+            if (FeedConfig.Deferred && savedGBuffer != null && _depthSwapOk)
+                RunDeferredLighting(commandList, rtv, cullCtx);
+
+            // Atmosphere. Two arguments — a command list and a target — so by the test
+            // that has decided everything else, this one should be reachable.
+            if (FeedConfig.Atmosphere && !_atmoBlocked)
+            {
+                try
+                {
+                    if (_miAtmo == null)
+                    {
+                        _atmoJob = _sceneDrawSystem?.GetType().GetField("_atmosphereAdditiveJob", Any)?.GetValue(_sceneDrawSystem);
+                        _miAtmo = _atmoJob?.GetType().GetMethods(Any)
+                            .FirstOrDefault(m => m.Name == "DoWork" && m.GetParameters().Length == 2);
+                        if (_miAtmo == null) { _atmoBlocked = true; RttLog.Line("Atmosphere: DoWork(2 args) not found."); }
+                    }
+                    if (_miAtmo != null)
+                    {
+                        _miAtmo.Invoke(_atmoJob, new object[] { commandList, rtv });
+                        if (_atmoLogs++ == 0) RttLog.Line("=== ATMOSPHERE: AtmosphereAdditiveJob applied. ===");
+                    }
+                }
+                catch (Exception e) { _atmoBlocked = true; RttLog.Error("atmosphere (disabled, feed continues)", e); }
+            }
 
             // Sky, on top of the geometry pass and using its depth so it fills only
             // what geometry did not cover.
@@ -528,9 +768,35 @@ internal static class CameraRender
                     }
                     else
                     {
-                        _miPlanetEnvDoWork.Invoke(_planetEnvJob, new object[]
-                            { commandList, cameraCb, rtv, rtv, depthSrv, view });
-                        if (_skyLogs++ == 0) RttLog.Line("=== SKY: IndirectPlanetEnvironmentJob applied. ===");
+                        // Two DISTINCT targets. Handing the same render target to both
+                        // closeTarget and farTarget is what made the sky spin: the job
+                        // draws a near and a far sky layer with different projections,
+                        // so a shared target means the second overwrites the first
+                        // every frame and the result tumbles. The engine's probe path
+                        // keeps them separate.
+                        //
+                        // We only want one image, so the far layer goes to a scratch
+                        // target that is borrowed and immediately returned. Wasteful by
+                        // one small draw, and the alternative is guessing at which
+                        // layer we want.
+                        object farBorrow = null;
+                        try
+                        {
+                            farBorrow = _miBorrowRt.Invoke(_texPool, new object[]
+                                { "RttSkyFar", colourFormat, colourFormat, res, 1, null, 128 });
+                            var farRtv = ViewOf(farBorrow, "IRenderTargetView") ?? rtv;
+
+                            _miPlanetEnvDoWork.Invoke(_planetEnvJob, new object[]
+                                { commandList, cameraCb, rtv, farRtv, depthSrv, view });
+
+                            if (_skyLogs++ == 0)
+                                RttLog.Line($"=== SKY: IndirectPlanetEnvironmentJob applied " +
+                                            $"(close=ours, far={(farBorrow == null ? "SHARED — expect spin" : "separate scratch")}). ===");
+                        }
+                        finally
+                        {
+                            if (farBorrow != null) try { ReturnBorrowed(farBorrow); } catch { }
+                        }
                     }
                 }
                 catch (Exception e)
@@ -550,6 +816,11 @@ internal static class CameraRender
         }
         finally
         {
+            // FIRST, before anything else can throw: the engine must not be left
+            // pointing at our 512x512 array.
+            RestoreCamera(savedCamera);
+            RestoreGBuffer(savedGBuffer);
+
             try { if (geomBorrowed) Call(_geomBuffers, "Return"); } catch { }
             try { OwnContexts.Return(borrowedCulling); } catch { }
             try { if (depthBorrow != null) ReturnBorrowed(depthBorrow); } catch { }
@@ -772,20 +1043,51 @@ internal static class CameraRender
                                     // wrong shape. Checked rather than passed, because
                                     // handing it over throws an ArgumentException that
                                     // disables tonemapping AND bloom for the session.
-                                    if (exposure != null && !(exposure is null) &&
+                                    if (exposure != null &&
                                         !_miApplyToneMapping.GetParameters()[3].ParameterType.IsInstanceOfType(exposure))
                                     {
-                                        if (_exposureSrcLogs++ == 0)
+                                        if (!_logProbeExp)
+                                        {
+                                            _logProbeExp = true;
                                             RttLog.Line($"Exposure: EnvironmentProbeExposureJob.Exposure is " +
                                                         $"{exposure.GetType().Name}, not a texture view — it is the probe's " +
-                                                        "scalar exposure. Needs wrapping in a 1x1 texture (or " +
-                                                        "EyeAdaptationJob.ConstantExposure) before it can drive ApplyToneMapping. " +
-                                                        "Using ComputeExposure for now.");
+                                                        "scalar exposure, so it cannot drive ApplyToneMapping directly.");
+                                        }
                                         exposure = null;
                                     }
-                                    else if (exposure != null && _exposureSrcLogs++ == 0)
-                                        RttLog.Line("Exposure: using EnvironmentProbeExposureJob.Exposure — no eye-adaptation " +
-                                                    "pass, no interference with the main view's exposure.");
+                                    else if (exposure != null) _exposureSource = "probe";
+                                }
+
+                                // Reuse an exposure the engine already computed, rather
+                                // than running ComputeExposure ourselves. This is the
+                                // bisect last night's test never did: ComputeExposure and
+                                // ApplyToneMapping ran together, so "the post passes
+                                // corrupt the main view" was concluded about the pair.
+                                // ComputeExposure is the one that WRITES shared state
+                                // (histogram, _autoExposures, temporal adaptation);
+                                // ApplyToneMapping may be a pure blit.
+                                // Preferred: our own constant. Reuse is the fallback,
+                                // kept because it is what proved ApplyToneMapping safe.
+                                if (exposure == null && FeedConfig.ExposureValue > 0.0)
+                                {
+                                    exposure = OwnConstantExposure(ReuseExistingExposure());
+                                    if (exposure != null)
+                                    {
+                                        // Write the value EXPLICITLY rather than trusting
+                                        // the pool's clearColor argument to have been
+                                        // applied eagerly. That was an assumption, and an
+                                        // uncleared texture holds whatever the pool last
+                                        // left there — which would make exposureValue a
+                                        // number that does nothing. One pixel, so free.
+                                        ClearExposure(commandList);
+                                        _exposureSource = $"constant {FeedConfig.ExposureValue} (owned 1x1, explicit clear)";
+                                    }
+                                }
+
+                                if (exposure == null && FeedConfig.ReuseExposure)
+                                {
+                                    exposure = ReuseExistingExposure();
+                                    if (exposure != null) _exposureSource = "reused (ComputeExposure NOT called)";
                                 }
 
                                 if (exposure == null)
@@ -794,9 +1096,18 @@ internal static class CameraRender
                                     var expArgs = new object[] { commandList, hdrTex, null, null };
                                     _miComputeExposure.Invoke(_sceneDrawSystem, expArgs);
                                     exposure = expArgs[2];
-                                    if (_exposureSrcLogs++ == 0)
-                                        RttLog.Line("Exposure: falling back to ComputeExposure (shared eye adaptation) — " +
-                                                    "expect the feed to be exposed for the player's view, not ours.");
+                                    _exposureSource = "ComputeExposure (WRITES shared eye-adaptation state)";
+                                }
+
+                                // One unambiguous line naming the source actually used.
+                                // The previous version shared a log counter across all
+                                // three branches, so whichever ran second and third was
+                                // silent — the bisect could not be read from the log at
+                                // all, which is the same defect as the drawOne telemetry.
+                                if (_exposureSource != _loggedExposureSource)
+                                {
+                                    _loggedExposureSource = _exposureSource;
+                                    RttLog.Line($"Exposure source: {_exposureSource}");
                                 }
 
                                 // ApplyToneMapping threw a NullReferenceException from
@@ -923,8 +1234,25 @@ internal static class CameraRender
                         else if (_toneLogs++ < 2)
                             RttLog.Line("Tonemap: no ITexture2DView on the tonemapped target — blitting raw HDR instead.");
                     }
+                    // cropRect is the SOURCE region, and leaving it null makes CopyJob
+                    // read a rect the size of the DESTINATION rather than the whole
+                    // source. With a 1024x1024 render into a 512x512 panel that copies
+                    // the top-left quadrant 1:1 — which is precisely the "feed zoomed
+                    // into the top left" symptom, not a projection problem.
+                    //
+                    // Naming the full source rect makes the blit scale instead of crop,
+                    // which is what turns the extra pixels into anti-aliasing.
+                    object crop = null;
+                    var srcRes = Prop2(Prop2(rtBorrow, "Resource") ?? rtBorrow, "Resolution");
+                    if (srcRes != null) crop = MakeRect(_miCopyDoWork.GetParameters()[7].ParameterType, srcRes);
+
+                    // Zero the slot first, so the alpha (= metalness) we deliberately
+                    // stop writing is 0 rather than whatever the pool left behind.
+                    if (FeedConfig.ZeroMetalness) ClearSlotToZero(commandList, dstRtv);
+
+                    var channels = (FeedConfig.BlitAlpha ? _channelAll : _channelRgb) ?? _channelAll;
                     _miCopyDoWork.Invoke(_copyJob, new object[]
-                        { commandList, dstRtv, blitSrc, null, null, _channelAll, null, null });
+                        { commandList, dstRtv, blitSrc, null, null, channels, null, crop });
 
                     copySource = ldrBorrow;
                     // Its own flag, not _copyLogs. That counter gates ERROR logging and
@@ -958,7 +1286,7 @@ internal static class CameraRender
 
     private static object _copyJob;
     private static MethodInfo _miCopyDoWork;
-    private static object _channelAll;
+    private static object _channelAll, _channelRgb;
     private static object _postProcess;   // CopyJob.PostProcess.Normalize, or null
     private static readonly object[] _ldrRing = new object[3];   // session-owned; see CopyToFeed
     private static object _ldrReady;                             // the slot handed to the UI stage
@@ -969,8 +1297,123 @@ internal static class CameraRender
     private static bool _startupLogged, _startupDoneLogged;
     private static object _sceneDrawSystem;
     private static MethodInfo _miComputeExposure, _miApplyToneMapping, _miApplyBloom;
-    private static object _planetEnvJob, _probeExposureJob;
-    private static int _exposureSrcLogs;
+    private static object _planetEnvJob, _probeExposureJob, _eyeAdaptationJob;
+    private static FieldInfo _autoExposuresField;
+    private static string _exposureSource = "", _loggedExposureSource = "";
+    private static bool _logProbeExp;
+
+    // An exposure texture the engine already computed, read without writing anything.
+    // Its VALUE is the player's adaptation, so brightness will not be ideal — but the
+    // question this answers is whether ApplyToneMapping alone is safe, and for that
+    // any valid exposure texture will do.
+    // A 1x1 texture holding a CONSTANT exposure we choose.
+    //
+    // Reusing the engine's eye-adaptation texture is safe but gives the wrong value:
+    // it is adapted to the player's surroundings, so standing inside a dim ship
+    // produces a high exposure, and multiplying a sunlit space scene by that keeps
+    // everything clamped — which is exactly the "brightness looks the same" result.
+    //
+    // The pool clears a borrowed target to a colour we supply, so a 1x1 target with
+    // clearColor = exposure IS a constant-exposure texture. Fully ours, nothing
+    // shared, no ComputeExposure, and tunable live from feed-config.txt.
+    private static object _ownExposureBorrow;
+    private static double _ownExposureFor = double.NaN;
+    private static MethodInfo _miBorrowRenderTarget;
+    private static bool _ownExposureBlocked;
+
+    private static object OwnConstantExposure(object referenceTex)
+    {
+        if (_ownExposureBlocked) return null;
+        try
+        {
+            double want = FeedConfig.ExposureValue;
+
+            // Re-borrow only when the value actually changes, so live tuning works
+            // without churning the pool every frame.
+            if (_ownExposureBorrow != null && Math.Abs(want - _ownExposureFor) < 1e-9)
+                return ViewOf(_ownExposureBorrow, "ITexture2DView") ?? _ownExposureBorrow;
+
+            if (_miBorrowRenderTarget == null)
+                _miBorrowRenderTarget = _texPool?.GetType().GetMethods(Any)
+                    .FirstOrDefault(m => m.Name == "BorrowRenderTargetTexture" && m.GetParameters().Length == 5);
+            if (_miBorrowRenderTarget == null) { _ownExposureBlocked = true; return null; }
+
+            // Match the engine's own exposure format so the tonemap samples it the
+            // same way it samples the real thing.
+            var fmt = Prop2(referenceTex, "Format") ?? _feedFormat;
+            var clear = MakeClearColour(_miBorrowRenderTarget.GetParameters()[3].ParameterType, (float)want);
+            if (clear == null)
+            {
+                _ownExposureBlocked = true;
+                RttLog.Line("Constant exposure: could not build a clear colour — falling back to the reused texture.");
+                return null;
+            }
+
+            var old = _ownExposureBorrow;
+            _ownExposureBorrow = _miBorrowRenderTarget.Invoke(_texPool, new object[]
+                { "RttConstExposure", fmt, MakeVector2I(1, 1), clear, 128 });
+            _ownExposureFor = want;
+            if (old != null) try { ReturnBorrowed(old); } catch { }
+
+            RttLog.Line($"Constant exposure: 1x1 {fmt} cleared to {want} — owned, no shared state.");
+            return ViewOf(_ownExposureBorrow, "ITexture2DView") ?? _ownExposureBorrow;
+        }
+        catch (Exception e)
+        {
+            _ownExposureBlocked = true;
+            RttLog.Error("constant exposure", e);
+            return null;
+        }
+    }
+
+    // The clear-colour parameter is Nullable<something>; discover how to build it
+    // rather than assuming a type. Tries a 4-float ctor, then 1-float, then a
+    // default instance with its channel fields set.
+    private static object MakeClearColour(Type nullableType, float v)
+    {
+        var t = Nullable.GetUnderlyingType(nullableType) ?? nullableType;
+        try
+        {
+            foreach (var ctor in t.GetConstructors())
+            {
+                var ps = ctor.GetParameters();
+                if (ps.Length == 4 && ps.All(p => p.ParameterType == typeof(float)))
+                    return ctor.Invoke(new object[] { v, v, v, v });
+                if (ps.Length == 1 && ps[0].ParameterType == typeof(float))
+                    return ctor.Invoke(new object[] { v });
+            }
+
+            var box = Activator.CreateInstance(t);
+            int set = 0;
+            foreach (var f in t.GetFields(BindingFlags.Public | BindingFlags.Instance))
+                if (f.FieldType == typeof(float)) { f.SetValue(box, v); set++; }
+            if (set > 0) return box;
+
+            RttLog.Line($"Constant exposure: {t.Name} has no float ctor or float fields — " +
+                        $"members: {string.Join(", ", t.GetFields(BindingFlags.Public | BindingFlags.Instance).Select(f => f.FieldType.Name + " " + f.Name))}");
+        }
+        catch (Exception e) { RttLog.Error("clear colour", e); }
+        return null;
+    }
+
+    private static object ReuseExistingExposure()
+    {
+        try
+        {
+            if (_autoExposuresField == null || _eyeAdaptationJob == null) return null;
+            if (_autoExposuresField.GetValue(_eyeAdaptationJob) is not Array arr || arr.Length == 0) return null;
+
+            for (int i = 0; i < arr.Length; i++)
+            {
+                var tex = arr.GetValue(i);
+                if (tex == null) continue;
+                var srv = ViewOf(tex, "ITexture2DView") ?? tex;
+                if (srv != null) return srv;
+            }
+        }
+        catch (Exception e) { RttLog.Error("reuse exposure", e); }
+        return null;
+    }
     private static MethodInfo _miPlanetEnvDoWork;
     private static MethodInfo _miBorrowResizableRt, _miBorrowResizableRenderTarget;
 
@@ -1078,6 +1521,1014 @@ internal static class CameraRender
             RttLog.Line($"Fidelity survey -> {path}");
         }
         catch (Exception e) { RttLog.Error("fidelity survey", e); }
+    }
+
+    // ------------------------------------------------ deferred lighting (step 4)
+    // With a GBuffer written, the engine's own lighting jobs can composite into our
+    // HDR target by reading surface data instead of us relying on the probe path's
+    // single-pass shading.
+    //
+    // This REPLACES IndirectEnvironmentPassJob rather than adding to it. That pass
+    // already writes fully-lit colour, so running both would light the scene twice —
+    // brighter and wronger, not softer. `envPass` keeps the forward path available so
+    // the two can be compared live.
+    //
+    // AmbientLightJob is the one that matters for the reported harshness: direct sun
+    // plus clustered lights with no ambient term is exactly why lit faces blow out and
+    // unlit faces go flat.
+    private static object _dirLightJob, _localLightsJob, _ambientJob, _atmoJob;
+    private static MethodInfo _miAtmo, _miExecLighting;
+    private static bool _execLightBlocked;
+    private static int _execLightLogs;
+    private static bool _atmoBlocked;
+    private static int _atmoLogs;
+    private static MethodInfo _miDirLight, _miLocalLights, _miAmbient;
+    private static bool _dirBlocked, _localBlocked, _ambientBlocked, _lightingResolved;
+    private static int _dirLogs, _localLogs, _ambientLogs;
+    private static bool _localDiffuseNull = true;   // try null first, fall back to rtv
+
+    private static void ResolveLightingJobs()
+    {
+        if (_lightingResolved) return;
+        _lightingResolved = true;
+        try
+        {
+            var t = _sceneDrawSystem?.GetType();
+            _dirLightJob    = t?.GetField("_directionalLightJob", Any)?.GetValue(_sceneDrawSystem);
+            _localLightsJob = t?.GetField("_localLightsJob", Any)?.GetValue(_sceneDrawSystem);
+            _ambientJob     = t?.GetField("_ambientLightJob", Any)?.GetValue(_sceneDrawSystem);
+
+            _miDirLight     = Pick4(_dirLightJob, 4);
+            _miLocalLights  = Pick4(_localLightsJob, 5);
+            // Prefer the 4-arg overload (explicit GI buffers); fall back to 2-arg.
+            _miAmbient      = Pick4(_ambientJob, 4) ?? Pick4(_ambientJob, 2);
+
+            RttLog.Line($"Deferred lighting: directional={(_miDirLight == null ? "NOT FOUND" : "ok")} " +
+                        $"local={(_miLocalLights == null ? "NOT FOUND" : "ok")} " +
+                        $"ambient={(_miAmbient == null ? "NOT FOUND" : $"ok({_miAmbient.GetParameters().Length} args)")}");
+        }
+        catch (Exception e) { RttLog.Error("resolve lighting jobs", e); }
+    }
+
+    private static MethodInfo Pick4(object job, int argc) => job?.GetType().GetMethods(Any)
+        .FirstOrDefault(m => m.Name == "DoWork" && m.GetParameters().Length == argc);
+
+    // DirectionalLightJob wants an ITexture2DView of the shadow atlas. Guessing at
+    // "ShadowMap"/"Texture" found nothing and the job threw on a null, so enumerate
+    // DirectionalLightShadowResources and take the first texture view on it —
+    // reporting every member once, so a miss is one log line from a fix.
+    private static object _shadowSrvCache;
+    private static bool _shadowSrvLogged;
+
+    private static object FindShadowView()
+    {
+        if (_shadowSrvCache != null) return _shadowSrvCache;
+        try
+        {
+            if (_shadowResources == null) return null;
+            var t = _shadowResources.GetType();
+            var sb = new StringBuilder($"Deferred: {t.Name} members —");
+
+            foreach (var (name, val) in t.GetFields(Any).Select(f => (f.Name, Get(f)))
+                     .Concat(t.GetProperties(Any).Where(p => p.GetIndexParameters().Length == 0)
+                                                .Select(p => (p.Name, Get(p)))))
+            {
+                if (val == null) { sb.Append($"\n    {name} = null"); continue; }
+                sb.Append($"\n    {name} = {val.GetType().Name}");
+
+                var srv = ViewOf(val, "ITexture2DView");
+                if (srv != null && _shadowSrvCache == null)
+                {
+                    _shadowSrvCache = srv;
+                    sb.Append("   <-- using this as shadowRtView");
+                }
+            }
+
+            if (!_shadowSrvLogged) { _shadowSrvLogged = true; RttLog.Line(sb.ToString()); }
+            return _shadowSrvCache;
+
+            object Get(MemberInfo m)
+            {
+                try { return m is FieldInfo f ? f.GetValue(_shadowResources) : ((PropertyInfo)m).GetValue(_shadowResources); }
+                catch { return null; }
+            }
+        }
+        catch (Exception e) { RttLog.Error("find shadow view", e); return null; }
+    }
+
+    // AmbientLightJob rejects null GI buffers. It has no 2-argument overload on this
+    // build (the 2-arg DoWork in the recon belongs to AtmosphereAdditiveJob), so the
+    // only way in is to supply real textures. Ours are empty, which means zero GI
+    // contribution — but ambient itself is computed from the GBuffer and sky, and that
+    // is the term the feed is missing.
+    private static object _giDiffuse, _giSpecular;
+
+    private static bool EnsureGiBuffers(object res)
+    {
+        if (_giDiffuse != null) return true;
+        try
+        {
+            if (_miBorrowRt == null) return false;
+            _giDiffuse  = _miBorrowRt.Invoke(_texPool, new object[] { "RttGiDiffuse",  _hdrFormat, _hdrFormat, res, 1, null, 128 });
+            _giSpecular = _miBorrowRt.Invoke(_texPool, new object[] { "RttGiSpecular", _hdrFormat, _hdrFormat, res, 1, null, 128 });
+            RttLog.Line("Deferred: allocated empty GI buffers for AmbientLightJob (no GI contribution, ambient still applies).");
+            return true;
+        }
+        catch (Exception e) { RttLog.Error("gi buffers", e); return false; }
+    }
+
+    private static void RunDeferredLighting(object commandList, object rtv, object cullCtx)
+    {
+        ResolveLightingJobs();
+
+        // Directional sun. shadowRtView is a texture view we do not obviously own —
+        // look for one on the shadow resources the engine handed us, and skip the job
+        // rather than guess if it is not there. Shadows fitted to the PLAYER's frustum
+        // remain a known limitation (see "own shadow cascades" in the roadmap).
+        if (FeedConfig.DeferredDirectional && !_dirBlocked && _miDirLight != null)
+        {
+            try
+            {
+                var shadowSrv = FindShadowView();
+                _miDirLight.Invoke(_dirLightJob, new object[] { commandList, shadowSrv, _shadowResources, rtv });
+                if (_dirLogs++ == 0)
+                    RttLog.Line($"=== DEFERRED: directional light applied (shadowRtView={(shadowSrv == null ? "null" : "ok")}). ===");
+            }
+            catch (Exception e) { _dirBlocked = true; RttLog.Error("directional light (disabled)", e); }
+        }
+
+        // Clustered local lights. Takes OUR clustering context and geometry buffers,
+        // which is why this one is a good fit.
+        if (FeedConfig.DeferredLocal && !_localBlocked && _miLocalLights != null)
+        {
+            try
+            {
+                _miLocalLights.Invoke(_localLightsJob, new object[]
+                    { commandList, rtv, _localDiffuseNull ? null : rtv, _clusterCtx, _geomBuffers });
+                if (_localLogs++ == 0)
+                    RttLog.Line($"=== DEFERRED: local lights applied (diffuseOnly={(_localDiffuseNull ? "null" : "shared rtv")}). ===");
+            }
+            catch (Exception e)
+            {
+                // A null diffuse-only target is the likeliest thing it dislikes; retry
+                // once sharing our target before giving up on the job entirely.
+                if (_localDiffuseNull)
+                {
+                    _localDiffuseNull = false;
+                    RttLog.Line("Local lights: null rtViewDiffuseOnly rejected — retrying with our own target.");
+                }
+                else { _localBlocked = true; RttLog.Error("local lights (disabled)", e); }
+            }
+        }
+
+        // Ambient. THE fix for the harshness — the missing indirect term.
+        if (FeedConfig.DeferredAmbient && !_ambientBlocked && _miAmbient != null)
+        {
+            try
+            {
+                object[] args;
+                if (_miAmbient.GetParameters().Length == 2)
+                    args = new object[] { commandList, rtv };
+                else
+                {
+                    // Null GI buffers throw inside the job, so supply real (empty) ones.
+                    if (!EnsureGiBuffers(_feedRes ?? MakeVector2I(RenderW, RenderH)))
+                    { _ambientBlocked = true; RttLog.Line("Ambient: no GI buffers — disabled."); return; }
+
+                    args = new object[]
+                    {
+                        commandList, rtv,
+                        ViewOf(_giDiffuse, "ITexture2DView"),
+                        ViewOf(_giSpecular, "ITexture2DView"),
+                    };
+                }
+                _miAmbient.Invoke(_ambientJob, args);
+                if (_ambientLogs++ == 0)
+                    RttLog.Line($"=== DEFERRED: ambient light applied ({args.Length} args). ===");
+            }
+            catch (Exception e) { _ambientBlocked = true; RttLog.Error("ambient light (disabled)", e); }
+        }
+    }
+
+    // ---------------------------------------------------- GBuffer swap (step 2)
+    // Own the GBuffer so the deferred lighting passes have surface data to read.
+    //
+    // ScreenBuffers.GBuffer is a public settable ResizableRWRenderTargetTexture[5],
+    // so this is a swap around our pass rather than a whole second ScreenBuffers:
+    //
+    //   save global -> install ours -> (our passes) -> restore global
+    //
+    // The window is inside a single synchronous postfix, so no engine code runs in
+    // between, and resource bindings are recorded into the command list at record
+    // time — the engine's own recorded commands keep referring to its textures.
+    //
+    // Step 2 deliberately runs NO passes. If allocate/swap/restore survives on its
+    // own, the mechanism is sound and the passes can go on top one at a time. Doing
+    // both at once would leave a failure ambiguous, which has cost a launch before.
+    private static object[] _ourGBuffer;          // the borrows, kept for the session
+    private static Array _ourGBufferArray;        // typed array handed to the setter
+    private static PropertyInfo _gbProp, _dsProp;
+    private static FieldInfo _dsField;
+    private static FieldInfo[] _resFields;
+    private static bool _resSwapLogged;
+    private static string _ourGBufferRes;
+    private static FieldInfo[] _giFields;
+    private static bool _giSuppressLogged;
+    private static object _ourDepthBorrow, _ourDepthTex;
+    private static MethodInfo _miBorrowResizableDepth;
+    private static bool _gbBlocked, _gbLogged, _depthSwapOk, _gbPassBlocked;
+    private static object _gBufferPassJob;
+    private static MethodInfo _miGBufferPass;
+    private static int _gbPassLogs;
+    private static int _gbSwaps;
+
+    // Clear a target to (0,0,0,0). Reuses the same ClearRenderTargetView the exposure
+    // path proved works. Purpose: alpha 0 = non-metal, so the feed renders as a diffuse
+    // surface instead of a mirror with nothing to reflect.
+    private static object _zeroColour;
+    private static int _zeroState;   // 0 untried, 1 ok, -1 unavailable
+
+    private static void ClearSlotToZero(object commandList, object rtv)
+    {
+        if (_zeroState == -1 || rtv == null) return;
+        try
+        {
+            if (_zeroState == 0)
+            {
+                _miClearRtv ??= commandList.GetType().GetMethods(Any)
+                    .FirstOrDefault(m => m.Name == "ClearRenderTargetView" && m.GetParameters().Length == 2);
+                if (_miClearRtv == null) { _zeroState = -1; return; }
+                _zeroColour = MakeClearColour(_miClearRtv.GetParameters()[1].ParameterType, 0f);
+                _zeroState = _zeroColour != null ? 1 : -1;
+                RttLog.Line(_zeroState == 1
+                    ? "Blit: clearing the panel slot to (0,0,0,0) first — alpha 0 = NON-METAL."
+                    : "Blit: could not build a zero clear colour; alpha stays as-is.");
+                if (_zeroState == -1) return;
+            }
+            _miClearRtv.Invoke(commandList, new[] { rtv, _zeroColour });
+        }
+        catch (Exception e) { _zeroState = -1; RttLog.Error("zero slot", e); }
+    }
+
+    // Write the exposure value into our 1x1 texture with an explicit clear.
+    //
+    // Sweeping exposureValue from 0.25 to 0.02 — a 12x change — produced NO visible
+    // difference, which means the texture is inert. The pool's clearColor argument was
+    // an assumption; this removes it. If the image still does not respond after this,
+    // the fault is in what ApplyToneMapping does with the exposure, not in our value.
+    private static MethodInfo _miClearRtv;
+    private static int _clearExpState;   // 0 untried, 1 ok, -1 unavailable
+    private static object _clearColourCache;
+    private static double _clearColourFor = double.NaN;
+
+    private static void ClearExposure(object commandList)
+    {
+        if (_clearExpState == -1 || _ownExposureBorrow == null) return;
+        try
+        {
+            if (_clearExpState == 0)
+            {
+                _miClearRtv = commandList.GetType().GetMethods(Any)
+                    .FirstOrDefault(m => m.Name == "ClearRenderTargetView" && m.GetParameters().Length == 2);
+                _clearExpState = _miClearRtv != null ? 1 : -1;
+                RttLog.Line(_miClearRtv != null
+                    ? $"Exposure: explicit ClearRenderTargetView found " +
+                      $"({string.Join(", ", _miClearRtv.GetParameters().Select(p => p.ParameterType.Name))})."
+                    : "Exposure: ClearRenderTargetView(2 args) NOT FOUND — cannot write the value explicitly.");
+                if (_clearExpState == -1) return;
+            }
+
+            var rtv = ViewOf(_ownExposureBorrow, "IRenderTargetView");
+            if (rtv == null) { _clearExpState = -1; RttLog.Line("Exposure: no IRenderTargetView on our 1x1 target."); return; }
+
+            double want = FeedConfig.ExposureValue;
+            if (_clearColourCache == null || Math.Abs(want - _clearColourFor) > 1e-9)
+            {
+                _clearColourCache = MakeClearColour(_miClearRtv.GetParameters()[1].ParameterType, (float)want);
+                _clearColourFor = want;
+                if (_clearColourCache == null)
+                {
+                    _clearExpState = -1;
+                    RttLog.Line($"Exposure: could not build a clear colour of type " +
+                                $"{_miClearRtv.GetParameters()[1].ParameterType.Name}.");
+                    return;
+                }
+                RttLog.Line($"Exposure: clearing our 1x1 target to {want} explicitly each pass.");
+            }
+
+            _miClearRtv.Invoke(commandList, new[] { rtv, _clearColourCache });
+        }
+        catch (Exception e) { _clearExpState = -1; RttLog.Error("clear exposure", e); }
+    }
+
+    // Property setter if the engine exposes one, backing field otherwise.
+    private static void SetDepthBuffer(object screenBuffers, object value)
+    {
+        if (_dsProp is { CanWrite: true }) _dsProp.SetValue(screenBuffers, value);
+        else _dsField?.SetValue(screenBuffers, value);
+    }
+
+    // The panel's resolution multiplied by renderScale, clamped so a typo cannot ask
+    // for a 16K render target.
+    private static string _resLogged;
+
+    private static object ScaledRenderRes()
+    {
+        var baseRes = _feedRes ?? MakeVector2I(RenderW, RenderH);
+        double s = Math.Clamp(FeedConfig.RenderScale, 1.0, 8.0);
+        if (s <= 1.0) return baseRes;
+
+        try
+        {
+            int bx = (int)(Prop2(baseRes, "X") ?? RenderW);
+            int by = (int)(Prop2(baseRes, "Y") ?? RenderH);
+            int x = Math.Clamp((int)(bx * s), 16, 8192);
+            int y = Math.Clamp((int)(by * s), 16, 8192);
+            var scaled = MakeVector2I(x, y);
+
+            var tag = $"{bx}x{by} x{s} -> {x}x{y}";
+            if (tag != _resLogged)
+            {
+                _resLogged = tag;
+                RttLog.Line($"Render scale: supersampling {tag}; the panel copy downsamples it.");
+            }
+            return scaled ?? baseRes;
+        }
+        catch { return baseRes; }
+    }
+
+    // System.Drawing.Rectangle(0, 0, w, h) built by reflection, since the parameter's
+    // assembly is not referenced here.
+    private static bool _rectLogged;
+
+    private static object MakeRect(Type nullableRect, object resolution)
+    {
+        try
+        {
+            var t = Nullable.GetUnderlyingType(nullableRect) ?? nullableRect;
+            int w = (int)(Prop2(resolution, "X") ?? 0);
+            int h = (int)(Prop2(resolution, "Y") ?? 0);
+            if (w <= 0 || h <= 0) return null;
+
+            var ctor = t.GetConstructors().FirstOrDefault(c => c.GetParameters().Length == 4
+                && c.GetParameters().All(p => p.ParameterType == typeof(int)));
+            if (ctor == null)
+            {
+                if (!_rectLogged) { _rectLogged = true; RttLog.Line($"Blit: {t.Name} has no (int,int,int,int) ctor — crop rect unavailable."); }
+                return null;
+            }
+
+            var r = ctor.Invoke(new object[] { 0, 0, w, h });
+            if (!_rectLogged) { _rectLogged = true; RttLog.Line($"Blit: source crop rect {w}x{h} — the blit scales to the panel instead of cropping."); }
+            return r;
+        }
+        catch (Exception e) { RttLog.Error("crop rect", e); return null; }
+    }
+
+    // Hand the whole set back to the pool. Called only when re-allocating at a new
+    // resolution, and only from the pass itself, so nothing is reading them.
+    private static void ReleaseOurGBuffer()
+    {
+        try
+        {
+            if (_ourGBuffer != null)
+                foreach (var b in _ourGBuffer)
+                    if (b != null) try { ReturnBorrowed(b); } catch { }
+            if (_ourDepthBorrow != null) try { ReturnBorrowed(_ourDepthBorrow); } catch { }
+        }
+        catch { }
+        _ourGBuffer = null;
+        _ourGBufferArray = null;
+        _ourGBufferRes = null;
+        _ourDepthBorrow = _ourDepthTex = null;
+        _depthSwapOk = false;
+    }
+
+    // ------------------------------------------- where the rasterising camera lives
+    // Swapping SettingsManager._renderView changed nothing, and the reason is timing:
+    // _renderView is the CPU-side source the engine converts into a camera CONSTANT
+    // BUFFER earlier in the frame. By our postfix that conversion has happened, so the
+    // bound CB still describes the player. IndirectEnvironmentPassJob takes cameraCb
+    // explicitly, which is why the forward path was never affected; GBufferPassJob takes
+    // none and uses whatever is bound.
+    //
+    // So find the carrier. Most likely OutputGeometryBufferContext (the per-view bundle
+    // we hand the pass), or a per-frame constants object. Read-only survey.
+    private static void CameraCarrierSurvey(StringBuilder outer)
+    {
+        try
+        {
+            var sb = new StringBuilder($"=== Camera carrier survey {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
+            sb.AppendLine();
+            sb.AppendLine();
+
+            sb.AppendLine("-- OutputGeometryBufferContext (what we pass to GBufferPassJob) --");
+            if (_geomBuffers == null) sb.AppendLine("  null");
+            else
+            {
+                sb.AppendLine($"  {_geomBuffers.GetType().FullName}");
+                foreach (var f in _geomBuffers.GetType().GetFields(Any).OrderBy(f => f.Name))
+                {
+                    object v = null; try { v = f.GetValue(_geomBuffers); } catch { }
+                    var mark = f.FieldType.Name.Contains("ConstantBuffer") || f.FieldType.Name.Contains("Camera")
+                               || f.Name.Contains("amera", StringComparison.Ordinal) ? "   <-- CAMERA?" : "";
+                    sb.AppendLine($"    {(f.IsInitOnly ? "readonly " : "         ")}{f.FieldType.Name,-36} {Clean2(f.Name),-32} = {Short(v)}{mark}");
+                }
+                foreach (var p in _geomBuffers.GetType().GetProperties(Any).Where(p => p.GetIndexParameters().Length == 0))
+                {
+                    object v = null; try { v = p.GetValue(_geomBuffers); } catch { }
+                    var mark = p.PropertyType.Name.Contains("ConstantBuffer") || p.Name.Contains("amera", StringComparison.Ordinal)
+                               ? "   <-- CAMERA?" : "";
+                    sb.AppendLine($"    prop     {p.PropertyType.Name,-36} {p.Name,-32} = {Short(v)}{mark}{(p.CanWrite ? "  [settable]" : "")}");
+                }
+            }
+            sb.AppendLine();
+
+            // A per-frame constants holder is the other candidate.
+            sb.AppendLine("-- Frame / per-frame camera holders --");
+            var asm = _sceneDrawSystem?.GetType().Assembly;
+            foreach (var tn in new[] { "Frame", "FrameConstants", "RenderFrame" })
+            {
+                var t = asm?.GetTypes().FirstOrDefault(x => x.Name == tn);
+                if (t == null) { sb.AppendLine($"  {tn}: not found"); continue; }
+                sb.AppendLine($"  {t.FullName}");
+                foreach (var f in t.GetFields(Any).Where(f => f.FieldType.Name.Contains("Camera")
+                                                           || f.Name.Contains("amera", StringComparison.Ordinal)
+                                                           || f.FieldType.Name.Contains("ConstantBuffer")))
+                    sb.AppendLine($"    {(f.IsStatic ? "static " : "       ")}{f.FieldType.Name,-36} {Clean2(f.Name)}");
+            }
+            sb.AppendLine();
+
+            // And whatever on CoreSystems looks like it holds a bound camera.
+            sb.AppendLine("-- CoreSystems statics mentioning camera/constant --");
+            var cs = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            if (cs != null)
+                foreach (var f in cs.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
+                    if (f.Name.Contains("amera", StringComparison.Ordinal) || f.FieldType.Name.Contains("Camera")
+                        || f.FieldType.Name.Contains("Frame"))
+                        sb.AppendLine($"    {f.FieldType.Name,-36} CoreSystems.{f.Name}");
+
+            var path = Path.Combine(RttLog.OutDir, "camera-carrier-survey.txt");
+            File.WriteAllText(path, sb.ToString());
+            outer.AppendLine($"-- camera carrier survey -> {path} --");
+            RttLog.Line($"Camera carrier survey -> {path}");
+        }
+        catch (Exception e) { RttLog.Error("camera carrier survey", e); }
+    }
+
+    // ---------------------------------------------- the global camera (RenderView)
+    // GBufferPassJob and ExecuteLighting take NO camera parameter, so they rasterise
+    // and light from SettingsManager._renderView — the player's. The geometry list was
+    // ours (culled from our view) but drawn from where the player stands, which is
+    // exactly the "viewpoint stuck inside the ship" symptom.
+    //
+    // SetCameraParameters would be the tidy route, but it writes _freezedRenderView and
+    // maintains temporal state (camera speed buffer, last-frame positions). Calling it
+    // twice a frame would corrupt the player's motion vectors.
+    //
+    // So: our own RenderView instance, every field copied from the player's so we
+    // inherit projection, clipping, resolution and anything else we do not understand,
+    // with only the camera overridden. Swapped in for the pass, restored after.
+    private static FieldInfo _renderViewField;
+    private static object _ourRenderView;
+    private static FieldInfo[] _rvFields;
+    private static bool _camSwapBlocked, _camSwapLogged;
+    private static object _lastCamWorld, _lastViewD;
+
+    private static object InstallOurCamera(object camWorld, object viewD)
+    {
+        if (_camSwapBlocked || !FeedConfig.SwapCamera || _settings == null) return null;
+        try
+        {
+            _renderViewField ??= _settings.GetType().GetFields(Any)
+                .FirstOrDefault(f => f.Name.Contains("renderView", StringComparison.OrdinalIgnoreCase)
+                                  && !f.Name.Contains("previous", StringComparison.OrdinalIgnoreCase)
+                                  && !f.Name.Contains("freez", StringComparison.OrdinalIgnoreCase));
+            if (_renderViewField == null)
+            {
+                _camSwapBlocked = true;
+                RttLog.Line("Camera swap: SettingsManager._renderView not found — " +
+                            "the GBuffer pass will keep using the player's viewpoint.");
+                return null;
+            }
+
+            var theirs = _renderViewField.GetValue(_settings);
+            if (theirs == null) return null;
+            var rvType = theirs.GetType();
+
+            _rvFields ??= rvType.GetFields(Any).Where(f => !f.IsStatic).ToArray();
+            _ourRenderView ??= System.Runtime.CompilerServices.RuntimeHelpers
+                .GetUninitializedObject(rvType);
+
+            // Copy everything, then override the camera. Copying first means projection,
+            // clipping, FOV and resolution stay current with the player's settings.
+            foreach (var f in _rvFields)
+            {
+                try { f.SetValue(_ourRenderView, f.GetValue(theirs)); } catch { }
+            }
+
+            int set = 0;
+            set += SetRv("ViewD", viewD);
+            set += SetRv("InvViewD", camWorld);
+            set += SetRv("CameraPosition", Prop2(camWorld, "Translation"));
+
+            if (!_camSwapLogged)
+            {
+                _camSwapLogged = true;
+                RttLog.Line($"Camera swap: own RenderView built ({_rvFields.Length} fields copied, " +
+                            $"{set}/3 camera fields overridden). ViewAt0/InvViewAt0 are inherited — " +
+                            "if the feed looks translated, those are the floating-origin pair to fix next.");
+            }
+
+            _renderViewField.SetValue(_settings, _ourRenderView);
+            return theirs;
+        }
+        catch (Exception e) { _camSwapBlocked = true; RttLog.Error("install camera", e); return null; }
+    }
+
+    private static int SetRv(string name, object value)
+    {
+        if (value == null) return 0;
+        var f = _rvFields.FirstOrDefault(x =>
+            x.Name.Contains($"<{name}>", StringComparison.Ordinal) || x.Name == name);
+        if (f == null || !f.FieldType.IsInstanceOfType(value)) return 0;
+        try { f.SetValue(_ourRenderView, value); return 1; } catch { return 0; }
+    }
+
+    private static void RestoreCamera(object saved)
+    {
+        if (saved == null || _renderViewField == null || _settings == null) return;
+        try { _renderViewField.SetValue(_settings, saved); }
+        catch (Exception e)
+        {
+            _camSwapBlocked = true;
+            RttLog.Error("RESTORE CAMERA FAILED — the main view is now using our camera", e);
+        }
+    }
+
+    private static object ScreenBuffersInstance()
+    {
+        try
+        {
+            var cs = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            if (cs == null) return null;
+            foreach (var f in cs.GetFields(BindingFlags.Public | BindingFlags.Static))
+                if (f.FieldType.Name.Contains("ScreenBuffers"))
+                    return f.GetValue(null);
+        }
+        catch { }
+        return null;
+    }
+
+    // Allocate our five targets once, at OUR resolution. The engine's are 3840x2160;
+    // ours are 512x512, which is where the cost saving lives.
+    private static bool EnsureOurGBuffer(object screenBuffers, object res)
+    {
+        // Re-allocate if the resolution has moved.
+        //
+        // This was allocated once, on the FIRST pass — which runs before _feedRes is
+        // known, because that resolves later inside CopyToFeed. So the GBuffer came out
+        // at RenderW/RenderH (256x256) while the colour target settled at the panel's
+        // 512x512, and the lighting stage covered exactly one quadrant of it. That is
+        // the "top left quadrant" symptom, and it is an initialisation-order bug rather
+        // than anything to do with viewports.
+        var wantRes = res?.ToString();
+        if (_ourGBufferArray != null && wantRes == _ourGBufferRes) return true;
+
+        if (_ourGBufferArray != null)
+        {
+            RttLog.Line($"GBuffer: resolution changed {_ourGBufferRes} -> {wantRes}; re-allocating.");
+            ReleaseOurGBuffer();
+        }
+
+        try
+        {
+            if (_miBorrowResizableRt == null) return false;
+            if (Prop2(screenBuffers, "GBufferFormats") is not Array fmts || fmts.Length == 0) return false;
+
+            _gbProp ??= screenBuffers.GetType().GetProperty("GBuffer", Any);
+            if (_gbProp == null || !_gbProp.CanWrite) return false;
+
+            var elemType = _gbProp.PropertyType.GetElementType();
+            if (elemType == null) return false;
+
+            var borrows = new object[fmts.Length];
+            var arr = Array.CreateInstance(elemType, fmts.Length);
+            for (int i = 0; i < fmts.Length; i++)
+            {
+                // (debugName, srvFormat, maxResolution, uavFormat, mipMaps, clearColor, lifetime)
+                borrows[i] = _miBorrowResizableRt.Invoke(_texPool, new object[]
+                    { $"RttGBuffer{i}", fmts.GetValue(i), res, null, 1, null, 128 });
+                var tex = Prop2(borrows[i], "Resource") ?? borrows[i];
+                if (tex == null || !elemType.IsInstanceOfType(tex))
+                {
+                    RttLog.Line($"GBuffer: slot {i} came back as {(tex == null ? "null" : tex.GetType().Name)}, " +
+                                $"need {elemType.Name} — swap disabled.");
+                    return false;
+                }
+                arr.SetValue(tex, i);
+            }
+
+            _ourGBuffer = borrows;
+            _ourGBufferArray = arr;
+            _ourGBufferRes = res?.ToString();
+            RttLog.Line($"GBuffer: allocated {fmts.Length} targets at {res} " +
+                        $"(engine's are {Prop2(screenBuffers, "PreUpscaleResolution")}).");
+
+            // Depth as well. GBufferPassJob takes NO depth parameter, so it writes
+            // through ScreenBuffers.DepthStencilBuffer — the engine's 4K one. Running
+            // it without swapping that would scribble our 512x512 scene's depth into
+            // the buffer the player's view depends on.
+            _dsProp = screenBuffers.GetType().GetProperty("DepthStencilBuffer", Any);
+            _miBorrowResizableDepth ??= _texPool?.GetType().GetMethods(Any)
+                .FirstOrDefault(m => m.Name == "BorrowResizableDepthStencilTexture" && m.GetParameters().Length == 5);
+
+            // The property is CanWrite=False, but an auto-property still has a
+            // settable backing field. GBuffer's setter is public and this one is not,
+            // which is a hint that Keen did not intend it to move — worth knowing, and
+            // worth doing anyway since the alternative is writing the player's depth.
+            if (_dsProp is { CanWrite: false })
+            {
+                // Case-INSENSITIVE: the field is `_depthStencilBuffer`, lowercase after
+                // the underscore, so an exact-case Contains missed it and reported "no
+                // backing field" when the storage was sitting right there.
+                _dsField = screenBuffers.GetType().GetFields(Any)
+                    .FirstOrDefault(f => !f.IsInitOnly
+                                      && f.FieldType == _dsProp.PropertyType
+                                      && f.Name.Contains("depthstencilbuffer", StringComparison.OrdinalIgnoreCase));
+                RttLog.Line($"GBuffer: DepthStencilBuffer setter is private; backing field " +
+                            $"{(_dsField == null ? "NOT FOUND" : "'" + _dsField.Name + "' found")}.");
+            }
+
+            RttLog.Line($"GBuffer: DepthStencilBuffer property found={_dsProp != null} " +
+                        $"CanWrite={_dsProp?.CanWrite} field={_dsField != null} " +
+                        $"resizableDepthBorrow={_miBorrowResizableDepth != null}");
+
+            if ((_dsProp is { CanWrite: true } || _dsField != null) && _miBorrowResizableDepth != null)
+            {
+                // (debugName, format, maxResolution, clearValue, lifetime)
+                _ourDepthBorrow = _miBorrowResizableDepth.Invoke(_texPool, new object[]
+                    { "RttGBufferDepth", _depthFormat, res, null, 128 });
+                _ourDepthTex = Prop2(_ourDepthBorrow, "Resource") ?? _ourDepthBorrow;
+
+                var want = _dsProp.PropertyType;
+                _depthSwapOk = _ourDepthTex != null && want.IsInstanceOfType(_ourDepthTex);
+                RttLog.Line(_depthSwapOk
+                    ? "GBuffer: own depth allocated — the GBuffer pass can be driven safely."
+                    : $"GBuffer: depth is {(_ourDepthTex == null ? "null" : _ourDepthTex.GetType().Name)}, " +
+                      $"need {want.Name} — GBuffer PASS must stay off (swap alone is still safe).");
+            }
+            else
+            {
+                _depthSwapOk = false;
+                RttLog.Line("GBuffer: cannot own the depth buffer — GBuffer PASS must stay off " +
+                            "(it would write the engine's 4K depth). The array swap alone remains safe.");
+            }
+            return true;
+        }
+        catch (Exception e) { RttLog.Error("allocate gbuffer", e); return false; }
+    }
+
+    // Install ours, returning the engine's array so the caller can restore it. Null
+    // means "not installed, do not restore".
+    private static object InstallOurGBuffer(object res)
+    {
+        if (_gbBlocked || !FeedConfig.GBufferSwap) return null;
+        try
+        {
+            var screenBuffers = ScreenBuffersInstance();
+            if (screenBuffers == null) { _gbBlocked = true; RttLog.Line("GBuffer: ScreenBuffers not reachable — swap disabled."); return null; }
+            if (!EnsureOurGBuffer(screenBuffers, res)) { _gbBlocked = true; return null; }
+
+            var saved = new object[4];
+            saved[0] = _gbProp.GetValue(screenBuffers);
+            _gbProp.SetValue(screenBuffers, _ourGBufferArray);
+
+            // Resolution too. ExecuteLighting sizes its dispatch from
+            // ScreenBuffers.PreUpscaleResolution (3840x2160), so with a 512x512 GBuffer
+            // it lit a 4K-sized area and only a small top-left corner landed on our
+            // target — the "tiny segment top left, rest black" symptom.
+            //
+            // Prev is set to the same value on purpose: a mismatch reads as "the
+            // resolution just changed", which is how temporal passes decide to reset.
+            if (_resFields == null)
+            {
+                _resFields = screenBuffers.GetType().GetFields(Any)
+                    .Where(f => !f.IsInitOnly && f.FieldType.Name == "Vector2I"
+                             && (f.Name.Contains("PreUpscaleResolution", StringComparison.OrdinalIgnoreCase)
+                              || f.Name.Contains("usedMaxResolution", StringComparison.OrdinalIgnoreCase)))
+                    .ToArray();
+                RttLog.Line($"GBuffer: resolution fields to swap — " +
+                            $"{(_resFields.Length == 0 ? "NONE FOUND" : string.Join(", ", _resFields.Select(f => Clean2(f.Name))))}");
+            }
+
+            // Suppress GI for the duration of our pass.
+            //
+            // ExecuteLighting includes ray-traced GI, and GI is TEMPORAL — it accumulates
+            // across frames. Running it a second time per frame against a different
+            // camera and a 512x512 GBuffer pollutes that accumulator, which is what the
+            // flickering noise in the player's view is. Nulling the jobs means
+            // ExecuteLighting skips GI (if it null-checks) and keeps ambient, directional
+            // and local, which are what the feed actually needs — GI contributes least at
+            // this resolution anyway.
+            //
+            // If it does NOT null-check it will throw, which is caught and disables
+            // ExecuteLighting rather than the feed.
+            if (FeedConfig.SuppressGi && _sceneDrawSystem != null)
+            {
+                if (_giFields == null)
+                    _giFields = new[] { "_raytraceGiJob", "_surfelGenerationJob", "_legacyRaytraceGiJob" }
+                        .Select(n => _sceneDrawSystem.GetType().GetField(n, Any))
+                        .Where(f => f != null).ToArray();
+
+                if (_giFields.Length > 0)
+                {
+                    var savedGi = new object[_giFields.Length];
+                    for (int i = 0; i < _giFields.Length; i++)
+                    {
+                        savedGi[i] = _giFields[i].GetValue(_sceneDrawSystem);
+                        if (savedGi[i] != null) _giFields[i].SetValue(_sceneDrawSystem, null);
+                    }
+                    saved[3] = savedGi;
+                    if (!_giSuppressLogged)
+                    {
+                        _giSuppressLogged = true;
+                        RttLog.Line($"GI suppressed for our pass: {string.Join(", ", _giFields.Select(f => f.Name))} " +
+                                    "— keeps the player's temporal GI accumulator clean.");
+                    }
+                }
+            }
+
+            if (_resFields.Length > 0 && FeedConfig.SwapResolution)
+            {
+                var savedRes = new object[_resFields.Length];
+                for (int i = 0; i < _resFields.Length; i++)
+                {
+                    savedRes[i] = _resFields[i].GetValue(screenBuffers);
+                    _resFields[i].SetValue(screenBuffers, res);
+                }
+                saved[2] = savedRes;
+                if (!_resSwapLogged)
+                {
+                    _resSwapLogged = true;
+                    RttLog.Line($"GBuffer: ScreenBuffers resolution swapped to {res} for the pass " +
+                                $"(was {savedRes[0]}).");
+                }
+            }
+
+            // Depth only when we can actually own it, and only when the pass that
+            // needs it is being driven.
+            if (_depthSwapOk && FeedConfig.GBufferPass && _ourDepthTex != null)
+            {
+                saved[1] = _dsProp.GetValue(screenBuffers);
+                SetDepthBuffer(screenBuffers, _ourDepthTex);
+            }
+            _gbSwaps++;
+
+            if (!_gbLogged)
+            {
+                _gbLogged = true;
+                RttLog.Line($"=== GBUFFER SWAP: ours installed for the camera pass " +
+                            $"(depth={(saved[1] != null ? "also ours" : "engine's, pass not driven")}). ===");
+            }
+            return saved;
+        }
+        catch (Exception e) { _gbBlocked = true; RttLog.Error("install gbuffer", e); return null; }
+    }
+
+    private static void RestoreGBuffer(object savedObj)
+    {
+        if (savedObj is not object[] saved) return;
+        try
+        {
+            var screenBuffers = ScreenBuffersInstance();
+            if (screenBuffers == null) return;
+            if (saved[0] != null && _gbProp != null) _gbProp.SetValue(screenBuffers, saved[0]);
+            if (saved[1] != null) SetDepthBuffer(screenBuffers, saved[1]);
+
+            // Resolution last, and never skipped: leaving the engine believing its
+            // viewport is 512x512 would wreck the player's view outright.
+            if (saved[2] is object[] savedRes && _resFields != null)
+                for (int i = 0; i < _resFields.Length && i < savedRes.Length; i++)
+                    if (savedRes[i] != null) _resFields[i].SetValue(screenBuffers, savedRes[i]);
+
+            // GI jobs back. Never skipped — leaving these null would disable the
+            // player's global illumination entirely.
+            if (saved[3] is object[] savedGi && _giFields != null && _sceneDrawSystem != null)
+                for (int i = 0; i < _giFields.Length && i < savedGi.Length; i++)
+                    if (savedGi[i] != null) _giFields[i].SetValue(_sceneDrawSystem, savedGi[i]);
+        }
+        catch (Exception e)
+        {
+            // Failing to restore leaves the ENGINE rendering into our 512x512 array,
+            // which would wreck the player's view. Loud, and disable further swaps.
+            _gbBlocked = true;
+            RttLog.Error("RESTORE GBUFFER FAILED — main view is now writing our array", e);
+        }
+    }
+
+    // ------------------------------------------------------- GBuffer recon (step 1)
+    // READ ONLY. Nothing here allocates, swaps or invokes anything — it answers the
+    // questions the GBuffer swap depends on before a single byte of it is written.
+    // Guessing at engine internals has cost a launch every time; surveying first has
+    // worked every time.
+    private static void GBufferSurvey(object sds, StringBuilder outer)
+    {
+        try
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine($"=== GBuffer survey {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
+            sb.AppendLine();
+
+            // 1. Reach ScreenBuffers off CoreSystems.
+            var cs = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            object screenBuffers = null;
+            string sbField = null;
+            if (cs != null)
+                foreach (var f in cs.GetFields(BindingFlags.Public | BindingFlags.Static))
+                {
+                    if (!f.FieldType.Name.Contains("ScreenBuffers")) continue;
+                    try { screenBuffers = f.GetValue(null); sbField = f.Name; } catch { }
+                    break;
+                }
+            sb.AppendLine($"CoreSystems.{sbField ?? "?"} -> {(screenBuffers == null ? "NULL" : screenBuffers.GetType().FullName)}");
+            sb.AppendLine();
+
+            // 2. The array we would swap, and whether it can be set.
+            if (screenBuffers != null)
+            {
+                var t = screenBuffers.GetType();
+                var gbProp = t.GetProperty("GBuffer", Any);
+                sb.AppendLine("-- GBuffer property --");
+                sb.AppendLine($"  found      : {gbProp != null}");
+                sb.AppendLine($"  type       : {gbProp?.PropertyType.Name}");
+                sb.AppendLine($"  CanWrite   : {gbProp?.CanWrite}   <- the swap depends on this");
+                sb.AppendLine($"  setter     : {(t.GetMethod("set_GBuffer", Any) != null ? "set_GBuffer present" : "NOT FOUND")}");
+
+                object gb = null;
+                try { gb = gbProp?.GetValue(screenBuffers); } catch (Exception e) { sb.AppendLine($"  read threw : {e.GetType().Name}"); }
+                if (gb is Array arr)
+                {
+                    sb.AppendLine($"  length     : {arr.Length}");
+                    for (int i = 0; i < arr.Length; i++)
+                    {
+                        var e = arr.GetValue(i);
+                        sb.AppendLine($"    [{i}] {(e == null ? "null" : e.GetType().Name)}" +
+                                      $"  fmt={Prop2(e, "Format")}  res={Prop2(e, "Resolution")}  mips={Prop2(e, "MipLevels")}");
+                    }
+                }
+                sb.AppendLine();
+
+                // Formats we would have to match when allocating our own.
+                sb.AppendLine("-- GBufferFormats --");
+                try
+                {
+                    if (Prop2(screenBuffers, "GBufferFormats") is Array fmts)
+                        for (int i = 0; i < fmts.Length; i++) sb.AppendLine($"    [{i}] {fmts.GetValue(i)}");
+                    else sb.AppendLine("    NOT FOUND");
+                }
+                catch (Exception e) { sb.AppendLine($"    threw {e.GetType().Name}"); }
+                sb.AppendLine();
+
+                // What each slot means.
+                var idxType = t.Assembly.GetTypes().FirstOrDefault(x => x.Name == "GBufferIndex");
+                sb.AppendLine("-- GBufferIndex --");
+                sb.AppendLine(idxType == null
+                    ? "    NOT FOUND"
+                    : "    " + string.Join(", ", Enum.GetNames(idxType).Select(n => $"{n}={(int)(object)Enum.Parse(idxType, n)}")));
+                sb.AppendLine();
+
+                // DepthStencilBuffer is CanWrite=False with no backing field, so it is
+                // computed from something else. Whatever that is may be settable, and
+                // GBufferPassJob cannot be driven safely until it is — the job takes no
+                // depth parameter and would otherwise write the player's 4K depth.
+                sb.AppendLine("-- ALL ScreenBuffers fields (hunting the depth storage) --");
+                foreach (var f in t.GetFields(Any).OrderBy(f => f.Name))
+                {
+                    object v = null; try { v = f.GetValue(screenBuffers); } catch { }
+                    var mark = f.FieldType.Name.Contains("Depth") ? "   <-- DEPTH" : "";
+                    sb.AppendLine($"    {(f.IsInitOnly ? "readonly " : "         ")}{f.FieldType.Name,-34} {f.Name,-32} = {Short(v)}{mark}");
+                }
+                sb.AppendLine();
+
+                // Anything else on ScreenBuffers we may need to keep consistent.
+                sb.AppendLine("-- other ScreenBuffers members --");
+                foreach (var p in t.GetProperties(Any).OrderBy(p => p.Name))
+                {
+                    if (p.GetIndexParameters().Length != 0 || p.Name == "GBuffer") continue;
+                    object v = null; try { v = p.GetValue(screenBuffers); } catch { }
+                    sb.AppendLine($"    {p.PropertyType.Name,-34} {p.Name,-28} = {Short(v)}");
+                }
+                sb.AppendLine();
+            }
+
+            // 3. The jobs the swap would drive, and exactly what they want.
+            sb.AppendLine("-- candidate jobs on SceneDrawSystem --");
+            foreach (var fieldName in new[]
+            {
+                "_gBufferPass", "_ambientLightJob", "_directionalLightJob", "_localLightsJob",
+                "_hbaoJob", "_raytraceGiJob", "_surfelGenerationJob", "_atmosphereAdditiveJob",
+            })
+            {
+                var f = sds.GetType().GetField(fieldName, Any);
+                object job = null; try { job = f?.GetValue(sds); } catch { }
+                sb.AppendLine($"  {fieldName}: {(f == null ? "FIELD NOT FOUND" : job == null ? "null" : job.GetType().Name)}");
+                if (job == null) continue;
+                foreach (var m in job.GetType().GetMethods(Any).Where(m => m.Name.StartsWith("DoWork")))
+                    sb.AppendLine($"      {m.Name}({string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"))})");
+            }
+
+            var path = Path.Combine(RttLog.OutDir, "gbuffer-survey.txt");
+            File.WriteAllText(path, sb.ToString());
+            outer.AppendLine($"-- GBuffer survey written to {path} --");
+            RttLog.Line($"GBuffer survey -> {path}");
+        }
+        catch (Exception e) { RttLog.Error("gbuffer survey", e); }
+    }
+
+    private static string Short(object v)
+    {
+        if (v == null) return "null";
+        var s = v.ToString() ?? "";
+        s = s.Replace('\n', ' ').Replace('\r', ' ');
+        return s.Length > 70 ? s[..70] + "..." : s;
+    }
+
+    // -------------------------------------------------- shadow recon (read only)
+    // The feed's shadows are the PLAYER's cascades, fitted to their frustum, which is
+    // why they are partial and unreliable from a camera 100 m away. Owning them also
+    // produces the screen-space shadow mask that DirectionalLightJob wanted and we
+    // could not supply.
+    //
+    // Read-only. The question is which shadow jobs take their state as parameters,
+    // since that is what has decided reachability every single time.
+    private static void ShadowSurvey(object sds, StringBuilder outer)
+    {
+        try
+        {
+            var sb = new StringBuilder($"=== Shadow survey {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===");
+            sb.AppendLine();
+            sb.AppendLine();
+
+            sb.AppendLine("-- shadow / depth / cascade jobs on SceneDrawSystem --");
+            foreach (var f in sds.GetType().GetFields(Any).OrderBy(f => f.Name))
+            {
+                var tn = f.FieldType.Name;
+                if (!tn.Contains("Shadow") && !tn.Contains("Cascade") && !tn.Contains("Depth")
+                    && !tn.Contains("DepthJob") && !f.Name.Contains("depth", StringComparison.OrdinalIgnoreCase)) continue;
+
+                object v = null; try { v = f.GetValue(sds); } catch { }
+                sb.AppendLine($"  {tn,-34} {f.Name,-32} = {(v == null ? "null" : "set")}");
+                if (v == null) continue;
+                foreach (var m in v.GetType().GetMethods(Any)
+                             .Where(m => m.Name is "DoWork" or "Render" or "Execute" || m.Name.StartsWith("DoWork")))
+                    sb.AppendLine($"      {m.Name}({string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"))})");
+            }
+            sb.AppendLine();
+
+            // Can we build the resources bundle DirectionalLightJob wants, or only
+            // read the engine's?
+            sb.AppendLine("-- DirectionalLightShadowResources --");
+            var resType = _shadowResources?.GetType();
+            if (resType == null) sb.AppendLine("  engine instance not held");
+            else
+            {
+                sb.AppendLine($"  {resType.FullName}  (isValueType={resType.IsValueType})");
+                foreach (var c in resType.GetConstructors(Any))
+                    sb.AppendLine($"    ctor({string.Join(", ", c.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"))})");
+                foreach (var f in resType.GetFields(Any))
+                    sb.AppendLine($"    field {f.FieldType.Name,-30} {Clean2(f.Name)}");
+            }
+            sb.AppendLine();
+
+            // The shadow-mask format is a strong hint at what shadowRtView must be.
+            sb.AppendLine("-- shadow-related SceneDrawSystem methods --");
+            foreach (var m in sds.GetType().GetMethods(Any)
+                         .Where(m => m.Name.Contains("Shadow") || m.Name.Contains("Cascade"))
+                         .OrderBy(m => m.Name))
+                sb.AppendLine($"  {m.ReturnType.Name} {m.Name}({string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"))})");
+            sb.AppendLine();
+
+            // Also cheap and requested: atmosphere takes a command list and a target,
+            // nothing else. Confirm the signature before driving it.
+            sb.AppendLine("-- AtmosphereAdditiveJob (2-arg candidate) --");
+            var atmo = sds.GetType().GetField("_atmosphereAdditiveJob", Any)?.GetValue(sds);
+            if (atmo == null) sb.AppendLine("  not held");
+            else foreach (var m in atmo.GetType().GetMethods(Any).Where(m => m.Name.StartsWith("DoWork") || m.Name.StartsWith("Draw")))
+                sb.AppendLine($"  {m.Name}({string.Join(", ", m.GetParameters().Select(p => $"{p.ParameterType.Name} {p.Name}"))})");
+
+            var path = Path.Combine(RttLog.OutDir, "shadow-survey.txt");
+            File.WriteAllText(path, sb.ToString());
+            outer.AppendLine($"-- shadow survey written to {path} --");
+            RttLog.Line($"Shadow survey -> {path}");
+        }
+        catch (Exception e) { RttLog.Error("shadow survey", e); }
+    }
+
+    private static string Clean2(string n)
+    {
+        int a = n.IndexOf('<'), b = n.IndexOf('>');
+        return (a == 0 && b > 1) ? n[1..b] : n;
     }
 
     private static string Chain(Type t)
@@ -1346,6 +2797,7 @@ internal static class CameraRender
             grid ? target.Extent : 0.0,
             t);
         var view = InvertMatrixD(camWorld);
+        _lastCamWorld = camWorld; _lastViewD = view;   // for the global camera swap
         if (view == null) { _orbitNull = "view matrix inversion failed"; return null; }
 
         // RenderViewSlim is internal but its fields are public; mutate a boxed copy
