@@ -51,12 +51,35 @@ internal static class FeedConfig
     // answered by a file edit rather than a rebuild.
     public static bool UsePooledCulling { get; private set; } = true;
 
-    // rootEntityId handed to BorrowShadowCulling. Very likely the POOL KEY: we passed -1,
-    // which is what the engine's own cascade culling uses, so we were borrowing the very
-    // context it was refilling — objects popping in and out as our culling results were
-    // overwritten. A distinct id should map to a context nobody else asks for.
-    // -1 restores the old (colliding) behaviour for comparison.
-    public static int CullRootEntityId { get; private set; } = 0x52545443;   // "RTTC"
+    // rootEntityId handed to BorrowShadowCulling.
+    //
+    // This was guessed to be the POOL KEY, and it is not. The IL is unambiguous:
+    //
+    //     TryPop(_unusedShadowCulling)          <- a plain LIFO free-list, keyed by nothing
+    //     if empty: new CullingContext(...)
+    //     context.RootEntityId = rootEntityId   <- SET ON the context, not looked up by it
+    //
+    // So the pool already hands out a context nobody else holds, and passing a distinct
+    // id bought nothing — which is why the flicker survived it. Worse, RootEntityId is a
+    // real culling parameter: GeometryContext.UpdateRanges is its one consumer, so a
+    // bogus entity id is a live suspect for geometry going missing.
+    //
+    // -1 is what the engine's own probe and cascade paths pass, and is the default again.
+    public static int CullRootEntityId { get; private set; } = -1;
+
+    // Which OutputGeometryBufferContext the pass writes its draw commands into.
+    //
+    // Borrow() on one of these is an `_isBorrowed` mutex flag, not an allocation — the
+    // same physical draw-command buffers come back every time. MainOutputGeometryBuffers
+    // is read by EIGHTEEN engine methods across the frame; MainOutputEffectGeometryBuffers
+    // by one (RenderHighlightsAndTransparentUnlit).
+    //
+    // This is the other half of the flash/flicker pair. Sharing BOTH the culling context
+    // and this buffer was self-consistent — the pass simply drew the engine's probe-view
+    // data, which is the single-frame flash from the player's position. Taking a private
+    // culling context fixed the viewpoint but split the pair: our culling results in our
+    // context, our draw commands in a buffer the engine rewrites around us.
+    public static bool EffectGeomBuffers { get; private set; }
 
     // Explicit resource barriers around the handover copy, one switch per end.
     //
@@ -332,7 +355,7 @@ internal static class FeedConfig
             double farPlane = CullFarPlane;
             double radius = OrbitRadius, period = OrbitPeriod, height = OrbitHeight, clearance = OrbitClearance;
             bool orbitGrid = OrbitGrid;
-            bool lodMain = LodMainView, fixScreen = FixScreenRes, fullCam = FullCameraCb;
+            bool lodMain = LodMainView, fixScreen = FixScreenRes, fullCam = FullCameraCb, effectGeom = EffectGeomBuffers;
             double emissive = Emissivity, dimDist = DimDistance;
             int recursive = RecursiveReflections;
 
@@ -473,6 +496,9 @@ internal static class FeedConfig
                     case "orbitgrid":
                         orbitGrid = val is "1" or "true" or "yes";
                         break;
+                    case "effectgeombuffers":
+                        effectGeom = val is "1" or "true" or "yes";
+                        break;
                     case "lodmainview":
                         lodMain = val is "1" or "true" or "yes";
                         break;
@@ -502,7 +528,7 @@ internal static class FeedConfig
                         || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
-                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb
+                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
                         || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || gateGi != GateGi || envScratch != EnvPassToScratch || skyMode != SkyMode || cullRoot != CullRootEntityId;
@@ -514,7 +540,7 @@ internal static class FeedConfig
             ReuseExposure = reuseExp; ExposureValue = expValue; GBufferSwap = gbSwap; GBufferPass = gbPass; Deferred = defer; EnvPass = envP;
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
-            LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam;
+            LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom;
             Emissivity = emissive; RecursiveReflections = recursive; DimDistance = dimDist;
 
             if (changed)
@@ -535,7 +561,8 @@ internal static class FeedConfig
                             // of the log says which combination produced the image.
                             $"| lodMainView={LodMainView} fixScreenRes={FixScreenRes} " +
                             $"fullCameraCb={FullCameraCb} emissivity={Emissivity} " +
-                            $"recursiveReflections={RecursiveReflections} dimDistance={DimDistance}");
+                            $"recursiveReflections={RecursiveReflections} dimDistance={DimDistance} " +
+                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers}");
         }
         catch { /* keep the last good values */ }
     }

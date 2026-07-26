@@ -42,8 +42,19 @@ internal static class CameraRender
     // Resolved once by the dry run.
     private static object _drawContexts, _settings, _texPool, _bufMgr;
     private static object _cullJob, _clusterJob, _envPass;
-    private static object _cullCtx, _clusterCtx, _geomBuffers, _shadowResources;
+    private static object _cullCtx, _clusterCtx, _shadowResources;
+    private static object _geomBuffersMain, _geomBuffersEffect;
     private static object _lodProbe, _lodMainView;
+
+    // A throwaway for optional resolves, so a missing member cannot fail the dry run.
+    private static bool _ignored;
+    private static object _lastGeomBuffers;
+
+    // Which OutputGeometryBufferContext this pass writes its draw commands into.
+    // See the resolve-time comment: the choice is between a buffer eighteen engine
+    // passes touch and one that a single pass touches.
+    private static object GeomBuffers =>
+        (FeedConfig.EffectGeomBuffers && _geomBuffersEffect != null) ? _geomBuffersEffect : _geomBuffersMain;
     private static MethodInfo _miDoCullingFirstPass, _miClusterDoWork, _miEnvPassDoWork;
     private static MethodInfo _miBorrowRt, _miBorrowDepth, _miCreateCb;
     private static Type _tRenderViewSlim, _tTrackedCam, _tCamSettings;
@@ -238,7 +249,29 @@ internal static class CameraRender
         else { sb.AppendLine("  EnvProbeCulling                UNUSABLE"); ok = false; }
 
         _clusterCtx      = Prop(_drawContexts, "EnvProbeClustering", sb, ref ok);
-        _geomBuffers     = Prop(_drawContexts, "MainOutputGeometryBuffers", sb, ref ok);
+        // Two OutputGeometryBufferContexts exist. The difference decides the flicker.
+        //
+        // `Borrow()` on one of these is NOT an allocation — it is an `_isBorrowed` mutex
+        // flag, and the same physical draw-command and instance buffers come back every
+        // time. So whichever we pass to DoCullingFirstPass is where OUR draw commands
+        // land, in a buffer the engine is also using.
+        //
+        //   MainOutputGeometryBuffers        read by EIGHTEEN engine methods across the
+        //                                    frame — MainViewCulling, ExecuteForwardPasses,
+        //                                    DrawUnlit, RenderTransparent, RenderHolograms,
+        //                                    RenderFlares, DrawWater, SceneFinalize, DrawUI...
+        //   MainOutputEffectGeometryBuffers  read by ONE: RenderHighlightsAndTransparentUnlit.
+        //
+        // This is the other half of the flash/flicker pair. Originally we shared BOTH the
+        // culling context and this buffer, so our pass was self-consistent — it just drew
+        // the engine's probe-view data, which is the single-frame flash from the player's
+        // position. Taking a private culling context fixed the viewpoint but split the
+        // pair: culling results in our context, draw commands in a buffer eighteen engine
+        // passes rewrite around us. Geometry appearing and disappearing at certain angles
+        // is exactly what that looks like.
+        _geomBuffersMain   = Prop(_drawContexts, "MainOutputGeometryBuffers", sb, ref ok);
+        _geomBuffersEffect = Prop(_drawContexts, "MainOutputEffectGeometryBuffers", sb, ref _ignored);
+        sb.AppendLine($"  (effect buffers {(_geomBuffersEffect == null ? "NOT FOUND — flicker fix unavailable" : "available")})");
 
         // Phase 1: borrow a culling context from the engine's pool per pass instead of
         // sharing the probe one. _cullCtx below stays as the fallback for when the
@@ -457,6 +490,19 @@ internal static class CameraRender
         object rtBorrow = null, depthBorrow = null, cameraCb = null, borrowedCulling = null;
         object savedGBuffer = null, savedCamera = null, scratchBorrow = null, savedProbeSettings = null;
         bool geomBorrowed = false;
+
+        // Captured ONCE for the whole pass. The config is polled between passes, so
+        // reading the property per use could Borrow one context and Return the other
+        // if the switch flipped mid-pass — which would leave an engine context stuck
+        // marked as borrowed.
+        object geomBuffers = GeomBuffers;
+        if (!ReferenceEquals(geomBuffers, _lastGeomBuffers))
+        {
+            _lastGeomBuffers = geomBuffers;
+            RttLog.Line($"Geometry buffers: {(ReferenceEquals(geomBuffers, _geomBuffersEffect) ? "MainOutputEffect" : "Main")} " +
+                        "— Main is shared with 18 engine passes; Effect with one " +
+                        "(RenderHighlightsAndTransparentUnlit).");
+        }
         try
         {
             File.WriteAllText(LivePath, $"camera pass entered {DateTime.Now:O}\n");
@@ -560,7 +606,7 @@ internal static class CameraRender
                 return;
             }
 
-            Call(_geomBuffers, "Borrow"); geomBorrowed = true;
+            Call(geomBuffers, "Borrow"); geomBorrowed = true;
 
             // Step 2: own the GBuffer for the duration of this pass. Restored in the
             // finally below, unconditionally — leaving the engine pointed at our
@@ -592,7 +638,7 @@ internal static class CameraRender
 
             _miDoCullingFirstPass.Invoke(_cullJob, new object[]
             {
-                commandList, view, lodSettings, cullCtx, _geomBuffers,
+                commandList, view, lodSettings, cullCtx, geomBuffers,
                 null, null, null, null, -1, 0, -1,
             });
 
@@ -603,7 +649,7 @@ internal static class CameraRender
             // until the far plane clips something you wanted to see.
             _miClusterDoWork.Invoke(_clusterJob, new object[]
             {
-                commandList, Prop2(cullCtx, "EntityProxies"), _geomBuffers, _clusterCtx, res,
+                commandList, Prop2(cullCtx, "EntityProxies"), geomBuffers, _clusterCtx, res,
                 (float)FeedConfig.CullFarPlane,
             });
 
@@ -646,7 +692,7 @@ internal static class CameraRender
                     try
                     {
                         _miGBufferPass.Invoke(_gBufferPassJob, new object[]
-                            { commandList, Prop2(cullCtx, "FirstPass"), _geomBuffers, true, null });
+                            { commandList, Prop2(cullCtx, "FirstPass"), geomBuffers, true, null });
                         if (_gbPassLogs++ == 0)
                             RttLog.Line("=== GBUFFER PASS: surface data written into our own GBuffer. ===");
                     }
@@ -697,7 +743,7 @@ internal static class CameraRender
             if (FeedConfig.EnvPass)
                 _miEnvPassDoWork.Invoke(_envPass, new object[]
                 {
-                    commandList, _geomBuffers, cameraCb, view,
+                    commandList, geomBuffers, cameraCb, view,
                     Prop2(cullCtx, "FirstPass"), _clusterCtx, _shadowResources,
                     envRtv, dsv, true,
                 });
@@ -729,7 +775,7 @@ internal static class CameraRender
                     try
                     {
                         _miGBufferPass.Invoke(_gBufferPassJob, new object[]
-                            { commandList, Prop2(cullCtx, "FirstPass"), _geomBuffers, true, null });
+                            { commandList, Prop2(cullCtx, "FirstPass"), geomBuffers, true, null });
                         if (_gbPassLogs++ == 0)
                             RttLog.Line("=== GBUFFER PASS: written AFTER the env pass, so our camera CB is bound. ===");
                     }
@@ -953,7 +999,7 @@ internal static class CameraRender
             RestoreCamera(savedCamera);
             RestoreGBuffer(savedGBuffer);
 
-            try { if (geomBorrowed) Call(_geomBuffers, "Return"); } catch { }
+            try { if (geomBorrowed) Call(geomBuffers, "Return"); } catch { }
             try { OwnContexts.Return(borrowedCulling); } catch { }
             try { if (depthBorrow != null) ReturnBorrowed(depthBorrow); } catch { }
             try { if (scratchBorrow != null) ReturnBorrowed(scratchBorrow); } catch { }
@@ -1977,7 +2023,7 @@ internal static class CameraRender
             try
             {
                 _miLocalLights.Invoke(_localLightsJob, new object[]
-                    { commandList, rtv, _localDiffuseNull ? null : rtv, _clusterCtx, _geomBuffers });
+                    { commandList, rtv, _localDiffuseNull ? null : rtv, _clusterCtx, GeomBuffers });
                 if (_localLogs++ == 0)
                     RttLog.Line($"=== DEFERRED: local lights applied (diffuseOnly={(_localDiffuseNull ? "null" : "shared rtv")}). ===");
             }
@@ -2236,20 +2282,20 @@ internal static class CameraRender
             sb.AppendLine();
 
             sb.AppendLine("-- OutputGeometryBufferContext (what we pass to GBufferPassJob) --");
-            if (_geomBuffers == null) sb.AppendLine("  null");
+            if (GeomBuffers == null) sb.AppendLine("  null");
             else
             {
-                sb.AppendLine($"  {_geomBuffers.GetType().FullName}");
-                foreach (var f in _geomBuffers.GetType().GetFields(Any).OrderBy(f => f.Name))
+                sb.AppendLine($"  {GeomBuffers.GetType().FullName}");
+                foreach (var f in GeomBuffers.GetType().GetFields(Any).OrderBy(f => f.Name))
                 {
-                    object v = null; try { v = f.GetValue(_geomBuffers); } catch { }
+                    object v = null; try { v = f.GetValue(GeomBuffers); } catch { }
                     var mark = f.FieldType.Name.Contains("ConstantBuffer") || f.FieldType.Name.Contains("Camera")
                                || f.Name.Contains("amera", StringComparison.Ordinal) ? "   <-- CAMERA?" : "";
                     sb.AppendLine($"    {(f.IsInitOnly ? "readonly " : "         ")}{f.FieldType.Name,-36} {Clean2(f.Name),-32} = {Short(v)}{mark}");
                 }
-                foreach (var p in _geomBuffers.GetType().GetProperties(Any).Where(p => p.GetIndexParameters().Length == 0))
+                foreach (var p in GeomBuffers.GetType().GetProperties(Any).Where(p => p.GetIndexParameters().Length == 0))
                 {
-                    object v = null; try { v = p.GetValue(_geomBuffers); } catch { }
+                    object v = null; try { v = p.GetValue(GeomBuffers); } catch { }
                     var mark = p.PropertyType.Name.Contains("ConstantBuffer") || p.Name.Contains("amera", StringComparison.Ordinal)
                                ? "   <-- CAMERA?" : "";
                     sb.AppendLine($"    prop     {p.PropertyType.Name,-36} {p.Name,-32} = {Short(v)}{mark}{(p.CanWrite ? "  [settable]" : "")}");
