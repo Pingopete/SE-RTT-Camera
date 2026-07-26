@@ -473,3 +473,41 @@ Two consequences worth internalising:
 
 Steps 1–5 are all inside code we already own and none mutates engine state beyond a
 set-and-restore of a settings field.
+
+## Voxel fidelity: Route B (tessellation modifier) is dead, with evidence (2026-07-26)
+
+Blocky asteroids and planet silhouettes clipping through the atmosphere haze are both
+the same cause, and it is not LOD, streaming or resolution. Our path draws voxels through
+`TriplanarGIGlobal`, and its definition settles the question outright:
+
+```json
+"Description": "Low quality master terrain material used for GI. Uses Far3 colors.",
+"HullShader": null,
+"DomainShader": null,
+"Macros": [ ..., "UNTESSELLATED_GI", ... ],
+"Flags": "StateBackfaceCulling, StateZWriteEnabled, PassIndirect, RayTracing, MarkVoxelStencil"
+```
+
+The main view's `TriplanarTessellationSingleGlobal` carries
+`HullShader: triplanarsinglehull.hlsl` and `DomainShader: triplanarsingledomain.hlsl`,
+plus `PassGBuffer, PassDepth, DeferredTexturing`.
+
+So `MaterialStateModifiers.AllowTessellation` — which threads
+`GeometryPassJob.DrawPSOVariantsInternal` -> `GeometryPSOCache.GetPassPSOVariants` ->
+`MaterialsManager.GetPassPSOVariants(PassType, GlobalMaterialState, bool)` — **cannot
+help**. There are no tessellation stages on the indirect variant for it to switch on, and
+the shader is compiled with an explicit `UNTESSELLATED_GI` macro.
+
+"Uses Far3 colors" answers the texture half too: the GI variant samples the coarsest
+colour set by design. Blocky silhouettes and muddy voxel texturing are both baked in.
+
+**Consequence:** the deferred path is not one option among several for voxel fidelity, it
+is the only one. `GBufferPassJob` renders the `PassGBuffer` variants — tessellated, with
+`DeferredTexturing` (PassType 23/24) available — and it is the same route that delivers
+ambient, AO and the tonal range.
+
+Also scratched: texture streaming residency.
+`ManagedTexturePrioritizerComponent.GetPixelsPerSurfaceMeterBase` computes from
+`RenderView.FovV` and `SwapChain.ResolutionF` — the player's FOV at their full
+resolution. Rendering 512x512 we need COARSER mips than the player, so we are
+over-served, not under. Not a contributor.

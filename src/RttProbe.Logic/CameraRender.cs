@@ -1627,6 +1627,32 @@ internal static class CameraRender
                     var srcRes = Prop2(Prop2(rtBorrow, "Resource") ?? rtBorrow, "Resolution");
                     if (srcRes != null) crop = MakeRect(_miCopyDoWork.GetParameters()[7].ParameterType, srcRes);
 
+                    // DEBUG: put a GBuffer slot on the panel instead of the rendered image.
+                    //
+                    // "GBufferPassJob ran without throwing" has never meant "wrote correct
+                    // pixels" on this project — the range-culling bug is the most recent
+                    // case, where a pass completed cleanly and silently dropped most of its
+                    // output. The whole deferred path is built on that GBuffer, so it is
+                    // worth one switch to see it rather than three passes to infer it.
+                    //
+                    // Slots, from GBufferIndex: 1=BaseColor/Emissivity, 2=Normal,
+                    // 3=Metalness/Roughness/AO, 4=Parallax, 5=MotionVectors.
+                    //
+                    // What to expect: BaseColor should be a recognisable albedo image from
+                    // the ORBIT camera's angle. Normal should be smooth colour gradients
+                    // that shift as the camera moves. Either being black, garbage, or the
+                    // PLAYER'S viewpoint kills the deferred path until it is fixed, and
+                    // that is much cheaper to learn now.
+                    if (FeedConfig.DebugGBuffer > 0)
+                    {
+                        var slotSrv = DebugGBufferSrv(FeedConfig.DebugGBuffer - 1);
+                        if (slotSrv != null)
+                        {
+                            blitSrc = slotSrv;
+                            crop = null;   // the GBuffer is our render resolution already
+                        }
+                    }
+
                     // Zero the slot first, so the alpha (= metalness) we deliberately
                     // stop writing is 0 rather than whatever the pool left behind.
                     if (FeedConfig.ZeroMetalness) ClearSlotToZero(commandList, dstRtv);
@@ -2096,6 +2122,40 @@ internal static class CameraRender
     private static int _execLightLogs, _scratchLogs, _eyeJumpLogs;
     private static Keen.VRage.Library.Mathematics.Vector3D _lastEye;
     private static bool _haveLastEye;
+    // An SRV onto one of OUR GBuffer slots, for the debug blit. Reads the array we
+    // installed rather than ScreenBuffers, so it reports what WE wrote even if the
+    // swap were somehow not in effect — which is itself part of what is being tested.
+    private static string _debugGbLog;
+
+    private static object DebugGBufferSrv(int slot)
+    {
+        try
+        {
+            if (_ourGBufferArray == null || slot < 0 || slot >= _ourGBufferArray.Length)
+            {
+                LogDebugGb($"slot {slot + 1} unavailable — our GBuffer array is " +
+                           $"{(_ourGBufferArray == null ? "null (gbufferSwap off?)" : $"length {_ourGBufferArray.Length}")}");
+                return null;
+            }
+            var tex = _ourGBufferArray.GetValue(slot);
+            var srv = ViewOf(tex, "ITexture2DView");
+            LogDebugGb(srv == null
+                ? $"slot {slot + 1} is {tex?.GetType().Name ?? "null"} with no ITexture2DView"
+                : $"slot {slot + 1} ({tex?.GetType().Name}, {Prop2(tex, "Resolution")}) on the panel — " +
+                  "expect albedo for slot 1, normals for slot 2. The player's viewpoint or " +
+                  "black means the GBuffer pass is not writing our view.");
+            return srv;
+        }
+        catch (Exception e) { LogDebugGb("threw: " + e.Message); return null; }
+    }
+
+    private static void LogDebugGb(string what)
+    {
+        if (what == _debugGbLog) return;
+        _debugGbLog = what;
+        RttLog.Line("GBuffer debug: " + what);
+    }
+
     private static MethodInfo _miDrawSkybox;
     private static bool _sunBlocked, _sunSettingsLogged;
     private static int _sunLogs;
