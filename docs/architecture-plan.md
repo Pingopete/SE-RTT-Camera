@@ -1056,3 +1056,47 @@ runs today while still sharing the probe context.
 We have no timing data. Before committing to full lighting it is worth logging
 per-pass GPU/CPU cost at 15 and 30 fps, so the budget is known rather than assumed —
 Grid Schematics' `BandCost` telemetry is the model.
+
+## Verdict on the whole-scene path (branch `alternate-rendering`)
+
+`Draw()` delivers genuinely high-fidelity output — the complete main-view pipeline into
+a target we supply, confirmed visually on the panel. It is also unusable as a *camera*
+feed, and the four symptoms are **one root cause**, not four bugs:
+
+| Symptom | Cause |
+|---|---|
+| feed is a pixel copy of the player's display | renders the camera the **frame** established |
+| swapping `_renderView` does nothing | written only by the ctor; `SetCameraParameters` mutates it **in place**, and preparation has already consumed it |
+| whole-world black flicker per feed frame | writes the frame's **shared** buffers; isolating GBuffer+depth was not enough |
+| native death (no exception) at 33 ms, stable at 500 ms | consumes a **frame's** ring-allocator budget per call |
+
+**`Draw` renders *the* frame, not *a* view.** It is a singleton operation.
+`SetCameraParameters` would move the viewpoint, but it maintains the camera speed buffer
+and last-frame positions, so it would corrupt the player's motion vectors and TAA on
+every feed frame — three defects traded for one. Not pursued.
+
+### What stands, and what main should build on
+
+* **Local light shadows are suppressible.** `CoreSystems.LocalLights` holds five
+  shadow-specific `PooledList`s; fields are readonly, lists are mutable, so they can be
+  emptied and refilled around a nested render. Removed the `RenderLocalLightShadows`
+  crash outright.
+* **`Draw` looks resources up BY FORMAT** — an HDR target throws `KeyNotFoundException`
+  on `R11G11B10_Float`. `ScreenBuffers.LDR_FORMAT` is a static constant.
+* **A half-executed whole-frame render corrupts the ENGINE's frame**, not just our
+  command list. Abandoning our own frame afterwards did not save the process.
+* **We can own a GBuffer and write real surface data into it**, and `LocalLightsJob`
+  runs against it happily, because every input is a parameter.
+
+### Why the probe path is the right home for fidelity work
+
+The probe pass is the only facility in this engine for rendering from a second
+viewpoint, because nothing in the game needs another one. It is deliberately cheap and
+flat — probes are the *input* to ambient lighting, so they are rendered without it.
+
+That last point is also the opportunity: **the missing term is ambient.** Direct sun
+with no fill is exactly why lit faces blow out and unlit faces go flat, and it is the
+one thing we can add ourselves. `AmbientLightJob` is blocked by frame state, but a
+constant or sky-derived ambient composited using the GBuffer normals we already produce
+needs no shared state, no temporal accumulation and no re-entrancy — and it targets the
+actual visual complaint at full frame rate with zero cost to the player's view.
