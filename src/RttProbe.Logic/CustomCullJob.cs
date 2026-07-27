@@ -1,0 +1,189 @@
+using System.Reflection;
+
+namespace RttProbe;
+
+// Our own CullingJob, targeting the main-view pass groups without the main-view job's
+// side effects.
+//
+// WHY NOT THE ENGINE'S _mainViewCullingJob. Two reasons, and the second is the one that
+// cost a session.
+//
+// 1. Pass groups. It targets [MainViewPass, MainViewDeferredTexturingPass,
+//    MainViewCountVolumeSegments, MainViewGatherVolumeSegments] and NOT Indirect. Our
+//    visible image is drawn from the Indirect group, so using that job alone deletes the
+//    feed. Co-culling solves that, and this class is compatible with it.
+//
+// 2. LOD TRANSITIONS. CullingJob.DoWork does not take a LODTransitionContext — it reads
+//    the global:
+//
+//        ldsfld   CoreSystems.DrawContexts
+//        callvirt DrawContextManager.get_LODTransitions()
+//
+//    That is the parameter test failing: a pass reading state it was not handed.
+//    LODTransitionContext is per-view temporal state tracking which objects are mid
+//    LOD crossfade. Culling from a second camera at a different distance writes different
+//    transition state for the same objects, the player's view reads it, and their geometry
+//    pops between LOD levels. That is the ship-light flicker, and it is why the flicker
+//    survived giving the cull private visibility lists AND private geometry buffers — it
+//    was never either of those.
+//
+// THE FIX. CullingGeometryJob.DoWork null-guards every use of lodTransitions, and the
+// engine's own assert states the contract outright:
+//
+//     "lodTransitions != null || (_forcedLODMethod.HasValue &&
+//                                 _forcedLODMethod != LODMethod.TransitionTimeBased)"
+//
+// So a forced LOD method that is not TransitionTimeBased makes the transition context
+// legitimately optional. We force LODMethod.SingleLevel — value 1, exactly what the
+// engine's own _indirectCullingJob forces, and that job has never disturbed the player's
+// view. Paired with nulling the global for the duration of our pass (see
+// CameraRender.InstallNoLodTransitions), every write lands on a null guard instead of on
+// the player's state.
+//
+// Losing LOD crossfade costs us nothing worth having: it is a sub-pixel nicety on a
+// 512x512 feed, and the alternative is corrupting the main render.
+//
+// FLAGS. Mirrors the indirect job everywhere it is safe to, since that configuration is
+// proven not to disturb the player:
+//
+//                          indirect      main view     ours
+//     targetPasses         [12]          [0,2,3,4]     [0,2,3,4]
+//     forcedLODMethod      SingleLevel   null          SingleLevel
+//     twoPassCulling       false         true          false
+//     isForMainView        false         true          false
+//     geometryOnly         true          false         false
+//
+// geometryOnly follows the main-view job rather than the indirect one because it decides
+// whether the entity-proxy job runs for all proxy types or only GPUEntityProxyType 4, and
+// the main-view pass groups need the full set. It is the one flag not copied from the
+// proven-safe side, so it is the first thing to suspect if this misbehaves.
+//
+// TASKS. The ctor takes a List<Task> the sub-jobs add shader compilation work to. The
+// engine collects and awaits its own during load; ours is fresh, so nothing would await
+// it. Ready gates on every task in our list having completed, so the job is not used
+// until its shaders exist — a job used early would either no-op or fault.
+internal static class CustomCullJob
+{
+    private const BindingFlags Any =
+        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+
+    private static object _job;
+    private static List<Task> _tasks;
+    private static int _state;          // 0 untried, 1 built, -1 unavailable
+    private static bool _readyLogged;
+
+    public static object Job => _state == 1 ? _job : null;
+
+    // Built AND its shaders compiled. Callers must check this, not Job != null.
+    public static bool Ready
+    {
+        get
+        {
+            if (_state != 1) return false;
+            if (_tasks == null) return true;
+            lock (_tasks)
+            {
+                foreach (var t in _tasks)
+                    if (t != null && !t.IsCompleted) return false;
+            }
+            if (!_readyLogged)
+            {
+                _readyLogged = true;
+                RttLog.Line($"Custom cull job: ready — {_tasks.Count} shader task(s) completed.");
+            }
+            return true;
+        }
+    }
+
+    public static void Reset()
+    {
+        if (_job is IDisposable d) { try { d.Dispose(); } catch { } }
+        _job = null;
+        _tasks = null;
+        _state = 0;
+        _readyLogged = false;
+    }
+
+    public static bool Ensure()
+    {
+        if (_state != 0) return _state == 1;
+        _state = -1;
+        try
+        {
+            var anchor = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            var asm = anchor?.Assembly;
+            var jobType = asm?.GetTypes().FirstOrDefault(t => t.Name == "CullingJob");
+            var groupType = FindType(asm, "PassGroupType");
+            var lodType = Type.GetType("Keen.VRage.Render.Data.LODMethod, VRage.Render")
+                          ?? FindTypeAnywhere("LODMethod");
+            if (jobType == null || groupType == null || lodType == null)
+            {
+                RttLog.Line($"Custom cull job: types not found (CullingJob={jobType != null}, " +
+                            $"PassGroupType={groupType != null}, LODMethod={lodType != null}).");
+                return false;
+            }
+
+            var ctor = jobType.GetConstructors(Any).FirstOrDefault(c => c.GetParameters().Length == 7);
+            if (ctor == null)
+            {
+                RttLog.Line("Custom cull job: CullingJob ctor(7 args) not found.");
+                return false;
+            }
+
+            // [MainViewPass=0, MainViewDeferredTexturingPass=2,
+            //  MainViewCountVolumeSegments=3, MainViewGatherVolumeSegments=4]
+            var listType = typeof(List<>).MakeGenericType(groupType);
+            var groups = (System.Collections.IList)Activator.CreateInstance(listType);
+            foreach (var v in new[] { 0, 2, 3, 4 })
+                groups.Add(Enum.ToObject(groupType, v));
+
+            // SingleLevel = 1. Not TransitionTimeBased, which is what lets the transition
+            // context be null without tripping CullingGeometryJob's assert.
+            var forced = Activator.CreateInstance(
+                typeof(Nullable<>).MakeGenericType(lodType), Enum.ToObject(lodType, 1));
+
+            _tasks = new List<Task>();
+            _job = ctor.Invoke(new object[]
+            {
+                groups,     // targetPasses
+                forced,     // forcedLODMethod = SingleLevel
+                false,      // isUsedWithTwoPassCulling
+                false,      // isForMainView
+                false,      // geometryOnly
+                _tasks,     // tasks
+                false,      // isLocalLights
+            });
+
+            _state = _job != null ? 1 : -1;
+            RttLog.Line(_state == 1
+                ? $"Custom cull job: BUILT — groups [MainViewPass, DeferredTexturing, " +
+                  $"CountVolumeSegments, GatherVolumeSegments], forcedLODMethod=SingleLevel, " +
+                  $"twoPass=false, isForMainView=false. {_tasks.Count} shader task(s) pending. " +
+                  "SingleLevel is what makes a null LODTransitionContext legal, which is what " +
+                  "stops our cull writing the player's LOD crossfade state."
+                : "Custom cull job: construction returned null.");
+            return _state == 1;
+        }
+        catch (Exception e) { RttLog.Error("build custom culling job", e); return false; }
+    }
+
+    private static Type FindType(Assembly asm, string name)
+    {
+        try { return asm?.GetTypes().FirstOrDefault(t => t.Name == name); }
+        catch { return null; }
+    }
+
+    private static Type FindTypeAnywhere(string name)
+    {
+        foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            try
+            {
+                var t = a.GetTypes().FirstOrDefault(x => x.Name == name);
+                if (t != null) return t;
+            }
+            catch { }
+        }
+        return null;
+    }
+}

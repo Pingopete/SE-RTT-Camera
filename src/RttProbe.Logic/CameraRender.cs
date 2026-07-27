@@ -973,8 +973,15 @@ internal static class CameraRender
             // the per-pass-group ranges live and GBufferPassJob is handed one of them.
             // Sharing a single context between two culls would have the second overwrite
             // the first's counters.
-            if (FeedConfig.CoCullMainView && _cullJobMainView != null && !mainView
-                && visLists != null && occlusion != null)
+            // OUR OWN JOB, not the engine's _mainViewCullingJob — see CustomCullJob for
+            // why. In short: DoWork reads DrawContexts.LODTransitions out of a global
+            // rather than taking it as a parameter, so a second camera's cull rewrites the
+            // player's LOD crossfade state and their geometry pops. Forcing
+            // LODMethod.SingleLevel makes a null transition context legal, and
+            // InstallNoLodTransitions supplies the null.
+            if (FeedConfig.CoCullMainView && !mainView
+                && visLists != null && occlusion != null
+                && CustomCullJob.Ensure() && CustomCullJob.Ready)
             {
                 coCulling = OwnContexts.Borrow();
                 if (coCulling != null)
@@ -985,9 +992,10 @@ internal static class CameraRender
                         commandList, view, lodSettings, coCulling, geomBuffers,
                         visLists, occlusion, null, null, -1, 0, -1,
                     };
+                    var savedLodTrans = InstallNoLodTransitions();
                     try
                     {
-                        _miDoCullingFirstPass.Invoke(_cullJobMainView, coArgs);
+                        _miDoCullingFirstPass.Invoke(CustomCullJob.Job, coArgs);
                         if (!_coCullLogged)
                         {
                             _coCullLogged = true;
@@ -1004,6 +1012,14 @@ internal static class CameraRender
                         OwnContexts.Return(coCulling);
                         coCulling = null;
                         if (_coCullErrs++ < 3) RttLog.Error("co-cull (feed continues)", e);
+                    }
+                    finally
+                    {
+                        // Unconditional. The engine's own main-view cull runs later in the
+                        // frame and asserts on a null transition context without a forced
+                        // LOD method — and an assert tripped mid-session turns the next
+                        // quit into a crash report.
+                        RestoreLodTransitions(savedLodTrans);
                     }
                 }
             }
@@ -3712,6 +3728,85 @@ internal static class CameraRender
     //
     // The real fix is a private OcclusionContext plus our own depth prepass and HiZ build.
     // This is the cheap version that makes the deferred route usable now.
+    // Take the player's LOD transition state out of reach for the duration of our pass.
+    //
+    // THE ACTUAL CAUSE OF THE SHIP-LIGHT FLICKER, and it outlived two plausible fixes
+    // because it is neither of the things they addressed. CullingJob.DoWork does not
+    // accept a LODTransitionContext — it reads the global:
+    //
+    //     ldsfld   CoreSystems.DrawContexts
+    //     callvirt DrawContextManager.get_LODTransitions()
+    //
+    // The parameter test, failing exactly where it is meant to. LODTransitionContext holds
+    // per-view temporal state: which objects are part-way through an LOD crossfade and how
+    // far. Our camera sits at a different distance from the same objects, so our cull
+    // writes different transition state for them, the player's view reads it next frame,
+    // and their geometry pops between levels. Private visibility lists did not help.
+    // Private geometry buffers did not help. Neither was ever the shared thing.
+    //
+    // NULL rather than a private context, because CullingGeometryJob.DoWork null-guards
+    // every use of it and the engine's own assert says null is legal given a forced LOD
+    // method:
+    //
+    //     "lodTransitions != null || (_forcedLODMethod.HasValue &&
+    //                                 _forcedLODMethod != LODMethod.TransitionTimeBased)"
+    //
+    // CustomCullJob forces SingleLevel, satisfying that. A private LODTransitionContext
+    // would also work but would need Flush / ProcessFinishedFrame / PrepareReadback driven
+    // every frame by us, and would buy nothing — LOD crossfade is a sub-pixel nicety at
+    // 512x512.
+    //
+    // Restored unconditionally in the finally. Leaving the engine's own main-view cull
+    // without its transition context would trip that assert, and an assert tripped
+    // mid-session turns the next quit into a crash report via DiagnosticReporter.
+    private static FieldInfo _lodTransField;
+    private static bool _lodTransBlocked, _lodTransLogged;
+
+    private static object[] InstallNoLodTransitions()
+    {
+        if (_lodTransBlocked || _drawContexts == null) return null;
+        try
+        {
+            _lodTransField ??= _drawContexts.GetType()
+                .GetField("<LODTransitions>k__BackingField", Any);
+            if (_lodTransField == null)
+            {
+                _lodTransBlocked = true;
+                RttLog.Line("LOD transitions: <LODTransitions>k__BackingField not found — our cull " +
+                            "will keep writing the player's LOD crossfade state, which is what makes " +
+                            "their geometry flicker. The main-view co-cull is unsafe without this.");
+                return null;
+            }
+
+            var saved = _lodTransField.GetValue(_drawContexts);
+            if (saved == null) return null;          // already null; nothing to restore
+            _lodTransField.SetValue(_drawContexts, null);
+
+            if (!_lodTransLogged)
+            {
+                _lodTransLogged = true;
+                RttLog.Line("LOD transitions: global nulled for our pass. CullingJob.DoWork reads " +
+                            "DrawContexts.LODTransitions directly rather than taking it as a parameter, " +
+                            "so this is the only way to stop a second camera writing the player's " +
+                            "crossfade state. Legal because our job forces LODMethod.SingleLevel.");
+            }
+            return new[] { saved };
+        }
+        catch (Exception e)
+        {
+            _lodTransBlocked = true;
+            RttLog.Error("install null LOD transitions", e);
+            return null;
+        }
+    }
+
+    private static void RestoreLodTransitions(object[] saved)
+    {
+        if (saved == null || _lodTransField == null || _drawContexts == null) return;
+        try { _lodTransField.SetValue(_drawContexts, saved[0]); }
+        catch (Exception e) { RttLog.Error("restore LOD transitions", e); }
+    }
+
     private static FieldInfo _hzboField;
     private static bool _hzboBlocked, _hzboLogged;
 

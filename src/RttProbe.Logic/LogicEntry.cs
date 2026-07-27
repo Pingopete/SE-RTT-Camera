@@ -17,6 +17,7 @@ public static class LogicEntry
             OwnContexts.Reset();
             DynamicExposure.Reset();
             PrivateCullContexts.Reset();
+            CustomCullJob.Reset();
             CameraCbSwap.Reset();
             FeedHandover.Reset();
             PanelBinding.Reset();
