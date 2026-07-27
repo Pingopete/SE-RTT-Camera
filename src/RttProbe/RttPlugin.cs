@@ -226,8 +226,14 @@ public sealed class RttPlugin : IPlugin
         "ExecuteRaytracingPrepareAndSceneFinalize",  // 1  raytracing prepare
         "RenderEnvironmentProbe",                    // 2  shared probe atlas (ambient + reflections)
         "RenderShadows",                             // 3  shadow cascades
-        "ComputeExposure",                           // 4  auto-exposure history
+        "ComputeExposure",                           // 4  auto-exposure history  (UNSAFE: out params)
         "UpdateSurfels",                             // 5  water surfels
+        "PrepareClusters",                           // 6  light cluster grid
+        "ProcessParticles",                          // 7  particle SIMULATION state
+        "RenderDecals",                              // 8  decal atlas
+        "ExecuteHBAO",                               // 9  ambient occlusion
+        "ExecuteLighting",                           // 10 whole lighting stage (our image dies without it)
+        "RenderMainView",                            // 11 the geometry pass (ditto)
     };
 
     private static void PatchSkippableStages(HarmonyLib.Harmony harmony, Type sds)
@@ -270,6 +276,12 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage3() => Skip(3);
     private static bool SkipStage4() => Skip(4);
     private static bool SkipStage5() => Skip(5);
+    private static bool SkipStage6() => Skip(6);
+    private static bool SkipStage7() => Skip(7);
+    private static bool SkipStage8() => Skip(8);
+    private static bool SkipStage9() => Skip(9);
+    private static bool SkipStage10() => Skip(10);
+    private static bool SkipStage11() => Skip(11);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the

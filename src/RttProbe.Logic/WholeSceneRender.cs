@@ -163,6 +163,12 @@ internal static class WholeSceneRender
         3 => "RenderShadows",
         4 => "ComputeExposure",
         5 => "UpdateSurfels",
+        6 => "PrepareClusters",
+        7 => "ProcessParticles",
+        8 => "RenderDecals",
+        9 => "ExecuteHBAO",
+        10 => "ExecuteLighting",
+        11 => "RenderMainView",
         _ => "unknown",
     };
 
