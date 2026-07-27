@@ -545,6 +545,65 @@ internal static class WholeSceneRender
         catch { return false; }
     }
 
+    // Same box-copy-restore as ScopeOff, but SETS values — enums, floats, bools — so a
+    // settings group can be retuned for our render rather than only having flags
+    // cleared. Chained boxes compose: a group already scoped this pass is re-boxed from
+    // its current (already-modified) value, and the reverse unwind restores the true
+    // original last.
+    private static void ScopeSetValues(string settingsTypeName, string label,
+        params (string Field, object Value)[] sets)
+    {
+        try
+        {
+            var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            var settings = core?.GetField("Settings", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            if (settings == null) return;
+
+            _settingsObj ??= settings;
+            var field = settings.GetType().GetFields(Any)
+                .FirstOrDefault(f => f.FieldType.Name == settingsTypeName);
+            if (field == null)
+            {
+                if (_scopeWarned.Add(settingsTypeName + label))
+                    RttLog.Line($"Whole-scene: SettingsManager has no {settingsTypeName} field — {label} unavailable.");
+                return;
+            }
+
+            var saved = field.GetValue(settings);
+            var ours = field.GetValue(settings);        // struct field: independent box
+
+            int applied = 0;
+            foreach (var (name, value) in sets)
+            {
+                var f = ours.GetType().GetField(name, Any);
+                if (f == null) continue;
+                try
+                {
+                    object v = value;
+                    if (f.FieldType.IsEnum && value is int iv) v = Enum.ToObject(f.FieldType, iv);
+                    else if (f.FieldType == typeof(float)) v = System.Convert.ToSingle(value);
+                    else if (!f.FieldType.IsInstanceOfType(value)) continue;
+                    f.SetValue(ours, v);
+                    applied++;
+                }
+                catch { }
+            }
+            if (applied == 0)
+            {
+                if (_scopeWarned.Add(settingsTypeName + label))
+                    RttLog.Line($"Whole-scene: no matching fields on {settingsTypeName} for {label}.");
+                return;
+            }
+
+            field.SetValue(settings, ours);
+            _scoped.Add((field, saved));
+
+            if (_scopeWarned.Add(settingsTypeName + label + ":ok"))
+                RttLog.Line($"Whole-scene: {label} set for our render ({applied}/{sets.Length} fields on {settingsTypeName}).");
+        }
+        catch (Exception e) { RttLog.Error($"whole-scene scope set {settingsTypeName}", e); }
+    }
+
     private static void RestoreScoped()
     {
         for (int i = _scoped.Count - 1; i >= 0; i--)
@@ -602,6 +661,31 @@ internal static class WholeSceneRender
         // feed loses its ambient term anyway, Enable gates both and this needs splitting.
         if (FeedConfig.WholeSceneDisableProbeUpdates)
             ScopeOff("EnvironmentSettings", "environment probe updates", "ProbeSettings.Enable");
+
+        // TEMPORAL AA / UPSCALING. FSR consumes motion vectors, and ours are garbage:
+        // the second view's frames are 200ms apart and its previous-frame camera state
+        // was the PLAYER'S — ghost trails and edge smear on everything that moves.
+        // AAMode: None=0, FXAA=1 (spatial-only, needs no motion vectors — the right AA
+        // for this feed), FSR=2 (engine default). ScalingMode NativeAA=4 removes the
+        // upscale entirely; sharpening off because it amplifies 512px artefacts.
+        // SPLIT, because bundling these CTD'd in the post chain (ForwardAndPostPasses
+        // 178/255) and left three suspects. ScalingMode is the dangerous one: it selects
+        // between UpscaleTargetFSR and ApplyNonFSRUpscalingAndAA, which borrow
+        // differently-sized targets — and our ScreenBuffers were InitializeBuffers'd for
+        // one geometry. AAMode alone only picks the AA kernel.
+        if (FeedConfig.WholeSceneAAMode >= 0)
+            ScopeSetValues("DRSSettings", "feed AA mode", ("AAMode", FeedConfig.WholeSceneAAMode));
+
+        if (FeedConfig.WholeSceneNativeScaling)
+            ScopeSetValues("DRSSettings", "feed native scaling",
+                ("ScalingMode", 4), ("EnableSharpening", false));
+
+        // FEED EXPOSURE. Adaptation is scoped off (shared history), so the feed runs on
+        // the fixed LuminanceExposure — the player's value, tuned for wherever THEY are.
+        // This makes it the feed's own knob.
+        if (FeedConfig.WholeSceneExposure > 0)
+            ScopeSetValues("PostProcessSettings", "feed exposure",
+                ("LuminanceExposure", (float)FeedConfig.WholeSceneExposure));
     }
 
 

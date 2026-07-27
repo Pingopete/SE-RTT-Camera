@@ -355,6 +355,20 @@ internal static class FeedConfig
     // flip live to re-test and bisect.
     public static int WholeSceneCameraRebuild { get; private set; }
 
+    // AA mode for the whole-scene render: -1 leave engine (FSR: temporal, ghosts at 5fps),
+    // 0 none, 1 FXAA (spatial-only — the right choice for this feed), 2 FSR. Also forces
+    // ScalingMode NativeAA and sharpening off while >= 0.
+    public static int WholeSceneAAMode { get; private set; } = -1;
+
+    // Force ScalingMode NativeAA + sharpening off for our render. SEPARATE from the AA
+    // mode because bundling them CTD'd in the post chain: ScalingMode selects between
+    // UpscaleTargetFSR and ApplyNonFSRUpscalingAndAA, which borrow differently-sized
+    // targets against our fixed-geometry ScreenBuffers. The riskier half.
+    public static bool WholeSceneNativeScaling { get; private set; }
+
+    // Fixed exposure for the feed (adaptation is scoped off). 0 = leave the engine value.
+    public static double WholeSceneExposure { get; private set; }
+
     // Show OUR render on the panel instead of the probe feed.
     //
     // The probe pass keeps running (it drives the orbit transform); it just stops
@@ -794,7 +808,9 @@ internal static class FeedConfig
             int wsW = WholeSceneWidth, wsH = WholeSceneHeight;
             bool wsCam = WholeSceneCamera, wsNoRt = WholeSceneDisableRaytracing;
             bool wsPanel = WholeSceneToPanel;
-            int wsCamRebuild = WholeSceneCameraRebuild;
+            int wsCamRebuild = WholeSceneCameraRebuild, wsAa = WholeSceneAAMode;
+            double wsExp = WholeSceneExposure;
+            bool wsNative = WholeSceneNativeScaling;
             bool wsNoEye = WholeSceneDisableEyeAdaptation, wsNoProbe = WholeSceneDisableProbeUpdates;
             bool wsOwnDc = WholeSceneOwnDrawContexts;
             int[] wsSkip = WholeSceneSkipStages;
@@ -969,6 +985,15 @@ internal static class FeedConfig
                     case "wholescenedisableraytracing":
                         wsNoRt = val is "1" or "true" or "yes";
                         break;
+                    case "wholescenenativescaling":
+                        wsNative = val is "1" or "true" or "yes";
+                        break;
+                    case "wholesceneaamode":
+                        if (int.TryParse(val, out var wsam)) wsAa = Math.Clamp(wsam, -1, 2);
+                        break;
+                    case "wholesceneexposure":
+                        if (double.TryParse(val, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var wse)) wsExp = Math.Clamp(wse, 0.0, 1000.0);
+                        break;
                     case "wholescenecamerarebuild":
                         wsCamRebuild = val is "true" or "yes" ? 1
                                      : int.TryParse(val, out var wcr) ? Math.Clamp(wcr, 0, 3) : wsCamRebuild;
@@ -1111,7 +1136,7 @@ internal static class FeedConfig
                         || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || clearGb != ClearGBufferBeforePass
                         || wsBuild != WholeSceneBuildBuffers || wsRender != WholeSceneEnabled
                         || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts
                         || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
@@ -1134,7 +1159,7 @@ internal static class FeedConfig
             // it rather than leave it allocated.
             bool wsChanged = wsBuild != WholeSceneBuildBuffers
                              || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts;
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts;
 
             WholeSceneEnabled = wsRender;
             WholeSceneBuildBuffers = wsBuild;
@@ -1143,6 +1168,9 @@ internal static class FeedConfig
             WholeSceneCamera = wsCam;
             WholeSceneToPanel = wsPanel;
             WholeSceneCameraRebuild = wsCamRebuild;
+            WholeSceneAAMode = wsAa;
+            WholeSceneNativeScaling = wsNative;
+            WholeSceneExposure = wsExp;
             WholeSceneIntervalMs = wsInterval;
             WholeSceneDisableRaytracing = wsNoRt;
             WholeSceneDisableEyeAdaptation = wsNoEye;

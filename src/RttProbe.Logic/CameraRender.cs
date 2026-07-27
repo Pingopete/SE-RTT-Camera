@@ -3678,6 +3678,22 @@ internal static class CameraRender
                 catch { }
             }
 
+            // PREVIOUS-FRAME state must be OURS, not the player's. The field copy above
+            // stamped the PLAYER'S LastFrameCameraPosition into our view, so motion
+            // vectors were computed as (orbit position − player position) — kilometres of
+            // false motion feeding FSR/TAA, which is the ghost-trail smear. Our real
+            // previous position is the orbit's last render; first render uses current
+            // (zero motion), which is exactly right for a fresh view.
+            try
+            {
+                var cur = Prop2(_lastCamWorld, "Translation");
+                var prev = _wsPrevCamPos ?? cur;
+                SetRvOn(_wsRenderView, "LastFrameCameraPosition", prev);
+                SetRvOn(_wsRenderView, "LastFrameCameraPositionWithCuts", prev);
+                _wsPrevCamPos = cur;
+            }
+            catch { }
+
             // MODE 2 — THE RACE FIX, and the intended production setting.
             //
             // Both rebuild CTDs faulted at DIFFERENT sites (mid-bloom with a real VA,
@@ -3781,6 +3797,7 @@ internal static class CameraRender
     private static bool _wsRvLogged;
     private static int _wsRvErrs;
     private static long _wsDiagMs;
+    private static object _wsPrevCamPos;
 
     private static object MField(object o, string name)
     {
