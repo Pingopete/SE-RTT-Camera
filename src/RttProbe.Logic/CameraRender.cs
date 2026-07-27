@@ -969,65 +969,78 @@ internal static class CameraRender
             // MainOutputGeometryBuffers, the same context MainViewCulling writes its
             // MainViewPass commands into. Different groups, different ranges, one buffer.
             //
-            // A SECOND culling context is needed though, because GeometryContext is where
-            // the per-pass-group ranges live and GBufferPassJob is handed one of them.
-            // Sharing a single context between two culls would have the second overwrite
-            // the first's counters.
-            // OUR OWN JOB, not the engine's _mainViewCullingJob — see CustomCullJob for
-            // why. In short: DoWork reads DrawContexts.LODTransitions out of a global
-            // rather than taking it as a parameter, so a second camera's cull rewrites the
-            // player's LOD crossfade state and their geometry pops. Forcing
-            // LODMethod.SingleLevel makes a null transition context legal, and
-            // InstallNoLodTransitions supplies the null.
-            if (FeedConfig.CoCullMainView && !mainView
-                && visLists != null && occlusion != null
-                && CustomCullJob.Ensure() && CustomCullJob.Ready)
+            // A SECOND culling context is needed too, because GeometryContext is where the
+            // per-pass-group ranges live and GBufferPassJob is handed one of them.
+            //
+            // RUN LATE, NOT HERE. The first version culled both back to back, and that put
+            // large white wedges through the feed at changing angles. The engine's shared
+            // geometry buffers are SCRATCH, reused serially: it culls, draws, culls again,
+            // draws again, and each cull's commands are consumed before the next overwrites
+            // them. Doing cull-cull-draw-draw instead means the second cull clobbers the
+            // first's draw commands, and IndirectEnvironmentPassJob — which draws the image
+            // we actually see — then reads ranges that no longer describe what is in the
+            // buffer. Garbage draw commands rasterise as exactly those wedges.
+            //
+            // So the co-cull is deferred into a local function and invoked immediately
+            // before the GBuffer pass that consumes it, after the environment pass has
+            // already drawn. That restores the engine's cull-draw-cull-draw ordering and
+            // costs nothing, where a second OutputGeometryBufferContext would cost another
+            // ~180 MB to fix the same problem.
+            //
+            // OUR OWN JOB, not the engine's _mainViewCullingJob — see CustomCullJob. In
+            // short: DoWork reads DrawContexts.LODTransitions out of a global rather than
+            // taking it as a parameter, so a second camera's cull rewrites the player's LOD
+            // crossfade state and their geometry pops. Forcing LODMethod.SingleLevel makes
+            // a null transition context legal, and InstallNoLodTransitions supplies it.
+            object RunCoCull()
             {
-                coCulling = OwnContexts.Borrow();
-                if (coCulling != null)
+                if (coCulling != null) return coCulling;       // once per pass
+                if (!FeedConfig.CoCullMainView || mainView
+                    || visLists == null || occlusion == null
+                    || !CustomCullJob.Ensure() || !CustomCullJob.Ready) return null;
+
+                var ctx = OwnContexts.Borrow();
+                if (ctx == null) return null;
+
+                OwnContexts.EnsureRanges(ctx, commandList);
+                var coArgs = new object[]
                 {
-                    OwnContexts.EnsureRanges(coCulling, commandList);
-                    var coArgs = new object[]
+                    commandList, view, lodSettings, ctx, geomBuffers,
+                    visLists, occlusion, null, null, -1, 0, -1,
+                };
+                var savedLodTrans = InstallNoLodTransitions();
+                try
+                {
+                    _miDoCullingFirstPass.Invoke(CustomCullJob.Job, coArgs);
+                    coCulling = ctx;
+                    if (!_coCullLogged)
                     {
-                        commandList, view, lodSettings, coCulling, geomBuffers,
-                        visLists, occlusion, null, null, -1, 0, -1,
-                    };
-                    var savedLodTrans = InstallNoLodTransitions();
-                    try
-                    {
-                        _miDoCullingFirstPass.Invoke(CustomCullJob.Job, coArgs);
-                        if (!_coCullLogged)
-                        {
-                            _coCullLogged = true;
-                            RttLog.Line("=== CO-CULL: main-view job run ALONGSIDE the indirect one, into a " +
-                                        "second culling context. Indirect still feeds the visible image; " +
-                                        "MainViewPass/DeferredTexturing now have draw commands for the " +
-                                        "GBuffer pass, where the real 172-line triplanar shader lives. ===");
-                        }
+                        _coCullLogged = true;
+                        RttLog.Line("=== CO-CULL: main-view pass groups culled into a second context, " +
+                                    "AFTER the environment pass has drawn. Indirect still feeds the " +
+                                    "visible image; MainViewPass/DeferredTexturing now have draw commands " +
+                                    "for the GBuffer pass, where the real 172-line triplanar shader is. ===");
                     }
-                    catch (Exception e)
-                    {
-                        // Do not disarm. The indirect cull has already run, so the feed is
-                        // intact; losing the co-cull costs GBuffer content, nothing visible.
-                        OwnContexts.Return(coCulling);
-                        coCulling = null;
-                        if (_coCullErrs++ < 3) RttLog.Error("co-cull (feed continues)", e);
-                    }
-                    finally
-                    {
-                        // Unconditional. The engine's own main-view cull runs later in the
-                        // frame and asserts on a null transition context without a forced
-                        // LOD method — and an assert tripped mid-session turns the next
-                        // quit into a crash report.
-                        RestoreLodTransitions(savedLodTrans);
-                    }
+                    return coCulling;
+                }
+                catch (Exception e)
+                {
+                    // Do not disarm. The indirect cull has already run and the environment
+                    // pass has already drawn, so the feed is intact; losing the co-cull
+                    // costs GBuffer content and nothing visible.
+                    OwnContexts.Return(ctx);
+                    if (_coCullErrs++ < 3) RttLog.Error("co-cull (feed continues)", e);
+                    return null;
+                }
+                finally
+                {
+                    // Unconditional. The engine's own main-view cull runs later in the frame
+                    // and asserts on a null transition context without a forced LOD method —
+                    // and an assert tripped mid-session turns the next quit into a crash
+                    // report.
+                    RestoreLodTransitions(savedLodTrans);
                 }
             }
-
-            // Whichever context actually holds MainViewPass commands. Falls back to the
-            // indirect one so every existing path behaves exactly as before when the
-            // co-cull is off.
-            object gbufCullCtx = coCulling ?? cullCtx;
 
             // Far plane drives how much space the clustering job has to bin lights
             // into. 5 km was copied from the probe pass, which is sizing for a whole
@@ -1078,6 +1091,9 @@ internal static class CameraRender
                 {
                     try
                     {
+                        // Cull for the main-view groups HERE, immediately before the pass
+                        // that consumes them, so nothing overwrites the commands in between.
+                        var gbufCullCtx = RunCoCull() ?? cullCtx;
                         _miGBufferPass.Invoke(_gBufferPassJob, new object[]
                             { commandList, Prop2(gbufCullCtx, "FirstPass"), geomBuffers, true, null });
                         RunDeferredTexturing(commandList, gbufCullCtx, geomBuffers);
@@ -1162,6 +1178,11 @@ internal static class CameraRender
                 {
                     try
                     {
+                        // THE ordering that matters. The environment pass has already drawn
+                        // the Indirect group by now, so overwriting the shared geometry
+                        // buffers with main-view commands is safe — this is the engine's own
+                        // cull-draw-cull-draw discipline, which the first version broke.
+                        var gbufCullCtx = RunCoCull() ?? cullCtx;
                         _miGBufferPass.Invoke(_gBufferPassJob, new object[]
                             { commandList, Prop2(gbufCullCtx, "FirstPass"), geomBuffers, true, null });
                         RunDeferredTexturing(commandList, gbufCullCtx, geomBuffers);
