@@ -306,6 +306,19 @@ internal static class FeedConfig
     // lighting misbehaving while direct lights look fine.
     public static bool WholeSceneDisableProbeUpdates { get; private set; } = true;
 
+    // Swap CoreSystems.DrawContexts for our own DrawContextManager during our render.
+    //
+    // The stage bisect ruled out every skippable stage and the flashing persisted, so
+    // the cause is in what remains — and everything that remains culls and ranges
+    // through DrawContexts: visibility lists, occlusion, geometry buffers, the shared
+    // GPU counters ScenePreparation clears every frame, LOD transitions. The
+    // experimental branch recorded the signature exactly: a second cull writing the
+    // engine's visibility lists made the player's ship lights flicker.
+    //
+    // Also the PREREQUISITE for wholeSceneCamera — culling from the orbit camera into
+    // the player's contexts would be strictly worse than today's perturbation.
+    public static bool WholeSceneOwnDrawContexts { get; private set; }
+
     // Draw sub-stages skipped INSIDE our render only. Comma-separated ids:
     //
     //   0 ExecuteAccelerationStructuresBuilding    raytracing scene / TLAS
@@ -765,6 +778,7 @@ internal static class FeedConfig
             int wsW = WholeSceneWidth, wsH = WholeSceneHeight;
             bool wsCam = WholeSceneCamera, wsNoRt = WholeSceneDisableRaytracing;
             bool wsNoEye = WholeSceneDisableEyeAdaptation, wsNoProbe = WholeSceneDisableProbeUpdates;
+            bool wsOwnDc = WholeSceneOwnDrawContexts;
             int[] wsSkip = WholeSceneSkipStages;
             int wsInterval = WholeSceneIntervalMs;
 
@@ -916,6 +930,9 @@ internal static class FeedConfig
                         break;
                     case "wholescenebuildbuffers":
                         wsBuild = val is "1" or "true" or "yes";
+                        break;
+                    case "wholesceneowndrawcontexts":
+                        wsOwnDc = val is "1" or "true" or "yes";
                         break;
                     case "wholesceneskipstages":
                     {
@@ -1069,7 +1086,7 @@ internal static class FeedConfig
                         || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || clearGb != ClearGBufferBeforePass
                         || wsBuild != WholeSceneBuildBuffers || wsRender != WholeSceneEnabled
                         || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages)
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts
                         || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
@@ -1092,7 +1109,7 @@ internal static class FeedConfig
             // it rather than leave it allocated.
             bool wsChanged = wsBuild != WholeSceneBuildBuffers
                              || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages);
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts;
 
             WholeSceneEnabled = wsRender;
             WholeSceneBuildBuffers = wsBuild;
@@ -1104,6 +1121,7 @@ internal static class FeedConfig
             WholeSceneDisableEyeAdaptation = wsNoEye;
             WholeSceneDisableProbeUpdates = wsNoProbe;
             WholeSceneSkipStages = wsSkip;
+            WholeSceneOwnDrawContexts = wsOwnDc;
 
             // A resolution or buffer-mode change needs a full rebuild; anything else
             // just needs the one-strike disable cleared, so an experiment is a config

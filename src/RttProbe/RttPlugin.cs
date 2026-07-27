@@ -234,6 +234,10 @@ public sealed class RttPlugin : IPlugin
         "ExecuteHBAO",                               // 9  ambient occlusion
         "ExecuteLighting",                           // 10 whole lighting stage (our image dies without it)
         "RenderMainView",                            // 11 the geometry pass (ditto)
+        "ComputeDirectionalLighting",                // 12 sun light + shadow mask
+        "ComputeLocalLights",                        // 13 clustered point/spot lights
+        "ComputeCloudShadows",                       // 14 writes SHARED CommonResources.CloudShadowmap
+        "UpdateAtmosphere",                          // 15 atmosphere LUT updates
     };
 
     private static void PatchSkippableStages(HarmonyLib.Harmony harmony, Type sds)
@@ -282,6 +286,10 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage9() => Skip(9);
     private static bool SkipStage10() => Skip(10);
     private static bool SkipStage11() => Skip(11);
+    private static bool SkipStage12() => Skip(12);
+    private static bool SkipStage13() => Skip(13);
+    private static bool SkipStage14() => Skip(14);
+    private static bool SkipStage15() => Skip(15);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the

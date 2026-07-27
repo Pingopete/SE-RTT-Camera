@@ -76,6 +76,31 @@ internal static class WholeSceneRender
     private static object _ourScreenBuffers;
     private static bool _sbBuilt, _sbLogged;
 
+    // Our own DrawContextManager — the OTHER global family, and the one the stage
+    // bisect pointed at by elimination.
+    //
+    // With every skippable stage suppressed the player's indirect-lighting flashing
+    // persisted, so the cause sits in what remains: ScenePreparation, RenderMainView
+    // and ExecuteLighting. All of those cull, range and read through
+    // CoreSystems.DrawContexts — visibility lists, occlusion contexts, geometry
+    // buffers, the shared GPU counters ScenePreparation ReadCurrent/ClearCurrent's
+    // every frame, and LODTransitions. We own a second ScreenBuffers, but this entire
+    // family was still shared, and the experimental branch already recorded its exact
+    // signature: a second cull writing the engine's visibility lists made the player's
+    // ship lights go bright and flicker.
+    //
+    // This was on the critical path anyway: culling from the ORBIT camera (stage 3b)
+    // into the engine's contexts would corrupt the player's view far worse than the
+    // current same-camera perturbation does. Fixing the flashing and unblocking the
+    // camera swap are the same edit.
+    //
+    // DrawContextManager..ctor() is public, parameterless, and calls
+    // CreateInitialContexts itself — so construction is one Activator call, exactly
+    // like ScreenBuffers.
+    private static object _ourDrawContexts;
+    private static object _ourFreshShadowResources;
+    private static bool _dcBuilt;
+
     public static void Reset()
     {
         // Do NOT dispose the engine's. Ours is disposable and holds real GPU memory, so
@@ -85,6 +110,23 @@ internal static class WholeSceneRender
         if (_ourScreenBuffers is IDisposable d) { try { d.Dispose(); } catch { } }
         _ourScreenBuffers = null;
         _sbBuilt = _sbLogged = false;
+        if (_ourDrawContexts != null)
+        {
+            // Put OUR fresh shadow resources back before disposing, so Dispose releases
+            // what we created rather than the engine's live object.
+            try
+            {
+                if (_ourFreshShadowResources != null)
+                    _ourDrawContexts.GetType().GetProperty("DirectionalLightShadowResources", Any)
+                        ?.SetValue(_ourDrawContexts, _ourFreshShadowResources);
+            }
+            catch { }
+            if (_ourDrawContexts is IDisposable dc) { try { dc.Dispose(); } catch { } }
+        }
+        _ourDrawContexts = null;
+        _ourFreshShadowResources = null;
+        _dcBuilt = false;
+        _dcField = null;
         _state = 0;
         _hookCount = 0;
         _lastLogMs = 0;
@@ -169,6 +211,10 @@ internal static class WholeSceneRender
         9 => "ExecuteHBAO",
         10 => "ExecuteLighting",
         11 => "RenderMainView",
+        12 => "ComputeDirectionalLighting",
+        13 => "ComputeLocalLights",
+        14 => "ComputeCloudShadows",
+        15 => "UpdateAtmosphere",
         _ => "unknown",
     };
 
@@ -275,13 +321,33 @@ internal static class WholeSceneRender
             }
 
             var savedSb = _sbField.GetValue(null);
-            object savedCam = null;
+            object savedCam = null, savedDc = null;
             bool camSwapped = false;
 
             _inOurRender = true;
             try
             {
                 _sbField.SetValue(null, _ourScreenBuffers);
+
+                // Swap the context family too, when we have one. Everything our render
+                // culls and ranges then lands in contexts the player's frame never
+                // reads — which is both the flashing fix and the prerequisite for
+                // culling from a different camera at all.
+                if (FeedConfig.WholeSceneOwnDrawContexts)
+                {
+                    EnsureDrawContexts();
+                    if (_ourDrawContexts != null)
+                    {
+                        _dcField ??= _coreType?.GetField("DrawContexts",
+                            BindingFlags.Public | BindingFlags.Static);
+                        if (_dcField != null)
+                        {
+                            savedDc = _dcField.GetValue(null);
+                            _dcField.SetValue(null, _ourDrawContexts);
+                        }
+                    }
+                }
+
                 ScopeSharedState();
                 if (FeedConfig.WholeSceneCamera) camSwapped = InstallCamera(out savedCam);
 
@@ -300,9 +366,11 @@ internal static class WholeSceneRender
             finally
             {
                 // Unconditional, and in reverse install order: camera, then every scoped
-                // settings group, then the buffers the engine's next frame renders into.
+                // settings group, then both global families the engine's next frame
+                // renders through.
                 if (camSwapped) RestoreCamera(savedCam);
                 RestoreScoped();
+                if (savedDc != null) _dcField.SetValue(null, savedDc);
                 _sbField.SetValue(null, savedSb);
                 _inOurRender = false;
             }
@@ -500,6 +568,56 @@ internal static class WholeSceneRender
     private static object _settingsObj;
     private static long _lastRenderMs;
     private static int _renderCount;
+
+    // Construct the second DrawContextManager. One attempt per load, hot-reloadable,
+    // falls back to the shared one (current behaviour) on any failure rather than
+    // disabling the route — a shared-context render is degraded, not broken.
+    private static void EnsureDrawContexts()
+    {
+        if (_dcBuilt || _ourDrawContexts != null) return;
+        _dcBuilt = true;
+        try
+        {
+            var t = Type.GetType("Keen.VRage.Render12.Core.Systems.DrawContextManager, VRage.Render12");
+            if (t == null) { RttLog.Line("Whole-scene: DrawContextManager type not found."); return; }
+
+            _ourDrawContexts = Activator.CreateInstance(t);
+
+            // Share the ENGINE'S DirectionalLightShadowResources into our manager.
+            //
+            // ComputeDirectionalLighting pulls this off DrawContexts (IL_0068) and hands
+            // it to the shadow-mask draw. Our fresh manager's copy has never had cascades
+            // rendered into it — our pending-work queues are never filled by the game and
+            // we skip RenderShadows anyway — so the mask draw died on an empty Nullable
+            // the first time it ran against our contexts.
+            //
+            // Sharing is safe here where sharing the CONTEXTS was not: the mask draw only
+            // READS the resources (cascade depth maps + setup constant buffer). The feed
+            // gets the player's real sun-shadow cascades — approximately correct near the
+            // player, degrading with distance since cascades are player-centred. Honest
+            // limitation, revisit if remote shadows matter.
+            //
+            // DISPOSE SAFETY: our manager's Dispose would dispose whatever this property
+            // holds — which would be the ENGINE'S live object. Reset() puts the fresh one
+            // back first, so each side disposes only what it created.
+            var resProp = t.GetProperty("DirectionalLightShadowResources", Any);
+            var engineDc = _coreType?.GetField("DrawContexts", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            if (resProp != null && engineDc != null)
+            {
+                _ourFreshShadowResources = resProp.GetValue(_ourDrawContexts);
+                resProp.SetValue(_ourDrawContexts, resProp.GetValue(engineDc));
+            }
+
+            RttLog.Line("Whole-scene: SECOND DrawContextManager built — its ctor runs " +
+                        "CreateInitialContexts, so this is the full context family (visibility " +
+                        "lists, occlusion, geometry buffers, shared counters, LOD transitions) " +
+                        "owned by us. The player's contexts are no longer written by our render. " +
+                        $"DirectionalLightShadowResources {(engineDc != null ? "SHARED from the engine (read-only in the mask draw)" : "NOT shared — engine manager unreachable")}.");
+        }
+        catch (Exception e) { RttLog.Error("build second DrawContextManager", e); }
+    }
+
+    private static FieldInfo _dcField;
 
     // STAGE 2: construct a second ScreenBuffers, and do nothing with it.
     //
