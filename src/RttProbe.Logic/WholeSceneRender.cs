@@ -101,6 +101,8 @@ internal static class WholeSceneRender
     private static object _ourFreshShadowResources;
     private static bool _dcBuilt;
     private static object _panelSourceTex;
+    private static bool _cbSwapLogged;
+    private static int _cbSwapErrs;
 
     // Our render's finished image, for CameraRender's blit to use as its source.
     //
@@ -348,6 +350,7 @@ internal static class WholeSceneRender
 
             var savedSb = _sbField.GetValue(null);
             object savedCam = null, savedDc = null;
+            object[] savedCb = null;
             bool camSwapped = false;
 
             _inOurRender = true;
@@ -377,6 +380,39 @@ internal static class WholeSceneRender
                 ScopeSharedState();
                 if (FeedConfig.WholeSceneCamera) camSwapped = InstallCamera(out savedCam);
 
+                // The camera CONSTANT BUFFER, not just the view. The matrix check proved
+                // the installed view was rebuilt perfectly — square projection, orbiting
+                // At0 pair — and the panel still rendered with the player's aspect and a
+                // head-tracked sky. Shaders never read the view: they read the per-frame
+                // camera CB, which the engine builds from the PLAYER'S view before Draw
+                // runs, and our nested Draw inherits it. Culling and camera-relative
+                // positioning read the installed view directly — which is exactly why
+                // geometry orbited while the sky did not. Both halves have to be ours.
+                //
+                // The probe pass has done this precise swap every 33ms for weeks
+                // (CameraCbSwap: restore in the same frame bracket, never null, never
+                // the same buffer in both fields).
+                if (camSwapped && FeedConfig.WholeSceneCameraRebuild >= 2)
+                {
+                    var cb = CameraRender.WholeSceneCameraCb();
+                    if (cb != null)
+                    {
+                        savedCb = CameraCbSwap.Install(cb);
+                        if (!_cbSwapLogged)
+                        {
+                            _cbSwapLogged = true;
+                            RttLog.Line("Whole-scene camera CB: swapped in for our render — shaders now " +
+                                        "read the orbit camera's projection, sky rotation and 512x512 " +
+                                        "Screen.Resolution instead of inheriting the player's frame CB.");
+                        }
+                    }
+                    else if (_cbSwapErrs++ < 2)
+                    {
+                        RttLog.Line("Whole-scene camera CB: build failed — feed keeps the player's " +
+                                    "projection/sky until it succeeds.");
+                    }
+                }
+
                 if (_renderCount == 0)
                     RttLog.Line($"=== WHOLE-SCENE RENDER: calling SceneDrawSystem.Draw a second time, " +
                                 $"into our own {FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight} " +
@@ -400,9 +436,11 @@ internal static class WholeSceneRender
             }
             finally
             {
-                // Unconditional, and in reverse install order: camera, then every scoped
-                // settings group, then both global families the engine's next frame
-                // renders through.
+                // Unconditional, and in reverse install order: the camera CB first (it
+                // must go back inside this same frame bracket — OnEndDraw disposes
+                // whatever is in the field), then camera, scoped settings groups, and
+                // both global families the engine's next frame renders through.
+                if (savedCb != null) { try { CameraCbSwap.Restore(savedCb); } catch (Exception e) { RttLog.Error("whole-scene CB restore", e); } }
                 if (camSwapped) RestoreCamera(savedCam);
                 RestoreScoped();
                 if (savedDc != null) _dcField.SetValue(null, savedDc);

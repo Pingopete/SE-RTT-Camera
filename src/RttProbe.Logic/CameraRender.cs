@@ -3712,14 +3712,80 @@ internal static class CameraRender
                             "projection aspect, ViewAt0/InvViewAt0 (the stationary-sky pair) and camera " +
                             "position now all come from one coherent engine rebuild. Jitter zeroed.");
             }
+
+            // VERIFY THE REBUILD TOOK, with numbers rather than optimism. The panel
+            // showed baseline symptoms (squash + head-tracked sky) while the rebuild
+            // path logged success, so one of two things is true: SetCameraParameters
+            // did not actually change the matrices, or downstream consumes the player's
+            // values regardless. M11==M22 means square aspect; ours differing from the
+            // player's on InvViewAt0 means the sky pair really was rebuilt. Whichever
+            // half is FALSE names the bug.
+            long dnow = Clock.Ms;
+            if (dnow - _wsDiagMs >= 10000)
+            {
+                _wsDiagMs = dnow;
+                try
+                {
+                    string DescProj(object rv)
+                    {
+                        var pm = _rvFields.FirstOrDefault(f => f.Name.Contains("<Projection>", StringComparison.Ordinal))?.GetValue(rv);
+                        var m = Prop2(pm, "Projection");
+                        return m == null ? "?" :
+                            $"M11={System.Convert.ToSingle(Prop2(m, "M11") ?? MField(m, "M11")):F4} " +
+                            $"M22={System.Convert.ToSingle(Prop2(m, "M22") ?? MField(m, "M22")):F4}";
+                    }
+                    string DescAt0(object rv)
+                    {
+                        var m = _rvFields.FirstOrDefault(f => f.Name.Contains("<InvViewAt0>", StringComparison.Ordinal))?.GetValue(rv);
+                        return m == null ? "?" :
+                            $"M31={System.Convert.ToSingle(Prop2(m, "M31") ?? MField(m, "M31")):F3} " +
+                            $"M32={System.Convert.ToSingle(Prop2(m, "M32") ?? MField(m, "M32")):F3}";
+                    }
+                    RttLog.Line($"Whole-scene camera CHECK: ours proj[{DescProj(_wsRenderView)}] " +
+                                $"at0[{DescAt0(_wsRenderView)}]  player proj[{DescProj(theirs)}] " +
+                                $"at0[{DescAt0(theirs)}]  (square aspect = M11==M22; rebuilt sky pair = " +
+                                "our at0 differing from the player's and changing as the orbit turns)");
+                }
+                catch (Exception e) { RttLog.Error("whole-scene camera check", e); }
+            }
             return _wsRenderView;
         }
         catch (Exception e) { RttLog.Error("whole-scene render view", e); return null; }
     }
 
+    // A camera CONSTANT BUFFER for the whole-scene render, built by the same machinery
+    // the probe pass uses every 33ms (FullCameraSettings + tracked conversion).
+    //
+    // WHY THIS EXISTS. The matrix check proved the installed RenderView rebuild is
+    // perfect — square projection, orbiting At0 pair — and the panel still showed the
+    // player's aspect and a head-tracked sky. The shaders never read the view: they
+    // read the per-frame camera CB, which the engine builds from the PLAYER'S view
+    // before Draw runs, and our nested Draw inherits it. Culling and camera-relative
+    // positioning read the installed view directly, which is why geometry orbited
+    // while the sky did not — the exact split the symptoms showed.
+    //
+    // So the whole-scene bracket must do what the probe pass already does: build our
+    // own CB and CameraCbSwap it in for the duration of the call.
+    public static object WholeSceneCameraCb()
+    {
+        try
+        {
+            var view = CurrentViewSlim();
+            if (view == null || _wsResolution == null) return null;
+            return BuildCameraCb(view, _wsResolution);
+        }
+        catch (Exception e) { RttLog.Error("whole-scene camera CB", e); return null; }
+    }
+
     private static object _wsRenderView, _wsResolution;
     private static bool _wsRvLogged;
     private static int _wsRvErrs;
+    private static long _wsDiagMs;
+
+    private static object MField(object o, string name)
+    {
+        try { return o?.GetType().GetField(name, Any)?.GetValue(o); } catch { return null; }
+    }
 
     private static void SetRvOn(object rv, string name, object value)
     {
