@@ -18,6 +18,7 @@ public static class LogicEntry
             DynamicExposure.Reset();
             PrivateCullContexts.Reset();
             CustomCullJob.Reset();
+            WholeSceneRender.Reset();
             CameraCbSwap.Reset();
             FeedHandover.Reset();
             PanelBinding.Reset();
@@ -32,6 +33,22 @@ public static class LogicEntry
             bridge.GetField("PanelRenderHook")?.SetValue(null, (Action<object, object, object>)BlitProbe.OnPanelRender);
             bridge.GetField("SceneDrawHook")?.SetValue(null, (Action<object, object, int>)SceneDrawRecon.OnSceneDraw);
             bridge.GetField("OffscreenUiDrawHook")?.SetValue(null, (Action<object[]>)FeedHandover.OnOffscreenUiDraw);
+
+            // The whole-scene route. Null on an older bootstrap, which is the expected
+            // state until the game is restarted to adopt the new one — the field is
+            // looked up rather than assumed so a stale bootstrap degrades to "this
+            // route is off" instead of throwing and taking the other hooks with it.
+            var wholeScene = bridge.GetField("WholeSceneHook");
+            if (wholeScene != null)
+            {
+                wholeScene.SetValue(null, (Action<object, object>)WholeSceneRender.OnWholeScene);
+                RttLog.Line("Whole-scene hook registered (SceneDrawSystem.Draw postfix).");
+            }
+            else
+            {
+                RttLog.Line("WholeSceneHook not on this bootstrap — restart the game to adopt it. " +
+                            "The probe-based feed is unaffected.");
+            }
             RttLog.Line("Hooks registered. Scene-draw recon is read-only and runs on its own.");
             RttLog.Line("Tag a panel [RTT] for blit stages 1-3, [RTT!] to also arm the blit.");
         }

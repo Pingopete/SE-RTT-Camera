@@ -236,6 +236,35 @@ internal static class FeedConfig
     // env pass's depth.
     public static bool ClearGBufferBeforePass { get; private set; } = true;
 
+    // ---------------------------------------------------------------- whole-scene route
+    //
+    // Drive SceneDrawSystem.Draw a second time from our camera into our own target,
+    // instead of reassembling the main pipeline pass by pass. See WholeSceneRender and
+    // docs/second-view-hunt.md.
+    //
+    // Staged deliberately. Every one of these defaults OFF, and each is meant to be
+    // proven on its own before the next is switched on — the deferred route's failures
+    // were unattributable precisely because three things moved at once.
+
+    // Stage 2: construct a second ScreenBuffers and do nothing with it. Proves the
+    // public parameterless constructor and InitializeBuffers work before anything is
+    // swapped. Costs a second set of screen-sized targets, so not free — but far less
+    // than finding out mid-render that it could not be built.
+    public static bool WholeSceneBuildBuffers { get; private set; }
+
+    // Stage 3: swap the globals and actually call Draw. The real experiment.
+    //
+    // Named Enabled rather than WholeSceneRender because that is the CLASS that does the
+    // work, and a property with the same name shadows it inside this type — which is
+    // exactly the kind of collision that produces a confusing compile error at the worst
+    // moment.
+    public static bool WholeSceneEnabled { get; private set; }
+
+    // Resolution of the second render. The whole point of this route is that Draw takes
+    // its size from the buffer it is handed, so this is a real knob rather than a wish.
+    public static int WholeSceneWidth { get; private set; } = 512;
+    public static int WholeSceneHeight { get; private set; } = 512;
+
     // Extra margin on top of the sizing basis. ZERO by default, and deliberately.
     //
     // The first guess here was 50%, on the theory that the report describes a cull from
@@ -658,6 +687,8 @@ internal static class FeedConfig
             bool coMainView = CoCullForMainView, coTwoPass = CoCullTwoPass,
                  coGeomOnly = CoCullGeometryOnly, coSingleLod = CoCullForceSingleLod;
             bool clearGb = ClearGBufferBeforePass;
+            bool wsBuild = WholeSceneBuildBuffers, wsRender = WholeSceneEnabled;
+            int wsW = WholeSceneWidth, wsH = WholeSceneHeight;
 
             foreach (var raw in File.ReadAllLines(Path_))
             {
@@ -805,6 +836,18 @@ internal static class FeedConfig
                     case "cocullmainview":
                         coCull = val is "1" or "true" or "yes";
                         break;
+                    case "wholescenebuildbuffers":
+                        wsBuild = val is "1" or "true" or "yes";
+                        break;
+                    case "wholescenerender":
+                        wsRender = val is "1" or "true" or "yes";
+                        break;
+                    case "wholescenewidth":
+                        if (int.TryParse(val, out var wsw)) wsW = Math.Clamp(wsw, 64, 4096);
+                        break;
+                    case "wholesceneheight":
+                        if (int.TryParse(val, out var wsh)) wsH = Math.Clamp(wsh, 64, 4096);
+                        break;
                     case "cleargbufferbeforepass":
                         clearGb = val is "1" or "true" or "yes";
                         break;
@@ -923,6 +966,8 @@ internal static class FeedConfig
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
                         || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || clearGb != ClearGBufferBeforePass
+                        || wsBuild != WholeSceneBuildBuffers || wsRender != WholeSceneEnabled
+                        || wsW != WholeSceneWidth || wsH != WholeSceneHeight
                         || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
@@ -938,6 +983,20 @@ internal static class FeedConfig
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
             LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass; SunPassDepth = sunDepth; DebugGBuffer = dbgGb; DeferredTexturing = defTex;
             MainViewCulling = mvCull; CullSecondPass = cull2; DisableOcclusionCulling = noOcc; PrivateCullContexts = privCtx; PrivateGeomBuffers = privGeom; CoCullMainView = coCull; ClearGBufferBeforePass = clearGb;
+
+            // Compare BEFORE assigning. The second ScreenBuffers is initialised at a
+            // fixed size, so a changed resolution has to rebuild it rather than quietly
+            // render at the old one — and turning buffer construction off should release
+            // it rather than leave it allocated.
+            bool wsChanged = wsBuild != WholeSceneBuildBuffers
+                             || wsW != WholeSceneWidth || wsH != WholeSceneHeight;
+
+            WholeSceneEnabled = wsRender;
+            WholeSceneBuildBuffers = wsBuild;
+            WholeSceneWidth = wsW;
+            WholeSceneHeight = wsH;
+
+            if (wsChanged) RttProbe.WholeSceneRender.Reset();
 
             // The custom culling job bakes its pass-group list AND its flags in at
             // construction, so any change means a rebuilt job — otherwise editing the

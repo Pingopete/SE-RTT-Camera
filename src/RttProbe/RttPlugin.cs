@@ -24,6 +24,26 @@ public static class RttBridge
     // into an offscreen render target — the one point in the frame where that
     // resource is in the right state to be written.
     public static volatile Action<object[]> OffscreenUiDrawHook;
+
+    // (sceneDrawSystem, finalLDRBuffer) — fires AFTER the engine's whole frame.
+    //
+    // SceneDrawSystem.Draw is the top of the pipeline: public, and it takes both its
+    // destination buffer and (through that buffer's Resolution) its render size as
+    // parameters. Everything else it needs comes from CoreSystems statics, and those
+    // are public FIELDS rather than readonly properties — so a second render is a
+    // matter of swapping them around a second call, not of finding a second renderer.
+    //
+    // POSTFIX, not prefix. After the engine's frame the temporal state is settled and
+    // we are conceptually between frames; running ahead of it would interleave our
+    // render with the one the player sees.
+    //
+    // Draw has ZERO managed callers — it is invoked from engine glue — which is what
+    // makes this a usable site at all. The probe hook could never host a second Draw
+    // because it already sits inside one.
+    //
+    // Re-entrancy is the logic side's problem: our own nested Draw will fire this hook
+    // again, and the handler must return immediately when it does.
+    public static volatile Action<object, object> WholeSceneHook;
 }
 
 public sealed class RttPlugin : IPlugin
@@ -142,6 +162,36 @@ public sealed class RttPlugin : IPlugin
             }
             catch (Exception e) { Log($"Patching SceneDrawSystem.{name} FAILED: {e.Message}"); }
         }
+
+        // Draw is the TOP of the pipeline, and the only site where a second whole-scene
+        // render can be driven. Patched separately from the loop above because it takes
+        // a different argument (the final LDR buffer, not a command list) and because it
+        // is the one hook that calls back into the method it patches.
+        try
+        {
+            var draw = sds.GetMethod("Draw", Any);
+            if (draw == null)
+            {
+                Log("SceneDrawSystem.Draw not found — the whole-scene route has no hook site.");
+            }
+            else
+            {
+                var post = typeof(RttPlugin).GetMethod(nameof(WholeScenePostfix),
+                    BindingFlags.Static | BindingFlags.NonPublic);
+                harmony.Patch(draw, postfix: new HarmonyLib.HarmonyMethod(post));
+                Log($"Patched SceneDrawSystem.Draw({string.Join(", ", draw.GetParameters().Select(p => p.ParameterType.Name))}) " +
+                    "— the whole-scene render hook.");
+            }
+        }
+        catch (Exception e) { Log("Patching SceneDrawSystem.Draw FAILED: " + e.Message); }
+    }
+
+    // __0 is the ResizableRWRenderTargetTexture the engine just rendered the player's
+    // frame into. We do not touch it — it is passed through so the logic side can read
+    // its format and resolution, which is what a second target has to match.
+    private static void WholeScenePostfix(object __instance, object __0)
+    {
+        try { RttBridge.WholeSceneHook?.Invoke(__instance, __0); } catch { }
     }
 
     // __0 is the DirectCommandList both passes take as their first parameter.
