@@ -68,7 +68,13 @@ internal static class CustomCullJob
         BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
 
     private static object _job;
-    private static List<Task> _tasks;
+
+    // Keen.VRage.Library.Threading.Task, NOT System.Threading.Tasks.Task. The ctor's
+    // parameter is List<Keen…Task>, and handing it a BCL list throws ArgumentException at
+    // Invoke — which is how this was found. It is a struct with a public IsCompleted, so
+    // the list is held as a non-generic IList and polled by reflection.
+    private static System.Collections.IList _tasks;
+    private static PropertyInfo _piIsCompleted;
     private static int _state;          // 0 untried, 1 built, -1 unavailable
     private static bool _readyLogged;
 
@@ -81,11 +87,20 @@ internal static class CustomCullJob
         {
             if (_state != 1) return false;
             if (_tasks == null) return true;
-            lock (_tasks)
+            try
             {
-                foreach (var t in _tasks)
-                    if (t != null && !t.IsCompleted) return false;
+                lock (_tasks.SyncRoot ?? new object())
+                {
+                    foreach (var t in _tasks)
+                    {
+                        if (t == null) continue;
+                        _piIsCompleted ??= t.GetType().GetProperty("IsCompleted", Any);
+                        if (_piIsCompleted?.GetValue(t) is bool done && !done) return false;
+                    }
+                }
             }
+            catch { return true; }   // unreadable: do not deadlock the pass on a poll
+
             if (!_readyLogged)
             {
                 _readyLogged = true;
@@ -100,6 +115,7 @@ internal static class CustomCullJob
         if (_job is IDisposable d) { try { d.Dispose(); } catch { } }
         _job = null;
         _tasks = null;
+        _piIsCompleted = null;
         _state = 0;
         _readyLogged = false;
     }
@@ -130,6 +146,18 @@ internal static class CustomCullJob
                 return false;
             }
 
+            // Take the element type from the ctor signature rather than assuming it.
+            // Assuming System.Threading.Tasks.Task is exactly what failed here — the
+            // engine has its own Keen.VRage.Library.Threading.Task and Invoke rejects the
+            // BCL one outright.
+            var tasksParam = ctor.GetParameters()[5].ParameterType;
+            var taskElem = tasksParam.IsGenericType ? tasksParam.GetGenericArguments()[0] : null;
+            if (taskElem == null)
+            {
+                RttLog.Line($"Custom cull job: tasks parameter is {tasksParam.Name}, not a List<T>.");
+                return false;
+            }
+
             // [MainViewPass=0, MainViewDeferredTexturingPass=2,
             //  MainViewCountVolumeSegments=3, MainViewGatherVolumeSegments=4]
             var listType = typeof(List<>).MakeGenericType(groupType);
@@ -142,7 +170,8 @@ internal static class CustomCullJob
             var forced = Activator.CreateInstance(
                 typeof(Nullable<>).MakeGenericType(lodType), Enum.ToObject(lodType, 1));
 
-            _tasks = new List<Task>();
+            _tasks = (System.Collections.IList)Activator.CreateInstance(
+                typeof(List<>).MakeGenericType(taskElem));
             _job = ctor.Invoke(new object[]
             {
                 groups,     // targetPasses
