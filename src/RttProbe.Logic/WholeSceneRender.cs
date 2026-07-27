@@ -98,6 +98,29 @@ internal static class WholeSceneRender
         _renderCount = 0;
     }
 
+    // Clear the one-strike disable after a config change, WITHOUT throwing away the
+    // second ScreenBuffers.
+    //
+    // RunSecondRender latches _state = -1 on any exception, which is right — a
+    // whole-frame render that faults should not retry five times a second while the log
+    // is being read. But it made every experiment cost a rebuild, because only a
+    // resolution change called Reset(). Re-arming on any whole-scene config edit keeps
+    // the safety and returns the fast iteration loop.
+    //
+    // Deliberately NOT Reset(): that disposes the ScreenBuffers, and rebuilding a full
+    // set of render targets to retry a flag change is pure waste.
+    public static void Rearm()
+    {
+        if (_state == -1)
+        {
+            _state = _describedTarget ? 1 : 0;
+            RttLog.Line("Whole-scene: re-armed after a config change (the route had disabled itself " +
+                        "on an error). Buffers kept.");
+        }
+        _skippedLogged.Clear();
+        _scopeWarned.Clear();
+    }
+
     // Should a Draw sub-stage be skipped right now?
     //
     // TRUE only while OUR render is running. The engine's own frame must always get

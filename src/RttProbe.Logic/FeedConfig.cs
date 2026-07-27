@@ -312,10 +312,20 @@ internal static class FeedConfig
     //   1 ExecuteRaytracingPrepareAndSceneFinalize raytracing prepare
     //   2 RenderEnvironmentProbe                   shared probe atlas (ambient + reflections)
     //   3 RenderShadows                            shadow cascades
-    //   4 ComputeExposure                          auto-exposure history
+    //   4 ComputeExposure                          auto-exposure history  ** SEE BELOW **
     //   5 UpdateSurfels                            water surfels
     //
-    // This exists because settings flags cannot reach everything.
+    // STAGE 4 IS NOT SAFELY SKIPPABLE. ComputeExposure has OUT PARAMETERS:
+    //
+    //     ComputeExposure(cl, lBuffer, out ITexture2DView exposure, out Nullable<..>)
+    //
+    // A prefix that skips it leaves those null, and ApplyBloom and ApplyToneMapping
+    // consume them immediately — instant NullReferenceException. It is listed so the
+    // distinction is on record: the other stages only have SIDE EFFECTS, this one
+    // PRODUCES something Draw needs. Use WholeSceneDisableEyeAdaptation for the
+    // exposure-history problem instead.
+    //
+    // This mechanism exists because settings flags cannot reach everything.
     // ExecuteAccelerationStructuresBuilding is called unconditionally at the top of Draw
     // and checks only EnableGPUParallelization, so clearing RaytracingSettings.Enabled
     // never stopped it — three rounds of settings scoping missed it for that reason.
@@ -1095,7 +1105,11 @@ internal static class FeedConfig
             WholeSceneDisableProbeUpdates = wsNoProbe;
             WholeSceneSkipStages = wsSkip;
 
+            // A resolution or buffer-mode change needs a full rebuild; anything else
+            // just needs the one-strike disable cleared, so an experiment is a config
+            // save rather than a rebuild.
             if (wsChanged) RttProbe.WholeSceneRender.Reset();
+            else RttProbe.WholeSceneRender.Rearm();
 
             // The custom culling job bakes its pass-group list AND its flags in at
             // construction, so any change means a rebuilt job — otherwise editing the
