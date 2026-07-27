@@ -238,6 +238,7 @@ public sealed class RttPlugin : IPlugin
         "ComputeLocalLights",                        // 13 clustered point/spot lights
         "ComputeCloudShadows",                       // 14 writes SHARED CommonResources.CloudShadowmap
         "UpdateAtmosphere",                          // 15 atmosphere LUT updates
+        "DrawUI",                                    // 16 the player's HUD, baked into the feed otherwise
     };
 
     private static void PatchSkippableStages(HarmonyLib.Harmony harmony, Type sds)
@@ -290,6 +291,7 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage13() => Skip(13);
     private static bool SkipStage14() => Skip(14);
     private static bool SkipStage15() => Skip(15);
+    private static bool SkipStage16() => Skip(16);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the

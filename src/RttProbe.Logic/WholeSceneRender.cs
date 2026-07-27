@@ -240,6 +240,7 @@ internal static class WholeSceneRender
         13 => "ComputeLocalLights",
         14 => "ComputeCloudShadows",
         15 => "UpdateAtmosphere",
+        16 => "DrawUI",
         _ => "unknown",
     };
 

@@ -3584,20 +3584,120 @@ internal static class CameraRender
 
             var rvType = theirs.GetType();
             _rvFields ??= rvType.GetFields(Any).Where(f => !f.IsStatic).ToArray();
-            _ourRenderView ??= System.Runtime.CompilerServices.RuntimeHelpers
+            _wsRenderView ??= System.Runtime.CompilerServices.RuntimeHelpers
                 .GetUninitializedObject(rvType);
 
+            // Baseline: everything the player's live view has — clipping planes, FOV,
+            // smoothing state, environment roots — so anything we do not explicitly
+            // rebuild stays current with their settings.
             foreach (var f in _rvFields)
             {
-                try { f.SetValue(_ourRenderView, f.GetValue(theirs)); } catch { }
+                try { f.SetValue(_wsRenderView, f.GetValue(theirs)); } catch { }
             }
 
-            SetRv("ViewD", _lastViewD);
-            SetRv("InvViewD", _lastCamWorld);
-            SetRv("CameraPosition", Prop2(_lastCamWorld, "Translation"));
-            return _ourRenderView;
+            // The first version stopped here plus three field overrides (ViewD, InvViewD,
+            // CameraPosition), and the feed showed the cost of every field it did NOT
+            // override: the player's 16:9 PROJECTION squashed into the 1:1 panel, and the
+            // sky stationary because the skybox renders through the floating-origin
+            // ViewAt0/InvViewAt0 pair — which stayed glued to the player's head. Patching
+            // matrices one by one is a losing game; the engine has the consistent-rebuild
+            // API, and the _cbRenderView recipe below in this file already proved it safe:
+            //
+            //   1. null _cameraSpeedBuffer — Update() -> ResetContext() Clears it, and the
+            //      uninitialized clone's copy is shared with the PLAYER'S live view.
+            //      smooth:true should keep ResetContext unreachable; belt and braces.
+            //   2. SetResolution FIRST — Update() derives FovV from _resolution, so the
+            //      other order computes our FOV from the player's screen. This is also
+            //      what makes the projection aspect 1:1 instead of the player's 16:9.
+            //   3. SetCameraParameters with the orbit transform — rebuilds ViewD, InvViewD,
+            //      CameraPosition, ViewAt0/InvViewAt0 AND the projection set coherently.
+            foreach (var f in _rvFields)
+                if (f.Name == "_cameraSpeedBuffer")
+                    try { f.SetValue(_wsRenderView, null); } catch { }
+
+            _miRvSetResolution ??= rvType.GetMethod("SetResolution", Any);
+            _miRvSetCamera ??= rvType.GetMethod("SetCameraParameters", Any);
+            if (!FeedConfig.WholeSceneCameraRebuild || _miRvSetResolution == null || _miRvSetCamera == null)
+            {
+                // The PROVEN baseline: three field overrides. Costs a squashed aspect
+                // (player's 16:9 projection into our 1:1 target) and a stationary sky
+                // (inherited ViewAt0/InvViewAt0), but it ran the milestone session
+                // without incident. The full rebuild below fixed both — and then the
+                // session died on a GPU page fault in a bloom chain 45 renders later,
+                // with THREE camera sub-changes landed at once (resolution, rebuild,
+                // jitter zeroing), so the guilty one is unknown. Hence the flag: flip
+                // wholeSceneCameraRebuild live to re-test, bisect the sub-changes if it
+                // reproduces, and always have this baseline to fall back to.
+                SetRvOn(_wsRenderView, "ViewD", _lastViewD);
+                SetRvOn(_wsRenderView, "InvViewD", _lastCamWorld);
+                SetRvOn(_wsRenderView, "CameraPosition", Prop2(_lastCamWorld, "Translation"));
+                return _wsRenderView;
+            }
+
+            // 1:1 render target, built from the same Vector2I type the view carries.
+            if (_wsResolution == null)
+            {
+                var resField = _rvFields.FirstOrDefault(f => f.Name == "_resolution");
+                var ctor = resField?.FieldType.GetConstructor(new[] { typeof(int), typeof(int) });
+                _wsResolution = ctor?.Invoke(new object[] { FeedConfig.WholeSceneWidth, FeedConfig.WholeSceneHeight });
+                if (_wsResolution == null)
+                {
+                    if (_wsRvErrs++ < 2) RttLog.Line("Whole-scene camera: could not build Vector2I resolution.");
+                    return null;
+                }
+            }
+            _miRvSetResolution.Invoke(_wsRenderView, new[] { _wsResolution });
+
+            float fovH    = System.Convert.ToSingle(Prop2(_wsRenderView, "FovH") ?? 0f);
+            float near    = System.Convert.ToSingle(Prop2(_wsRenderView, "NearClipping") ?? 0f);
+            float far     = System.Convert.ToSingle(Prop2(_wsRenderView, "FarClipping") ?? 0f);
+            float veryFar = System.Convert.ToSingle(Prop2(_wsRenderView, "VeryFarClipping") ?? 0f);
+            var projOff   = Prop2(_wsRenderView, "ProjectionOffset");
+            bool ortho    = System.Convert.ToBoolean(Prop2(_wsRenderView, "IsOrthographic") ?? false);
+
+            _miRvSetCamera.Invoke(_wsRenderView, new object[]
+                { _lastCamWorld, fovH, near, far, veryFar, projOff, /* smooth */ true, ortho });
+
+            // Kill TAA jitter for our render: the inherited jitter phase was computed for
+            // the player's 4K target, and sub-pixel offsets that large at 512x512 are a
+            // live suspect for the surface banding. A 5 fps feed gains nothing from
+            // temporal jitter anyway. JitteredProjection := Projection, offset := zero.
+            try
+            {
+                var proj = _rvFields.FirstOrDefault(f => f.Name.Contains("<Projection>", StringComparison.Ordinal));
+                var jitProj = _rvFields.FirstOrDefault(f => f.Name.Contains("<JitteredProjection>", StringComparison.Ordinal));
+                var jitOff = _rvFields.FirstOrDefault(f => f.Name.Contains("<JitterPixelOffset>", StringComparison.Ordinal));
+                if (proj != null && jitProj != null)
+                    jitProj.SetValue(_wsRenderView, proj.GetValue(_wsRenderView));
+                if (jitOff != null)
+                    jitOff.SetValue(_wsRenderView, Activator.CreateInstance(jitOff.FieldType));
+            }
+            catch { }
+
+            if (!_wsRvLogged)
+            {
+                _wsRvLogged = true;
+                RttLog.Line($"Whole-scene camera: rebuilt via SetResolution({FeedConfig.WholeSceneWidth}x" +
+                            $"{FeedConfig.WholeSceneHeight}) + SetCameraParameters(orbit, fovH={fovH:F2}) — " +
+                            "projection aspect, ViewAt0/InvViewAt0 (the stationary-sky pair) and camera " +
+                            "position now all come from one coherent engine rebuild. Jitter zeroed.");
+            }
+            return _wsRenderView;
         }
         catch (Exception e) { RttLog.Error("whole-scene render view", e); return null; }
+    }
+
+    private static object _wsRenderView, _wsResolution;
+    private static bool _wsRvLogged;
+    private static int _wsRvErrs;
+
+    private static void SetRvOn(object rv, string name, object value)
+    {
+        if (value == null || rv == null) return;
+        var f = _rvFields.FirstOrDefault(x =>
+            x.Name.Contains($"<{name}>", StringComparison.Ordinal) || x.Name == name);
+        if (f == null || !f.FieldType.IsInstanceOfType(value)) return;
+        try { f.SetValue(rv, value); } catch { }
     }
 
     private static int SetRv(string name, object value)
