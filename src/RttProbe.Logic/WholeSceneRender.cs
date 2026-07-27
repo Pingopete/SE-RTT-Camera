@@ -278,10 +278,7 @@ internal static class WholeSceneRender
 
             int set = 0;
             foreach (var n in flags)
-            {
-                var f = ours.GetType().GetField(n, Any);
-                if (f != null && f.FieldType == typeof(bool)) { f.SetValue(ours, false); set++; }
-            }
+                if (ClearBool(ours, n)) set++;
             if (set == 0)
             {
                 if (_scopeWarned.Add(settingsTypeName))
@@ -297,6 +294,40 @@ internal static class WholeSceneRender
                             $"cleared on {settingsTypeName}).");
         }
         catch (Exception e) { RttLog.Error($"whole-scene scope off {settingsTypeName}", e); }
+    }
+
+    // Clear a bool on a boxed struct, following a dotted path through nested structs.
+    //
+    // Needed because the interesting flags are not all at the top level:
+    // EnvironmentSettings.ProbeSettings.Enable is two deep. Nested STRUCTS do not
+    // behave like nested objects — GetValue on a struct field returns a COPY, so
+    // mutating it changes nothing unless the copy is written back at every level on
+    // the way out. That is what the recursion is for, and getting it wrong would look
+    // exactly like "the flag had no effect".
+    private static bool ClearBool(object box, string path)
+    {
+        try
+        {
+            int dot = path.IndexOf('.');
+            if (dot < 0)
+            {
+                var f = box.GetType().GetField(path, Any);
+                if (f == null || f.FieldType != typeof(bool)) return false;
+                f.SetValue(box, false);
+                return true;
+            }
+
+            var outer = box.GetType().GetField(path.Substring(0, dot), Any);
+            if (outer == null) return false;
+
+            var inner = outer.GetValue(box);            // a COPY when it is a struct
+            if (inner == null) return false;
+            if (!ClearBool(inner, path.Substring(dot + 1))) return false;
+
+            outer.SetValue(box, inner);                 // write the mutated copy back
+            return true;
+        }
+        catch { return false; }
     }
 
     private static void RestoreScoped()
@@ -338,6 +369,24 @@ internal static class WholeSceneRender
         // anyway.
         if (FeedConfig.WholeSceneDisableEyeAdaptation)
             ScopeOff("PostProcessSettings", "eye adaptation", "EyeAdaptation");
+
+        // ENVIRONMENT PROBES. Reported as "reflections or ambient lighting from light
+        // sources, but not the lights themselves" — which is indirect lighting exactly,
+        // and that is what probes supply.
+        //
+        // The engine updates probe faces round-robin across frames into a SHARED atlas,
+        // driven by DrawContextManager.EnvProbesToUpdate. Our second Draw calls
+        // RenderEnvironmentProbe as well, so we both advance that queue at double rate
+        // AND write probe faces using our settings — with raytracing already scoped off.
+        // The player's frame then samples that atlas for ambient and reflections, which
+        // is why the symptom is indirect light and not direct.
+        //
+        // ProbeSettings.Enable is two levels deep (EnvironmentSettings.ProbeSettings),
+        // hence the dotted path. ApplyEnvProbe is deliberately NOT cleared: we want our
+        // render to keep USING the probes for ambient, just not to update them. If the
+        // feed loses its ambient term anyway, Enable gates both and this needs splitting.
+        if (FeedConfig.WholeSceneDisableProbeUpdates)
+            ScopeOff("EnvironmentSettings", "environment probe updates", "ProbeSettings.Enable");
     }
 
 
