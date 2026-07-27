@@ -63,6 +63,31 @@ internal static class OwnContexts
     private static object _defaultRangeStats;
     private static bool _rangeBlocked, _rangeLogged;
 
+    // The capacity a full-scene cull actually needs, as REPORTED BY THE ENGINE.
+    //
+    // UpdateRanges' second parameter is `ref RangeStats`, and the by-ref is the entire
+    // point — this was read as a floor being passed IN, when it is really the answer
+    // coming OUT. CullingContext.UpdateRanges calls GeometryContext.UpdateRanges on both
+    // passes, which sizes itself from CullCapacityTrackingManager.GetTotalMaterialUsagesForRoot
+    // plus the GPU counter readback, and then Math.Max'es each total into the caller's
+    // struct. SceneDrawSystem.EnsureRangesOutputGeometryBuffers proves the intended use:
+    // it seeds one local with RangeStats.Default, walks every pending-work queue MAXing
+    // into it, hands that local to MainOutputGeometryBuffers.EnsureRanges — and then
+    // RESETS the local to Default before doing the effects pair. That reset is only
+    // meaningful if the struct has been accumulating.
+    //
+    // So this is not decoration. OutputGeometryBufferContext.EnsureRanges is a plain
+    // resize — EnsureCapacity(rangeStats.XCount) per buffer, no counter lookup of its own
+    // — and its constructor creates every buffer with a capacity of ONE. Handing it
+    // RangeStats.Default therefore asks for a capacity of one and gets it, which is what
+    // took the device out the moment a private geometry context was wired in.
+    private static object _lastRangeStats;
+    private static long _lastStatsLogMs;
+
+    // Null until a pass has ranged a context. Callers must cope: with usePooledCulling
+    // off we never range anything, and on the very first pass there is no reading yet.
+    public static object LastRangeStats => _lastRangeStats;
+
     public static bool Available => _state == 1;
 
     public static void Reset()
@@ -74,6 +99,43 @@ internal static class OwnContexts
         _miUpdateRanges = null;
         _defaultRangeStats = null;
         _rangeBlocked = _rangeLogged = false;
+        _lastRangeStats = null;
+        _lastStatsLogMs = 0;
+    }
+
+    // Read the seven public Int32s out of a boxed RangeStats for logging, and for the
+    // private geometry context to size itself from.
+    public static int[] ReadRangeStats(object rangeStats)
+    {
+        if (rangeStats == null) return null;
+        try
+        {
+            var t = rangeStats.GetType();
+            var names = new[]
+            {
+                "SingleFirstPassCount", "SingleSecondPassCount",
+                "VolumeFirstPassCount", "VolumeSecondPassCount",
+                "InstancedFirstPassCount", "InstancedSecondPassCount",
+                "EntityProxyCount",
+            };
+            var v = new int[names.Length];
+            for (int i = 0; i < names.Length; i++)
+            {
+                var f = t.GetField(names[i], BindingFlags.Public | BindingFlags.Instance);
+                if (f == null) return null;
+                v[i] = (int)f.GetValue(rangeStats);
+            }
+            return v;
+        }
+        catch { return null; }
+    }
+
+    public static string DescribeRangeStats(object rangeStats)
+    {
+        var v = ReadRangeStats(rangeStats);
+        return v == null
+            ? "unreadable"
+            : $"single={v[0]}/{v[1]} volume={v[2]}/{v[3]} instanced={v[4]}/{v[5]} entityProxies={v[6]} (first/second pass)";
     }
 
     public static void Resolve(object drawContexts, StringBuilder sb)
@@ -124,12 +186,15 @@ internal static class OwnContexts
         catch (Exception e) { if (_errLogs++ < 3) RttLog.Error("borrow culling", e); return null; }
     }
 
-    // Grow the borrowed context's draw-command buffers to fit a full scene cull.
+    // Grow the borrowed context's draw-command buffers to fit a full scene cull, and
+    // find out how big that is.
     //
-    // Must run on the same command list, before DoCullingFirstPass. RangeStats.Default
-    // is passed exactly as the engine passes it — it is a floor, not a request; the
-    // actual growth comes from the shared counters, so this converges over a frame or
-    // two rather than immediately, and is cheap once the ranges already fit.
+    // Must run on the same command list, before DoCullingFirstPass. RangeStats.Default is
+    // passed in exactly as the engine passes it — as a SEED, not a request. The earlier
+    // reading of this, that Default was a floor and real growth arrived a frame later via
+    // the shared counters, was wrong in a way that mattered: it made the by-ref parameter
+    // look like an implementation detail instead of the return value it is. See
+    // LastRangeStats.
     public static void EnsureRanges(object cullingContext, object commandList)
     {
         if (_rangeBlocked || cullingContext == null || commandList == null) return;
@@ -155,9 +220,17 @@ internal static class OwnContexts
                 }
             }
 
-            // Invoke copies the boxed struct in and out; we do not care about the value
-            // that comes back, only that the context grew.
-            _miUpdateRanges.Invoke(cullingContext, new[] { commandList, _defaultRangeStats });
+            // Seed with Default and read the ANSWER back out of the args array.
+            //
+            // The parameter is `ref RangeStats`, and the by-ref is the entire point.
+            // Reflection honours it: Invoke boxes the struct, the callee mutates the box,
+            // and the mutated box is written back into args[1]. So this one line both
+            // ranges the culling context AND reports how large a full-scene cull's
+            // draw-command buffers have to be — the number the private
+            // OutputGeometryBufferContext needed and never had.
+            var args = new[] { commandList, _defaultRangeStats };
+            _miUpdateRanges.Invoke(cullingContext, args);
+            _lastRangeStats = args[1];
 
             if (!_rangeLogged)
             {
@@ -165,6 +238,24 @@ internal static class OwnContexts
                 RttLog.Line("Culling ranges: UpdateRanges now called on the borrowed context each pass. " +
                             "Without it the context sits at RangeStats.Default — ONE draw per category — " +
                             "because the engine only ranges contexts its own pending-work queues name.");
+            }
+
+            // Report what the scene actually needs, rate-limited.
+            //
+            // These numbers are the whole reason the private geometry context took the
+            // device out, so they are worth seeing rather than assuming. They also say
+            // whether rootEntityId=-1 really is the wildcard it was taken for:
+            // GeometryContext.UpdateRanges sizes from
+            // CullCapacityTrackingManager.GetTotalMaterialUsagesForRoot(RootEntityId), so
+            // a suspiciously small number here would mean -1 selects nothing rather than
+            // everything.
+            long now = Clock.Ms;
+            if (now - _lastStatsLogMs >= 3000)
+            {
+                _lastStatsLogMs = now;
+                RttLog.Line($"Culling ranges: a full-scene cull needs {DescribeRangeStats(_lastRangeStats)}. " +
+                            "OutputGeometryBufferContext is built with capacity ONE per buffer and its " +
+                            "EnsureRanges is a plain resize to whatever RangeStats asks for.");
             }
         }
         catch (Exception e)

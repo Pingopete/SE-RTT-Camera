@@ -42,8 +42,9 @@ internal static class PrivateCullContexts
     private static MethodInfo _miVisEnsureRanges, _miVisBorrow, _miVisReturn;
     private static MethodInfo _miGeomEnsureRanges, _miGeomBorrow, _miGeomReturn;
     private static object _defaultRangeStats;
+    private static Type _rangeStatsType;
     private static int _state;          // 0 untried, 1 built, -1 unavailable
-    private static bool _rangesLogged;
+    private static bool _rangesLogged, _sizeLogged, _declineLogged;
 
     public static bool Available => _state == 1;
     public static object Visibility => _state == 1 ? _visibility : null;
@@ -84,9 +85,10 @@ internal static class PrivateCullContexts
         _visibility = _occlusion = _geomBuffers = null;
         _miGeomEnsureRanges = _miGeomBorrow = _miGeomReturn = null;
         _defaultRangeStats = null;
+        _rangeStatsType = null;
         _miVisEnsureRanges = _miVisBorrow = _miVisReturn = null;
         _state = 0;
-        _rangesLogged = false;
+        _rangesLogged = _sizeLogged = _declineLogged = false;
     }
 
     // Build both, or report exactly which step failed. Returns true only when BOTH exist.
@@ -155,6 +157,7 @@ internal static class PrivateCullContexts
 
             var rsType = _miGeomEnsureRanges?.GetParameters()[0].ParameterType;
             if (rsType != null && rsType.IsByRef) rsType = rsType.GetElementType();
+            _rangeStatsType = rsType;
             _defaultRangeStats = rsType?.GetField("Default", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
 
             _state = 1;
@@ -169,12 +172,19 @@ internal static class PrivateCullContexts
         catch (Exception e) { RttLog.Error("build private cull contexts", e); return false; }
     }
 
-    // Size the visibility buffers before culling into them.
+    // Size and borrow the VISIBILITY buffers before culling into them.
     //
     // Straight from the lesson that cost us the asteroids: a freshly constructed context
     // starts at a floor, and the engine only grows the ones its own pending-work queues
     // name. Nothing names ours. CullingContext needed UpdateRanges for exactly this reason
-    // and this is the same shape.
+    // and this is the same shape. VisibilityListBufferContext.EnsureRanges takes only a
+    // command list — it has no RangeStats to get wrong.
+    //
+    // Geometry is deliberately NOT touched here. It used to be, and that made this method
+    // and PrepareGeomForPass both borrow the same context: with mainViewCulling and
+    // privateGeomBuffers on together the second Borrow would trip EnsureRanges'
+    // `!_isBorrowed` assert, and an assert tripped mid-session turns the next quit into a
+    // crash report via DiagnosticReporter. One owner per resource.
     public static void PrepareForPass(object commandList)
     {
         if (_state != 1 || commandList == null) return;
@@ -183,18 +193,10 @@ internal static class PrivateCullContexts
             _miVisBorrow?.Invoke(_visibility, null);
             _miVisEnsureRanges?.Invoke(_visibility, new[] { commandList });
 
-            // Range the geometry buffers BEFORE borrowing, which is the order
-            // SurfelGenerationJob uses. RangeStats.Default is a floor rather than a
-            // request — the real capacity comes from the shared counters a frame later,
-            // exactly as it does for CullingContext.
-            if (_miGeomEnsureRanges != null && _defaultRangeStats != null)
-                _miGeomEnsureRanges.Invoke(_geomBuffers, new[] { _defaultRangeStats, commandList });
-            _miGeomBorrow?.Invoke(_geomBuffers, null);
-
             if (!_rangesLogged)
             {
                 _rangesLogged = true;
-                RttLog.Line("Private contexts: visibility and geometry buffers borrowed and ranged for our pass.");
+                RttLog.Line("Private contexts: visibility buffers borrowed and ranged for our pass.");
             }
         }
         catch (Exception e) { _state = -1; RttLog.Error("prepare private cull contexts", e); }
@@ -205,19 +207,151 @@ internal static class PrivateCullContexts
     // Kept separate from PrepareForPass so the geometry context can be swapped in on its
     // own, without the visibility/occlusion pair. That is what lets it be tested as a
     // change which should produce no visible difference at all — one variable, not three.
-    public static void PrepareGeomForPass(object commandList)
+    //
+    // `sceneStats` is the boxed RangeStats that CullingContext.UpdateRanges just reported
+    // for this pass — see OwnContexts.LastRangeStats. Passing it, rather than
+    // RangeStats.Default, is the fix for the instant device removal this route hit twice.
+    // OutputGeometryBufferContext's constructor creates every buffer at capacity ONE and
+    // its EnsureRanges is a plain resize to whatever it is handed, with no counter lookup
+    // of its own, so Default (all 1s) sized the buffers for a single draw and the cull
+    // then wrote a whole scene into them.
+    //
+    // `engineGeom` is DrawContexts.MainOutputGeometryBuffers — the context the engine has
+    // already sized for a full-scene main-view cull, this frame, for the player's camera.
+    // Mirroring its capacities is the sturdiest source we have, and it is needed because
+    // sceneStats alone may not be trustworthy: GeometryContext.UpdateRanges sizes from
+    // CullCapacityTrackingManager.GetTotalMaterialUsagesForRoot(RootEntityId), and that is
+    // a plain dictionary lookup returning Span.Empty on a miss. rootEntityId -1 was assumed
+    // to mean "everything"; it is a key, so if nothing tracks -1 the report comes back
+    // small and sizing from it would remove the device exactly as Default did.
+    //
+    // So we take the MAX of the two, which is safe whichever assumption is wrong.
+    //
+    // Returns true only when the buffers were actually ranged and borrowed; false means
+    // the caller should fall back to the shared buffers for this pass.
+    public static bool PrepareGeomForPass(object commandList, object sceneStats, object engineGeom)
     {
-        if (_state != 1 || commandList == null) return;
+        if (_state != 1 || commandList == null) return false;
+        if (_miGeomEnsureRanges == null) return false;
         try
         {
-            // EnsureRanges BEFORE Borrow, the order SurfelGenerationJob uses. A private
-            // context nobody else ranges starts at a floor, which is the defect that made
-            // the asteroids vanish — applied here before it can cost anything.
-            if (_miGeomEnsureRanges != null && _defaultRangeStats != null)
-                _miGeomEnsureRanges.Invoke(_geomBuffers, new[] { _defaultRangeStats, commandList });
+            var stats = SizeWithHeadroom(sceneStats, engineGeom);
+            if (stats == null)
+            {
+                if (!_declineLogged)
+                {
+                    _declineLogged = true;
+                    RttLog.Line("Private geometry buffers: neither the engine's main-view capacities nor a " +
+                                "RangeStats report were readable, so the shared buffers stay in use. " +
+                                "Sizing a private context from a guess is what removed the device — " +
+                                "OutputGeometryBufferContext is built at capacity ONE and its EnsureRanges " +
+                                "resizes to exactly what it is told.");
+                }
+                return false;
+            }
+
+            // EnsureRanges BEFORE Borrow, the order SurfelGenerationJob uses — and it
+            // asserts !_isBorrowed, so the other order trips a deferred-fatal assert that
+            // turns the next quit into a crash report.
+            _miGeomEnsureRanges.Invoke(_geomBuffers, new[] { stats, commandList });
             _miGeomBorrow?.Invoke(_geomBuffers, null);
+
+            if (!_sizeLogged)
+            {
+                _sizeLogged = true;
+                RttLog.Line($"Private geometry buffers: ranged for {OwnContexts.DescribeRangeStats(stats)}. " +
+                            $"Engine main view holds {DescribeCapacities(engineGeom)}; " +
+                            $"UpdateRanges reported {OwnContexts.DescribeRangeStats(sceneStats)}. " +
+                            $"Max of the two, +{FeedConfig.GeomRangeHeadroom:P0} headroom, " +
+                            $"floor {FeedConfig.GeomRangeFloor}.");
+            }
+            return true;
         }
-        catch (Exception e) { _state = -1; RttLog.Error("prepare private geometry buffers", e); }
+        catch (Exception e) { _state = -1; RttLog.Error("prepare private geometry buffers", e); return false; }
+    }
+
+    private static readonly string[] RangeFields =
+    {
+        "SingleFirstPassCount", "SingleSecondPassCount",
+        "VolumeFirstPassCount", "VolumeSecondPassCount",
+        "InstancedFirstPassCount", "InstancedSecondPassCount",
+        "EntityProxyCount",
+    };
+
+    // The six DrawInstanceBuffers on an OutputGeometryBufferContext, in RangeStats order,
+    // then the entity-proxy buffer. Straight off the constructor's field list.
+    private static readonly string[] BufferFields =
+    {
+        "_instanceBuffersFirstPass", "_instanceBuffersSecondPass",
+        "_volumeInstanceBuffersFirstPass", "_volumeInstanceBuffersSecondPass",
+        "_instancedInstanceBuffersFirstPass", "_instancedInstanceBuffersSecondPass",
+    };
+
+    // Take the larger of what the engine's main view holds and what UpdateRanges reported,
+    // scale for headroom, floor each field.
+    //
+    // Headroom because both sources describe a cull that ALREADY happened, from the
+    // player's viewpoint; ours is about to run from a different one. EnsureCapacity only
+    // ever grows (CalculateCapacity rounds up and it never contracts unless a contract is
+    // scheduled), so over-asking costs one allocation and under-asking costs the device.
+    // The asymmetry is the whole argument.
+    private static object SizeWithHeadroom(object sceneStats, object engineGeom)
+    {
+        if (_rangeStatsType == null) return null;
+
+        var reported = OwnContexts.ReadRangeStats(sceneStats);
+        var engine = ReadCapacities(engineGeom);
+        if (reported == null && engine == null) return null;
+
+        double scale = Math.Max(1.0, FeedConfig.GeomRangeHeadroom + 1.0);
+        int floor = Math.Max(1, FeedConfig.GeomRangeFloor);
+
+        // Box a fresh copy rather than mutating either source — EnsureRanges takes it by
+        // ref, and handing back the same box every pass would let it edit in place.
+        object boxed = Activator.CreateInstance(_rangeStatsType);
+        for (int i = 0; i < RangeFields.Length; i++)
+        {
+            int basis = Math.Max(reported == null ? 0 : reported[i], engine == null ? 0 : engine[i]);
+            long want = (long)Math.Ceiling(basis * scale);
+            int sized = (int)Math.Clamp(Math.Max(want, floor), 1, int.MaxValue);
+            _rangeStatsType.GetField(RangeFields[i], BindingFlags.Public | BindingFlags.Instance)
+                          ?.SetValue(boxed, sized);
+        }
+        return boxed;
+    }
+
+    // Read an OutputGeometryBufferContext's live capacities — what the engine has actually
+    // sized itself to. All three buffer classes expose a public Capacity getter, and the
+    // entity-proxy buffer exposes ElementCount, which is exactly what EnsureRanges compares
+    // RangeStats.EntityProxyCount against.
+    public static int[] ReadCapacities(object geomContext)
+    {
+        if (geomContext == null) return null;
+        try
+        {
+            var t = geomContext.GetType();
+            var v = new int[RangeFields.Length];
+            for (int i = 0; i < BufferFields.Length; i++)
+            {
+                var buf = t.GetField(BufferFields[i], Any)?.GetValue(geomContext);
+                var cap = buf?.GetType().GetProperty("Capacity", Any)?.GetValue(buf);
+                if (cap is not int c) return null;
+                v[i] = c;
+            }
+            var proxy = t.GetField("_entityProxyOutputBuffer", Any)?.GetValue(geomContext);
+            var count = proxy?.GetType().GetProperty("ElementCount", Any)?.GetValue(proxy);
+            v[6] = count is int pc ? pc : 0;
+            return v;
+        }
+        catch { return null; }
+    }
+
+    public static string DescribeCapacities(object geomContext)
+    {
+        var v = ReadCapacities(geomContext);
+        return v == null
+            ? "unreadable"
+            : $"single={v[0]}/{v[1]} volume={v[2]}/{v[3]} instanced={v[4]}/{v[5]} entityProxies={v[6]}";
     }
 
     public static void EndGeomPass()
@@ -227,10 +361,12 @@ internal static class PrivateCullContexts
         catch (Exception e) { _state = -1; RttLog.Error("return private geometry buffers", e); }
     }
 
+    // Visibility only — EndGeomPass owns the geometry side, and returning it twice is the
+    // mirror of the double-borrow PrepareForPass used to cause.
     public static void EndPass()
     {
         if (_state != 1) return;
-        try { _miVisReturn?.Invoke(_visibility, null); _miGeomReturn?.Invoke(_geomBuffers, null); }
+        try { _miVisReturn?.Invoke(_visibility, null); }
         catch (Exception e) { _state = -1; RttLog.Error("return private visibility context", e); }
     }
 

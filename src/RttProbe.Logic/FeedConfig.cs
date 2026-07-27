@@ -153,6 +153,23 @@ internal static class FeedConfig
     // feature. SurfelGenerationJob constructs its own for exactly this reason.
     public static bool PrivateGeomBuffers { get; private set; }
 
+    // How much bigger than the reported scene the private geometry buffers are sized.
+    //
+    // CullingContext.UpdateRanges reports what the cull that ALREADY ran needed; ours is
+    // about to run from a different viewpoint and can legitimately want more. The cost is
+    // asymmetric and not close: over-asking costs one allocation that
+    // DrawInstanceBuffers.EnsureCapacity would likely have rounded up to anyway (it only
+    // ever grows — it never contracts unless a contract is scheduled), while under-asking
+    // writes past the end of a GPU buffer and removes the device. Hence a default of 50%
+    // rather than something tight.
+    public static double GeomRangeHeadroom { get; private set; } = 0.5;
+
+    // Absolute minimum capacity per category, regardless of what was reported.
+    //
+    // Guards the first pass and any frame where the readback has not caught up. Small
+    // enough to be free — these are per-draw-command structures, not per-pixel.
+    public static int GeomRangeFloor { get; private set; } = 1024;
+
     // Disable occlusion culling for the duration of our pass.
     //
     // The engine sequences main-view culling as first pass -> depth prepass -> build HiZ ->
@@ -543,6 +560,8 @@ internal static class FeedConfig
             double expSun = AutoExposureSunRange;
             double emissive = Emissivity, dimDist = DimDistance;
             int recursive = RecursiveReflections;
+            double geomHead = GeomRangeHeadroom;
+            int geomFloor = GeomRangeFloor;
 
             foreach (var raw in File.ReadAllLines(Path_))
             {
@@ -690,6 +709,14 @@ internal static class FeedConfig
                     case "privategeombuffers":
                         privGeom = val is "1" or "true" or "yes";
                         break;
+                    case "geomrangeheadroom":
+                        if (double.TryParse(val, System.Globalization.NumberStyles.Float,
+                                            System.Globalization.CultureInfo.InvariantCulture, out var ghd))
+                            geomHead = Math.Clamp(ghd, 0.0, 8.0);
+                        break;
+                    case "geomrangefloor":
+                        if (int.TryParse(val, out var gfl)) geomFloor = Math.Clamp(gfl, 1, 1 << 20);
+                        break;
                     case "privatecullcontexts":
                         privCtx = val is "1" or "true" or "yes";
                         break;
@@ -775,6 +802,7 @@ internal static class FeedConfig
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
                         || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
+                        || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
                         || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || gateGi != GateGi || envScratch != EnvPassToScratch || skyMode != SkyMode || cullRoot != CullRootEntityId;
             IntervalMs = interval; PanelMs = panel; StartupDelayMs = startup; UsePooledCulling = pooled; OrbitRadius = radius; OrbitPeriod = period; OrbitHeight = height;
@@ -787,6 +815,7 @@ internal static class FeedConfig
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
             LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass; SunPassDepth = sunDepth; DebugGBuffer = dbgGb; DeferredTexturing = defTex;
             MainViewCulling = mvCull; CullSecondPass = cull2; DisableOcclusionCulling = noOcc; PrivateCullContexts = privCtx; PrivateGeomBuffers = privGeom;
+            GeomRangeHeadroom = geomHead; GeomRangeFloor = geomFloor;
             AutoExposure = autoExp; AutoExposureDownSpeed = expDown; AutoExposureUpSpeed = expUp;
             AutoExposureMin = expMin; AutoExposureMax = expMax; AutoExposureBias = expBias;
             AutoExposureSunRange = expSun;
@@ -811,7 +840,7 @@ internal static class FeedConfig
                             $"| lodMainView={LodMainView} fixScreenRes={FixScreenRes} " +
                             $"fullCameraCb={FullCameraCb} emissivity={Emissivity} " +
                             $"recursiveReflections={RecursiveReflections} dimDistance={DimDistance} " +
-                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass} sunPassDepth={SunPassDepth} debugGBuffer={DebugGBuffer} deferredTexturing={DeferredTexturing} autoExposure={AutoExposure} mainViewCulling={MainViewCulling} cullSecondPass={CullSecondPass}");
+                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass} sunPassDepth={SunPassDepth} debugGBuffer={DebugGBuffer} deferredTexturing={DeferredTexturing} autoExposure={AutoExposure} mainViewCulling={MainViewCulling} cullSecondPass={CullSecondPass} privateGeomBuffers={PrivateGeomBuffers} geomRangeHeadroom={GeomRangeHeadroom} geomRangeFloor={GeomRangeFloor}");
         }
         catch { /* keep the last good values */ }
     }

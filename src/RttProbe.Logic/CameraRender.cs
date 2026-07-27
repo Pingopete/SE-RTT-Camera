@@ -49,6 +49,7 @@ internal static class CameraRender
     private static bool _mainCullWarned, _secondPassWarned, _secondPassLogged;
     private static MethodInfo _miDoCullingSecondPass;
     private static object _geomBuffersMain, _geomBuffersEffect;
+    private static long _geomCapLogMs;
     private static object _lodProbe, _lodMainView;
 
     // A throwaway for optional resolves, so a missing member cannot fail the dry run.
@@ -703,14 +704,16 @@ internal static class CameraRender
                 return;
             }
 
-            // A private context needs RANGING before it is culled into, and nothing else
-            // will do it for us — the engine only ranges the contexts its own pending-work
-            // queues name. That is the lesson the missing asteroids taught, applied here
-            // before it can cost anything: EnsureRanges then Borrow, the order
-            // SurfelGenerationJob uses.
-            if (usingPrivateGeom) PrivateCullContexts.PrepareGeomForPass(commandList);
-            else { Call(geomBuffers, "Borrow"); }
-            geomBorrowed = true;
+            // The SHARED buffers can be borrowed now — the engine has already sized them
+            // for its own main view, so there is nothing to work out first.
+            //
+            // The private ones cannot. They need a RangeStats, and the only thing that
+            // knows the right one is CullingContext.UpdateRanges, which runs below once a
+            // context has been borrowed. So that half moves after it. Doing it here with
+            // RangeStats.Default is what removed the device twice: Default is ONE draw per
+            // category and OutputGeometryBufferContext.EnsureRanges resizes to exactly
+            // what it is handed.
+            if (!usingPrivateGeom) { Call(geomBuffers, "Borrow"); geomBorrowed = true; }
 
             // Step 2: own the GBuffer for the duration of this pass. Restored in the
             // finally below, unconditionally — leaving the engine pointed at our
@@ -739,6 +742,47 @@ internal static class CameraRender
             // which is the missing asteroids and the flickering structure.
             // EnvProbeCulling[0] never needed this: the engine ranges it every frame.
             if (borrowedCulling != null) OwnContexts.EnsureRanges(borrowedCulling, commandList);
+
+            // Report the engine's OWN main-view capacities alongside ours, rate-limited.
+            //
+            // This is the measurement that decides whether privateGeomBuffers is safe to
+            // switch on, and it costs nothing to take while it is still off. The engine
+            // sizes MainOutputGeometryBuffers for a full-scene cull every frame, so these
+            // numbers are what a private context has to match. If they turn out far larger
+            // than what UpdateRanges reports for rootEntityId -1, that settles whether -1
+            // is the wildcard it was assumed to be — GetTotalMaterialUsagesForRoot is a
+            // dictionary lookup returning an empty span on a miss, not a match-all.
+            if (Clock.Ms - _geomCapLogMs >= 3000)
+            {
+                _geomCapLogMs = Clock.Ms;
+                RttLog.Line($"Geometry capacity: engine main view holds " +
+                            $"{PrivateCullContexts.DescribeCapacities(GeomBuffers)} — " +
+                            "a private context must be ranged to at least this before a scene is culled " +
+                            "into it, and is constructed at ONE per buffer.");
+            }
+
+            // NOW the private geometry buffers can be sized, because UpdateRanges has just
+            // reported what a full-scene cull needs. EnsureRanges then Borrow, the order
+            // SurfelGenerationJob uses and the one EnsureRanges' `!_isBorrowed` assert
+            // requires.
+            //
+            // If it declines — no RangeStats yet, first pass, or usePooledCulling off —
+            // fall back to the shared buffers for this pass rather than culling into a
+            // context sized by guesswork. The feed looks the same; the device survives.
+            if (usingPrivateGeom)
+            {
+                if (PrivateCullContexts.PrepareGeomForPass(commandList, OwnContexts.LastRangeStats, GeomBuffers))
+                {
+                    geomBorrowed = true;
+                }
+                else
+                {
+                    usingPrivateGeom = false;
+                    geomBuffers = GeomBuffers;
+                    Call(geomBuffers, "Borrow");
+                    geomBorrowed = true;
+                }
+            }
 
             // MainView unclamps MinLOD from 8 to 0 — see the resolve-time comment. Falls
             // back to the probe profile if MainView could not be resolved, so a missing
