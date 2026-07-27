@@ -50,6 +50,7 @@ internal static class CameraRender
     private static MethodInfo _miDoCullingSecondPass;
     private static object _geomBuffersMain, _geomBuffersEffect;
     private static long _geomCapLogMs;
+    private static bool _lastCtxLive;
     private static object _lodProbe, _lodMainView;
 
     // A throwaway for optional resolves, so a missing member cannot fail the dry run.
@@ -836,7 +837,21 @@ internal static class CameraRender
             bool mainView = ReferenceEquals(cullJob, _cullJobMainView);
             object visLists = null, occlusion = null;
 
-            if (mainView)
+            // The main-view job REQUIRES these; the indirect job merely forwards them.
+            //
+            // Forwarding is what makes an isolated test possible, and that is the whole
+            // reason for the second half of this condition. CullingJob.DoWork hands
+            // visibilityListBufferContext and occlusionContext straight to
+            // CullingEntityProxyJob.DoWork and CullingGeometryJob.DoWork with no
+            // _isForMainView gate, so the indirect job takes them too. Switching
+            // privateCullContexts on while mainViewCulling stays off therefore exercises
+            // the contexts on a path already known to work — one variable, and a result
+            // that means something either way.
+            //
+            // Without this, mainViewCulling would move three things at once: the job, the
+            // pass groups, and these contexts going from null to live. That is exactly how
+            // the earlier attempts became unattributable.
+            if (mainView || FeedConfig.PrivateCullContexts)
             {
                 // OURS, never the engine's.
                 //
@@ -855,7 +870,10 @@ internal static class CameraRender
                     privateCtxHeld = true;
                 }
 
-                if (visLists == null || occlusion == null)
+                // Only the MAIN VIEW job cannot proceed without them. The indirect job has
+                // been passing nulls all along, so a failure to build them there is a
+                // no-op rather than a reason to change jobs.
+                if (mainView && (visLists == null || occlusion == null))
                 {
                     if (!_mainCullWarned)
                     {
@@ -868,6 +886,16 @@ internal static class CameraRender
                     mainView = false;
                     visLists = occlusion = null;
                 }
+            }
+
+            bool ctxLive = visLists != null && occlusion != null;
+            if (ctxLive != _lastCtxLive)
+            {
+                _lastCtxLive = ctxLive;
+                RttLog.Line($"Cull contexts: visibility/occlusion {(ctxLive ? "PRIVATE (ours)" : "null")} " +
+                            $"on the {(mainView ? "MAIN VIEW" : "indirect")} job. On the indirect job this " +
+                            "should change nothing — it is the isolation test for the contexts before the " +
+                            "main-view job is asked to depend on them.");
             }
 
             var cullArgs = new object[]
