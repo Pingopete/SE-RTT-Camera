@@ -51,6 +51,8 @@ internal static class CameraRender
     private static object _geomBuffersMain, _geomBuffersEffect;
     private static long _geomCapLogMs;
     private static bool _lastCtxLive;
+    private static bool _wsBlitLogged;
+    private static int _wsBlitErrs;
     private static bool _coCullLogged;
     private static int _coCullErrs;
     private static object _lodProbe, _lodMainView;
@@ -2008,6 +2010,42 @@ internal static class CameraRender
                         else if (_toneLogs++ < 2)
                             RttLog.Line("Tonemap: no ITexture2DView on the tonemapped target — blitting raw HDR instead.");
                     }
+                    // THE WHOLE-SCENE FEED. When the whole-scene route has a finished
+                    // image, it becomes this blit's source and the probe image is
+                    // ignored — everything downstream (ring, parking, UI-stage copy) is
+                    // untouched, proven machinery. Parking the whole-scene texture
+                    // DIRECTLY was tried and CTD'd (E_INVALIDARG in
+                    // CopyCommandList.Replay — the raw copy path chokes on resizable
+                    // engine-internal textures); a resizable texture as a CopyJob blit
+                    // source is exactly what _ldrResizable above does every frame, so
+                    // this rides a path already in production.
+                    //
+                    // Already tonemapped by the full pipeline, so no tonemap wanted here
+                    // — and PanelSource returning null (flag off, route errored, no
+                    // render yet) falls back to the probe image automatically.
+                    object wsSource = null;
+                    var wsPanel = WholeSceneRender.PanelSource;
+                    if (wsPanel != null)
+                    {
+                        var wsSrv = ViewOf(wsPanel, "ITexture2DView");
+                        if (wsSrv != null)
+                        {
+                            blitSrc = wsSrv;
+                            wsSource = wsPanel;
+                            if (!_wsBlitLogged)
+                            {
+                                _wsBlitLogged = true;
+                                RttLog.Line("=== WHOLE-SCENE -> PANEL: the feed blit now sources the full " +
+                                            "renderer's FinalLDRTexture. The panel shows the whole-scene render. ===");
+                            }
+                        }
+                        else if (_wsBlitErrs++ < 2)
+                        {
+                            RttLog.Line("Whole-scene panel: no ITexture2DView on FinalLDRTexture — " +
+                                        "probe image stays on the panel.");
+                        }
+                    }
+
                     // cropRect is the SOURCE region, and leaving it null makes CopyJob
                     // read a rect the size of the DESTINATION rather than the whole
                     // source. With a 1024x1024 render into a 512x512 panel that copies
@@ -2016,8 +2054,11 @@ internal static class CameraRender
                     //
                     // Naming the full source rect makes the blit scale instead of crop,
                     // which is what turns the extra pixels into anti-aliasing.
+                    //
+                    // For the whole-scene source the rect comes from ITS resolution, not
+                    // the probe target's — they can legitimately differ.
                     object crop = null;
-                    var srcRes = Prop2(Prop2(rtBorrow, "Resource") ?? rtBorrow, "Resolution");
+                    var srcRes = Prop2(Prop2(wsSource ?? rtBorrow, "Resource") ?? wsSource ?? rtBorrow, "Resolution");
                     if (srcRes != null) crop = MakeRect(_miCopyDoWork.GetParameters()[7].ParameterType, srcRes);
 
                     // DEBUG: put a GBuffer slot on the panel instead of the rendered image.

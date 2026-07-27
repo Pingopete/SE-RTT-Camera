@@ -347,6 +347,14 @@ internal static class FeedConfig
     // read by the player's next frame, none of them needed for a camera feed.
     public static int[] WholeSceneSkipStages { get; private set; } = { 0, 1, 2 };
 
+    // Show OUR render on the panel instead of the probe feed.
+    //
+    // The probe pass keeps running (it drives the orbit transform); it just stops
+    // parking frames while this is on, and the whole-scene render parks its
+    // FinalLDRTexture instead. Flipping this off restores the probe feed within one
+    // panel tick — instant A/B comparison between the two pipelines.
+    public static bool WholeSceneToPanel { get; private set; }
+
     // Minimum gap between second renders. Draw is a WHOLE FRAME: ungated at 53 fps this
     // would roughly halve the game's frame rate before teaching us anything, and a fault
     // would repeat 53 times a second while the log is being read.
@@ -777,6 +785,7 @@ internal static class FeedConfig
             bool wsBuild = WholeSceneBuildBuffers, wsRender = WholeSceneEnabled;
             int wsW = WholeSceneWidth, wsH = WholeSceneHeight;
             bool wsCam = WholeSceneCamera, wsNoRt = WholeSceneDisableRaytracing;
+            bool wsPanel = WholeSceneToPanel;
             bool wsNoEye = WholeSceneDisableEyeAdaptation, wsNoProbe = WholeSceneDisableProbeUpdates;
             bool wsOwnDc = WholeSceneOwnDrawContexts;
             int[] wsSkip = WholeSceneSkipStages;
@@ -951,6 +960,9 @@ internal static class FeedConfig
                     case "wholescenedisableraytracing":
                         wsNoRt = val is "1" or "true" or "yes";
                         break;
+                    case "wholescenetopanel":
+                        wsPanel = val is "1" or "true" or "yes";
+                        break;
                     case "wholescenecamera":
                         wsCam = val is "1" or "true" or "yes";
                         break;
@@ -1086,7 +1098,7 @@ internal static class FeedConfig
                         || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || clearGb != ClearGBufferBeforePass
                         || wsBuild != WholeSceneBuildBuffers || wsRender != WholeSceneEnabled
                         || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts
                         || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
@@ -1109,13 +1121,14 @@ internal static class FeedConfig
             // it rather than leave it allocated.
             bool wsChanged = wsBuild != WholeSceneBuildBuffers
                              || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts;
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts;
 
             WholeSceneEnabled = wsRender;
             WholeSceneBuildBuffers = wsBuild;
             WholeSceneWidth = wsW;
             WholeSceneHeight = wsH;
             WholeSceneCamera = wsCam;
+            WholeSceneToPanel = wsPanel;
             WholeSceneIntervalMs = wsInterval;
             WholeSceneDisableRaytracing = wsNoRt;
             WholeSceneDisableEyeAdaptation = wsNoEye;

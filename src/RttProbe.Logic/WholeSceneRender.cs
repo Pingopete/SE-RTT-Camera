@@ -100,6 +100,29 @@ internal static class WholeSceneRender
     private static object _ourDrawContexts;
     private static object _ourFreshShadowResources;
     private static bool _dcBuilt;
+    private static object _panelSourceTex;
+
+    // Our render's finished image, for CameraRender's blit to use as its source.
+    //
+    // Null whenever the whole-scene image should NOT own the panel: flag off, route
+    // errored, buffers not built, or no render completed yet — the blit then falls back
+    // to the probe image automatically, which makes wholeSceneToPanel a safe live A/B
+    // switch between the two pipelines.
+    public static object PanelSource
+    {
+        get
+        {
+            if (!FeedConfig.WholeSceneToPanel || _state != 1 || _ourScreenBuffers == null || _renderCount == 0)
+                return null;
+            try
+            {
+                _panelSourceTex ??= _ourScreenBuffers.GetType()
+                    .GetProperty("FinalLDRTexture", Any)?.GetValue(_ourScreenBuffers);
+                return _panelSourceTex;
+            }
+            catch { return null; }
+        }
+    }
 
     public static void Reset()
     {
@@ -107,6 +130,8 @@ internal static class WholeSceneRender
         // dropping it on a hot reload would leak — the pool asserts about exactly that
         // at shutdown, which is what turned every quit into a crash report earlier in
         // this project.
+        _panelSourceTex = null;
+
         if (_ourScreenBuffers is IDisposable d) { try { d.Dispose(); } catch { } }
         _ourScreenBuffers = null;
         _sbBuilt = _sbLogged = false;
@@ -358,6 +383,15 @@ internal static class WholeSceneRender
 
                 _miDraw.Invoke(sceneDrawSystem, new[] { ourLdr });
                 _renderCount++;
+
+                // The image now sits in our FinalLDRTexture. Delivery to the panel is
+                // NOT done here — parking it directly was tried and CTD'd:
+                // CopyCommandList.Replay threw E_INVALIDARG, because the raw
+                // CopyTextureSubresource path chokes on a resizable engine-internal
+                // texture where the probe ring's plain pool textures copy fine. Instead
+                // CameraRender's proven blit takes PanelSource as its CopyJob source and
+                // the ring/parking machinery stays untouched — the exact pattern its
+                // tonemap scratch target already uses in production.
 
                 if (_renderCount == 1)
                     RttLog.Line("=== WHOLE-SCENE RENDER SURVIVED THE FIRST CALL. The engine's entire " +

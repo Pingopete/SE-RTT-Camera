@@ -204,6 +204,20 @@ internal static class FeedHandover
         _parkGeneration++;
     }
 
+    // Un-park a specific resource, for owners about to dispose it. The whole-scene
+    // route parks its FinalLDRTexture ONCE (ParkFrame dedupes by reference, and the UI
+    // stage re-copies the texture's latest contents every servicing) — so on a hot
+    // reload the parked pointer would outlive the texture unless cleared first, and the
+    // UI stage would copy from a disposed resource.
+    public static void ClearParkedIf(object resource)
+    {
+        if (resource != null && ReferenceEquals(_pendingResource, resource))
+        {
+            _pendingResource = null;
+            _pendingFrame = null;
+        }
+    }
+
     public static object TakeStaleFrame()
     {
         // The previous frame was never consumed — hand it back for returning so the
