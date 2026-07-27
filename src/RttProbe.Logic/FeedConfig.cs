@@ -285,6 +285,18 @@ internal static class FeedConfig
     // RT GI is worth more than a main view with corrupted GI.
     public static bool WholeSceneDisableRaytracing { get; private set; } = true;
 
+    // Disable EYE ADAPTATION for our render.
+    //
+    // ComputeExposure drives EyeAdaptationJob, which ping-pongs a shared auto-exposure
+    // history — this project already recorded a second call per frame as unsafe. Our
+    // 512x512 view of the same scene has a different average luminance, so the player's
+    // adaptation oscillates between the two exposures and their world lighting flickers
+    // at exactly our render cadence.
+    //
+    // Exposure itself stays ON so our image is still exposed; only the TEMPORAL
+    // adaptation is cut, which for a fixed-purpose camera feed is arguably correct.
+    public static bool WholeSceneDisableEyeAdaptation { get; private set; } = true;
+
     // Minimum gap between second renders. Draw is a WHOLE FRAME: ungated at 53 fps this
     // would roughly halve the game's frame rate before teaching us anything, and a fault
     // would repeat 53 times a second while the log is being read.
@@ -715,6 +727,7 @@ internal static class FeedConfig
             bool wsBuild = WholeSceneBuildBuffers, wsRender = WholeSceneEnabled;
             int wsW = WholeSceneWidth, wsH = WholeSceneHeight;
             bool wsCam = WholeSceneCamera, wsNoRt = WholeSceneDisableRaytracing;
+            bool wsNoEye = WholeSceneDisableEyeAdaptation;
             int wsInterval = WholeSceneIntervalMs;
 
             foreach (var raw in File.ReadAllLines(Path_))
@@ -866,6 +879,9 @@ internal static class FeedConfig
                     case "wholescenebuildbuffers":
                         wsBuild = val is "1" or "true" or "yes";
                         break;
+                    case "wholescenedisableeyeadaptation":
+                        wsNoEye = val is "1" or "true" or "yes";
+                        break;
                     case "wholescenedisableraytracing":
                         wsNoRt = val is "1" or "true" or "yes";
                         break;
@@ -1004,7 +1020,7 @@ internal static class FeedConfig
                         || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || clearGb != ClearGBufferBeforePass
                         || wsBuild != WholeSceneBuildBuffers || wsRender != WholeSceneEnabled
                         || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation
                         || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
@@ -1027,7 +1043,7 @@ internal static class FeedConfig
             // it rather than leave it allocated.
             bool wsChanged = wsBuild != WholeSceneBuildBuffers
                              || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing;
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation;
 
             WholeSceneEnabled = wsRender;
             WholeSceneBuildBuffers = wsBuild;
@@ -1036,6 +1052,7 @@ internal static class FeedConfig
             WholeSceneCamera = wsCam;
             WholeSceneIntervalMs = wsInterval;
             WholeSceneDisableRaytracing = wsNoRt;
+            WholeSceneDisableEyeAdaptation = wsNoEye;
 
             if (wsChanged) RttProbe.WholeSceneRender.Reset();
 

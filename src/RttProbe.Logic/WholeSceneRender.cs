@@ -201,14 +201,14 @@ internal static class WholeSceneRender
             }
 
             var savedSb = _sbField.GetValue(null);
-            object savedCam = null, savedRt = null;
+            object savedCam = null;
             bool camSwapped = false;
 
             _inOurRender = true;
             try
             {
                 _sbField.SetValue(null, _ourScreenBuffers);
-                savedRt = InstallNoRaytracing();
+                ScopeSharedState();
                 if (FeedConfig.WholeSceneCamera) camSwapped = InstallCamera(out savedCam);
 
                 if (_renderCount == 0)
@@ -225,10 +225,10 @@ internal static class WholeSceneRender
             }
             finally
             {
-                // Unconditional, and in reverse install order: camera, then raytracing,
-                // then the buffers the engine's next frame will be rendered into.
+                // Unconditional, and in reverse install order: camera, then every scoped
+                // settings group, then the buffers the engine's next frame renders into.
                 if (camSwapped) RestoreCamera(savedCam);
-                RestoreRaytracing(savedRt);
+                RestoreScoped();
                 _sbField.SetValue(null, savedSb);
                 _inOurRender = false;
             }
@@ -240,87 +240,106 @@ internal static class WholeSceneRender
         }
     }
 
-    // Keep our second render out of the player's GLOBAL ILLUMINATION.
+    // Scope a settings group off for the duration of our render, and remember how to
+    // put it back.
     //
-    // Reported from the game: with stage 3a running, the player's world render went
-    // patchy and shifting in its GI. That is not a rendering bug in our second frame —
-    // it is our second frame's side effects landing on theirs.
+    // GENERALISED ON PURPOSE. The first of these was raytracing, written bespoke; the
+    // second (eye adaptation) arrived within minutes, exactly as predicted. Every
+    // SettingsManager group is a STRUCT in a private backing field, so they all take the
+    // same treatment: box it twice, clear the flags on one, restore the other afterwards.
+    // Writing a new method per group would be five copies of this by morning.
     //
-    // Draw's first and last acts are global and temporal, and none of them live in
-    // ScreenBuffers, so owning a ScreenBuffers does not isolate them:
-    //
-    //     IL_003c  ExecuteAccelerationStructuresBuilding()      raytracing scene
-    //     IL_008d  ExecuteRaytracingPrepareAndSceneFinalize()
-    //
-    // and RaytracingSettings is full of accumulators — EnableTemporalReSTIR,
-    // EnableTemporalFilter, EnableIRCache, EnableIRCacheScrolling. Those integrate over
-    // frames in WORLD space, so running the pipeline a second time per frame advances
-    // them twice. Patchy and shifting is precisely what a temporal accumulator looks
-    // like when it is stepped at the wrong rate.
-    //
-    // RaytracingSettings is a STRUCT and SettingsManager._raytracing is the backing
-    // field, so this is the InstallNoOcclusion shape: box it twice, mutate one, restore
-    // the other. Clearing Enabled gates the whole RT path rather than picking at
-    // individual accumulators.
-    //
-    // Costs our feed raytraced GI, which is a scope item that was excluded anyway — and
-    // a feed without RT GI is worth more than a main view with corrupted GI.
-    private static object InstallNoRaytracing()
+    // The saved boxes are stacked and unwound in reverse, so a group added later cannot
+    // disturb the restore order of one added earlier.
+    private static readonly List<(FieldInfo Field, object Saved)> _scoped = new();
+
+    private static void ScopeOff(string settingsTypeName, string label, params string[] flags)
     {
-        if (_rtBlocked || !FeedConfig.WholeSceneDisableRaytracing) return null;
         try
         {
             var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
             var settings = core?.GetField("Settings", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-            if (settings == null) return null;
+            if (settings == null) return;
 
-            _rtField ??= settings.GetType().GetFields(Any)
-                .FirstOrDefault(f => f.FieldType.Name == "RaytracingSettings");
-            if (_rtField == null)
+            _settingsObj ??= settings;
+            var field = settings.GetType().GetFields(Any)
+                .FirstOrDefault(f => f.FieldType.Name == settingsTypeName);
+            if (field == null)
             {
-                _rtBlocked = true;
-                RttLog.Line("Whole-scene: SettingsManager RaytracingSettings field not found — our second " +
-                            "render will keep advancing the player's RT/GI accumulation twice per frame.");
-                return null;
+                if (_scopeWarned.Add(settingsTypeName))
+                    RttLog.Line($"Whole-scene: SettingsManager has no {settingsTypeName} field — " +
+                                $"{label} stays live during our render and will keep leaking into the " +
+                                "player's frame.");
+                return;
             }
 
-            _rtSettingsObj = settings;
-            var saved = _rtField.GetValue(settings);
-            var ours = _rtField.GetValue(settings);     // struct field: a second, independent box
+            var saved = field.GetValue(settings);
+            var ours = field.GetValue(settings);        // struct field: a second, independent box
 
             int set = 0;
-            foreach (var n in new[] { "Enabled", "EnableTemporalReSTIR", "EnableSpatialReSTIR",
-                                      "EnableTemporalFilter", "EnableIRCache", "EnableIRCacheScrolling" })
+            foreach (var n in flags)
             {
                 var f = ours.GetType().GetField(n, Any);
                 if (f != null && f.FieldType == typeof(bool)) { f.SetValue(ours, false); set++; }
             }
-            if (set == 0) { _rtBlocked = true; RttLog.Line("Whole-scene: no raytracing flags found."); return null; }
-
-            _rtField.SetValue(settings, ours);
-            if (!_rtLogged)
+            if (set == 0)
             {
-                _rtLogged = true;
-                RttLog.Line($"Whole-scene: raytracing disabled for our render ({set} flags cleared). " +
-                            "Draw builds acceleration structures and steps ReSTIR/IR-cache accumulators " +
-                            "that integrate over frames in WORLD space — running the pipeline twice per " +
-                            "frame advanced them twice, which is what made the player's GI patchy.");
+                if (_scopeWarned.Add(settingsTypeName))
+                    RttLog.Line($"Whole-scene: no matching flags on {settingsTypeName} for {label}.");
+                return;
             }
-            return saved;
+
+            field.SetValue(settings, ours);
+            _scoped.Add((field, saved));
+
+            if (_scopeWarned.Add(settingsTypeName + ":ok"))
+                RttLog.Line($"Whole-scene: {label} disabled for our render ({set}/{flags.Length} flags " +
+                            $"cleared on {settingsTypeName}).");
         }
-        catch (Exception e) { _rtBlocked = true; RttLog.Error("whole-scene disable raytracing", e); return null; }
+        catch (Exception e) { RttLog.Error($"whole-scene scope off {settingsTypeName}", e); }
     }
 
-    private static void RestoreRaytracing(object saved)
+    private static void RestoreScoped()
     {
-        if (saved == null || _rtField == null || _rtSettingsObj == null) return;
-        try { _rtField.SetValue(_rtSettingsObj, saved); }
-        catch (Exception e) { RttLog.Error("whole-scene restore raytracing", e); }
+        for (int i = _scoped.Count - 1; i >= 0; i--)
+        {
+            try { _scoped[i].Field.SetValue(_settingsObj, _scoped[i].Saved); }
+            catch (Exception e) { RttLog.Error("whole-scene restore scoped setting", e); }
+        }
+        _scoped.Clear();
     }
 
-    private static FieldInfo _rtField;
-    private static object _rtSettingsObj;
-    private static bool _rtBlocked, _rtLogged;
+    private static readonly HashSet<string> _scopeWarned = new();
+
+    // Everything our render must not advance on the player's behalf.
+    //
+    // Each entry here was a visible defect in the PLAYER'S view, not ours — which is the
+    // signature of this whole class of problem. Owning a ScreenBuffers isolates image
+    // state; it does nothing for state that integrates in world space or across frames.
+    private static void ScopeSharedState()
+    {
+        // RAYTRACING / GI. Draw builds acceleration structures and steps ReSTIR and the
+        // IR cache, all of which integrate over frames against the WORLD. Running the
+        // pipeline twice per frame advanced them twice: the player's GI went patchy and
+        // shifting. Not corruption — over-integration.
+        if (FeedConfig.WholeSceneDisableRaytracing)
+            ScopeOff("RaytracingSettings", "raytracing",
+                     "Enabled", "EnableTemporalReSTIR", "EnableSpatialReSTIR",
+                     "EnableTemporalFilter", "EnableIRCache", "EnableIRCacheScrolling");
+
+        // EYE ADAPTATION. ComputeExposure drives EyeAdaptationJob, which ping-pongs a
+        // shared auto-exposure history — this project already recorded that running it a
+        // second time per frame is unsafe. Our 512x512 view of the same scene has a
+        // different average luminance, so the player's adaptation oscillates between the
+        // two exposures: lighting flickering at exactly our render cadence.
+        //
+        // Exposure itself is left ON so our image is still exposed; only the TEMPORAL
+        // adaptation is cut, which for a fixed-purpose camera feed is arguably correct
+        // anyway.
+        if (FeedConfig.WholeSceneDisableEyeAdaptation)
+            ScopeOff("PostProcessSettings", "eye adaptation", "EyeAdaptation");
+    }
+
 
     // The camera half, stage 3b. Writes SettingsManager._renderView, which is the same
     // field CameraRender.InstallOurCamera uses — a proven mechanism, not a new one.
