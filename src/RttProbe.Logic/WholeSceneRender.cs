@@ -627,9 +627,28 @@ internal static class WholeSceneRender
         // IR cache, all of which integrate over frames against the WORLD. Running the
         // pipeline twice per frame advanced them twice: the player's GI went patchy and
         // shifting. Not corruption — over-integration.
-        if (FeedConfig.WholeSceneDisableRaytracing)
-            ScopeOff("RaytracingSettings", "raytracing",
+        // MODE 1 clears Enabled as well, which stops RaytraceGIJob running at all — and
+        // ComputeGI borrows its DiffuseGIBuffer WITHOUT a clear value:
+        //
+        //     BorrowResizableRWRenderTargetTexture("DiffuseGIBuffer", 26, res,
+        //                                          null, 1, /* clear */ null, 0)
+        //
+        // Safe for the engine, because RaytraceGIJob normally overwrites every pixel.
+        // With it skipped, AmbientLightJob reads a RECYCLED, UNCLEARED pool texture whose
+        // contents change every frame — which is the ambient flashing on shadowed sides,
+        // where the ambient term dominates.
+        //
+        // MODE 2 keeps Enabled TRUE so the GI job still writes those buffers, and clears
+        // only the accumulators that integrate in world space across frames — which were
+        // the actual cause of the player's-view GI going patchy. Best of both, in theory:
+        // stable feed ambient, player's history still frozen.
+        if (FeedConfig.WholeSceneDisableRaytracing == 1)
+            ScopeOff("RaytracingSettings", "raytracing (full, incl. Enabled)",
                      "Enabled", "EnableTemporalReSTIR", "EnableSpatialReSTIR",
+                     "EnableTemporalFilter", "EnableIRCache", "EnableIRCacheScrolling");
+        else if (FeedConfig.WholeSceneDisableRaytracing == 2)
+            ScopeOff("RaytracingSettings", "raytracing accumulators only (GI buffers still written)",
+                     "EnableTemporalReSTIR", "EnableSpatialReSTIR",
                      "EnableTemporalFilter", "EnableIRCache", "EnableIRCacheScrolling");
 
         // EYE ADAPTATION. ComputeExposure drives EyeAdaptationJob, which ping-pongs a
@@ -668,16 +687,29 @@ internal static class WholeSceneRender
         // AAMode: None=0, FXAA=1 (spatial-only, needs no motion vectors — the right AA
         // for this feed), FSR=2 (engine default). ScalingMode NativeAA=4 removes the
         // upscale entirely; sharpening off because it amplifies 512px artefacts.
-        // SPLIT, because bundling these CTD'd in the post chain (ForwardAndPostPasses
-        // 178/255) and left three suspects. ScalingMode is the dangerous one: it selects
-        // between UpscaleTargetFSR and ApplyNonFSRUpscalingAndAA, which borrow
-        // differently-sized targets — and our ScreenBuffers were InitializeBuffers'd for
-        // one geometry. AAMode alone only picks the AA kernel.
+        // DRS IS NOT SAFELY SWITCHABLE PER-RENDER. Three CTDs now, all in
+        // ForwardAndPostPasses (178/255, 20/255, and the bundled one), all touching
+        // DRSSettings — first with AAMode+ScalingMode together, then with AAMode ALONE
+        // after they were split. That is enough repetition to call it.
+        //
+        // The mechanism is the producer/consumer law again, one level up. AAMode and
+        // ScalingMode select between UpscaleTargetFSR and ApplyNonFSRUpscalingAndAA, and
+        // those are not interchangeable branches — UpscaleTargetFSR PRODUCES
+        // tempLDRBuffer / tempHDRBuffer / toneMappingInput / toneMappingOutput as
+        // out-params that the bloom and tonemap stages then consume. The engine picks a
+        // branch during ITS frame setup; switching branch for a nested render leaves the
+        // consumers reading buffers the other branch never populated.
+        //
+        // So the ghosting fix has to come from CORRECT MOTION VECTORS (done — our view
+        // now carries our own previous orbit position instead of the player's), not from
+        // changing AA mode. Left switchable, defaulting off, because the knob is
+        // harmless when unused and the finding is worth keeping demonstrable.
         if (FeedConfig.WholeSceneAAMode >= 0)
-            ScopeSetValues("DRSSettings", "feed AA mode", ("AAMode", FeedConfig.WholeSceneAAMode));
+            ScopeSetValues("DRSSettings", "feed AA mode (UNSAFE — see comment)",
+                ("AAMode", FeedConfig.WholeSceneAAMode));
 
         if (FeedConfig.WholeSceneNativeScaling)
-            ScopeSetValues("DRSSettings", "feed native scaling",
+            ScopeSetValues("DRSSettings", "feed native scaling (UNSAFE — see comment)",
                 ("ScalingMode", 4), ("EnableSharpening", false));
 
         // FEED EXPOSURE. Adaptation is scoped off (shared history), so the feed runs on

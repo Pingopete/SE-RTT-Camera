@@ -283,7 +283,12 @@ internal static class FeedConfig
     //
     // Costs our feed raytraced GI, which was excluded from scope anyway. A feed without
     // RT GI is worth more than a main view with corrupted GI.
-    public static bool WholeSceneDisableRaytracing { get; private set; } = true;
+    // 0 = leave raytracing alone. 1 = clear Enabled + all accumulators (stops
+    // RaytraceGIJob, so ComputeGI's UNCLEARED DiffuseGIBuffer borrow reaches
+    // AmbientLightJob as recycled garbage — the ambient flashing on shadowed sides).
+    // 2 = clear only the world-space accumulators, keeping Enabled so the GI buffers
+    // are still written. 2 is the intended setting if the player's view stays clean.
+    public static int WholeSceneDisableRaytracing { get; private set; } = 1;
 
     // Disable EYE ADAPTATION for our render.
     //
@@ -806,12 +811,13 @@ internal static class FeedConfig
             bool clearGb = ClearGBufferBeforePass;
             bool wsBuild = WholeSceneBuildBuffers, wsRender = WholeSceneEnabled;
             int wsW = WholeSceneWidth, wsH = WholeSceneHeight;
-            bool wsCam = WholeSceneCamera, wsNoRt = WholeSceneDisableRaytracing;
+            bool wsCam = WholeSceneCamera;
             bool wsPanel = WholeSceneToPanel;
             int wsCamRebuild = WholeSceneCameraRebuild, wsAa = WholeSceneAAMode;
             double wsExp = WholeSceneExposure;
             bool wsNative = WholeSceneNativeScaling;
             bool wsNoEye = WholeSceneDisableEyeAdaptation, wsNoProbe = WholeSceneDisableProbeUpdates;
+            int wsNoRtMode = WholeSceneDisableRaytracing;
             bool wsOwnDc = WholeSceneOwnDrawContexts;
             int[] wsSkip = WholeSceneSkipStages;
             int wsInterval = WholeSceneIntervalMs;
@@ -983,7 +989,7 @@ internal static class FeedConfig
                         wsNoEye = val is "1" or "true" or "yes";
                         break;
                     case "wholescenedisableraytracing":
-                        wsNoRt = val is "1" or "true" or "yes";
+                        wsNoRtMode = val is "true" or "yes" ? 1 : int.TryParse(val, out var wnr) ? Math.Clamp(wnr, 0, 2) : wsNoRtMode;
                         break;
                     case "wholescenenativescaling":
                         wsNative = val is "1" or "true" or "yes";
@@ -1136,7 +1142,7 @@ internal static class FeedConfig
                         || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || clearGb != ClearGBufferBeforePass
                         || wsBuild != WholeSceneBuildBuffers || wsRender != WholeSceneEnabled
                         || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRtMode != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts
                         || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
@@ -1159,7 +1165,7 @@ internal static class FeedConfig
             // it rather than leave it allocated.
             bool wsChanged = wsBuild != WholeSceneBuildBuffers
                              || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts;
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRtMode != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts;
 
             WholeSceneEnabled = wsRender;
             WholeSceneBuildBuffers = wsBuild;
@@ -1172,7 +1178,7 @@ internal static class FeedConfig
             WholeSceneNativeScaling = wsNative;
             WholeSceneExposure = wsExp;
             WholeSceneIntervalMs = wsInterval;
-            WholeSceneDisableRaytracing = wsNoRt;
+            WholeSceneDisableRaytracing = wsNoRtMode;
             WholeSceneDisableEyeAdaptation = wsNoEye;
             WholeSceneDisableProbeUpdates = wsNoProbe;
             WholeSceneSkipStages = wsSkip;
