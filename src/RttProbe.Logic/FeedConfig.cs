@@ -153,16 +153,25 @@ internal static class FeedConfig
     // feature. SurfelGenerationJob constructs its own for exactly this reason.
     public static bool PrivateGeomBuffers { get; private set; }
 
-    // How much bigger than the reported scene the private geometry buffers are sized.
+    // Extra margin on top of the sizing basis. ZERO by default, and deliberately.
     //
-    // CullingContext.UpdateRanges reports what the cull that ALREADY ran needed; ours is
-    // about to run from a different viewpoint and can legitimately want more. The cost is
-    // asymmetric and not close: over-asking costs one allocation that
-    // DrawInstanceBuffers.EnsureCapacity would likely have rounded up to anyway (it only
-    // ever grows — it never contracts unless a contract is scheduled), while under-asking
-    // writes past the end of a GPU buffer and removes the device. Hence a default of 50%
-    // rather than something tight.
-    public static double GeomRangeHeadroom { get; private set; } = 0.5;
+    // The first guess here was 50%, on the theory that the report describes a cull from
+    // the player's viewpoint while ours runs from another and might need more. Measurement
+    // killed that theory: the report sits at exactly 325508 singles across every sample,
+    // unchanged while the player's camera moves. It is a SCENE TOTAL, not a frustum count
+    // — which is the entire purpose of CullCapacityTrackingManager, sizing for the worst
+    // case rather than the current view. So our viewpoint cannot exceed it.
+    //
+    // And the margin is already there twice over: we size from max(reported, the engine's
+    // live capacity), and the engine's capacity carries its own slack from growing in
+    // 1.2x steps — 358400 held against 325508 needed. On top of that
+    // DrawInstanceBuffers.EnsureCapacity runs CalculateCapacity, which is
+    // ceil(max(needed, Capacity * 1.2) / 1024) * 1024. Adding 50% here would have
+    // multiplied a ~180 MB allocation by another half for no reason.
+    //
+    // Left configurable because it is cheap insurance if a scene ever proves the
+    // scene-total reading wrong.
+    public static double GeomRangeHeadroom { get; private set; }
 
     // Absolute minimum capacity per category, regardless of what was reported.
     //
