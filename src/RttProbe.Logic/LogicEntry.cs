@@ -43,6 +43,15 @@ public static class LogicEntry
             {
                 wholeScene.SetValue(null, (Action<object, object>)WholeSceneRender.OnWholeScene);
                 RttLog.Line("Whole-scene hook registered (SceneDrawSystem.Draw postfix).");
+
+                var skip = bridge.GetField("SkipStageHook");
+                if (skip != null)
+                {
+                    skip.SetValue(null, (Func<int, bool>)WholeSceneRender.ShouldSkipStage);
+                    RttLog.Line("Stage-skip hook registered — Draw sub-stages can now be suppressed " +
+                                "inside our render only. This is the only lever that reaches stages the " +
+                                "settings do not gate, such as acceleration-structure building.");
+                }
             }
             else
             {

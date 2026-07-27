@@ -306,6 +306,24 @@ internal static class FeedConfig
     // lighting misbehaving while direct lights look fine.
     public static bool WholeSceneDisableProbeUpdates { get; private set; } = true;
 
+    // Draw sub-stages skipped INSIDE our render only. Comma-separated ids:
+    //
+    //   0 ExecuteAccelerationStructuresBuilding    raytracing scene / TLAS
+    //   1 ExecuteRaytracingPrepareAndSceneFinalize raytracing prepare
+    //   2 RenderEnvironmentProbe                   shared probe atlas (ambient + reflections)
+    //   3 RenderShadows                            shadow cascades
+    //   4 ComputeExposure                          auto-exposure history
+    //   5 UpdateSurfels                            water surfels
+    //
+    // This exists because settings flags cannot reach everything.
+    // ExecuteAccelerationStructuresBuilding is called unconditionally at the top of Draw
+    // and checks only EnableGPUParallelization, so clearing RaytracingSettings.Enabled
+    // never stopped it — three rounds of settings scoping missed it for that reason.
+    //
+    // Default is the two raytracing stages plus the probe atlas: all world-space, all
+    // read by the player's next frame, none of them needed for a camera feed.
+    public static int[] WholeSceneSkipStages { get; private set; } = { 0, 1, 2 };
+
     // Minimum gap between second renders. Draw is a WHOLE FRAME: ungated at 53 fps this
     // would roughly halve the game's frame rate before teaching us anything, and a fault
     // would repeat 53 times a second while the log is being read.
@@ -737,6 +755,7 @@ internal static class FeedConfig
             int wsW = WholeSceneWidth, wsH = WholeSceneHeight;
             bool wsCam = WholeSceneCamera, wsNoRt = WholeSceneDisableRaytracing;
             bool wsNoEye = WholeSceneDisableEyeAdaptation, wsNoProbe = WholeSceneDisableProbeUpdates;
+            int[] wsSkip = WholeSceneSkipStages;
             int wsInterval = WholeSceneIntervalMs;
 
             foreach (var raw in File.ReadAllLines(Path_))
@@ -888,6 +907,14 @@ internal static class FeedConfig
                     case "wholescenebuildbuffers":
                         wsBuild = val is "1" or "true" or "yes";
                         break;
+                    case "wholesceneskipstages":
+                    {
+                        var parsedSkip = new List<int>();
+                        foreach (var tok in val.Split(new[] { (char)44 }, StringSplitOptions.RemoveEmptyEntries))
+                            if (int.TryParse(tok.Trim(), out var sg) && sg >= 0 && sg <= 15) parsedSkip.Add(sg);
+                        wsSkip = parsedSkip.ToArray();
+                        break;
+                    }
                     case "wholescenedisableprobeupdates":
                         wsNoProbe = val is "1" or "true" or "yes";
                         break;
@@ -1032,7 +1059,7 @@ internal static class FeedConfig
                         || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || clearGb != ClearGBufferBeforePass
                         || wsBuild != WholeSceneBuildBuffers || wsRender != WholeSceneEnabled
                         || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages)
                         || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
@@ -1055,7 +1082,7 @@ internal static class FeedConfig
             // it rather than leave it allocated.
             bool wsChanged = wsBuild != WholeSceneBuildBuffers
                              || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates;
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsNoRt != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages);
 
             WholeSceneEnabled = wsRender;
             WholeSceneBuildBuffers = wsBuild;
@@ -1066,6 +1093,7 @@ internal static class FeedConfig
             WholeSceneDisableRaytracing = wsNoRt;
             WholeSceneDisableEyeAdaptation = wsNoEye;
             WholeSceneDisableProbeUpdates = wsNoProbe;
+            WholeSceneSkipStages = wsSkip;
 
             if (wsChanged) RttProbe.WholeSceneRender.Reset();
 

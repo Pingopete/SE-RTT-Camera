@@ -44,6 +44,20 @@ public static class RttBridge
     // Re-entrancy is the logic side's problem: our own nested Draw will fire this hook
     // again, and the handler must return immediately when it does.
     public static volatile Action<object, object> WholeSceneHook;
+
+    // Returns TRUE to skip a Draw sub-stage entirely. The int identifies which — see
+    // RttPlugin.SkippableStages.
+    //
+    // Settings flags cannot reach every stage. ExecuteAccelerationStructuresBuilding is
+    // the case that forced this: it is called unconditionally at the top of Draw and
+    // checks only EnableGPUParallelization, so clearing RaytracingSettings.Enabled never
+    // stopped it — we rebuilt the raytracing acceleration structures on every second
+    // render, and RayTracingSceneManager.CreateTLAS is camera-dependent and world-space
+    // shared.
+    //
+    // A prefix returning false skips the original outright, which is the only lever that
+    // reaches a stage the settings do not gate.
+    public static volatile Func<int, bool> SkipStageHook;
 }
 
 public sealed class RttPlugin : IPlugin
@@ -184,6 +198,8 @@ public sealed class RttPlugin : IPlugin
             }
         }
         catch (Exception e) { Log("Patching SceneDrawSystem.Draw FAILED: " + e.Message); }
+
+        PatchSkippableStages(harmony, sds);
     }
 
     // __0 is the ResizableRWRenderTargetTexture the engine just rendered the player's
@@ -193,6 +209,67 @@ public sealed class RttPlugin : IPlugin
     {
         try { RttBridge.WholeSceneHook?.Invoke(__instance, __0); } catch { }
     }
+
+    // Draw sub-stages that a second render must be able to skip.
+    //
+    // These are all WORLD-SPACE or CROSS-FRAME: they update state the player's next
+    // frame reads, so running them a second time per frame corrupts their view rather
+    // than ours. Several cannot be reached by any settings flag —
+    // ExecuteAccelerationStructuresBuilding checks only EnableGPUParallelization — which
+    // is why this exists at all.
+    //
+    // The id is positional and is what the logic side switches on; keep the order
+    // stable or the config's stage list silently means something else.
+    private static readonly string[] SkippableStages =
+    {
+        "ExecuteAccelerationStructuresBuilding",     // 0  raytracing scene / TLAS
+        "ExecuteRaytracingPrepareAndSceneFinalize",  // 1  raytracing prepare
+        "RenderEnvironmentProbe",                    // 2  shared probe atlas (ambient + reflections)
+        "RenderShadows",                             // 3  shadow cascades
+        "ComputeExposure",                           // 4  auto-exposure history
+        "UpdateSurfels",                             // 5  water surfels
+    };
+
+    private static void PatchSkippableStages(HarmonyLib.Harmony harmony, Type sds)
+    {
+        const BindingFlags Any = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        for (int i = 0; i < SkippableStages.Length; i++)
+        {
+            var name = SkippableStages[i];
+            try
+            {
+                var mi = sds.GetMethod(name, Any);
+                if (mi == null) { Log($"Skippable stage {name} not found."); continue; }
+
+                // One prefix per id. Harmony cannot pass extra arguments to a shared
+                // prefix, so each stage gets its own tiny method rather than a lookup by
+                // stack inspection.
+                var pre = typeof(RttPlugin).GetMethod("SkipStage" + i,
+                    BindingFlags.Static | BindingFlags.NonPublic);
+                if (pre == null) { Log($"No SkipStage{i} prefix for {name}."); continue; }
+
+                harmony.Patch(mi, prefix: new HarmonyLib.HarmonyMethod(pre));
+                Log($"Patched SceneDrawSystem.{name} as skippable stage {i}.");
+            }
+            catch (Exception e) { Log($"Patching skippable stage {name} FAILED: {e.Message}"); }
+        }
+    }
+
+    // A prefix returning false skips the original. Any exception must fall through to
+    // "run it" — silently skipping an engine stage because our hook threw would be a
+    // very hard failure to attribute.
+    private static bool Skip(int id)
+    {
+        try { return RttBridge.SkipStageHook?.Invoke(id) != true; }
+        catch { return true; }
+    }
+
+    private static bool SkipStage0() => Skip(0);
+    private static bool SkipStage1() => Skip(1);
+    private static bool SkipStage2() => Skip(2);
+    private static bool SkipStage3() => Skip(3);
+    private static bool SkipStage4() => Skip(4);
+    private static bool SkipStage5() => Skip(5);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the

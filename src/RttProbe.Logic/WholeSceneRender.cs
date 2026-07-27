@@ -98,6 +98,51 @@ internal static class WholeSceneRender
         _renderCount = 0;
     }
 
+    // Should a Draw sub-stage be skipped right now?
+    //
+    // TRUE only while OUR render is running. The engine's own frame must always get
+    // every stage — this suppresses work in the second render, not in the game.
+    //
+    // Settings flags could not reach all of these. ExecuteAccelerationStructuresBuilding
+    // is called unconditionally at the top of Draw and checks only
+    // EnableGPUParallelization, so clearing RaytracingSettings.Enabled never stopped it:
+    // we rebuilt the raytracing acceleration structures on every second render, and
+    // RayTracingSceneManager.CreateTLAS is camera-dependent and world-space shared. That
+    // is the leak that survived three rounds of settings scoping.
+    //
+    //   0 ExecuteAccelerationStructuresBuilding    raytracing scene / TLAS
+    //   1 ExecuteRaytracingPrepareAndSceneFinalize raytracing prepare
+    //   2 RenderEnvironmentProbe                   shared probe atlas (ambient + reflections)
+    //   3 RenderShadows                            shadow cascades
+    //   4 ComputeExposure                          auto-exposure history
+    //   5 UpdateSurfels                            water surfels
+    public static bool ShouldSkipStage(int id)
+    {
+        if (!_inOurRender) return false;
+        var stages = FeedConfig.WholeSceneSkipStages;
+        for (int i = 0; i < stages.Length; i++)
+            if (stages[i] == id)
+            {
+                if (_skippedLogged.Add(id))
+                    RttLog.Line($"Whole-scene: skipping stage {id} ({StageName(id)}) during our render.");
+                return true;
+            }
+        return false;
+    }
+
+    private static readonly HashSet<int> _skippedLogged = new();
+
+    private static string StageName(int id) => id switch
+    {
+        0 => "ExecuteAccelerationStructuresBuilding",
+        1 => "ExecuteRaytracingPrepareAndSceneFinalize",
+        2 => "RenderEnvironmentProbe",
+        3 => "RenderShadows",
+        4 => "ComputeExposure",
+        5 => "UpdateSurfels",
+        _ => "unknown",
+    };
+
     // Fires after the engine has finished the player's frame.
     public static void OnWholeScene(object sceneDrawSystem, object finalLdrBuffer)
     {
