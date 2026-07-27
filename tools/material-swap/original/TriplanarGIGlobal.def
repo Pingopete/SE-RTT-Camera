@@ -1,0 +1,57 @@
+{
+  "$Bundles": {
+    "System.Runtime": "1.0.0.0",
+    "VRage": "2.3.0.583"
+  },
+  "$Type": "VRage:Keen.VRage.Core.Render.Materials.MaterialStateDefinitionObjectBuilder",
+  "$Value": {
+    "Guid": "5d8e14de-bb53-410d-a48b-0829bd0fe7cb",
+    "Category": "Hidden",
+    "Name": "TriplanarGIGlobal",
+    "Description": " Low quality master terrain material used for GI. Uses Far3 colors.",
+    "VertexShader": {
+      "FullPath": "geometry\\materials\\triplanargivertex.hlsl"
+    },
+    "PixelShader": {
+      "FullPath": "geometry\\materials\\triplanargipixel.hlsl"
+    },
+    "HullShader": null,
+    "DomainShader": null,
+    "RaytracingShader": {
+      "FullPath": "geometry\\materials\\triplanargiraytracing.hlsl"
+    },
+    "Macros": [
+      {
+        "Key": "5e6f5e34-1505-43c1-9eba-f166b05110c1",
+        "Value": "INDEXED_MATERIAL"
+      },
+      {
+        "Key": "b37d4342-2d7e-4bb2-a1a1-c2254aefb34a",
+        "Value": "UNTESSELLATED_GI"
+      },
+      {
+        "Key": "482276dc-934f-49c8-984a-806da591f290",
+        "Value": "USE_REFLECTANCE"
+      }
+    ],
+    "EntityDataType": "VRage:Keen.VRage.Render.Materials.Templates.TriplanarCustomData",
+    "InstanceDataType": "VRage:Keen.VRage.Core.Render.Materials.InstanceCustomData",
+    "GlobalDataType": "VRage:Keen.VRage.Voxels.Client.Render.TriplanarGlobalCustomData",
+    "MaterialDataType": "VRage:Keen.VRage.Core.Render.Materials.MaterialDefinition",
+    "TopologyType": "Triangles",
+    "VertexStream0Type": "VRage:Keen.VRage.Render.Data.VertexFormat.VertexFormatPosition",
+    "VertexStream1Type": "VRage:Keen.VRage.Render.Data.VertexFormat.VertexFormatNormalWeightedBlendIndices",
+    "VertexStream2Type": "VRage:Keen.VRage.Core.Render.Data.VertexFormatNull",
+    "OrderLayer": "Expensive",
+    "OrderLayerOffset": 0,
+    "Blend": "Disable",
+    "Flags": "StateBackfaceCulling, StateZWriteEnabled, PassIndirect, RayTracing, MarkVoxelStencil",
+    "Options": [
+      {
+        "Key": "3f6ff6cf-38b6-493f-8238-9ca385bef9cd",
+        "Value": "e31b268f-9b7c-44cd-a366-cdedf1c67814"
+      }
+    ],
+    "DebugViews": []
+  }
+}
