@@ -674,7 +674,10 @@ internal static class CameraRender
                                 "the orbit transform and blits the whole-scene image to the panel. Nothing " +
                                 "below the strip point had a consumer. ===");
                 }
-                _stripped++;
+                // Heartbeat, so "is the strip actually engaged" is answerable from the log
+                // without reading GPU stats. Rare enough not to be noise.
+                if (++_stripped % 500 == 0)
+                    RttLog.Line($"Probe strip: {_stripped} passes have skipped the probe scene render.");
                 CopyToFeed(commandList, null);
                 return;                     // the finally still runs; nothing is borrowed yet
             }
