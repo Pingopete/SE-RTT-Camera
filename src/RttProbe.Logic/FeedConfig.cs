@@ -193,6 +193,33 @@ internal static class FeedConfig
     // stretched garbage. Default is the two we actually consume.
     public static int[] CoCullPassGroups { get; private set; } = { 0, 2 };
 
+    // The custom culling job's three remaining ctor flags.
+    //
+    // The first build mirrored the INDIRECT job on all of them, on the reasoning that it
+    // is the configuration proven not to disturb the player. That was the wrong instinct:
+    // the indirect job's flags go with the Indirect pass group, and we are emitting
+    // MainViewPass. The GBuffer came out as large flat polygons radiating from a point —
+    // the signature of garbage instance transforms, i.e. a malformed draw-command layout.
+    //
+    // isForMainView in particular is handed to DrawCommandsGenerationJob, which is what
+    // generates the indirect draw arguments. Emitting main-view commands with it false is
+    // a very plausible way to get the wrong layout.
+    //
+    // These now default to MIRRORING THE MAIN-VIEW JOB, because forcedLODMethod is the
+    // only flag we have an actual reason to deviate on (it is what keeps our cull out of
+    // the player's LOD crossfade state). Both of its old hazards are already handled:
+    // the LOD transition global is nulled for our pass, and the two-pass prologue's
+    // Assert.NotNull is gated on CullingSetup.IsOcclusionCullingAllowed, which is false
+    // because we disable HZBO.
+    public static bool CoCullForMainView { get; private set; } = true;
+    public static bool CoCullTwoPass { get; private set; } = true;
+    public static bool CoCullGeometryOnly { get; private set; }
+
+    // The one deliberate deviation from the main-view job. Off would restore the
+    // player's-LOD-state corruption, so this exists to CONFIRM that diagnosis on demand,
+    // not as a tuning knob.
+    public static bool CoCullForceSingleLod { get; private set; } = true;
+
     // Extra margin on top of the sizing basis. ZERO by default, and deliberately.
     //
     // The first guess here was 50%, on the theory that the report describes a cull from
@@ -612,6 +639,8 @@ internal static class FeedConfig
             double geomHead = GeomRangeHeadroom;
             int geomFloor = GeomRangeFloor;
             int[] coGroups = CoCullPassGroups;
+            bool coMainView = CoCullForMainView, coTwoPass = CoCullTwoPass,
+                 coGeomOnly = CoCullGeometryOnly, coSingleLod = CoCullForceSingleLod;
 
             foreach (var raw in File.ReadAllLines(Path_))
             {
@@ -759,6 +788,18 @@ internal static class FeedConfig
                     case "cocullmainview":
                         coCull = val is "1" or "true" or "yes";
                         break;
+                    case "cocullformainview":
+                        coMainView = val is "1" or "true" or "yes";
+                        break;
+                    case "coculltwopass":
+                        coTwoPass = val is "1" or "true" or "yes";
+                        break;
+                    case "cocullgeometryonly":
+                        coGeomOnly = val is "1" or "true" or "yes";
+                        break;
+                    case "cocullforcesinglelod":
+                        coSingleLod = val is "1" or "true" or "yes";
+                        break;
                     case "cocullpassgroups":
                     {
                         var parsed = new List<int>();
@@ -878,12 +919,16 @@ internal static class FeedConfig
             LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass; SunPassDepth = sunDepth; DebugGBuffer = dbgGb; DeferredTexturing = defTex;
             MainViewCulling = mvCull; CullSecondPass = cull2; DisableOcclusionCulling = noOcc; PrivateCullContexts = privCtx; PrivateGeomBuffers = privGeom; CoCullMainView = coCull;
 
-            // The custom culling job bakes its pass-group list in at construction, so a
-            // changed list means a rebuilt job — otherwise editing the config would appear
-            // to do nothing and we would be debugging the wrong thing.
-            if (!coGroups.SequenceEqual(CoCullPassGroups))
+            // The custom culling job bakes its pass-group list AND its flags in at
+            // construction, so any change means a rebuilt job — otherwise editing the
+            // config would appear to do nothing and we would be debugging the wrong thing.
+            if (!coGroups.SequenceEqual(CoCullPassGroups)
+                || coMainView != CoCullForMainView || coTwoPass != CoCullTwoPass
+                || coGeomOnly != CoCullGeometryOnly || coSingleLod != CoCullForceSingleLod)
             {
                 CoCullPassGroups = coGroups;
+                CoCullForMainView = coMainView; CoCullTwoPass = coTwoPass;
+                CoCullGeometryOnly = coGeomOnly; CoCullForceSingleLod = coSingleLod;
                 CustomCullJob.Reset();
             }
             GeomRangeHeadroom = geomHead; GeomRangeFloor = geomFloor;

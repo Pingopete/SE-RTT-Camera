@@ -182,30 +182,33 @@ internal static class CustomCullJob
             }
 
             // SingleLevel = 1. Not TransitionTimeBased, which is what lets the transition
-            // context be null without tripping CullingGeometryJob's assert.
-            var forced = Activator.CreateInstance(
-                typeof(Nullable<>).MakeGenericType(lodType), Enum.ToObject(lodType, 1));
+            // context be null without tripping CullingGeometryJob's assert. Null mirrors
+            // the main-view job and is what corrupts the player's LOD crossfade state —
+            // available only to re-confirm that diagnosis, never as a setting.
+            var nullableLod = typeof(Nullable<>).MakeGenericType(lodType);
+            var forced = FeedConfig.CoCullForceSingleLod
+                ? Activator.CreateInstance(nullableLod, Enum.ToObject(lodType, 1))
+                : Activator.CreateInstance(nullableLod);
 
             _tasks = (System.Collections.IList)Activator.CreateInstance(
                 typeof(List<>).MakeGenericType(taskElem));
             _job = ctor.Invoke(new object[]
             {
-                groups,     // targetPasses
-                forced,     // forcedLODMethod = SingleLevel
-                false,      // isUsedWithTwoPassCulling
-                false,      // isForMainView
-                false,      // geometryOnly
-                _tasks,     // tasks
-                false,      // isLocalLights
+                groups,                            // targetPasses
+                forced,                            // forcedLODMethod
+                FeedConfig.CoCullTwoPass,          // isUsedWithTwoPassCulling
+                FeedConfig.CoCullForMainView,      // isForMainView
+                FeedConfig.CoCullGeometryOnly,     // geometryOnly
+                _tasks,                            // tasks
+                false,                             // isLocalLights
             });
 
             _state = _job != null ? 1 : -1;
             RttLog.Line(_state == 1
                 ? $"Custom cull job: BUILT — groups [{string.Join(", ", FeedConfig.CoCullPassGroups.Select(NameGroup))}], " +
-                  $"forcedLODMethod=SingleLevel, twoPass=false, isForMainView=false. " +
-                  $"{_tasks.Count} shader task(s) pending. SingleLevel is what makes a null " +
-                  "LODTransitionContext legal, which is what stops our cull writing the player's " +
-                  "LOD crossfade state."
+                  $"forcedLODMethod={(FeedConfig.CoCullForceSingleLod ? "SingleLevel" : "null (WILL corrupt the player's LOD state)")}, " +
+                  $"twoPass={FeedConfig.CoCullTwoPass}, isForMainView={FeedConfig.CoCullForMainView}, " +
+                  $"geometryOnly={FeedConfig.CoCullGeometryOnly}. {_tasks.Count} shader task(s) pending."
                 : "Custom cull job: construction returned null.");
             return _state == 1;
         }
