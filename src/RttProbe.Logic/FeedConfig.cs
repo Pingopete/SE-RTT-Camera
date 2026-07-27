@@ -220,6 +220,22 @@ internal static class FeedConfig
     // not as a tuning knob.
     public static bool CoCullForceSingleLod { get; private set; } = true;
 
+    // Clear our GBuffer and depth immediately before the GBuffer pass.
+    //
+    // GBufferPassJob's own clearRenderTargets parameter is gated on
+    // GlobalDebugSettings.EnabledDebugDraw, so passing true has never cleared anything.
+    // Our GBuffer array is held for the session, so it had been accumulating since launch.
+    //
+    // Depth is the bigger half: gbufferAfterEnv runs the environment pass first (the
+    // GBuffer pass takes no camera and inherits whatever is bound), and the env pass fills
+    // depth with the whole scene. The GBuffer pass then draws the same scene through
+    // different pass groups and every fragment fails the depth test against geometry
+    // already at that depth.
+    //
+    // Off restores the old behaviour if something later in the pass turns out to need the
+    // env pass's depth.
+    public static bool ClearGBufferBeforePass { get; private set; } = true;
+
     // Extra margin on top of the sizing basis. ZERO by default, and deliberately.
     //
     // The first guess here was 50%, on the theory that the report describes a cull from
@@ -641,6 +657,7 @@ internal static class FeedConfig
             int[] coGroups = CoCullPassGroups;
             bool coMainView = CoCullForMainView, coTwoPass = CoCullTwoPass,
                  coGeomOnly = CoCullGeometryOnly, coSingleLod = CoCullForceSingleLod;
+            bool clearGb = ClearGBufferBeforePass;
 
             foreach (var raw in File.ReadAllLines(Path_))
             {
@@ -788,6 +805,9 @@ internal static class FeedConfig
                     case "cocullmainview":
                         coCull = val is "1" or "true" or "yes";
                         break;
+                    case "cleargbufferbeforepass":
+                        clearGb = val is "1" or "true" or "yes";
+                        break;
                     case "cocullformainview":
                         coMainView = val is "1" or "true" or "yes";
                         break;
@@ -902,7 +922,7 @@ internal static class FeedConfig
                         || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
-                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView
+                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || clearGb != ClearGBufferBeforePass
                         || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
@@ -917,7 +937,7 @@ internal static class FeedConfig
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
             LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass; SunPassDepth = sunDepth; DebugGBuffer = dbgGb; DeferredTexturing = defTex;
-            MainViewCulling = mvCull; CullSecondPass = cull2; DisableOcclusionCulling = noOcc; PrivateCullContexts = privCtx; PrivateGeomBuffers = privGeom; CoCullMainView = coCull;
+            MainViewCulling = mvCull; CullSecondPass = cull2; DisableOcclusionCulling = noOcc; PrivateCullContexts = privCtx; PrivateGeomBuffers = privGeom; CoCullMainView = coCull; ClearGBufferBeforePass = clearGb;
 
             // The custom culling job bakes its pass-group list AND its flags in at
             // construction, so any change means a rebuilt job — otherwise editing the

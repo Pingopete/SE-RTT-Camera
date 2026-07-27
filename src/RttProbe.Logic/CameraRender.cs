@@ -1094,6 +1094,7 @@ internal static class CameraRender
                         // Cull for the main-view groups HERE, immediately before the pass
                         // that consumes them, so nothing overwrites the commands in between.
                         var gbufCullCtx = RunCoCull() ?? cullCtx;
+                        ClearGBufferForPass(commandList, dsv);
                         _miGBufferPass.Invoke(_gBufferPassJob, new object[]
                             { commandList, Prop2(gbufCullCtx, "FirstPass"), geomBuffers, true, null });
                         RunDeferredTexturing(commandList, gbufCullCtx, geomBuffers);
@@ -1183,6 +1184,7 @@ internal static class CameraRender
                         // buffers with main-view commands is safe — this is the engine's own
                         // cull-draw-cull-draw discipline, which the first version broke.
                         var gbufCullCtx = RunCoCull() ?? cullCtx;
+                        ClearGBufferForPass(commandList, dsv);
                         _miGBufferPass.Invoke(_gBufferPassJob, new object[]
                             { commandList, Prop2(gbufCullCtx, "FirstPass"), geomBuffers, true, null });
                         RunDeferredTexturing(commandList, gbufCullCtx, geomBuffers);
@@ -3780,6 +3782,99 @@ internal static class CameraRender
     // Restored unconditionally in the finally. Leaving the engine's own main-view cull
     // without its transition context would trip that assert, and an assert tripped
     // mid-session turns the next quit into a crash report via DiagnosticReporter.
+    // Give the GBuffer pass a clean slate. THE thing that was never happening.
+    //
+    // GBufferPassJob takes a clearRenderTargets flag and we pass true, but the IL shows it
+    // is not the switch it looks like:
+    //
+    //     ldarg.s   clearRenderTargets
+    //     brfalse.s skip
+    //     call      VRageCore.GlobalDebugSettings.get_EnabledDebugDraw()
+    //     brfalse.s skip                      <- and debug draw is off
+    //
+    // So the clear never ran, not once. _ourGBufferArray is held for the whole session, so
+    // its contents accumulate across every frame and every experiment.
+    //
+    // DEPTH IS THE BIGGER HALF. gbufferAfterEnv makes the environment pass run first,
+    // because GBufferPassJob takes no camera and inherits whatever is bound. But the env
+    // pass fills the depth buffer with the entire scene on its way past — and the GBuffer
+    // pass then draws THE SAME SCENE through different pass groups, so every fragment
+    // fails the depth test against geometry already sitting at that exact depth. Only
+    // slivers where the two paths disagree survive, which is what the thin wedges and
+    // streaks in the debug blit actually were.
+    //
+    // It also explains the one good frame: the very first pass ran before anything had
+    // populated depth.
+    //
+    // Safe to clear here because the visible image is already finished by this point — the
+    // env pass has drawn it into the colour target, and bloom and tonemap do not read
+    // depth. Behind a flag anyway, since "nothing later needs this" is exactly the kind of
+    // claim that deserves a switch.
+    private static MethodInfo _miGbClearRtv, _miClearDsv;
+    private static bool _clearBlocked, _clearLogged;
+
+    private static void ClearGBufferForPass(object commandList, object dsv)
+    {
+        if (_clearBlocked || !FeedConfig.ClearGBufferBeforePass || commandList == null) return;
+        try
+        {
+            var clType = commandList.GetType();
+            _miGbClearRtv ??= clType.GetMethods(Any)
+                .FirstOrDefault(m => m.Name == "ClearRenderTargetView" && m.GetParameters().Length == 2);
+            _miClearDsv ??= clType.GetMethods(Any)
+                .FirstOrDefault(m => m.Name == "ClearDepthStencilView" && m.GetParameters().Length == 2);
+
+            if (_miGbClearRtv == null && _miClearDsv == null)
+            {
+                _clearBlocked = true;
+                RttLog.Line("GBuffer clear: neither ClearRenderTargetView nor ClearDepthStencilView found — " +
+                            "the GBuffer keeps accumulating and the depth test keeps rejecting our draws.");
+                return;
+            }
+
+            int cleared = 0;
+            if (_miGbClearRtv != null && _ourGBufferArray != null)
+            {
+                for (int i = 0; i < _ourGBufferArray.Length; i++)
+                {
+                    var rtv = ViewOf(_ourGBufferArray.GetValue(i), "IRenderTargetView");
+                    if (rtv == null) continue;
+                    _miGbClearRtv.Invoke(commandList, new[] { rtv, null });
+                    cleared++;
+                }
+            }
+
+            // ClearFlags is a flags enum on the DSV clear; All is what a depth prepass
+            // would use. Depth AND stencil, because GBufferPassJob marks stencil too.
+            bool depthCleared = false;
+            if (_miClearDsv != null && dsv != null)
+            {
+                var flagsType = _miClearDsv.GetParameters()[1].ParameterType;
+                object flags = null;
+                foreach (var n in new[] { "All", "DepthStencil", "Depth" })
+                    if (Enum.GetNames(flagsType).Contains(n)) { flags = Enum.Parse(flagsType, n); break; }
+                flags ??= Enum.ToObject(flagsType, 3);
+                _miClearDsv.Invoke(commandList, new[] { dsv, flags });
+                depthCleared = true;
+            }
+
+            if (!_clearLogged)
+            {
+                _clearLogged = true;
+                RttLog.Line($"GBuffer clear: {cleared} render target(s) and depth={depthCleared} cleared before " +
+                            "the GBuffer pass. GBufferPassJob's own clearRenderTargets flag is gated on " +
+                            "GlobalDebugSettings.EnabledDebugDraw, so it has never fired — the GBuffer had " +
+                            "been accumulating for the whole session, and the env pass had already filled " +
+                            "depth with the same scene we were trying to draw.");
+            }
+        }
+        catch (Exception e)
+        {
+            _clearBlocked = true;
+            RttLog.Error("clear GBuffer before pass", e);
+        }
+    }
+
     private static FieldInfo _lodTransField;
     private static bool _lodTransBlocked, _lodTransLogged;
 
