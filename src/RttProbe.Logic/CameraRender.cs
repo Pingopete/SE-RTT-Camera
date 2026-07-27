@@ -3617,7 +3617,7 @@ internal static class CameraRender
 
             _miRvSetResolution ??= rvType.GetMethod("SetResolution", Any);
             _miRvSetCamera ??= rvType.GetMethod("SetCameraParameters", Any);
-            if (!FeedConfig.WholeSceneCameraRebuild || _miRvSetResolution == null || _miRvSetCamera == null)
+            if (FeedConfig.WholeSceneCameraRebuild == 0 || _miRvSetResolution == null || _miRvSetCamera == null)
             {
                 // The PROVEN baseline: three field overrides. Costs a squashed aspect
                 // (player's 16:9 projection into our 1:1 target) and a stationary sky
@@ -3662,17 +3662,47 @@ internal static class CameraRender
             // the player's 4K target, and sub-pixel offsets that large at 512x512 are a
             // live suspect for the surface banding. A 5 fps feed gains nothing from
             // temporal jitter anyway. JitteredProjection := Projection, offset := zero.
-            try
+            // Mode 3 skips this, to isolate it if the fault ever needs a further bisect.
+            if (FeedConfig.WholeSceneCameraRebuild != 3)
             {
-                var proj = _rvFields.FirstOrDefault(f => f.Name.Contains("<Projection>", StringComparison.Ordinal));
-                var jitProj = _rvFields.FirstOrDefault(f => f.Name.Contains("<JitteredProjection>", StringComparison.Ordinal));
-                var jitOff = _rvFields.FirstOrDefault(f => f.Name.Contains("<JitterPixelOffset>", StringComparison.Ordinal));
-                if (proj != null && jitProj != null)
-                    jitProj.SetValue(_wsRenderView, proj.GetValue(_wsRenderView));
-                if (jitOff != null)
-                    jitOff.SetValue(_wsRenderView, Activator.CreateInstance(jitOff.FieldType));
+                try
+                {
+                    var proj = _rvFields.FirstOrDefault(f => f.Name.Contains("<Projection>", StringComparison.Ordinal));
+                    var jitProj = _rvFields.FirstOrDefault(f => f.Name.Contains("<JitteredProjection>", StringComparison.Ordinal));
+                    var jitOff = _rvFields.FirstOrDefault(f => f.Name.Contains("<JitterPixelOffset>", StringComparison.Ordinal));
+                    if (proj != null && jitProj != null)
+                        jitProj.SetValue(_wsRenderView, proj.GetValue(_wsRenderView));
+                    if (jitOff != null)
+                        jitOff.SetValue(_wsRenderView, Activator.CreateInstance(jitOff.FieldType));
+                }
+                catch { }
             }
-            catch { }
+
+            // MODE 2 — THE RACE FIX, and the intended production setting.
+            //
+            // Both rebuild CTDs faulted at DIFFERENT sites (mid-bloom with a real VA,
+            // then ScenePreparation with a null descriptor): the signature of a race,
+            // not a deterministic bad size. While our view is INSTALLED in the shared
+            // Settings._renderView, main-thread systems read that field freely — and a
+            // view whose RESOLUTION diverges from the player's poisons whatever
+            // buffer-size math the unlucky reader feeds. The baseline survives because
+            // camera-position divergence never sizes anything.
+            //
+            // So: let SetResolution shape the PROJECTION (the 1:1 aspect is baked into
+            // the matrices by SetCameraParameters above), then put the PLAYER'S
+            // resolution back in the field. Readers can no longer observe a divergent
+            // size; our render's actual pixel count comes from the LDR buffer we hand
+            // Draw, not from this field.
+            if (FeedConfig.WholeSceneCameraRebuild == 2)
+            {
+                try
+                {
+                    var resField = _rvFields.FirstOrDefault(f => f.Name == "_resolution");
+                    if (resField != null)
+                        resField.SetValue(_wsRenderView, resField.GetValue(theirs));
+                }
+                catch { }
+            }
 
             if (!_wsRvLogged)
             {

@@ -353,7 +353,7 @@ internal static class FeedConfig
     // outing ended in a GPU page fault in a bloom chain after ~45 renders, with three
     // sub-changes landed at once. OFF = the proven squashed-but-stable baseline;
     // flip live to re-test and bisect.
-    public static bool WholeSceneCameraRebuild { get; private set; }
+    public static int WholeSceneCameraRebuild { get; private set; }
 
     // Show OUR render on the panel instead of the probe feed.
     //
@@ -793,7 +793,8 @@ internal static class FeedConfig
             bool wsBuild = WholeSceneBuildBuffers, wsRender = WholeSceneEnabled;
             int wsW = WholeSceneWidth, wsH = WholeSceneHeight;
             bool wsCam = WholeSceneCamera, wsNoRt = WholeSceneDisableRaytracing;
-            bool wsPanel = WholeSceneToPanel, wsCamRebuild = WholeSceneCameraRebuild;
+            bool wsPanel = WholeSceneToPanel;
+            int wsCamRebuild = WholeSceneCameraRebuild;
             bool wsNoEye = WholeSceneDisableEyeAdaptation, wsNoProbe = WholeSceneDisableProbeUpdates;
             bool wsOwnDc = WholeSceneOwnDrawContexts;
             int[] wsSkip = WholeSceneSkipStages;
@@ -969,7 +970,8 @@ internal static class FeedConfig
                         wsNoRt = val is "1" or "true" or "yes";
                         break;
                     case "wholescenecamerarebuild":
-                        wsCamRebuild = val is "1" or "true" or "yes";
+                        wsCamRebuild = val is "true" or "yes" ? 1
+                                     : int.TryParse(val, out var wcr) ? Math.Clamp(wcr, 0, 3) : wsCamRebuild;
                         break;
                     case "wholescenetopanel":
                         wsPanel = val is "1" or "true" or "yes";
