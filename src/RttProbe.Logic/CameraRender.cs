@@ -77,7 +77,8 @@ internal static class CameraRender
         // line that proves the fix took — which is the failure mode that has wasted the
         // most time on this project.
         ReleaseHeldBorrows();
-        _sunBlocked = _sunSettingsLogged = false; _sunLogs = 0;
+        _sunBlocked = _sunSettingsLogged = false; _sunLogs = 0; _postSettingsLogged = false;
+        _expTransitionState = 0; _miExpTransition = null; _srvState = null; _clearColourProbed = false;
         _dtBlocked = false; _dtLogs = 0; _deferredTexturingJob = null; _miDeferredTexturing = null;
         _debugGbLog = null;
         _lodProbe = _lodMainView = _lastLodUsed = null;
@@ -515,6 +516,7 @@ internal static class CameraRender
             // Persistent, self-gating on change. Not part of the scoped swap below —
             // see the comment on ApplyDimDistance for why it cannot be.
             ApplyDimDistance();
+            LogPostProcessSettings();
 
             // The scene pass's PSOs are compiled for the HDR format. Binding a
             // render target of any other format is a pipeline-state mismatch, which
@@ -1780,11 +1782,44 @@ internal static class CameraRender
     // The clear-colour parameter is Nullable<something>; discover how to build it
     // rather than assuming a type. Tries a 4-float ctor, then 1-float, then a
     // default instance with its channel fields set.
+    // Does the clear colour survive a NEGATIVE value?
+    //
+    // This is the last untested link, and it fits every observation. The tonemap does
+    // exp2(AvgLuminance[0,0].g), so DARKENING requires a NEGATIVE number in that texel.
+    // If the clear-colour type clamps to [0,1] — as anything named Color plausibly does —
+    // then:
+    //
+    //   exposureValue 0.25  -> EV  +0.25 -> stored  0.25 -> exp2 = 1.19x
+    //   exposureValue 0.08  -> EV  -3.64 -> CLAMPED 0.00 -> exp2 = 1.00x
+    //   exposureValue 0.05  -> EV  -4.32 -> CLAMPED 0.00 -> exp2 = 1.00x
+    //   exposureValue 0.0005-> EV -10.97 -> CLAMPED 0.00 -> exp2 = 1.00x
+    //
+    // which is EXACTLY the observed behaviour: tiny differences between small positive
+    // values, and nothing whatsoever once the value goes negative. It also explains the
+    // original "12x sweep did nothing" — 0.25 and 0.02 both land in [0,1] and differ by
+    // 1.19x vs 1.01x — without needing the barrier or the binding to be at fault, both of
+    // which have now been verified correct.
+    //
+    // Printed rather than assumed, because I have assumed my way through four of these
+    // today and been wrong each time.
+    private static bool _clearColourProbed;
+
     private static object MakeClearColour(Type nullableType, float v)
     {
         var t = Nullable.GetUnderlyingType(nullableType) ?? nullableType;
         try
         {
+            if (!_clearColourProbed)
+            {
+                _clearColourProbed = true;
+                var probe = BuildClearColour(t, -3.5f);
+                RttLog.Line($"Exposure clear-colour probe: type={t.FullName}, asked for -3.5, got " +
+                            (probe == null ? "NULL"
+                             : string.Join(" ", probe.GetType().GetFields(BindingFlags.Public | BindingFlags.Instance)
+                                 .Select(f => $"{f.Name}={f.GetValue(probe)}"))) +
+                            ". If those read 0 instead of -3.5 the type CLAMPS, and darkening via " +
+                            "ClearRenderTargetView is impossible — exp2(0) = 1 and every negative EV is a no-op.");
+            }
             foreach (var ctor in t.GetConstructors())
             {
                 var ps = ctor.GetParameters();
@@ -1805,6 +1840,29 @@ internal static class CameraRender
         }
         catch (Exception e) { RttLog.Error("clear colour", e); }
         return null;
+    }
+
+    // The construction half on its own, so the probe above can build one without
+    // recursing into the probe.
+    private static object BuildClearColour(Type t, float v)
+    {
+        try
+        {
+            foreach (var ctor in t.GetConstructors())
+            {
+                var ps = ctor.GetParameters();
+                if (ps.Length == 4 && ps.All(p => p.ParameterType == typeof(float)))
+                    return ctor.Invoke(new object[] { v, v, v, v });
+                if (ps.Length == 1 && ps[0].ParameterType == typeof(float))
+                    return ctor.Invoke(new object[] { v });
+            }
+            var box = Activator.CreateInstance(t);
+            int set = 0;
+            foreach (var f in t.GetFields(BindingFlags.Public | BindingFlags.Instance))
+                if (f.FieldType == typeof(float)) { f.SetValue(box, v); set++; }
+            return set > 0 ? box : null;
+        }
+        catch { return null; }
     }
 
     private static object ReuseExistingExposure()
@@ -2189,6 +2247,119 @@ internal static class CameraRender
     // installed rather than ScreenBuffers, so it reports what WE wrote even if the
     // swap were somehow not in effect — which is itself part of what is being tested.
     private static string _debugGbLog;
+    private static long _expClearLogMs;
+    private static bool _postSettingsLogged;
+
+    // Move our 1x1 exposure target from RENDER_TARGET to a shader-readable state so the
+    // tonemap's SRV sample sees the value we just cleared into it.
+    //
+    // Mirrors what FeedHandover does for the copy source: ExplicitStateTransition takes an
+    // AutoResourceState, which hangs off a VIEW rather than the texture, plus the target
+    // state. Self-disabling — if any of it is unreachable the exposure path degrades to
+    // what it did before rather than taking the feed with it.
+    private static MethodInfo _miExpTransition;
+    private static object _srvState;
+    private static int _expTransitionState;   // 0 untried, 1 ok, -1 unavailable
+
+    private static void TransitionExposureToShaderResource(object commandList)
+    {
+        if (_expTransitionState == -1) return;
+        try
+        {
+            if (_expTransitionState == 0)
+            {
+                _miExpTransition = commandList.GetType().GetMethods(Any)
+                    .FirstOrDefault(m => m.Name == "ExplicitStateTransition" && m.GetParameters().Length == 3);
+                var stateEnum = _miExpTransition?.GetParameters()[1].ParameterType;
+                if (stateEnum != null && stateEnum.IsEnum)
+                {
+                    // The tonemap is a COMPUTE dispatch, so the read is a non-pixel shader
+                    // resource. Prefer that, then the generic/pixel variants.
+                    foreach (var n in new[] { "NonPixelShaderResource", "AllShaderResource",
+                                              "ShaderResource", "PixelShaderResource", "GenericRead" })
+                        if (Enum.GetNames(stateEnum).Contains(n)) { _srvState = Enum.Parse(stateEnum, n); break; }
+                }
+
+                if (_miExpTransition == null || _srvState == null)
+                {
+                    _expTransitionState = -1;
+                    RttLog.Line($"Exposure: no state transition available " +
+                                $"(ExplicitStateTransition={(_miExpTransition == null ? "NOT FOUND" : "ok")}, " +
+                                $"srvState={_srvState ?? (object)"NOT FOUND"}) — the tonemap may keep reading " +
+                                "a stale value, which is what made every exposure change invisible.");
+                    return;
+                }
+                _expTransitionState = 1;
+                RttLog.Line($"Exposure: transitioning our 1x1 target to {_srvState} after the clear, " +
+                            "so the tonemap's SRV read sees it.");
+            }
+
+            var autoState = ExposureAutoState();
+            if (autoState == null)
+            {
+                _expTransitionState = -1;
+                RttLog.Line("Exposure: no AutoResourceState reachable from our exposure target — " +
+                            "transition skipped.");
+                return;
+            }
+            _miExpTransition.Invoke(commandList, new object[] { autoState, _srvState, false });
+        }
+        catch (Exception e)
+        {
+            _expTransitionState = -1;
+            RttLog.Error("exposure state transition", e);
+        }
+    }
+
+    // AutoResourceState hangs off a view, not the texture — same walk FeedHandover does.
+    private static object ExposureAutoState()
+    {
+        var res = Prop2(_ownExposureBorrow, "Resource") ?? _ownExposureBorrow;
+        foreach (var candidate in new[] { Prop2(res, "AutoResourceState"),
+                                          Prop2(ViewOf(_ownExposureBorrow, "ITexture2DView"), "AutoResourceState"),
+                                          Prop2(ViewOf(_ownExposureBorrow, "IRenderTargetView"), "AutoResourceState") })
+            if (candidate != null) return candidate;
+        return null;
+    }
+
+    // The live PostProcess settings, printed once.
+    //
+    // Everything about the exposure path checks out on paper — the texture is written
+    // with the right log2 values, handed to ApplyToneMapping, the tonemap runs, and its
+    // output is what reaches the panel — and yet a TWENTY-FOLD exposure change is
+    // invisible. So an assumption is wrong, and the one I have been making from a config
+    // FILE rather than from the running game is the gate in ToneMapping.hlsl:
+    //
+    //     return Post_.EnableExposure == 1 ? exp2(AvgLuminance[uint2(0,0)].g) : 1;
+    //
+    // If EnableExposure is 0 at runtime, GetExposure() returns a constant 1 and nothing
+    // we write can ever matter. DefaultFrameSettingsConfiguration.def says "Exposure":
+    // true, but the shipped default is not necessarily what a "Quality" visual preset
+    // leaves in the live settings.
+    //
+    // ToneMapping is worth printing for the same reason: ToneMappingJob picks
+    // _psoDisableToneMapping when PostProcessSettings.ToneMapping is false, and that
+    // variant plausibly ignores exposure entirely. ConstantLuminance and
+    // LuminanceExposure sit right beside Exposure in the same settings block and may be
+    // the knobs that actually apply when adaptation is off.
+    private static void LogPostProcessSettings()
+    {
+        if (_postSettingsLogged || _settings == null) return;
+        _postSettingsLogged = true;
+        try
+        {
+            var pp = Prop2(_settings, "PostProcess");
+            if (pp == null) { RttLog.Line("PostProcess settings: unreadable."); return; }
+            RttLog.Line($"PostProcess LIVE: Enable={Prop2(pp, "Enable")} ToneMapping={Prop2(pp, "ToneMapping")} " +
+                        $"Exposure={Prop2(pp, "Exposure")} EyeAdaptation={Prop2(pp, "EyeAdaptation")} " +
+                        $"ConstantLuminance={Prop2(pp, "ConstantLuminance")} " +
+                        $"LuminanceExposure={Prop2(pp, "LuminanceExposure")} " +
+                        $"WhitePoint={Prop2(pp, "WhitePoint")} BloomLumaThreshold={Prop2(pp, "BloomLumaThreshold")}. " +
+                        "Exposure=False explains everything: the shader returns a constant 1 and our " +
+                        "texture is never read.");
+        }
+        catch (Exception e) { RttLog.Error("post-process settings", e); }
+    }
 
     private static object DebugGBufferSrv(int slot)
     {
@@ -2615,6 +2786,26 @@ internal static class CameraRender
             }
 
             _miClearRtv.Invoke(commandList, new[] { rtv, _clearColourCache });
+
+            // AND TRANSITION IT, which is why every exposure value has been invisible.
+            //
+            // We clear this texture as a RENDER TARGET and the tonemap then samples it as
+            // a SHADER RESOURCE. Without a barrier between those two uses the read is
+            // undefined — in practice it returns whatever was there before our clear, so
+            // the value we so carefully computed never arrives. The image does not go
+            // wrong in an obvious way; it simply ignores us, which is exactly what a
+            // twenty-fold change showing nothing looks like.
+            //
+            // The engine's AutoResourceState tracker cannot help here because it never saw
+            // the clear: we issued it by reflection onto a command list it is not tracking
+            // for this resource. That is the same shape as the invalid-copy bug that cost
+            // this project days — a GPU-side correctness fault that presents as "the code
+            // runs and nothing happens".
+            //
+            // Proven by elimination rather than assumed: with reuseExposure the ENGINE'S
+            // own exposure texture visibly moved the feed, so the tonemap honours its
+            // exposure input and the fault is on our side of the boundary.
+            TransitionExposureToShaderResource(commandList);
         }
         catch (Exception e) { _clearExpState = -1; RttLog.Error("clear exposure", e); }
     }
@@ -2848,6 +3039,44 @@ internal static class CameraRender
     private static FieldInfo[] _rvFields;
     private static bool _camSwapBlocked, _camSwapLogged;
     private static object _lastCamWorld, _lastViewD;
+
+    // How far down-sun the camera is looking: +1 straight away from the sun (subject fully
+    // lit, frame bright), -1 straight into it (subject backlit). NaN when the sun
+    // direction is unreachable, so the caller can drop the term rather than assume a value.
+    //
+    // Reachable and all public: SettingsManager.Light -> LightSettings.Sun -> SunSettings.Normal.
+    public static double SunFacing()
+    {
+        try
+        {
+            if (_lastCamWorld == null || _settings == null) return double.NaN;
+            var sun = Prop2(Prop2(Prop2(_settings, "Light"), "Sun"), "Normal");
+            if (sun == null) return double.NaN;
+
+            double sx = System.Convert.ToDouble(Prop2(sun, "X") ?? 0.0);
+            double sy = System.Convert.ToDouble(Prop2(sun, "Y") ?? 0.0);
+            double sz = System.Convert.ToDouble(Prop2(sun, "Z") ?? 0.0);
+            double sl = Math.Sqrt(sx * sx + sy * sy + sz * sz);
+            if (sl < 1e-6) return double.NaN;
+            sx /= sl; sy /= sl; sz /= sl;
+
+            // Row 2 of the camera world matrix points AWAY from the target in this engine —
+            // the same convention CameraFeed builds its basis with — so it is the backward
+            // vector and forward is its negation.
+            double fx = -System.Convert.ToDouble(Prop2(_lastCamWorld, "M31") ?? 0.0);
+            double fy = -System.Convert.ToDouble(Prop2(_lastCamWorld, "M32") ?? 0.0);
+            double fz = -System.Convert.ToDouble(Prop2(_lastCamWorld, "M33") ?? 0.0);
+            double fl = Math.Sqrt(fx * fx + fy * fy + fz * fz);
+            if (fl < 1e-6) return double.NaN;
+            fx /= fl; fy /= fl; fz /= fl;
+
+            // Normal's sign convention is not documented, so the value is REPORTED rather
+            // than assumed correct — if the feed brightens where it should darken, negate
+            // autoExposureSunRange in config rather than rebuilding.
+            return Math.Clamp(fx * sx + fy * sy + fz * sz, -1.0, 1.0);
+        }
+        catch { return double.NaN; }
+    }
 
     private static object InstallOurCamera(object camWorld, object viewD)
     {

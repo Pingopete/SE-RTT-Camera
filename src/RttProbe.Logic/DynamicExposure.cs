@@ -34,15 +34,15 @@ internal static class DynamicExposure
 {
     private static double _current = double.NaN;
     private static long _lastMs;
-    private static string _lastLog = "";
-    private static int _logs;
+    private static long _lastLogMs;
+
 
     public static void Reset()
     {
         _current = double.NaN;
         _lastMs = 0;
-        _lastLog = "";
-        _logs = 0;
+        _lastLogMs = 0;
+
     }
 
     // The linear exposure multiplier the tonemap should apply. Converted to a log2 EV
@@ -76,54 +76,83 @@ internal static class DynamicExposure
             target = _current;
         }
 
-        target = Math.Clamp(target, FeedConfig.AutoExposureMin, FeedConfig.AutoExposureMax);
+        // Clamp the AUTO value only.
+        //
+        // This used to clamp unconditionally, which silently floored a hand-set
+        // exposureValue to autoExposureMin — so a deliberate 2000x test was quietly
+        // turned into a 50x one and the log showed "constant 0.0005" next to
+        // "linear 0.020x". A manual value is an instruction, not a suggestion; the bounds
+        // exist to stop the ESTIMATOR running away, and have no business overriding a
+        // number a human typed to probe the pipeline.
+        if (FeedConfig.AutoExposure)
+            target = Math.Clamp(target, FeedConfig.AutoExposureMin, FeedConfig.AutoExposureMax);
 
-        // Change-detection logging, not one-shot: a one-shot line here would print the
-        // startup value and then never mention that the exposure had moved, which is the
-        // exact trap that made the old constant look inert.
-        if (_logs < 40)
+        // PERIODIC, not one-shot and not change-detected.
+        //
+        // The first version logged only on a changed value, which combined with a
+        // constant estimator produced exactly one line — and that single line is what
+        // made it look like nothing was being logged at all. A rate-limited line keeps
+        // reporting for as long as tuning takes, and prints the SUN TERM alongside the
+        // result so it is obvious whether the input is moving or the output is stuck.
+        long nowMs = Clock.Ms;
+        if (nowMs - _lastLogMs >= 1000)
         {
-            string s = $"{target:F3}";
-            if (s != _lastLog)
-            {
-                _lastLog = s;
-                _logs++;
-                RttLog.Line($"Exposure: {(FeedConfig.AutoExposure ? "auto" : "fixed")} -> {s}x linear " +
-                            $"(EV {Math.Log2(Math.Max(1e-6, target)):F2})");
-            }
+            _lastLogMs = nowMs;
+            string lit = double.IsNaN(_lastLit) ? "n/a (sun direction unavailable)" : $"{_lastLit:+0.00;-0.00}";
+            RttLog.Line($"Exposure: {(FeedConfig.AutoExposure ? "auto" : "fixed")} {target:F3}x " +
+                        $"(EV {Math.Log2(Math.Max(1e-6, target)):F2})  sunFacing={lit}  " +
+                        $"[+1 = looking down-sun, -1 = into the sun]");
         }
         return target;
     }
 
     // How bright the frame is likely to be, from what we already know about the shot.
     //
-    // Two terms, both derived from the camera we placed rather than measured off the GPU:
+    // The first version of this used only the subject's apparent angular size
+    // (extent / orbitRadius) and was WRONG IN THE ONE CASE WE ACTUALLY RUN: on a circular
+    // orbit both terms are constant, so the exposure never moved. It logged one value at
+    // startup and then nothing, which is exactly what was observed. A per-frame estimator
+    // whose inputs cannot vary is not an estimator.
     //
-    //   FILL — how much of the frame is lit surface rather than empty space. The target's
-    //   apparent angular size against our FOV. A ship filling the frame needs far less
-    //   exposure than the same ship as a speck against black, which is exactly the case
-    //   the fixed value gets wrong at both ends.
+    // What genuinely changes as the camera pans is the SUN ANGLE. Orbiting a ship, the
+    // shot swings between:
     //
-    //   SUN — whether we are looking anywhere near the sun. Not modelled yet; the orbit
-    //   camera always faces the target, so the sun is only ever incidental. Left as a
-    //   named gap rather than a silent assumption.
+    //   down-sun   sun behind the camera, the subject's near face fully lit, frame bright
+    //   backlit    sun beyond the subject, near face in shadow against bright space
+    //
+    // That is several stops between the extremes and it is the dominant variation in a
+    // space scene, where there is no ambient to soften either end. It is also free: we
+    // know the camera transform because we place it, and the sun direction is reachable
+    // at SettingsManager.Light.Sun.Normal.
+    //
+    // Still an estimate rather than a measurement — a real one means reading back the
+    // rendered frame's luminance, which costs either a render-thread stall or a frame of
+    // latency through a staging buffer. Worth doing if this proves not good enough, but
+    // the smoothing matters more than the accuracy and this varies correctly.
     private static double EstimateTarget()
     {
         var target = CameraFeed.Current;
         double radius = Math.Max(1.0, FeedConfig.OrbitRadius);
         double extent = target != null && target.Extent > 0.0 ? target.Extent : 10.0;
 
-        // Fraction of the half-FOV the subject subtends. Clamped well short of 1 because
-        // a subject that fills the frame still has sky around the edges at these framings.
+        // FILL — how much of the frame is surface rather than empty space. Constant on a
+        // circular orbit, so it sets the baseline rather than the variation.
         double subtend = Math.Clamp(extent / radius, 0.02, 1.2);
-
-        // Empty space wants a lot of exposure to show anything; a frame full of sunlit
-        // hull wants very little. Interpolated in log space so the ends are not lopsided.
+        double fillK = Math.Clamp((subtend - 0.02) / (1.2 - 0.02), 0.0, 1.0);
         const double emptyEv = 0.0;    // 1.0x  — mostly sky
-        const double fullEv = -2.5;    // 0.18x — mostly sunlit surface
-        double k = Math.Clamp((subtend - 0.02) / (1.2 - 0.02), 0.0, 1.0);
-        double ev = emptyEv + (fullEv - emptyEv) * k;
+        const double fullEv = -2.0;    // 0.25x — mostly sunlit surface
+        double ev = emptyEv + (fullEv - emptyEv) * fillK;
 
+        // SUN — the term that actually moves. +1 when looking directly down-sun (subject
+        // fully lit, needs the least exposure), -1 when looking straight into it.
+        double lit = CameraRender.SunFacing();
+        if (!double.IsNaN(lit))
+            ev += -FeedConfig.AutoExposureSunRange * lit;
+
+        _lastLit = lit;
         return Math.Pow(2.0, ev + FeedConfig.AutoExposureBias);
     }
+
+    private static double _lastLit = double.NaN;
+    public static double LastSunFacing => _lastLit;
 }

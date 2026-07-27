@@ -119,6 +119,12 @@ internal static class FeedConfig
     public static double AutoExposureDownSpeed { get; private set; } = 3.0;
     public static double AutoExposureUpSpeed { get; private set; } = 0.8;
 
+    // How many STOPS the sun angle swings the exposure. The dominant variation in a space
+    // scene: looking down-sun the subject is fully lit, backlit it is a silhouette against
+    // bright space. Negate this if the feed brightens where it should darken — SunSettings
+    // .Normal has no documented sign convention and the log reports the raw value.
+    public static double AutoExposureSunRange { get; private set; } = 1.5;
+
     // Bounds and a manual trim, all LINEAR multipliers.
     public static double AutoExposureMin { get; private set; } = 0.02;
     public static double AutoExposureMax { get; private set; } = 4.0;
@@ -476,6 +482,7 @@ internal static class FeedConfig
             bool defTex = DeferredTexturing, autoExp = AutoExposure;
             double expDown = AutoExposureDownSpeed, expUp = AutoExposureUpSpeed;
             double expMin = AutoExposureMin, expMax = AutoExposureMax, expBias = AutoExposureBias;
+            double expSun = AutoExposureSunRange;
             double emissive = Emissivity, dimDist = DimDistance;
             int recursive = RecursiveReflections;
 
@@ -637,6 +644,9 @@ internal static class FeedConfig
                     case "autoexposuremax":
                         if (double.TryParse(val, out var emx) && emx > 0) expMax = emx;
                         break;
+                    case "autoexposuresunrange":
+                        if (double.TryParse(val, out var es)) expSun = es;
+                        break;
                     case "autoexposurebias":
                         if (double.TryParse(val, out var eb)) expBias = eb;
                         break;
@@ -690,7 +700,7 @@ internal static class FeedConfig
                         || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
-                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias
+                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
                         || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || gateGi != GateGi || envScratch != EnvPassToScratch || skyMode != SkyMode || cullRoot != CullRootEntityId;
@@ -705,6 +715,7 @@ internal static class FeedConfig
             LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass; SunPassDepth = sunDepth; DebugGBuffer = dbgGb; DeferredTexturing = defTex;
             AutoExposure = autoExp; AutoExposureDownSpeed = expDown; AutoExposureUpSpeed = expUp;
             AutoExposureMin = expMin; AutoExposureMax = expMax; AutoExposureBias = expBias;
+            AutoExposureSunRange = expSun;
             Emissivity = emissive; RecursiveReflections = recursive; DimDistance = dimDist;
 
             if (changed)
