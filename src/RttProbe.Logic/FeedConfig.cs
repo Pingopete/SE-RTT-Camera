@@ -123,6 +123,47 @@ internal static class FeedConfig
     // it may want an OcclusionContext (we pass null) and a second culling pass.
     public static bool MainViewCulling { get; private set; }
 
+    // Run CullingJob.DoCullingSecondPass after the first.
+    //
+    // The main-view job is built with isUsedWithTwoPassCulling, and the engine calls
+    // MainViewCulling(cl, isFirstPass) TWICE per frame: the first pass culls coarsely and
+    // primes occlusion, the second generates the final draw commands. Running only the
+    // first yields a partial command set — which is what a single tiny fragment in the
+    // GBuffer looks like.
+    //
+    // Only applies when mainViewCulling is on; the indirect job is single-pass.
+    public static bool CullSecondPass { get; private set; } = true;
+
+    // Build our OWN visibility-list and occlusion contexts instead of borrowing the
+    // player's. Construct-only at first: it reports whether they build and does not wire
+    // them into culling, because the last shared-context attempt corrupted the player's
+    // view rather than merely failing.
+    public static bool PrivateCullContexts { get; private set; } = true;
+
+    // Use our OWN OutputGeometryBufferContext for the cull and the draws.
+    //
+    // DrawContexts.MainOutputGeometryBuffers has eighteen engine readers, and Borrow() on
+    // it is only an _isBorrowed mutex flag handing back the same physical buffers — so our
+    // draw commands land in the buffers the player's frame executes. Survivable with the
+    // indirect culling job, which writes a group the engine re-culls anyway; it corrupted
+    // the player's view outright with the main-view job.
+    //
+    // Flipping this ALONE should produce no visible change whatsoever. That is the point:
+    // it proves the private-context mechanism before the mechanism is asked to carry a
+    // feature. SurfelGenerationJob constructs its own for exactly this reason.
+    public static bool PrivateGeomBuffers { get; private set; }
+
+    // Disable occlusion culling for the duration of our pass.
+    //
+    // The engine sequences main-view culling as first pass -> depth prepass -> build HiZ ->
+    // second pass. We run both passes back to back with no HiZ rebuild, so the second one
+    // tests visibility against the PLAYER'S depth pyramid and rejects geometry our camera
+    // can plainly see. The tell was one correct frame followed by near-total culling.
+    //
+    // CullingSetup.IsOcclusionCullingAllowed reads SettingsManager.HZBO live, so this is a
+    // scoped set/restore. Costs some overdraw, which at 512x512 is nearly free.
+    public static bool DisableOcclusionCulling { get; private set; } = true;
+
     // Auto-exposure for the feed, from our own camera. See DynamicExposure.
     //
     // The engine's ComputeExposure is off-limits — it advances the temporal adaptation the
@@ -496,7 +537,7 @@ internal static class FeedConfig
             int bloomN = BloomEveryN;
             bool sunPass = SunPass, sunDepth = SunPassDepth;
             int dbgGb = DebugGBuffer;
-            bool defTex = DeferredTexturing, autoExp = AutoExposure, mvCull = MainViewCulling;
+            bool defTex = DeferredTexturing, autoExp = AutoExposure, mvCull = MainViewCulling, cull2 = CullSecondPass, noOcc = DisableOcclusionCulling, privCtx = PrivateCullContexts, privGeom = PrivateGeomBuffers;
             double expDown = AutoExposureDownSpeed, expUp = AutoExposureUpSpeed;
             double expMin = AutoExposureMin, expMax = AutoExposureMax, expBias = AutoExposureBias;
             double expSun = AutoExposureSunRange;
@@ -646,6 +687,18 @@ internal static class FeedConfig
                     case "swapcameracb":
                         swapCb = val is "1" or "true" or "yes";
                         break;
+                    case "privategeombuffers":
+                        privGeom = val is "1" or "true" or "yes";
+                        break;
+                    case "privatecullcontexts":
+                        privCtx = val is "1" or "true" or "yes";
+                        break;
+                    case "disableocclusionculling":
+                        noOcc = val is "1" or "true" or "yes";
+                        break;
+                    case "cullsecondpass":
+                        cull2 = val is "1" or "true" or "yes";
+                        break;
                     case "mainviewculling":
                         mvCull = val is "1" or "true" or "yes";
                         break;
@@ -720,7 +773,7 @@ internal static class FeedConfig
                         || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
-                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
+                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
                         || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || gateGi != GateGi || envScratch != EnvPassToScratch || skyMode != SkyMode || cullRoot != CullRootEntityId;
@@ -733,7 +786,7 @@ internal static class FeedConfig
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
             LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass; SunPassDepth = sunDepth; DebugGBuffer = dbgGb; DeferredTexturing = defTex;
-            MainViewCulling = mvCull;
+            MainViewCulling = mvCull; CullSecondPass = cull2; DisableOcclusionCulling = noOcc; PrivateCullContexts = privCtx; PrivateGeomBuffers = privGeom;
             AutoExposure = autoExp; AutoExposureDownSpeed = expDown; AutoExposureUpSpeed = expUp;
             AutoExposureMin = expMin; AutoExposureMax = expMax; AutoExposureBias = expBias;
             AutoExposureSunRange = expSun;
@@ -758,7 +811,7 @@ internal static class FeedConfig
                             $"| lodMainView={LodMainView} fixScreenRes={FixScreenRes} " +
                             $"fullCameraCb={FullCameraCb} emissivity={Emissivity} " +
                             $"recursiveReflections={RecursiveReflections} dimDistance={DimDistance} " +
-                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass} sunPassDepth={SunPassDepth} debugGBuffer={DebugGBuffer} deferredTexturing={DeferredTexturing} autoExposure={AutoExposure} mainViewCulling={MainViewCulling}");
+                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass} sunPassDepth={SunPassDepth} debugGBuffer={DebugGBuffer} deferredTexturing={DeferredTexturing} autoExposure={AutoExposure} mainViewCulling={MainViewCulling} cullSecondPass={CullSecondPass}");
         }
         catch { /* keep the last good values */ }
     }

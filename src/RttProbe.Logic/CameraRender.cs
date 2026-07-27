@@ -45,12 +45,16 @@ internal static class CameraRender
     private static object _cullCtx, _clusterCtx, _shadowResources;
     private static object _cullJobIndirect, _cullJobMainView;
     private static object _lastCullJobUsed;
+    private static object _mainVisibilityLists, _mainOcclusion;
+    private static bool _mainCullWarned, _secondPassWarned, _secondPassLogged;
+    private static MethodInfo _miDoCullingSecondPass;
     private static object _geomBuffersMain, _geomBuffersEffect;
     private static object _lodProbe, _lodMainView;
 
     // A throwaway for optional resolves, so a missing member cannot fail the dry run.
     private static bool _ignored;
     private static object _lastGeomBuffers;
+    private static bool _lastPrivateGeom;
 
     // Which OutputGeometryBufferContext this pass writes its draw commands into.
     // See the resolve-time comment: the choice is between a buffer eighteen engine
@@ -81,6 +85,10 @@ internal static class CameraRender
         ReleaseHeldBorrows();
         _sunBlocked = _sunSettingsLogged = false; _sunLogs = 0; _postSettingsLogged = false;
         _expTransitionState = 0; _miExpTransition = null; _srvState = null; _clearColourProbed = false;
+        _hzboField = null; _hzboBlocked = _hzboLogged = false;
+        _mainCullWarned = _secondPassWarned = _secondPassLogged = false; _miDoCullingSecondPass = null;
+        _cullJobIndirect = _cullJobMainView = _lastCullJobUsed = null;
+        _mainVisibilityLists = _mainOcclusion = null;
         _dtBlocked = false; _dtLogs = 0; _deferredTexturingJob = null; _miDeferredTexturing = null;
         _debugGbLog = null;
         _lodProbe = _lodMainView = _lastLodUsed = null;
@@ -303,6 +311,12 @@ internal static class CameraRender
         // passes rewrite around us. Geometry appearing and disappearing at certain angles
         // is exactly what that looks like.
         _geomBuffersMain   = Prop(_drawContexts, "MainOutputGeometryBuffers", sb, ref ok);
+
+        // The two contexts the MAIN-VIEW culling job dereferences and the indirect one does
+        // not. Optional: their absence downgrades mainViewCulling to the indirect job
+        // rather than failing the dry run.
+        _mainVisibilityLists = Prop(_drawContexts, "MainVisibilityListBuffers", sb, ref _ignored);
+        _mainOcclusion       = Prop(_drawContexts, "Occlusion", sb, ref _ignored);
         _geomBuffersEffect = Prop(_drawContexts, "MainOutputEffectGeometryBuffers", sb, ref _ignored);
         sb.AppendLine($"  (effect buffers {(_geomBuffersEffect == null ? "NOT FOUND — flicker fix unavailable" : "available")})");
 
@@ -523,13 +537,38 @@ internal static class CameraRender
         object rtBorrow = null, depthBorrow = null, cameraCb = null, borrowedCulling = null;
         object savedGBuffer = null, savedCamera = null, scratchBorrow = null, savedProbeSettings = null;
         object[] savedCameraCb = null;
+        object savedOcclusion = null;
+        bool privateCtxHeld = false, usingPrivateGeom = false;
         bool geomBorrowed = false;
 
         // Captured ONCE for the whole pass. The config is polled between passes, so
         // reading the property per use could Borrow one context and Return the other
         // if the switch flipped mid-pass — which would leave an engine context stuck
         // marked as borrowed.
+        // Draw-command buffers: ours if we have them, otherwise the engine's.
+        //
+        // This is the change that should be INVISIBLE. Same culling job, same pass group,
+        // same everything — only the buffer our draw commands land in moves from the main
+        // view's shared context to one we own. If the feed looks identical and the player's
+        // lights stay steady, the private-context mechanism is proven on its own, before it
+        // is asked to carry a feature.
+        //
+        // Doing it this way round is deliberate. mainViewCulling changes three things at
+        // once — private buffers, different pass groups, two-pass culling — and this
+        // afternoon showed how hard that is to unpick when it goes wrong.
         object geomBuffers = GeomBuffers;
+        if (FeedConfig.PrivateGeomBuffers && PrivateCullContexts.Ensure() && PrivateCullContexts.GeomBuffers != null)
+        {
+            geomBuffers = PrivateCullContexts.GeomBuffers;
+            usingPrivateGeom = true;
+        }
+        if (usingPrivateGeom != _lastPrivateGeom)
+        {
+            _lastPrivateGeom = usingPrivateGeom;
+            RttLog.Line($"Geometry buffers: {(usingPrivateGeom ? "PRIVATE (ours)" : "shared MainOutputGeometryBuffers")} " +
+                        "— the shared one has eighteen engine readers and Borrow() on it is only a mutex " +
+                        "flag, so our draw commands land in the buffers the player's frame executes.");
+        }
         if (!ReferenceEquals(geomBuffers, _lastGeomBuffers))
         {
             _lastGeomBuffers = geomBuffers;
@@ -545,6 +584,17 @@ internal static class CameraRender
             // see the comment on ApplyDimDistance for why it cannot be.
             ApplyDimDistance();
             LogPostProcessSettings();
+
+            // Construct-only verification. Builds the private contexts and reports, without
+            // wiring them to anything, so "do they construct" is answered separately from
+            // "do they work" — the discipline the shared-context attempt skipped, which
+            // cost the player's view rather than merely failing.
+            if (FeedConfig.PrivateCullContexts) PrivateCullContexts.Ensure();
+
+            // Construct-only verification: build the private contexts and report, but do NOT
+            // wire them into culling yet. Proving construction in isolation first is the
+            // discipline that the shared-context mistake skipped.
+
 
             // The scene pass's PSOs are compiled for the HDR format. Binding a
             // render target of any other format is a pipeline-state mismatch, which
@@ -653,7 +703,14 @@ internal static class CameraRender
                 return;
             }
 
-            Call(geomBuffers, "Borrow"); geomBorrowed = true;
+            // A private context needs RANGING before it is culled into, and nothing else
+            // will do it for us — the engine only ranges the contexts its own pending-work
+            // queues name. That is the lesson the missing asteroids taught, applied here
+            // before it can cost anything: EnsureRanges then Borrow, the order
+            // SurfelGenerationJob uses.
+            if (usingPrivateGeom) PrivateCullContexts.PrepareGeomForPass(commandList);
+            else { Call(geomBuffers, "Borrow"); }
+            geomBorrowed = true;
 
             // Step 2: own the GBuffer for the duration of this pass. Restored in the
             // finally below, unconditionally — leaving the engine pointed at our
@@ -665,6 +722,10 @@ internal static class CameraRender
 
             // Swap the real IBL cubes in for the flat default, for our pass only.
             savedProbeSettings = InstallProbeSettings();
+
+            // Occlusion off for the pass: we never rebuild HiZ between the two culling
+            // passes, so the second one tests against the player's depth pyramid.
+            savedOcclusion = InstallNoOcclusion();
 
             // cull -> cluster -> draw, exactly as the probe pass sequences them
             // Prefer a pooled culling context over the engine's probe one — sharing
@@ -710,11 +771,106 @@ internal static class CameraRender
                             "flat Far3 colours, no texture sampling at all).");
             }
 
-            _miDoCullingFirstPass.Invoke(cullJob, new object[]
+            // The main-view job is built with isUsedWithTwoPassCulling and isForMainView, so
+            // unlike the indirect job it dereferences the visibility-list and occlusion
+            // contexts rather than tolerating nulls — which is the NullReferenceException
+            // that disabled the pass the first time this was switched on.
+            //
+            // SceneDrawSystem.MainViewCulling is the engine's own recipe and names both:
+            //
+            //     DoCullingFirstPass(cl, RenderView, LOD.MainView,
+            //         DrawContexts.MainViewCulling,
+            //         DrawContexts.MainOutputGeometryBuffers,
+            //         DrawContexts.MainVisibilityListBuffers,   <- we passed null
+            //         DrawContexts.Occlusion,                   <- we passed null
+            //         ...)
+            //
+            // These are the MAIN VIEW's contexts, shared the same way
+            // MainOutputGeometryBuffers already is. The engine re-culls into them during
+            // RenderMainView later in the frame, so ours are transient — the same bargain
+            // that has held for the geometry buffers.
+            bool mainView = ReferenceEquals(cullJob, _cullJobMainView);
+            object visLists = null, occlusion = null;
+
+            if (mainView)
+            {
+                // OURS, never the engine's.
+                //
+                // The first attempt passed DrawContexts.MainVisibilityListBuffers and
+                // DrawContexts.Occlusion, copied from SceneDrawSystem.MainViewCulling
+                // without asking whether they were spare. They are the main view's working
+                // state: our cull wrote into the buffers the engine then read for the
+                // player's screen, and their ship lights went bright and flickered. Private
+                // contexts remove the shared state entirely rather than trying to schedule
+                // around it.
+                if (PrivateCullContexts.Ensure())
+                {
+                    PrivateCullContexts.PrepareForPass(commandList);
+                    visLists = PrivateCullContexts.Visibility;
+                    occlusion = PrivateCullContexts.Occlusion;
+                    privateCtxHeld = true;
+                }
+
+                if (visLists == null || occlusion == null)
+                {
+                    if (!_mainCullWarned)
+                    {
+                        _mainCullWarned = true;
+                        RttLog.Line("Culling job: MAIN VIEW needs private visibility/occlusion contexts and " +
+                                    "they are unavailable — falling back to the indirect job rather than " +
+                                    "borrowing the engine's, which corrupts the player's view.");
+                    }
+                    cullJob = _cullJobIndirect;
+                    mainView = false;
+                    visLists = occlusion = null;
+                }
+            }
+
+            var cullArgs = new object[]
             {
                 commandList, view, lodSettings, cullCtx, geomBuffers,
-                null, null, null, null, -1, 0, -1,
-            });
+                visLists, occlusion, null, null, -1, 0, -1,
+            };
+            _miDoCullingFirstPass.Invoke(cullJob, cullArgs);
+
+            // TWO-PASS CULLING. The main-view job is constructed with
+            // isUsedWithTwoPassCulling, and SceneDrawSystem.MainViewCulling(cl, isFirstPass)
+            // is called TWICE per frame — the first pass culls coarsely and primes the
+            // occlusion context, the second generates the final draw commands after the
+            // depth prepass and HiZ build.
+            //
+            // Running only the first is why the GBuffer showed a single tiny fragment
+            // rather than a scene: a partial command set is exactly what half of a two-pass
+            // cull produces.
+            //
+            // We do not rebuild HiZ between the two — that needs a depth prepass we do not
+            // run — so the second pass tests against whatever the engine's own main view
+            // left in the occlusion context. Wrong-but-populated occlusion should
+            // over-cull at worst; it cannot be worse than no commands at all.
+            if (mainView && FeedConfig.CullSecondPass)
+            {
+                _miDoCullingSecondPass ??= cullJob.GetType().GetMethods(Any)
+                    .FirstOrDefault(m => m.Name == "DoCullingSecondPass" && m.GetParameters().Length == 12);
+                if (_miDoCullingSecondPass == null)
+                {
+                    if (!_secondPassWarned)
+                    {
+                        _secondPassWarned = true;
+                        RttLog.Line("Culling: DoCullingSecondPass(12 args) not found — the main-view job " +
+                                    "will only ever produce a partial draw-command set.");
+                    }
+                }
+                else
+                {
+                    _miDoCullingSecondPass.Invoke(cullJob, cullArgs);
+                    if (!_secondPassLogged)
+                    {
+                        _secondPassLogged = true;
+                        RttLog.Line("=== CULLING: second pass run — the main-view job is two-pass, and only " +
+                                    "half of it was producing draw commands. ===");
+                    }
+                }
+            }
 
             // Far plane drives how much space the clustering job has to bin lights
             // into. 5 km was copied from the probe pass, which is sizing for a whole
@@ -1206,12 +1362,14 @@ internal static class CameraRender
         {
             // FIRST, before anything else can throw: the engine must not be left
             // pointing at our 512x512 array.
+            if (privateCtxHeld) try { PrivateCullContexts.EndPass(); } catch { }
+            RestoreOcclusion(savedOcclusion);
             CameraCbSwap.Restore(savedCameraCb);
             RestoreProbeSettings(savedProbeSettings);
             RestoreCamera(savedCamera);
             RestoreGBuffer(savedGBuffer);
 
-            try { if (geomBorrowed) Call(geomBuffers, "Return"); } catch { }
+            try { if (geomBorrowed) { if (usingPrivateGeom) PrivateCullContexts.EndGeomPass(); else Call(geomBuffers, "Return"); } } catch { }
             try { OwnContexts.Return(borrowedCulling); } catch { }
             try { if (depthBorrow != null) ReturnBorrowed(depthBorrow); } catch { }
             try { if (scratchBorrow != null) ReturnBorrowed(scratchBorrow); } catch { }
@@ -3392,6 +3550,78 @@ internal static class CameraRender
     // a scoped swap would be a silent no-op. See ApplyDimDistance.
     private static FieldInfo _environmentField;
     private static bool _probeSettingsBlocked, _probeSettingsLogged;
+
+    // Turn OCCLUSION CULLING off for our pass.
+    //
+    // The engine's two-pass main-view cull is: first pass -> depth prepass -> BUILD HiZ ->
+    // second pass. We run both passes back to back and never build HiZ, so the second pass
+    // tests visibility against whatever the engine's own main view left in the occlusion
+    // context — Hi-Z from the PLAYER'S viewpoint, at the player's depth. Geometry plainly
+    // visible to our camera sits "behind" something in that buffer and is rejected.
+    //
+    // The tell was precise: exactly ONE correct frame — ship and distant planet — and then
+    // a single blob. On the first pass the context happened to hold usable data; after
+    // that it was ours, stale, and rejected nearly everything. A pass that works once and
+    // then degrades is a state-carryover problem, not a wiring one.
+    //
+    // CullingSetup.IsOcclusionCullingAllowed reads SettingsManager.HZBO live, so a scoped
+    // set/restore around our pass is enough. We lose occlusion culling — some overdraw,
+    // no correctness cost — which is the right trade at 512x512 where fill is nearly free.
+    //
+    // The real fix is a private OcclusionContext plus our own depth prepass and HiZ build.
+    // This is the cheap version that makes the deferred route usable now.
+    private static FieldInfo _hzboField;
+    private static bool _hzboBlocked, _hzboLogged;
+
+    private static object InstallNoOcclusion()
+    {
+        if (_hzboBlocked || !FeedConfig.DisableOcclusionCulling || _settings == null) return null;
+        try
+        {
+            _hzboField ??= _settings.GetType().GetFields(Any)
+                .FirstOrDefault(f => f.FieldType.Name == "HZBOSettings");
+            if (_hzboField == null)
+            {
+                _hzboBlocked = true;
+                RttLog.Line("Occlusion: SettingsManager HZBOSettings field not found — the second " +
+                            "culling pass will keep testing against the player's stale Hi-Z.");
+                return null;
+            }
+
+            var saved = _hzboField.GetValue(_settings);
+            var ours = _hzboField.GetValue(_settings);   // struct field: a second, independent box
+
+            int set = 0;
+            foreach (var n in new[] { "Enabled", "MainViewEnabled", "CascadesEnabled" })
+            {
+                var f = ours.GetType().GetField(n, Any);
+                if (f != null && f.FieldType == typeof(bool)) { f.SetValue(ours, false); set++; }
+            }
+            if (set == 0) { _hzboBlocked = true; RttLog.Line("Occlusion: no HZBO enable flags found."); return null; }
+
+            _hzboField.SetValue(_settings, ours);
+            if (!_hzboLogged)
+            {
+                _hzboLogged = true;
+                RttLog.Line($"Occlusion: disabled for our pass ({set} HZBO flags cleared). We never build " +
+                            "HiZ between the two culling passes, so the second was rejecting our geometry " +
+                            "against the PLAYER'S depth pyramid.");
+            }
+            return saved;
+        }
+        catch (Exception e) { _hzboBlocked = true; RttLog.Error("install no-occlusion", e); return null; }
+    }
+
+    private static void RestoreOcclusion(object saved)
+    {
+        if (saved == null || _hzboField == null || _settings == null) return;
+        try { _hzboField.SetValue(_settings, saved); }
+        catch (Exception e)
+        {
+            _hzboBlocked = true;
+            RttLog.Error("RESTORE OCCLUSION FAILED — the player's view now has occlusion culling off", e);
+        }
+    }
 
     private static object InstallProbeSettings()
     {
