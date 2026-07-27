@@ -3516,6 +3516,49 @@ internal static class CameraRender
         catch (Exception e) { _camSwapBlocked = true; RttLog.Error("install camera", e); return null; }
     }
 
+    // A RenderView on the orbit camera, for the whole-scene route.
+    //
+    // Shares the machinery InstallOurCamera already uses — copy every field off the
+    // player's live RenderView so projection, clipping, FOV and resolution stay current,
+    // then override the three that place the camera. The difference is that the
+    // whole-scene route needs the OBJECT rather than the swap: it installs and restores
+    // around its own Draw call, on its own schedule.
+    //
+    // Deliberately NOT gated on FeedConfig.SwapCamera. That flag scopes the probe pass's
+    // swap; this is a different pass with a different lifetime, and tying them together
+    // would mean one route's safety switch silently disabling the other.
+    //
+    // Returns null when the orbit camera has not been placed yet — the caller then runs
+    // from the player's viewpoint, which is the intended stage-3a behaviour rather than
+    // a failure.
+    public static object WholeSceneRenderView()
+    {
+        if (_lastCamWorld == null || _lastViewD == null || _settings == null) return null;
+        try
+        {
+            _renderViewField ??= _settings.GetType().GetFields(Any)
+                .FirstOrDefault(f => f.Name == "_renderView");
+            var theirs = _renderViewField?.GetValue(_settings);
+            if (theirs == null) return null;
+
+            var rvType = theirs.GetType();
+            _rvFields ??= rvType.GetFields(Any).Where(f => !f.IsStatic).ToArray();
+            _ourRenderView ??= System.Runtime.CompilerServices.RuntimeHelpers
+                .GetUninitializedObject(rvType);
+
+            foreach (var f in _rvFields)
+            {
+                try { f.SetValue(_ourRenderView, f.GetValue(theirs)); } catch { }
+            }
+
+            SetRv("ViewD", _lastViewD);
+            SetRv("InvViewD", _lastCamWorld);
+            SetRv("CameraPosition", Prop2(_lastCamWorld, "Translation"));
+            return _ourRenderView;
+        }
+        catch (Exception e) { RttLog.Error("whole-scene render view", e); return null; }
+    }
+
     private static int SetRv(string name, object value)
     {
         if (value == null) return 0;

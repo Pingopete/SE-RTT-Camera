@@ -265,6 +265,19 @@ internal static class FeedConfig
     public static int WholeSceneWidth { get; private set; } = 512;
     public static int WholeSceneHeight { get; private set; } = 512;
 
+    // Stage 3b: swap the camera too, so the second render is OUR viewpoint.
+    //
+    // Off for the first test on purpose. With it off the second render is the player's
+    // view at our resolution — wrong, but visually verifiable and with only ONE global
+    // moved. Turning it on is then a single attributable change rather than part of a
+    // failure nobody can read.
+    public static bool WholeSceneCamera { get; private set; }
+
+    // Minimum gap between second renders. Draw is a WHOLE FRAME: ungated at 53 fps this
+    // would roughly halve the game's frame rate before teaching us anything, and a fault
+    // would repeat 53 times a second while the log is being read.
+    public static int WholeSceneIntervalMs { get; private set; } = 200;
+
     // Extra margin on top of the sizing basis. ZERO by default, and deliberately.
     //
     // The first guess here was 50%, on the theory that the report describes a cull from
@@ -689,6 +702,8 @@ internal static class FeedConfig
             bool clearGb = ClearGBufferBeforePass;
             bool wsBuild = WholeSceneBuildBuffers, wsRender = WholeSceneEnabled;
             int wsW = WholeSceneWidth, wsH = WholeSceneHeight;
+            bool wsCam = WholeSceneCamera;
+            int wsInterval = WholeSceneIntervalMs;
 
             foreach (var raw in File.ReadAllLines(Path_))
             {
@@ -839,6 +854,12 @@ internal static class FeedConfig
                     case "wholescenebuildbuffers":
                         wsBuild = val is "1" or "true" or "yes";
                         break;
+                    case "wholescenecamera":
+                        wsCam = val is "1" or "true" or "yes";
+                        break;
+                    case "wholesceneintervalms":
+                        if (int.TryParse(val, out var wsi)) wsInterval = Math.Clamp(wsi, 16, 5000);
+                        break;
                     case "wholescenerender":
                         wsRender = val is "1" or "true" or "yes";
                         break;
@@ -968,6 +989,7 @@ internal static class FeedConfig
                         || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || clearGb != ClearGBufferBeforePass
                         || wsBuild != WholeSceneBuildBuffers || wsRender != WholeSceneEnabled
                         || wsW != WholeSceneWidth || wsH != WholeSceneHeight
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs
                         || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
@@ -989,12 +1011,15 @@ internal static class FeedConfig
             // render at the old one — and turning buffer construction off should release
             // it rather than leave it allocated.
             bool wsChanged = wsBuild != WholeSceneBuildBuffers
-                             || wsW != WholeSceneWidth || wsH != WholeSceneHeight;
+                             || wsW != WholeSceneWidth || wsH != WholeSceneHeight
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs;
 
             WholeSceneEnabled = wsRender;
             WholeSceneBuildBuffers = wsBuild;
             WholeSceneWidth = wsW;
             WholeSceneHeight = wsH;
+            WholeSceneCamera = wsCam;
+            WholeSceneIntervalMs = wsInterval;
 
             if (wsChanged) RttProbe.WholeSceneRender.Reset();
 

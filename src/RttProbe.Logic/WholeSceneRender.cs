@@ -90,6 +90,12 @@ internal static class WholeSceneRender
         _lastLogMs = 0;
         _describedTarget = false;
         _inOurRender = false;
+        _miDraw = null;
+        _coreType = null;
+        _sbField = _rvField = null;
+        _settingsObj = null;
+        _lastRenderMs = 0;
+        _renderCount = 0;
     }
 
     // Fires after the engine has finished the player's frame.
@@ -118,17 +124,156 @@ internal static class WholeSceneRender
 
             if (FeedConfig.WholeSceneBuildBuffers) EnsureScreenBuffers();
 
+            // STAGE 3: the actual second render.
+            //
+            // RATE GATED. Draw is a whole frame; at 53 fps an ungated second render would
+            // roughly halve the game's frame rate before we have learned anything from it.
+            // The gate also means a fault costs one attempt per interval rather than one
+            // per frame while we work out what happened.
+            if (FeedConfig.WholeSceneEnabled && _ourScreenBuffers != null
+                && Clock.Ms - _lastRenderMs >= Math.Max(33, FeedConfig.WholeSceneIntervalMs))
+            {
+                _lastRenderMs = Clock.Ms;
+                RunSecondRender(sceneDrawSystem);
+            }
+
             long now = Clock.Ms;
             if (now - _lastLogMs >= 5000)
             {
                 _lastLogMs = now;
-                RttLog.Line($"Whole-scene hook: {_hookCount} frame(s) so far, " +
+                RttLog.Line($"Whole-scene hook: {_hookCount} frame(s), " +
                             $"ourScreenBuffers={(_ourScreenBuffers == null ? "not built" : "BUILT")}, " +
-                            $"rendering={FeedConfig.WholeSceneEnabled}. Nothing is swapped yet.");
+                            $"secondRenders={_renderCount}, camera={(FeedConfig.WholeSceneCamera ? "OURS" : "player's")}.");
             }
         }
         catch (Exception e) { _state = -1; RttLog.Error("whole-scene hook", e); }
     }
+
+    // STAGE 3: swap the globals, run a whole second frame, put them back.
+    //
+    // The entire route is this method. Everything else is scaffolding.
+    //
+    // WHAT IS SWAPPED, and deliberately how little. Stage 3a moves ONLY
+    // CoreSystems.ScreenBuffers, so the second render is the PLAYER'S viewpoint at our
+    // resolution. That isolates the one question worth asking first — can Draw run a
+    // second time at all with substituted globals — with no camera to confound it. If
+    // this works the picture is the player's view at 512x512, which is wrong but
+    // verifiable, and the camera becomes one more flip (wholeSceneCamera) rather than
+    // part of an unattributable failure. Three things moving at once is what made the
+    // deferred route's failures impossible to read.
+    //
+    // RESTORE ORDERING. The restore is in a finally and runs even if Draw throws
+    // mid-frame, because leaving the engine pointed at a 512x512 ScreenBuffers would
+    // render the player's next frame into our buffers — visually catastrophic and not
+    // obviously attributable to us. The re-entrancy guard is cleared in the same finally
+    // for the same reason: a stuck guard silently disables the route forever.
+    //
+    // ONE STRIKE. Any exception disables the route for the session. A whole-frame render
+    // that faults is not something to retry 53 times a second while reading the log.
+    private static void RunSecondRender(object sceneDrawSystem)
+    {
+        if (sceneDrawSystem == null) return;
+        try
+        {
+            _miDraw ??= sceneDrawSystem.GetType().GetMethods(Any)
+                .FirstOrDefault(m => m.Name == "Draw" && m.GetParameters().Length == 1);
+            _coreType ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            _sbField ??= _coreType?.GetField("ScreenBuffers", BindingFlags.Public | BindingFlags.Static);
+
+            if (_miDraw == null || _sbField == null)
+            {
+                _state = -1;
+                RttLog.Line($"Whole-scene: Draw={(_miDraw == null ? "NOT FOUND" : "ok")} " +
+                            $"CoreSystems.ScreenBuffers={(_sbField == null ? "NOT FOUND" : "ok")} — route disabled.");
+                return;
+            }
+
+            // Our own final target, out of our own ScreenBuffers. Draw takes its render
+            // resolution from whatever it is handed, so this is what makes the second
+            // render 512x512 rather than 4K.
+            var ourLdr = _ourScreenBuffers.GetType()
+                .GetProperty("FinalLDRTexture", Any)?.GetValue(_ourScreenBuffers);
+            if (ourLdr == null)
+            {
+                _state = -1;
+                RttLog.Line("Whole-scene: our ScreenBuffers has no FinalLDRTexture — route disabled.");
+                return;
+            }
+
+            var savedSb = _sbField.GetValue(null);
+            object savedCam = null;
+            bool camSwapped = false;
+
+            _inOurRender = true;
+            try
+            {
+                _sbField.SetValue(null, _ourScreenBuffers);
+                if (FeedConfig.WholeSceneCamera) camSwapped = InstallCamera(out savedCam);
+
+                if (_renderCount == 0)
+                    RttLog.Line($"=== WHOLE-SCENE RENDER: calling SceneDrawSystem.Draw a second time, " +
+                                $"into our own {FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight} " +
+                                $"ScreenBuffers. Camera is {(camSwapped ? "OURS" : "the player's")}. ===");
+
+                _miDraw.Invoke(sceneDrawSystem, new[] { ourLdr });
+                _renderCount++;
+
+                if (_renderCount == 1)
+                    RttLog.Line("=== WHOLE-SCENE RENDER SURVIVED THE FIRST CALL. The engine's entire " +
+                                "renderer just ran a second time this frame, into buffers we own. ===");
+            }
+            finally
+            {
+                // Unconditional, and in this order: camera first, then the buffers the
+                // engine's next frame will be rendered into.
+                if (camSwapped) RestoreCamera(savedCam);
+                _sbField.SetValue(null, savedSb);
+                _inOurRender = false;
+            }
+        }
+        catch (Exception e)
+        {
+            _state = -1;
+            RttLog.Error("whole-scene render (route DISABLED for this session)", e);
+        }
+    }
+
+    // The camera half, stage 3b. Writes SettingsManager._renderView, which is the same
+    // field CameraRender.InstallOurCamera uses — a proven mechanism, not a new one.
+    private static bool InstallCamera(out object saved)
+    {
+        saved = null;
+        try
+        {
+            var ours = CameraRender.WholeSceneRenderView();
+            if (ours == null) return false;
+
+            var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            var settings = core?.GetField("Settings", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            _rvField ??= settings?.GetType().GetFields(Any)
+                .FirstOrDefault(f => f.Name == "_renderView");
+            if (settings == null || _rvField == null) return false;
+
+            _settingsObj = settings;
+            saved = _rvField.GetValue(settings);
+            _rvField.SetValue(settings, ours);
+            return true;
+        }
+        catch (Exception e) { RttLog.Error("whole-scene camera install", e); return false; }
+    }
+
+    private static void RestoreCamera(object saved)
+    {
+        try { if (_rvField != null && _settingsObj != null) _rvField.SetValue(_settingsObj, saved); }
+        catch (Exception e) { RttLog.Error("whole-scene camera restore", e); }
+    }
+
+    private static MethodInfo _miDraw;
+    private static Type _coreType;
+    private static FieldInfo _sbField, _rvField;
+    private static object _settingsObj;
+    private static long _lastRenderMs;
+    private static int _renderCount;
 
     // STAGE 2: construct a second ScreenBuffers, and do nothing with it.
     //
