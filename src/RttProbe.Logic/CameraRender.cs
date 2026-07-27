@@ -53,6 +53,8 @@ internal static class CameraRender
     private static bool _lastCtxLive;
     private static bool _wsBlitLogged;
     private static int _wsBlitErrs;
+    private static bool _stripLogged;
+    private static int _stripped;          // passes that skipped the probe scene render
     private static bool _coCullLogged;
     private static int _coCullErrs;
     private static object _lodProbe, _lodMainView;
@@ -645,6 +647,37 @@ internal static class CameraRender
             if (view == null) { RttLog.Line("Camera pass: could not build RenderViewSlim."); _armed = false; return; }
             if (_renders == 0)
                 RttLog.Line($"Camera pass view source: {(CameraFeed.Current != null ? "ORBIT — " + CameraFeed.Describe() : "main view (no [RTC] panel yet)")}");
+
+            // ---- PROBE STRIP -------------------------------------------------------
+            // Once the whole-scene route is feeding the panel, everything below this
+            // point renders an image with no consumer: a full cull, GBuffer, deferred
+            // texturing, environment and lighting pass at 30 Hz, plus an exposure and
+            // tonemap chain, all thrown away by the blit in CopyToFeed. The probe
+            // pipeline was the route; it is now scaffolding.
+            //
+            // What still has to happen is entirely above this line and entirely on the
+            // CPU: OrbitViewSlim() advanced the orbit and stored _lastCamWorld /
+            // _lastViewD, which is the ONLY thing the whole-scene route takes from this
+            // pass (WholeSceneRenderView reads them; WholeSceneCameraCb reads the view
+            // we install, not anything rendered here). CopyToFeed then does the ring,
+            // the blit from PanelSource and the handover exactly as before.
+            //
+            // Gated, and self-disabling: PanelSource is null whenever the whole-scene
+            // route is off, has errored, or has not produced a frame yet, and in that
+            // case the probe render below runs and feeds the panel as it always has.
+            if (FeedConfig.WholeSceneStripProbe && WholeSceneRender.PanelSource != null)
+            {
+                if (!_stripLogged)
+                {
+                    _stripLogged = true;
+                    RttLog.Line("=== PROBE STRIP: the probe scene render is OFF. This pass now only advances " +
+                                "the orbit transform and blits the whole-scene image to the panel. Nothing " +
+                                "below the strip point had a consumer. ===");
+                }
+                _stripped++;
+                CopyToFeed(commandList, null);
+                return;                     // the finally still runs; nothing is borrowed yet
+            }
 
             cameraCb = BuildCameraCb(view, res);
             if (cameraCb == null) { RttLog.Line("Camera pass: camera conversion failed."); _armed = false; return; }
@@ -1660,6 +1693,19 @@ internal static class CameraRender
                 bool needsConvert = _feedFormat != null && _hdrFormat != null && !_feedFormat.Equals(_hdrFormat);
                 object copySource = rtBorrow;
 
+                // The no-convert path parks rtBorrow itself, so it cannot serve a
+                // stripped pass. In practice needsConvert is always true (LDR panel
+                // format vs HDR scene format) — this is a guard against parking null,
+                // not a case expected to fire.
+                if (!needsConvert && rtBorrow == null)
+                {
+                    if (_copyLogs++ < 2)
+                        RttLog.Line("Feed copy: probe render was stripped but the panel format matches the " +
+                                    "scene format, so there is no blit step to carry the whole-scene image. " +
+                                    "Turn wholeSceneStripProbe off.");
+                    return;
+                }
+
                 if (needsConvert)
                 {
                     if (_copyJob == null)
@@ -1715,11 +1761,47 @@ internal static class CameraRender
                     _ldrReady = prev >= 0 ? _ldrRing[prev] : null;
 
                     var dstRtv = ViewOf(ldrBorrow, "IRenderTargetView");
-                    var srcSrv = ViewOf(rtBorrow, "ITexture2DView");
-                    if (dstRtv == null || srcSrv == null)
+                    var srcSrv = ViewOf(rtBorrow, "ITexture2DView");   // null when the probe pass was stripped
+
+                    // THE WHOLE-SCENE FEED, resolved BEFORE the guard and before the
+                    // tonemap. It used to be picked up further down, after the probe
+                    // image had already been tonemapped into a scratch target — work
+                    // whose only consumer was then overwritten. Resolving it here lets
+                    // both the tonemap chain and (with wholeSceneStripProbe) the entire
+                    // probe render be skipped, and lets rtBorrow be legitimately null.
+                    //
+                    // Parking the whole-scene texture DIRECTLY was tried and CTD'd
+                    // (E_INVALIDARG in CopyCommandList.Replay — the raw copy path chokes
+                    // on resizable engine-internal textures); a resizable texture as a
+                    // CopyJob blit SOURCE is exactly what _ldrResizable does every frame,
+                    // so this rides a path already in production.
+                    object wsSource = null, wsSrv = null;
+                    var wsPanel = WholeSceneRender.PanelSource;
+                    if (wsPanel != null)
+                    {
+                        wsSrv = ViewOf(wsPanel, "ITexture2DView");
+                        if (wsSrv != null)
+                        {
+                            wsSource = wsPanel;
+                            if (!_wsBlitLogged)
+                            {
+                                _wsBlitLogged = true;
+                                RttLog.Line("=== WHOLE-SCENE -> PANEL: the feed blit now sources the full " +
+                                            "renderer's FinalLDRTexture. The panel shows the whole-scene render. ===");
+                            }
+                        }
+                        else if (_wsBlitErrs++ < 2)
+                        {
+                            RttLog.Line("Whole-scene panel: no ITexture2DView on FinalLDRTexture — " +
+                                        "probe image stays on the panel.");
+                        }
+                    }
+
+                    if (dstRtv == null || (srcSrv == null && wsSrv == null))
                     {
                         if (_copyLogs++ < 2)
-                            RttLog.Line($"Feed copy: view lookup failed (dstRtv={dstRtv != null}, srcSrv={srcSrv != null}).");
+                            RttLog.Line($"Feed copy: view lookup failed (dstRtv={dstRtv != null}, " +
+                                        $"srcSrv={srcSrv != null}, wholeSceneSrv={wsSrv != null}).");
                         _feedState = -1;
                         return;
                     }
@@ -1728,8 +1810,13 @@ internal static class CameraRender
                     // ComputeExposure nor ApplyToneMapping reads the global
                     // ScreenBuffers, so both work on our textures. This is what turns
                     // a clamped HDR image into one that looks like the main view.
+                    // ...but not when the whole-scene render is the source. Its image has
+                    // already been through the full pipeline's own exposure and tonemap,
+                    // and this chain would only be tonemapping a probe image that the
+                    // blit below is about to discard. Pure waste, every pass, since the
+                    // day the whole-scene route started feeding the panel.
                     bool toneMapped = false;
-                    if (FeedConfig.Tonemap && !_toneBlocked
+                    if (wsSrv == null && FeedConfig.Tonemap && !_toneBlocked
                         && _miComputeExposure != null && _miApplyToneMapping != null)
                     {
                         try
@@ -2002,6 +2089,11 @@ internal static class CameraRender
                     //
                     // postProcess stays null — PostProcess.Normalize crashes, it needs
                     // resources this call site does not set up.
+                    // Source priority: the whole-scene image if we have one (already
+                    // tonemapped by the full pipeline), else the tonemapped probe scratch,
+                    // else the raw probe HDR. PanelSource returning null — route off,
+                    // errored, or no render yet — falls back to the probe image
+                    // automatically, which is what makes wholeSceneToPanel an instant A/B.
                     var blitSrc = srcSrv;
                     if (toneMapped)
                     {
@@ -2010,41 +2102,7 @@ internal static class CameraRender
                         else if (_toneLogs++ < 2)
                             RttLog.Line("Tonemap: no ITexture2DView on the tonemapped target — blitting raw HDR instead.");
                     }
-                    // THE WHOLE-SCENE FEED. When the whole-scene route has a finished
-                    // image, it becomes this blit's source and the probe image is
-                    // ignored — everything downstream (ring, parking, UI-stage copy) is
-                    // untouched, proven machinery. Parking the whole-scene texture
-                    // DIRECTLY was tried and CTD'd (E_INVALIDARG in
-                    // CopyCommandList.Replay — the raw copy path chokes on resizable
-                    // engine-internal textures); a resizable texture as a CopyJob blit
-                    // source is exactly what _ldrResizable above does every frame, so
-                    // this rides a path already in production.
-                    //
-                    // Already tonemapped by the full pipeline, so no tonemap wanted here
-                    // — and PanelSource returning null (flag off, route errored, no
-                    // render yet) falls back to the probe image automatically.
-                    object wsSource = null;
-                    var wsPanel = WholeSceneRender.PanelSource;
-                    if (wsPanel != null)
-                    {
-                        var wsSrv = ViewOf(wsPanel, "ITexture2DView");
-                        if (wsSrv != null)
-                        {
-                            blitSrc = wsSrv;
-                            wsSource = wsPanel;
-                            if (!_wsBlitLogged)
-                            {
-                                _wsBlitLogged = true;
-                                RttLog.Line("=== WHOLE-SCENE -> PANEL: the feed blit now sources the full " +
-                                            "renderer's FinalLDRTexture. The panel shows the whole-scene render. ===");
-                            }
-                        }
-                        else if (_wsBlitErrs++ < 2)
-                        {
-                            RttLog.Line("Whole-scene panel: no ITexture2DView on FinalLDRTexture — " +
-                                        "probe image stays on the panel.");
-                        }
-                    }
+                    if (wsSrv != null) blitSrc = wsSrv;
 
                     // cropRect is the SOURCE region, and leaving it null makes CopyJob
                     // read a rect the size of the DESTINATION rather than the whole

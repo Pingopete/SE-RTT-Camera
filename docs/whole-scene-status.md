@@ -9,42 +9,139 @@ the player's view intact. This file is the audit of what remains, agreed with th
 
 | state | detail |
 |---|---|
-| ✓ in | MainView geometry + real triplanar terrain, deferred lighting on our own cluster grid, skybox/stars/planets/belts, sun + glare, atmosphere (in-scatter + extinction), volumetrics, transparency, bloom, tonemap |
-| ⚠ degraded | sun shadows = player-centred cascades (read-only share; fade/fail with distance); ambient + reflections = player-positioned probe atlas; exposure fixed (adaptation scoped off); texture streaming driven by player position |
-| ✗ out (fixable) | HBAO (stage 9 skip), decals (stage 8 skip), particles (stage 7 — needs sim-stepping investigation before unskipping) |
-| ✗ out (by scope) | raytraced GI/reflections, probe updates, water surfels, HUD (deliberate) |
+| ✓ in | MainView geometry + real triplanar terrain, deferred lighting on our own cluster grid, skybox/stars/planets/belts, sun + glare, atmosphere (in-scatter + extinction), volumetrics, transparency, bloom, tonemap, decals, **our own sun-shadow cascades fitted around the orbit camera** |
+| ⚠ degraded | ambient + reflections = player-positioned probe atlas; exposure fixed (adaptation scoped off) but now tunable per-feed in EV; texture streaming driven by player position; no local-light shadows |
+| ✗ out (fixable) | HBAO (stage 9 — CTD'd, see below), particles (stage 7 — user parked; needs sim-stepping investigation first) |
+| ✗ out (by user decision) | raytraced GI/reflections — "not for now, that can be an extra later" |
+| ✗ out (by scope) | probe updates, water surfels, HUD (deliberate) |
 
 ## User-observed glitches → diagnosis
 
-| observation | diagnosis | fix tier |
+| observation | diagnosis | status |
 |---|---|---|
-| blocks flash in brightness | decals missing (test: unskip 8) OR probe-reflection snap on metals | now / later |
-| in-shadow areas flash bright↔dark | shared probe atlas re-captured round-robin from the PLAYER's position — each face update snaps the ambient the feed samples | later (own probe set) |
-| whole ship/objects go fully dark at orbit points | camera exits the player-centred cascade volume — outside it everything samples "in shadow" | later (own cascades) |
-| ghosting/smearing (expected) | FSR temporal AA fed garbage motion vectors: prev-frame camera fields are the PLAYER's, frames 200ms apart | now (AA scope + prev-frame fix) |
+| blocks flash in brightness | decals missing | FIXED (stage 8 unskipped) |
+| in-shadow areas flash bright↔dark | uncleared `DiffuseGIBuffer` read as recycled pool garbage | masked by the 10fps rate; see "latent" below |
+| whole ship/objects go fully dark at orbit points | camera exits the player-centred cascade volume | FIXED (`wholeSceneOwnShadows`) |
+| ghosting/smearing | FSR fed the player's previous-frame camera | FIXED (our own prev-orbit position) |
+| squashed aspect, head-tracked sky | shaders read the camera CB, not the view | FIXED (`CameraCbSwap` around our Draw) |
 
-## Agreed plan
+## Own shadow cascades — how it works
 
-1. **NOW — unskip decals (8)**, then HBAO (9) after verification. Owned contexts changed
-   the safety calculus; each is one config flip.
-2. **NOW — temporal hygiene**: scope DRSSettings for our render (AAMode FXAA=1 —
-   spatial-only AA, no motion vectors; ScalingMode NativeAA=4; sharpening off), and fix
-   our RenderView's LastFrameCameraPosition fields to OUR previous orbit position
-   instead of the player's.
-3. **NOW — feed exposure knob**: scope PostProcessSettings.LuminanceExposure to a
-   config value during our render.
-4. **LATER — own the borrowed lighting** (fixes the flash/darkening tier): render our
-   own shadow cascades into our own DirectionalLightShadowResources; own or
-   double-buffer a probe set. Same own-the-object pattern proven five times.
-5. **LATER — player-view flicker** (parked): own EyeAdaptation ping-pong / cloud map.
-6. **LATER — performance**: raise rate (interval knob), strip the probe pipeline to
-   transform-only (it still renders 30 Hz nobody sees), measure.
+`DrawContextManager.OnBeginDraw` is the engine's cascade setup, and it turns out to be
+almost entirely **per-context**:
+
+```
+CascadeShadowsContext.FlushUpdates()
+    reads    CoreSystems.Settings.RenderView          <- OURS while installed
+    reads    Settings.Shadow.DirectionalLight, Settings.Light.Sun
+    mutates  only its OWN _cascades / _cascadePriorities / _lastCameraPosition
+    calls    Cascade.UpdateViewSetupFull(mainView, lightDir)   -> refits every frustum
+DirectionalLightShadowResources.OnBeginDraw()
+    reads    CoreSystems.DrawContexts.CascadeShadows / .CharacterShadows   <- OURS
+    builds   the depth-map Texture2DTable + the setup constant buffer
+```
+
+So a second independent cascade set needed no new machinery — just those two calls made
+while our view and our contexts are installed, plus stage 3 allowed to run.
+
+**We do NOT call `DrawContextManager.OnBeginDraw()` itself**, even though it is the
+engine's entry point, because it also runs `CoreSystems.LocalLights.FlushUpdates()` and
+`EnvironmentProbeManager.PrepareProbes()` — global managers whose queues the player's
+frame owns. Draining those twice a frame is the double-stepping bug class this project
+has already paid for twice.
+
+Leaving `LocalLightsToUpdate` / `ShadowMasksToUpdate` unset is safe: `Buffer<T>` is a
+**struct** (`IntPtr _data, int _count, int _capacity`), so the unassigned field is a
+zero-count buffer and `RenderLocalLightShadows` iterates it zero times. No local-light
+shadows in the feed — a fidelity gap, not a fault.
+
+Costs no extra VRAM: `CascadeShadowsContext`'s ctor calls `CheckShadowSettingChanged`,
+which sees `_cascades.Length == 0 != CascadesCount` and allocates the full set. We had
+been paying for those textures since the second manager was built, and rendering
+nothing into them.
+
+## Exposure — semantics, confirmed not guessed
+
+`wholeSceneExposure` is an **EV bias in stops**, signed. From the shipped HLSL:
+
+```
+ConstantExposure.hlsl:   CalculateExposure(Post_.ConstantLuminance, Post_.LuminanceExposure)
+Exposure.hlsli:          log2(keyValue(avgLum)/avgLum) + exposure
+GetExposureLinear.hlsl:  exp2(that)
+```
+
+`ConstantLuminance` is 1 and `LuminanceKeyValueCendos(1)` is 1, so the first term is
+exactly 0 — the field is a pure signed EV offset on unity. +1 doubles, −1 halves. It was
+gated `> 0`, which made the knob brighten-only; a 512px feed pointed at a sunlit planet
+needs to come *down* more often than up.
+
+## Probe strip
+
+The probe pipeline was the route; it is now scaffolding. It still runs a full cull,
+GBuffer, deferred texturing, environment and lighting pass at 30 Hz plus an exposure and
+tonemap chain, and `CopyToFeed` discards all of it in favour of the whole-scene image.
+
+The only thing the whole-scene route takes from that pass is the **orbit transform**
+(`OrbitViewSlim()` storing `_lastCamWorld` / `_lastViewD`), which is CPU work done before
+any GPU work starts. `wholeSceneStripProbe` returns immediately after it and goes
+straight to the ring/blit/handover.
+
+Two parts, one already unconditional:
+
+- **Tonemap skip (always on):** the probe tonemap chain ran and its output was
+  overwritten by `blitSrc = wsSrv` on the very next line. Pure waste; now skipped
+  whenever the whole-scene source exists. No visual change possible.
+- **Full strip (`wholeSceneStripProbe`, default off):** skips the scene render too.
+  Self-disabling — only applies while `PanelSource` is non-null, so the probe render
+  comes straight back if the route errors or is switched off.
+
+## What is still latent
+
+**The uncleared `DiffuseGIBuffer`.** `ComputeGI` borrows it with no clear value, safe for
+the engine because `RaytraceGIJob` overwrites every pixel. With raytracing fully off
+(mode 1, which the user wants kept), `AmbientLightJob` reads a recycled uncleared pool
+texture. The flashing *looks* fixed because at 10 fps we recycle the same pool texture
+consistently — the garbage is stable rather than varying. It could resurface under
+different GPU load.
+
+Mode 2 (keep `Enabled`, clear only the world-space accumulators) was the principled fix,
+but the user has ruled raytracing out for now. **The alternative that respects that
+constraint is to clear the buffer ourselves** rather than turn RT back on. Not yet built.
+
+## Plan
+
+1. ~~unskip decals~~ done · ~~temporal hygiene~~ done · ~~feed exposure knob~~ done
+2. ~~own shadow cascades~~ done — verify in game, then consider mode 2 (force all)
+3. **probe strip** — flip `wholeSceneStripProbe`, expect zero visual change + GPU refund
+4. **clear the GI buffer ourselves** — the RT-free fix for the latent ambient garbage
+5. **own or double-buffer a probe set** — the last borrowed-lighting item (reflections
+   and ambient still come from the player's position)
+6. LATER — player-view flicker (parked by user); particles (parked by user); HBAO
+7. LATER — raise the rate once the strip has paid for it
 
 ## Standing rules (hard-won, do not relearn)
 
 - Own the contexts → RUN the prepare stages; producers (4, 6, 14, likely 15) cannot be
-  skipped.
+  skipped. Owning a resource means rendering into it — that is why `wholeSceneOwnShadows`
+  force-runs stage 3.
 - View feeds culling, camera CB feeds shaders — swap both.
 - Never let the installed view's `_resolution` diverge (race → CTD); mode 2 handles it.
 - Resizable engine textures go to the panel via the CopyJob blit, never the raw copy.
 - CTD leaves `output/handover-live.marker` → delete or the feed is blank.
+- Never call a global manager's `FlushUpdates`/`Prepare` a second time per frame. Reach
+  into the per-context object instead.
+- ONE change per test. Bundling has cost this project three CTDs it could not attribute.
+
+## Dead ends, recorded
+
+- **HBAO (stage 9)** — unskipping removed the device within two seconds
+  (2026-07-27 19:26:34, `DXGI_ERROR_DEVICE_REMOVED`, `PageFaultVA 0x0`, breadcrumb
+  1174/1635 in "ScenePreparation + Render", stopping at the `ClearRenderTargetView`
+  right after ToneMapping). Not diagnosed further — small fidelity win, wrong fight.
+- **DRS / AA mode** — not safely switchable per-render. Three CTDs in
+  `ForwardAndPostPasses`, the last with `wholeSceneAAMode` isolated. `UpscaleTargetFSR`
+  produces temp buffers bloom/tonemap consume; switching branch leaves consumers reading
+  unpopulated buffers.
+- **`mainViewCulling` as a swap** — malformed by construction (disjoint pass groups).
+- **Material-state shader swap** — needs a coherent whole-state change, and it is a
+  game-install edit, not shippable.

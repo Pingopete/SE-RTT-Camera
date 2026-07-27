@@ -154,6 +154,8 @@ internal static class WholeSceneRender
         _ourFreshShadowResources = null;
         _dcBuilt = false;
         _dcField = null;
+        _cascFld = _charCascFld = null;
+        _ownShadowsLogged = false;
         _state = 0;
         _hookCount = 0;
         _lastLogMs = 0;
@@ -211,7 +213,24 @@ internal static class WholeSceneRender
     public static bool ShouldSkipStage(int id)
     {
         if (!_inOurRender) return false;
+
+        // Stage 3 and wholeSceneOwnShadows are not independent settings. Owning the
+        // resources means our DirectionalLightShadowResources holds OUR cascade depth
+        // table — and if RenderShadows never runs, nothing is ever drawn into it. That
+        // combination is the exact state that NRE'd the shadow-mask draw the first time
+        // a fresh manager was installed, which is why the engine's object got shared in
+        // the first place. Refuse the skip rather than let a stale skip list produce it.
         var stages = FeedConfig.WholeSceneSkipStages;
+
+        if (id == 3 && FeedConfig.WholeSceneOwnShadows > 0)
+        {
+            if (Array.IndexOf(stages, 3) >= 0 && _skippedLogged.Add(-3))
+                RttLog.Line("Whole-scene: stage 3 (RenderShadows) is in the skip list but " +
+                            "wholeSceneOwnShadows is on — running it anyway. Owning the cascades " +
+                            "means rendering into them; drop 3 from wholeSceneSkipStages.");
+            return false;
+        }
+
         for (int i = 0; i < stages.Length; i++)
             if (stages[i] == id)
             {
@@ -351,7 +370,7 @@ internal static class WholeSceneRender
             var savedSb = _sbField.GetValue(null);
             object savedCam = null, savedDc = null;
             object[] savedCb = null;
-            bool camSwapped = false;
+            bool camSwapped = false, ownShadows = false;
 
             _inOurRender = true;
             try
@@ -413,6 +432,11 @@ internal static class WholeSceneRender
                     }
                 }
 
+                // Last, because it reads BOTH globals we just installed: FlushUpdates
+                // fits the cascade frusta to CoreSystems.Settings.RenderView (ours), and
+                // the resource rebuild walks CoreSystems.DrawContexts (ours).
+                ownShadows = BeginOwnShadows();
+
                 if (_renderCount == 0)
                     RttLog.Line($"=== WHOLE-SCENE RENDER: calling SceneDrawSystem.Draw a second time, " +
                                 $"into our own {FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight} " +
@@ -440,6 +464,7 @@ internal static class WholeSceneRender
                 // must go back inside this same frame bracket — OnEndDraw disposes
                 // whatever is in the field), then camera, scoped settings groups, and
                 // both global families the engine's next frame renders through.
+                if (ownShadows) EndOwnShadows();
                 if (savedCb != null) { try { CameraCbSwap.Restore(savedCb); } catch (Exception e) { RttLog.Error("whole-scene CB restore", e); } }
                 if (camSwapped) RestoreCamera(savedCam);
                 RestoreScoped();
@@ -712,14 +737,142 @@ internal static class WholeSceneRender
             ScopeSetValues("DRSSettings", "feed native scaling (UNSAFE — see comment)",
                 ("ScalingMode", 4), ("EnableSharpening", false));
 
-        // FEED EXPOSURE. Adaptation is scoped off (shared history), so the feed runs on
-        // the fixed LuminanceExposure — the player's value, tuned for wherever THEY are.
-        // This makes it the feed's own knob.
-        if (FeedConfig.WholeSceneExposure > 0)
-            ScopeSetValues("PostProcessSettings", "feed exposure",
+        // FEED EXPOSURE, in EV stops. Adaptation is scoped off (shared history), so the
+        // feed runs ConstantExposure.hlsl, whose whole output is
+        // exp2(log2(keyValue/ConstantLuminance) + LuminanceExposure) — and with
+        // ConstantLuminance == 1 the first term is zero. So this field is a pure signed
+        // EV offset on unity: +1 doubles, -1 halves. See FeedConfig.WholeSceneExposure.
+        //
+        // Gate is `!= 0`, not `> 0`: 0 is the engine's own value AND the neutral EV, so it
+        // means "leave alone" for free, while negative values stay reachable. The label
+        // carries the value so a re-tune re-logs (the once-per-label guard is by string).
+        if (FeedConfig.WholeSceneExposure != 0)
+            ScopeSetValues("PostProcessSettings", $"feed exposure {FeedConfig.WholeSceneExposure:+0.##;-0.##} EV",
                 ("LuminanceExposure", (float)FeedConfig.WholeSceneExposure));
     }
 
+
+    // ---- OWN SUN-SHADOW CASCADES ------------------------------------------------------
+    //
+    // The last big borrowed-lighting item. Until now the feed sampled the ENGINE'S cascade
+    // set, which is fitted around the PLAYER: shadows soften and vanish with camera
+    // distance, and once the orbit leaves the cascade volume entirely the shadow lookup
+    // returns "occluded" for everything — the reported "whole ship goes dark at some points
+    // in the orbit".
+    //
+    // The engine's own setup is DrawContextManager.OnBeginDraw, and it turns out to be
+    // almost entirely per-context rather than global:
+    //
+    //   CascadeShadowsContext.FlushUpdates()
+    //       reads  CoreSystems.Settings.RenderView   <- OURS while installed
+    //       reads  Settings.Shadow.DirectionalLight, Settings.Light.Sun
+    //       mutates only its OWN _cascades / _cascadePriorities / _lastCameraPosition
+    //       calls  Cascade.UpdateViewSetupFull(mainView, lightDir)  -> refits every frustum
+    //   DirectionalLightShadowResources.OnBeginDraw()
+    //       reads  CoreSystems.DrawContexts.CascadeShadows/.CharacterShadows  <- OURS
+    //       builds the depth-map Texture2DTable + the setup constant buffer
+    //
+    // So a second, independent cascade set needs no new machinery at all — just these two
+    // calls made while our view and our contexts are installed, and stage 3 allowed to run.
+    //
+    // What we deliberately do NOT call is DrawContextManager.OnBeginDraw() itself, even
+    // though that is the engine's entry point. It also does
+    // CoreSystems.LocalLights.FlushUpdates() and EnvironmentProbeManager.PrepareProbes(),
+    // both of which drain queues on GLOBAL managers that the player's frame owns. Draining
+    // them a second time per frame is precisely the double-stepping class of bug this
+    // project has already paid for twice (probe atlas, raytracing accumulators).
+    //
+    // Leaving LocalLightsToUpdate / ShadowMasksToUpdate unset on our manager is safe:
+    // Buffer<T> is a STRUCT (IntPtr _data, int _count, int _capacity), so the unassigned
+    // field is a zero-count buffer and RenderLocalLightShadows iterates it zero times. The
+    // feed gets no local-light shadows, which is a fidelity gap, not a fault.
+    private static bool BeginOwnShadows()
+    {
+        if (FeedConfig.WholeSceneOwnShadows <= 0) return false;
+        if (_ourDrawContexts == null || _ourFreshShadowResources == null) return false;
+
+        try
+        {
+            var dcType = _ourDrawContexts.GetType();
+
+            // Mode 2: make every cascade re-render every time we do. The engine's policy
+            // (CascadesUpdateCount per draw, priority-sorted) assumes a 60fps continuous
+            // camera; ours moves in 100ms steps, so a round-robin can leave a far cascade
+            // several orbit positions stale.
+            if (FeedConfig.WholeSceneOwnShadows >= 2)
+            {
+                var casc = dcType.GetProperty("CascadeShadows", Any)?.GetValue(_ourDrawContexts);
+                casc?.GetType().GetField("_forceUpdateAll", Any)?.SetValue(casc, true);
+            }
+
+            _cascFld ??= dcType.GetField("CascadesToUpdate", Any);
+            _charCascFld ??= dcType.GetField("CharacterCascadesToUpdate", Any);
+
+            // Order matters: OnBeginDraw reads the cascades' DepthTextures, and
+            // CharacterShadowsContext allocates its pair lazily inside FlushUpdates.
+            FlushInto(dcType, "CascadeShadows", _cascFld);
+            FlushInto(dcType, "CharacterShadows", _charCascFld);
+
+            _ourFreshShadowResources.GetType().GetMethod("OnBeginDraw", Any)
+                ?.Invoke(_ourFreshShadowResources, null);
+
+            if (!_ownShadowsLogged)
+            {
+                _ownShadowsLogged = true;
+                RttLog.Line($"Whole-scene: OWN SHADOW CASCADES active (mode {FeedConfig.WholeSceneOwnShadows}) — " +
+                            "our CascadeShadowsContext refitted every cascade frustum around the ORBIT " +
+                            "camera and our DirectionalLightShadowResources rebuilt its depth table from " +
+                            "them. Stage 3 renders into our textures; the engine's cascade set is " +
+                            "untouched. Local-light shadow requests are empty by design.");
+            }
+            return true;
+        }
+        catch (Exception e) { RttLog.Error("whole-scene begin own shadows", e); return false; }
+    }
+
+    // Take the per-context update list and store it on our manager, where RenderShadows
+    // reads it from. FlushUpdates allocates a Buffer<T> that OnEndDraw would normally
+    // dispose; we dispose it ourselves in EndOwnShadows.
+    private static void FlushInto(Type dcType, string contextProp, FieldInfo target)
+    {
+        if (target == null) return;
+        var ctx = dcType.GetProperty(contextProp, Any)?.GetValue(_ourDrawContexts);
+        var buf = ctx?.GetType().GetMethod("FlushUpdates", Any)?.Invoke(ctx, null);
+        if (buf != null) target.SetValue(_ourDrawContexts, buf);
+    }
+
+    // Must run BEFORE the DrawContexts global is put back: OnBeginDraw read it, and the
+    // symmetric teardown should see the same world.
+    private static void EndOwnShadows()
+    {
+        try
+        {
+            _ourFreshShadowResources?.GetType().GetMethod("OnEndDraw", Any)
+                ?.Invoke(_ourFreshShadowResources, null);
+
+            // Buffer<T> is a struct, so GetValue boxes a COPY — but _data is an IntPtr and
+            // the copy points at the same native allocation, so Dispose on the box frees
+            // the real thing. Then reset the field to default (a zero-count buffer) so a
+            // failed render never leaves a dangling pointer for the next one to iterate.
+            DisposeBuffer(_cascFld);
+            DisposeBuffer(_charCascFld);
+        }
+        catch (Exception e) { RttLog.Error("whole-scene end own shadows", e); }
+    }
+
+    private static void DisposeBuffer(FieldInfo f)
+    {
+        if (f == null || _ourDrawContexts == null) return;
+        try
+        {
+            if (f.GetValue(_ourDrawContexts) is IDisposable d) d.Dispose();
+            f.SetValue(_ourDrawContexts, Activator.CreateInstance(f.FieldType));
+        }
+        catch (Exception e) { RttLog.Error($"whole-scene dispose {f.Name}", e); }
+    }
+
+    private static FieldInfo _cascFld, _charCascFld;
+    private static bool _ownShadowsLogged;
 
     // The camera half, stage 3b. Writes SettingsManager._renderView, which is the same
     // field CameraRender.InstallOurCamera uses — a proven mechanism, not a new one.
@@ -789,19 +942,30 @@ internal static class WholeSceneRender
             // DISPOSE SAFETY: our manager's Dispose would dispose whatever this property
             // holds — which would be the ENGINE'S live object. Reset() puts the fresh one
             // back first, so each side disposes only what it created.
+            //
+            // ...UNLESS wholeSceneOwnShadows is on, in which case we keep our own and
+            // BeginOwnShadows fills it each render. That is the upgrade path out of the
+            // limitation above: cascades fitted around OUR camera instead of the player's.
             var resProp = t.GetProperty("DirectionalLightShadowResources", Any);
             var engineDc = _coreType?.GetField("DrawContexts", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
-            if (resProp != null && engineDc != null)
+            bool ownShadows = FeedConfig.WholeSceneOwnShadows > 0;
+            if (resProp != null)
             {
                 _ourFreshShadowResources = resProp.GetValue(_ourDrawContexts);
-                resProp.SetValue(_ourDrawContexts, resProp.GetValue(engineDc));
+                if (!ownShadows && engineDc != null)
+                    resProp.SetValue(_ourDrawContexts, resProp.GetValue(engineDc));
             }
 
             RttLog.Line("Whole-scene: SECOND DrawContextManager built — its ctor runs " +
                         "CreateInitialContexts, so this is the full context family (visibility " +
                         "lists, occlusion, geometry buffers, shared counters, LOD transitions) " +
                         "owned by us. The player's contexts are no longer written by our render. " +
-                        $"DirectionalLightShadowResources {(engineDc != null ? "SHARED from the engine (read-only in the mask draw)" : "NOT shared — engine manager unreachable")}.");
+                        "DirectionalLightShadowResources " +
+                        (ownShadows
+                            ? $"OURS — own cascades, mode {FeedConfig.WholeSceneOwnShadows}, fitted around the orbit camera."
+                            : engineDc != null
+                                ? "SHARED from the engine (read-only in the mask draw)."
+                                : "NOT shared — engine manager unreachable."));
         }
         catch (Exception e) { RttLog.Error("build second DrawContextManager", e); }
     }
