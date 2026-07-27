@@ -179,6 +179,20 @@ internal static class FeedConfig
     // put the main-view job in the primary slot.
     public static bool CoCullMainView { get; private set; }
 
+    // Which pass groups the co-cull targets. Comma-separated PassGroupType values.
+    //
+    //   0  MainViewPass                   GBufferPassJob draws this
+    //   2  MainViewDeferredTexturingPass  DeferredTexturingJob draws this
+    //   3  MainViewCountVolumeSegments    volumetric, phase 1
+    //   4  MainViewGatherVolumeSegments   volumetric, phase 2
+    //
+    // The engine's own main-view job takes all four, and copying that wholesale put large
+    // white wedges through the feed at changing angles. 3 and 4 are a two-phase volumetric
+    // algorithm whose consuming passes we never run, so their commands sit in the volume
+    // instance buffers uninterpreted — and uninterpreted draw commands rasterise as
+    // stretched garbage. Default is the two we actually consume.
+    public static int[] CoCullPassGroups { get; private set; } = { 0, 2 };
+
     // Extra margin on top of the sizing basis. ZERO by default, and deliberately.
     //
     // The first guess here was 50%, on the theory that the report describes a cull from
@@ -597,6 +611,7 @@ internal static class FeedConfig
             int recursive = RecursiveReflections;
             double geomHead = GeomRangeHeadroom;
             int geomFloor = GeomRangeFloor;
+            int[] coGroups = CoCullPassGroups;
 
             foreach (var raw in File.ReadAllLines(Path_))
             {
@@ -744,6 +759,14 @@ internal static class FeedConfig
                     case "cocullmainview":
                         coCull = val is "1" or "true" or "yes";
                         break;
+                    case "cocullpassgroups":
+                    {
+                        var parsed = new List<int>();
+                        foreach (var tok in val.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                            if (int.TryParse(tok.Trim(), out var g) && g >= 0 && g <= 15) parsed.Add(g);
+                        if (parsed.Count > 0) coGroups = parsed.ToArray();
+                        break;
+                    }
                     case "privategeombuffers":
                         privGeom = val is "1" or "true" or "yes";
                         break;
@@ -838,7 +861,8 @@ internal static class FeedConfig
                         || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
-                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
+                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView
+                        || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
@@ -853,6 +877,15 @@ internal static class FeedConfig
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
             LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass; SunPassDepth = sunDepth; DebugGBuffer = dbgGb; DeferredTexturing = defTex;
             MainViewCulling = mvCull; CullSecondPass = cull2; DisableOcclusionCulling = noOcc; PrivateCullContexts = privCtx; PrivateGeomBuffers = privGeom; CoCullMainView = coCull;
+
+            // The custom culling job bakes its pass-group list in at construction, so a
+            // changed list means a rebuilt job — otherwise editing the config would appear
+            // to do nothing and we would be debugging the wrong thing.
+            if (!coGroups.SequenceEqual(CoCullPassGroups))
+            {
+                CoCullPassGroups = coGroups;
+                CustomCullJob.Reset();
+            }
             GeomRangeHeadroom = geomHead; GeomRangeFloor = geomFloor;
             AutoExposure = autoExp; AutoExposureDownSpeed = expDown; AutoExposureUpSpeed = expUp;
             AutoExposureMin = expMin; AutoExposureMax = expMax; AutoExposureBias = expBias;
@@ -878,7 +911,7 @@ internal static class FeedConfig
                             $"| lodMainView={LodMainView} fixScreenRes={FixScreenRes} " +
                             $"fullCameraCb={FullCameraCb} emissivity={Emissivity} " +
                             $"recursiveReflections={RecursiveReflections} dimDistance={DimDistance} " +
-                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass} sunPassDepth={SunPassDepth} debugGBuffer={DebugGBuffer} deferredTexturing={DeferredTexturing} autoExposure={AutoExposure} mainViewCulling={MainViewCulling} cullSecondPass={CullSecondPass} privateGeomBuffers={PrivateGeomBuffers} privateCullContexts={PrivateCullContexts} coCullMainView={CoCullMainView} geomRangeHeadroom={GeomRangeHeadroom} geomRangeFloor={GeomRangeFloor}");
+                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass} sunPassDepth={SunPassDepth} debugGBuffer={DebugGBuffer} deferredTexturing={DeferredTexturing} autoExposure={AutoExposure} mainViewCulling={MainViewCulling} cullSecondPass={CullSecondPass} privateGeomBuffers={PrivateGeomBuffers} privateCullContexts={PrivateCullContexts} coCullMainView={CoCullMainView} coCullPassGroups=[{string.Join(",", CoCullPassGroups)}] geomRangeHeadroom={GeomRangeHeadroom} geomRangeFloor={GeomRangeFloor}");
         }
         catch { /* keep the last good values */ }
     }

@@ -158,12 +158,28 @@ internal static class CustomCullJob
                 return false;
             }
 
-            // [MainViewPass=0, MainViewDeferredTexturingPass=2,
-            //  MainViewCountVolumeSegments=3, MainViewGatherVolumeSegments=4]
+            // Which pass groups to cull for. Configurable because the engine's main-view
+            // job takes all four and only two of them are any use to us:
+            //
+            //   0  MainViewPass                   GBufferPassJob draws this
+            //   2  MainViewDeferredTexturingPass  DeferredTexturingJob draws this
+            //   3  MainViewCountVolumeSegments    volumetric, phase 1
+            //   4  MainViewGatherVolumeSegments   volumetric, phase 2
+            //
+            // 3 and 4 are a two-phase volumetric algorithm whose consuming passes we do
+            // not run. Culling for them fills the volume instance buffers with commands
+            // nothing then interprets correctly, and unowned draw commands rasterise as
+            // large stretched wedges at changing angles — which is exactly what appeared
+            // in the feed the first time all four were used.
             var listType = typeof(List<>).MakeGenericType(groupType);
             var groups = (System.Collections.IList)Activator.CreateInstance(listType);
-            foreach (var v in new[] { 0, 2, 3, 4 })
+            foreach (var v in FeedConfig.CoCullPassGroups)
                 groups.Add(Enum.ToObject(groupType, v));
+            if (groups.Count == 0)
+            {
+                RttLog.Line("Custom cull job: coCullPassGroups is empty — nothing to cull for.");
+                return false;
+            }
 
             // SingleLevel = 1. Not TransitionTimeBased, which is what lets the transition
             // context be null without tripping CullingGeometryJob's assert.
@@ -185,16 +201,27 @@ internal static class CustomCullJob
 
             _state = _job != null ? 1 : -1;
             RttLog.Line(_state == 1
-                ? $"Custom cull job: BUILT — groups [MainViewPass, DeferredTexturing, " +
-                  $"CountVolumeSegments, GatherVolumeSegments], forcedLODMethod=SingleLevel, " +
-                  $"twoPass=false, isForMainView=false. {_tasks.Count} shader task(s) pending. " +
-                  "SingleLevel is what makes a null LODTransitionContext legal, which is what " +
-                  "stops our cull writing the player's LOD crossfade state."
+                ? $"Custom cull job: BUILT — groups [{string.Join(", ", FeedConfig.CoCullPassGroups.Select(NameGroup))}], " +
+                  $"forcedLODMethod=SingleLevel, twoPass=false, isForMainView=false. " +
+                  $"{_tasks.Count} shader task(s) pending. SingleLevel is what makes a null " +
+                  "LODTransitionContext legal, which is what stops our cull writing the player's " +
+                  "LOD crossfade state."
                 : "Custom cull job: construction returned null.");
             return _state == 1;
         }
         catch (Exception e) { RttLog.Error("build custom culling job", e); return false; }
     }
+
+    private static string NameGroup(int v) => v switch
+    {
+        0 => "MainViewPass",
+        1 => "MainViewEffects",
+        2 => "DeferredTexturing",
+        3 => "CountVolumeSegments",
+        4 => "GatherVolumeSegments",
+        12 => "Indirect",
+        _ => v.ToString(),
+    };
 
     private static Type FindType(Assembly asm, string name)
     {
