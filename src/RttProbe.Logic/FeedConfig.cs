@@ -153,6 +153,32 @@ internal static class FeedConfig
     // feature. SurfelGenerationJob constructs its own for exactly this reason.
     public static bool PrivateGeomBuffers { get; private set; }
 
+    // Run the main-view culling job ALONGSIDE the indirect one, into a second context.
+    //
+    // mainViewCulling swaps the job, and that can never work. The pass-group lists are
+    // disjoint where it matters:
+    //
+    //     _indirectCullingJob  -> [12]           Indirect
+    //     _mainViewCullingJob  -> [0, 2, 3, 4]   MainViewPass, DeferredTexturing,
+    //                                            Count/GatherVolumeSegments
+    //
+    // The visible image is drawn by IndirectEnvironmentPassJob from the Indirect group,
+    // so swapping does not break the feed — it deletes the draw commands the feed is made
+    // of. That is the "black with a small blob in the centre" this route produced twice,
+    // and it was never a bug: it is what the configuration asks for.
+    //
+    // Co-culling gets both. One OutputGeometryBufferContext can carry the output of
+    // several culls into different pass groups — the engine does exactly that, culling
+    // the probe's Indirect group into MainOutputGeometryBuffers, the same context the
+    // main view writes MainViewPass into. A second CullingContext is still needed because
+    // GeometryContext is where the per-group ranges live and it is what GBufferPassJob is
+    // handed.
+    //
+    // Requires privateCullContexts (the main-view job dereferences the visibility and
+    // occlusion contexts) and is ignored when mainViewCulling is on, since that already
+    // put the main-view job in the primary slot.
+    public static bool CoCullMainView { get; private set; }
+
     // Extra margin on top of the sizing basis. ZERO by default, and deliberately.
     //
     // The first guess here was 50%, on the theory that the report describes a cull from
@@ -563,7 +589,7 @@ internal static class FeedConfig
             int bloomN = BloomEveryN;
             bool sunPass = SunPass, sunDepth = SunPassDepth;
             int dbgGb = DebugGBuffer;
-            bool defTex = DeferredTexturing, autoExp = AutoExposure, mvCull = MainViewCulling, cull2 = CullSecondPass, noOcc = DisableOcclusionCulling, privCtx = PrivateCullContexts, privGeom = PrivateGeomBuffers;
+            bool defTex = DeferredTexturing, autoExp = AutoExposure, mvCull = MainViewCulling, cull2 = CullSecondPass, noOcc = DisableOcclusionCulling, privCtx = PrivateCullContexts, privGeom = PrivateGeomBuffers, coCull = CoCullMainView;
             double expDown = AutoExposureDownSpeed, expUp = AutoExposureUpSpeed;
             double expMin = AutoExposureMin, expMax = AutoExposureMax, expBias = AutoExposureBias;
             double expSun = AutoExposureSunRange;
@@ -715,6 +741,9 @@ internal static class FeedConfig
                     case "swapcameracb":
                         swapCb = val is "1" or "true" or "yes";
                         break;
+                    case "cocullmainview":
+                        coCull = val is "1" or "true" or "yes";
+                        break;
                     case "privategeombuffers":
                         privGeom = val is "1" or "true" or "yes";
                         break;
@@ -809,7 +838,7 @@ internal static class FeedConfig
                         || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
-                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
+                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
@@ -823,7 +852,7 @@ internal static class FeedConfig
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
             LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass; SunPassDepth = sunDepth; DebugGBuffer = dbgGb; DeferredTexturing = defTex;
-            MainViewCulling = mvCull; CullSecondPass = cull2; DisableOcclusionCulling = noOcc; PrivateCullContexts = privCtx; PrivateGeomBuffers = privGeom;
+            MainViewCulling = mvCull; CullSecondPass = cull2; DisableOcclusionCulling = noOcc; PrivateCullContexts = privCtx; PrivateGeomBuffers = privGeom; CoCullMainView = coCull;
             GeomRangeHeadroom = geomHead; GeomRangeFloor = geomFloor;
             AutoExposure = autoExp; AutoExposureDownSpeed = expDown; AutoExposureUpSpeed = expUp;
             AutoExposureMin = expMin; AutoExposureMax = expMax; AutoExposureBias = expBias;
@@ -849,7 +878,7 @@ internal static class FeedConfig
                             $"| lodMainView={LodMainView} fixScreenRes={FixScreenRes} " +
                             $"fullCameraCb={FullCameraCb} emissivity={Emissivity} " +
                             $"recursiveReflections={RecursiveReflections} dimDistance={DimDistance} " +
-                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass} sunPassDepth={SunPassDepth} debugGBuffer={DebugGBuffer} deferredTexturing={DeferredTexturing} autoExposure={AutoExposure} mainViewCulling={MainViewCulling} cullSecondPass={CullSecondPass} privateGeomBuffers={PrivateGeomBuffers} geomRangeHeadroom={GeomRangeHeadroom} geomRangeFloor={GeomRangeFloor}");
+                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass} sunPassDepth={SunPassDepth} debugGBuffer={DebugGBuffer} deferredTexturing={DeferredTexturing} autoExposure={AutoExposure} mainViewCulling={MainViewCulling} cullSecondPass={CullSecondPass} privateGeomBuffers={PrivateGeomBuffers} privateCullContexts={PrivateCullContexts} coCullMainView={CoCullMainView} geomRangeHeadroom={GeomRangeHeadroom} geomRangeFloor={GeomRangeFloor}");
         }
         catch { /* keep the last good values */ }
     }

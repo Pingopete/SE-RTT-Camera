@@ -51,6 +51,8 @@ internal static class CameraRender
     private static object _geomBuffersMain, _geomBuffersEffect;
     private static long _geomCapLogMs;
     private static bool _lastCtxLive;
+    private static bool _coCullLogged;
+    private static int _coCullErrs;
     private static object _lodProbe, _lodMainView;
 
     // A throwaway for optional resolves, so a missing member cannot fail the dry run.
@@ -537,6 +539,7 @@ internal static class CameraRender
     private static void RenderOnce(object commandList)
     {
         object rtBorrow = null, depthBorrow = null, cameraCb = null, borrowedCulling = null;
+        object coCulling = null;     // second culling context, for the main-view pass groups
         object savedGBuffer = null, savedCamera = null, scratchBorrow = null, savedProbeSettings = null;
         object[] savedCameraCb = null;
         object savedOcclusion = null;
@@ -944,6 +947,72 @@ internal static class CameraRender
                 }
             }
 
+            // CO-CULL: run the main-view job as an ADDITION, not a replacement.
+            //
+            // Swapping cullJob to the main-view one cannot work, and the pass-group lists
+            // say so outright:
+            //
+            //     _indirectCullingJob  -> [12]           Indirect
+            //     _mainViewCullingJob  -> [0, 2, 3, 4]   MainViewPass, DeferredTexturing,
+            //                                            Count/GatherVolumeSegments
+            //
+            // Indirect is not in the main-view job's list. Our visible image is drawn by
+            // IndirectEnvironmentPassJob from the Indirect group, so switching jobs does
+            // not break the feed — it removes the draw commands the feed is MADE of. A
+            // black frame with whatever sky and residue survived is the expected outcome,
+            // and it is exactly the "small blob in the centre" this route produced twice.
+            // There was never a bug there to find.
+            //
+            // So both culls run. The engine itself proves one OutputGeometryBufferContext
+            // can carry the output of several culls into different pass groups:
+            // ExecuteEnvironmentProbeUpdate culls the probe's Indirect group into
+            // MainOutputGeometryBuffers, the same context MainViewCulling writes its
+            // MainViewPass commands into. Different groups, different ranges, one buffer.
+            //
+            // A SECOND culling context is needed though, because GeometryContext is where
+            // the per-pass-group ranges live and GBufferPassJob is handed one of them.
+            // Sharing a single context between two culls would have the second overwrite
+            // the first's counters.
+            if (FeedConfig.CoCullMainView && _cullJobMainView != null && !mainView
+                && visLists != null && occlusion != null)
+            {
+                coCulling = OwnContexts.Borrow();
+                if (coCulling != null)
+                {
+                    OwnContexts.EnsureRanges(coCulling, commandList);
+                    var coArgs = new object[]
+                    {
+                        commandList, view, lodSettings, coCulling, geomBuffers,
+                        visLists, occlusion, null, null, -1, 0, -1,
+                    };
+                    try
+                    {
+                        _miDoCullingFirstPass.Invoke(_cullJobMainView, coArgs);
+                        if (!_coCullLogged)
+                        {
+                            _coCullLogged = true;
+                            RttLog.Line("=== CO-CULL: main-view job run ALONGSIDE the indirect one, into a " +
+                                        "second culling context. Indirect still feeds the visible image; " +
+                                        "MainViewPass/DeferredTexturing now have draw commands for the " +
+                                        "GBuffer pass, where the real 172-line triplanar shader lives. ===");
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        // Do not disarm. The indirect cull has already run, so the feed is
+                        // intact; losing the co-cull costs GBuffer content, nothing visible.
+                        OwnContexts.Return(coCulling);
+                        coCulling = null;
+                        if (_coCullErrs++ < 3) RttLog.Error("co-cull (feed continues)", e);
+                    }
+                }
+            }
+
+            // Whichever context actually holds MainViewPass commands. Falls back to the
+            // indirect one so every existing path behaves exactly as before when the
+            // co-cull is off.
+            object gbufCullCtx = coCulling ?? cullCtx;
+
             // Far plane drives how much space the clustering job has to bin lights
             // into. 5 km was copied from the probe pass, which is sizing for a whole
             // environment probe; a camera orbiting 100 m from a ship needs a fraction
@@ -994,8 +1063,8 @@ internal static class CameraRender
                     try
                     {
                         _miGBufferPass.Invoke(_gBufferPassJob, new object[]
-                            { commandList, Prop2(cullCtx, "FirstPass"), geomBuffers, true, null });
-                        RunDeferredTexturing(commandList, cullCtx, geomBuffers);
+                            { commandList, Prop2(gbufCullCtx, "FirstPass"), geomBuffers, true, null });
+                        RunDeferredTexturing(commandList, gbufCullCtx, geomBuffers);
                         if (_gbPassLogs++ == 0)
                             RttLog.Line("=== GBUFFER PASS: surface data written into our own GBuffer. ===");
                     }
@@ -1078,8 +1147,8 @@ internal static class CameraRender
                     try
                     {
                         _miGBufferPass.Invoke(_gBufferPassJob, new object[]
-                            { commandList, Prop2(cullCtx, "FirstPass"), geomBuffers, true, null });
-                        RunDeferredTexturing(commandList, cullCtx, geomBuffers);
+                            { commandList, Prop2(gbufCullCtx, "FirstPass"), geomBuffers, true, null });
+                        RunDeferredTexturing(commandList, gbufCullCtx, geomBuffers);
                         if (_gbPassLogs++ == 0)
                             RttLog.Line("=== GBUFFER PASS: written AFTER the env pass, so our camera CB is bound. ===");
                     }
@@ -1443,6 +1512,7 @@ internal static class CameraRender
 
             try { if (geomBorrowed) { if (usingPrivateGeom) PrivateCullContexts.EndGeomPass(); else Call(geomBuffers, "Return"); } } catch { }
             try { OwnContexts.Return(borrowedCulling); } catch { }
+            try { OwnContexts.Return(coCulling); } catch { }
             try { if (depthBorrow != null) ReturnBorrowed(depthBorrow); } catch { }
             try { if (scratchBorrow != null) ReturnBorrowed(scratchBorrow); } catch { }
             try { if (rtBorrow != null) ReturnBorrowed(rtBorrow); } catch { }
