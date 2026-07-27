@@ -43,6 +43,8 @@ internal static class CameraRender
     private static object _drawContexts, _settings, _texPool, _bufMgr;
     private static object _cullJob, _clusterJob, _envPass;
     private static object _cullCtx, _clusterCtx, _shadowResources;
+    private static object _cullJobIndirect, _cullJobMainView;
+    private static object _lastCullJobUsed;
     private static object _geomBuffersMain, _geomBuffersEffect;
     private static object _lodProbe, _lodMainView;
 
@@ -226,7 +228,33 @@ internal static class CameraRender
 
         // ---- jobs off the live SceneDrawSystem ----
         sb.AppendLine("-- jobs --");
-        _cullJob    = InstField(sds, "_indirectCullingJob", sb, ref ok);
+        // WHICH culling job, and this is the blocker for the entire deferred route.
+        //
+        // CullingJob's constructor takes a LIST OF TARGET PASS GROUPS, and the engine
+        // builds several instances with different lists:
+        //
+        //     _mainViewCullingJob   4 pass groups added in SceneDrawSystem..ctor
+        //     _indirectCullingJob   1
+        //
+        //     PassGroupType: MainViewPass = 0, MainViewEffects = 1,
+        //                    MainViewDeferredTexturingPass = 2, ..., Indirect = 12
+        //
+        // We cull with the indirect job, so the only draw commands generated are for the
+        // Indirect pass group. GBufferPassJob draws MainViewPass and DeferredTexturingJob
+        // draws MainViewDeferredTexturingPass — and for those our cull produced NOTHING.
+        // That is why the GBuffer debug blit showed a nearly empty frame with one stray
+        // fragment: not a broken blit, not a resolution problem, an empty buffer.
+        //
+        // It also explains why voxel texture quality could never improve. The indirect
+        // path draws terrain through TriplanarGIGlobal, whose 52-line pixel shader samples
+        // no textures at all — just GetColorFar3(), one flat colour per material. The real
+        // 172-line triplanar shader only runs in the MainView pass groups, which we were
+        // never culling for.
+        _cullJobIndirect = InstField(sds, "_indirectCullingJob", sb, ref ok);
+        _cullJobMainView = InstField(sds, "_mainViewCullingJob", sb, ref _ignored);
+        _cullJob = _cullJobIndirect;
+        sb.AppendLine($"  _mainViewCullingJob             {(_cullJobMainView == null ? "NOT FOUND" : "OK")} " +
+                      "(targets the MainView pass groups the GBuffer and deferred-texturing passes draw)");
         _clusterJob = InstField(sds, "_clusterJob", sb, ref ok);
         _envPass    = InstField(sds, "_indirectEnvironmentPass", sb, ref ok);
         sb.AppendLine();
@@ -662,7 +690,27 @@ internal static class CameraRender
                             $"— {DescribeLod(lodSettings)}");
             }
 
-            _miDoCullingFirstPass.Invoke(_cullJob, new object[]
+            // The MainView culling job generates draw commands for the pass groups the
+            // GBuffer and deferred-texturing passes actually draw. Without it those passes
+            // have nothing to render and the GBuffer stays empty, which is exactly what the
+            // debug blit showed.
+            //
+            // Not a free swap: this instance is constructed with isUsedWithTwoPassCulling
+            // and isForMainView, so it may want an OcclusionContext (we pass null) and a
+            // second pass. Switchable, and it reports which job ran so a failure is
+            // attributable rather than mysterious.
+            var cullJob = (FeedConfig.MainViewCulling && _cullJobMainView != null)
+                ? _cullJobMainView : _cullJobIndirect;
+            if (!ReferenceEquals(cullJob, _lastCullJobUsed))
+            {
+                _lastCullJobUsed = cullJob;
+                RttLog.Line($"Culling job: {(ReferenceEquals(cullJob, _cullJobMainView) ? "MAIN VIEW" : "indirect")} " +
+                            "— main view targets MainViewPass/DeferredTexturing (real triplanar textures, " +
+                            "tessellation); indirect targets only the Indirect group (TriplanarGIGlobal, " +
+                            "flat Far3 colours, no texture sampling at all).");
+            }
+
+            _miDoCullingFirstPass.Invoke(cullJob, new object[]
             {
                 commandList, view, lodSettings, cullCtx, geomBuffers,
                 null, null, null, null, -1, 0, -1,

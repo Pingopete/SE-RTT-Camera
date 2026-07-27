@@ -106,6 +106,23 @@ internal static class FeedConfig
     // Stars will read brighter than in the main view.
     public static bool SunPass { get; private set; }
 
+    // Cull with _mainViewCullingJob instead of _indirectCullingJob.
+    //
+    // THE blocker for the deferred route. CullingJob is constructed with a list of target
+    // PASS GROUPS; the indirect job targets one (Indirect), the main-view job targets four
+    // including MainViewPass and MainViewDeferredTexturingPass. GBufferPassJob and
+    // DeferredTexturingJob draw those groups, so culling with the indirect job leaves them
+    // nothing to draw and the GBuffer comes out empty.
+    //
+    // It is also why voxel texturing could never improve: the Indirect group draws terrain
+    // through TriplanarGIGlobal, a 52-line shader that samples NO textures — just
+    // GetColorFar3(), one flat colour per material. The real 172-line triplanar shader
+    // lives in the MainView groups.
+    //
+    // Not free: this instance is built with isUsedWithTwoPassCulling and isForMainView, so
+    // it may want an OcclusionContext (we pass null) and a second culling pass.
+    public static bool MainViewCulling { get; private set; }
+
     // Auto-exposure for the feed, from our own camera. See DynamicExposure.
     //
     // The engine's ComputeExposure is off-limits — it advances the temporal adaptation the
@@ -479,7 +496,7 @@ internal static class FeedConfig
             int bloomN = BloomEveryN;
             bool sunPass = SunPass, sunDepth = SunPassDepth;
             int dbgGb = DebugGBuffer;
-            bool defTex = DeferredTexturing, autoExp = AutoExposure;
+            bool defTex = DeferredTexturing, autoExp = AutoExposure, mvCull = MainViewCulling;
             double expDown = AutoExposureDownSpeed, expUp = AutoExposureUpSpeed;
             double expMin = AutoExposureMin, expMax = AutoExposureMax, expBias = AutoExposureBias;
             double expSun = AutoExposureSunRange;
@@ -629,6 +646,9 @@ internal static class FeedConfig
                     case "swapcameracb":
                         swapCb = val is "1" or "true" or "yes";
                         break;
+                    case "mainviewculling":
+                        mvCull = val is "1" or "true" or "yes";
+                        break;
                     case "autoexposure":
                         autoExp = val is "1" or "true" or "yes";
                         break;
@@ -700,7 +720,7 @@ internal static class FeedConfig
                         || cheapBloom != CheapBloom || farPlane != CullFarPlane || frameHook != PassOnFrameHook
                         || reuseExp != ReuseExposure || expValue != ExposureValue || gbSwap != GBufferSwap || gbPass != GBufferPass || defer != Deferred || envP != EnvPass
                         || defDir != DeferredDirectional || defLoc != DeferredLocal || defAmb != DeferredAmbient
-                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
+                        || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || atmo != Atmosphere || rScale != RenderScale || blitA != BlitAlpha
                         || zeroMetal != ZeroMetalness || execLight != ExecuteLighting || swapRes != SwapResolution || swapCam != SwapCamera || gbAfter != GBufferAfterEnv || supGi != SuppressGi || gateGi != GateGi || envScratch != EnvPassToScratch || skyMode != SkyMode || cullRoot != CullRootEntityId;
@@ -713,6 +733,7 @@ internal static class FeedConfig
             DeferredDirectional = defDir; DeferredLocal = defLoc; DeferredAmbient = defAmb;
             Atmosphere = atmo; RenderScale = rScale; ExecuteLighting = execLight; SwapResolution = swapRes; SwapCamera = swapCam; GBufferAfterEnv = gbAfter; SuppressGi = supGi; GateGi = gateGi; EnvPassToScratch = envScratch; SkyMode = skyMode; CullRootEntityId = cullRoot; BlitAlpha = blitA; ZeroMetalness = zeroMetal;
             LodMainView = lodMain; FixScreenRes = fixScreen; FullCameraCb = fullCam; EffectGeomBuffers = effectGeom; RangeCulling = rangeCull; SwapCameraCb = swapCb; AtmosphereMultiply = atmoMul; BloomEveryN = bloomN; SunPass = sunPass; SunPassDepth = sunDepth; DebugGBuffer = dbgGb; DeferredTexturing = defTex;
+            MainViewCulling = mvCull;
             AutoExposure = autoExp; AutoExposureDownSpeed = expDown; AutoExposureUpSpeed = expUp;
             AutoExposureMin = expMin; AutoExposureMax = expMax; AutoExposureBias = expBias;
             AutoExposureSunRange = expSun;
@@ -737,7 +758,7 @@ internal static class FeedConfig
                             $"| lodMainView={LodMainView} fixScreenRes={FixScreenRes} " +
                             $"fullCameraCb={FullCameraCb} emissivity={Emissivity} " +
                             $"recursiveReflections={RecursiveReflections} dimDistance={DimDistance} " +
-                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass} sunPassDepth={SunPassDepth} debugGBuffer={DebugGBuffer} deferredTexturing={DeferredTexturing} autoExposure={AutoExposure} bias={AutoExposureBias}");
+                            $"| cullRootEntityId={CullRootEntityId} effectGeomBuffers={EffectGeomBuffers} rangeCulling={RangeCulling} swapCameraCb={SwapCameraCb} atmosphereMultiply={AtmosphereMultiply} bloomEveryN={BloomEveryN} sunPass={SunPass} sunPassDepth={SunPassDepth} debugGBuffer={DebugGBuffer} deferredTexturing={DeferredTexturing} autoExposure={AutoExposure} mainViewCulling={MainViewCulling}");
         }
         catch { /* keep the last good values */ }
     }
