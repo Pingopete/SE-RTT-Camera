@@ -10,6 +10,7 @@ public static class LogicEntry
         RttLog.Line("=== logic installed ===");
         try
         {
+            FeedGate.Reset();
             BlitProbe.Reset();
             SceneDrawRecon.Reset();
             CameraRender.Reset();

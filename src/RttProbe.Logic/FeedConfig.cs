@@ -419,6 +419,14 @@ internal static class FeedConfig
     // it reads as ambient or reflections rather than as exposure.
     public static bool WholeSceneOwnExposure { get; private set; }
 
+    // How long a tagged panel may go without ticking before the mod shuts itself down.
+    //
+    // The LCD render component ticks every panel it draws, so a panel switched off,
+    // unpowered or destroyed simply stops arriving — the absence of the signal is the
+    // signal. Long enough to survive a stall or a streaming hitch, short enough that
+    // toggling the panel is a usable A/B against vanilla.
+    public static int PanelIdleMs { get; private set; } = 1500;
+
     // How often Perf emits its frame-interval report. 0 disables the instrument.
     public static int PerfReportMs { get; private set; } = 5000;
 
@@ -922,6 +930,7 @@ internal static class FeedConfig
             int wsOwnShadow = WholeSceneOwnShadows;
             bool wsStrip = WholeSceneStripProbe;
             int perfMs = PerfReportMs;
+            int panelIdle = PanelIdleMs;
             int wsCascRes = WholeSceneCascadeResolution, wsCascCnt = WholeSceneCascadeCount;
             bool wsOwnExp = WholeSceneOwnExposure;
             string[] wsRtFlags = WholeSceneRtFlags;
@@ -1094,6 +1103,9 @@ internal static class FeedConfig
                         break;
                     case "wholesceneownexposure":
                         wsOwnExp = val is "1" or "true" or "yes";
+                        break;
+                    case "panelidlems":
+                        if (int.TryParse(val, out var pim)) panelIdle = Math.Clamp(pim, 250, 30000);
                         break;
                     case "perfreportms":
                         if (int.TryParse(val, out var prm)) perfMs = Math.Clamp(prm, 0, 60000);
@@ -1318,6 +1330,7 @@ internal static class FeedConfig
             // must not trigger a Reset() that rebuilds the second ScreenBuffers.
             WholeSceneStripProbe = wsStrip;
             PerfReportMs = perfMs;
+            PanelIdleMs = panelIdle;
             WholeSceneCascadeResolution = wsCascRes;
             WholeSceneCascadeCount = wsCascCnt;
             WholeSceneOwnExposure = wsOwnExp;

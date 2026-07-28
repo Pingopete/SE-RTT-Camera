@@ -315,6 +315,13 @@ internal static class WholeSceneRender
     public static void OnWholeScene(object sceneDrawSystem, object finalLdrBuffer)
     {
         if (_inOurRender) return;               // our own nested Draw — do nothing
+
+        // The gate is polled HERE because this hook is the one that fires every engine
+        // frame regardless of what else is switched on. Polled before the disabled-state
+        // check so a dormant mod still notices the panel coming back.
+        FeedGate.Poll();
+        if (!FeedGate.Active) return;
+
         if (_state == -1) return;
 
         try

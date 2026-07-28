@@ -85,6 +85,12 @@ internal static class BlitProbe
         _tickCount++;
         try
         {
+            // Polled here as well as in the whole-scene hook: this is the tick that keeps
+            // running when the render-side route is off, so it is what lets a dormant mod
+            // notice the panel coming back. Panel DISCOVERY below must stay ungated —
+            // that is the signal the gate reads.
+            FeedGate.Poll();
+
             if (_tickLogs < 1) { _tickLogs++; RttLog.Line("Tick hook alive."); }
 
             // Locate the [RTC] panel this tick belongs to, if any.
@@ -277,6 +283,9 @@ internal static class BlitProbe
     // render target, so this is a genuine RT-to-RT blit.
     public static void OnPanelRender(object rendererObj, object batchObj, object ctxObj)
     {
+        // Dormant means the panel draws its own content, exactly as it would without
+        // this mod installed.
+        if (!FeedGate.Active) return;
         if (batchObj is not IDrawBatch batch || ctxObj is not LcdPanelSurfaceContext ctx) return;
         try
         {

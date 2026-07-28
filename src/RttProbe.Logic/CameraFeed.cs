@@ -104,6 +104,14 @@ internal static class CameraFeed
 
             if (!name.Contains(Tag, StringComparison.OrdinalIgnoreCase)) return;
 
+            // THE LIVENESS SIGNAL for the whole mod. This runs from the engine's LCD
+            // render component, so a panel that is switched off, unpowered, destroyed or
+            // simply not being drawn stops arriving here — and the absence of the signal
+            // is what puts the mod to sleep. Stamped before the position lookup, because
+            // a tagged panel that ticks but whose transform cannot be resolved is still
+            // very much alive.
+            FeedGate.NotePanelAlive();
+
             var pos = WorldPositionOf(entity);
             if (pos == null) return;
 

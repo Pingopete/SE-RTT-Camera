@@ -1,0 +1,128 @@
+using System;
+
+namespace RttProbe;
+
+// One authority for "is this mod doing anything at all right now".
+//
+// The point is a clean A/B against vanilla WITHOUT restarting the game. Turn the tagged
+// panel off and everything this mod does stops: no second Draw, no probe pass, no
+// parking, no panel material changes, and every GPU resource we own is released. Turn it
+// back on and the whole pipeline rebuilds from scratch.
+//
+// That matters more than convenience. Every conclusion in this project rests on
+// "compared to what?", and until now the only way to get a mod-free frame was to quit,
+// edit, and reload — which changes the world state, the VRAM residency and the streaming
+// set at the same time. Those are exactly the variables that produced two of today's
+// false diagnoses.
+//
+// THE SIGNAL is the tagged panel's own LCD tick. CameraFeed.OnLcdTick fires from the
+// engine's LCD render component for every panel it draws, so a panel that is switched
+// off, unpowered, destroyed or out of the render set simply stops ticking. No block-state
+// reflection, no power API, no polling of the sim from the render thread — the absence of
+// a signal IS the signal. A staleness window covers the gap between ticks.
+//
+// The Harmony patches stay installed while dormant. They cannot be removed safely
+// mid-session, and they do not need to be: every hook consults this gate and returns
+// immediately, and the stage-skip hooks already no-op outside our render. Dormant means
+// the engine runs its own code with our patches present but inert.
+internal static class FeedGate
+{
+    private static long _lastPanelMs;
+    private static bool _active;
+    private static bool _everActive;
+    private static long _lastPollMs;
+    private static int _cycles;
+
+    // True while a tagged panel is alive and the mod should be doing its work.
+    // Starts FALSE: until a tagged panel has ticked at least once, there is nothing to
+    // draw to and no reason to build anything.
+    public static bool Active => _active;
+
+    public static void Reset()
+    {
+        _lastPanelMs = 0;
+        _active = false;
+        _everActive = false;
+        _lastPollMs = 0;
+        _cycles = 0;
+    }
+
+    // Called from CameraFeed whenever a panel carrying the tag is seen ticking.
+    public static void NotePanelAlive() => _lastPanelMs = Clock.Ms;
+
+    // Called from the per-frame hooks. Cheap enough to call from several of them — the
+    // work is rate-limited here rather than at each call site, so no caller has to know
+    // whether another one already polled this frame.
+    public static void Poll()
+    {
+        long now = Clock.Ms;
+        if (now - _lastPollMs < 250) return;
+        _lastPollMs = now;
+
+        bool alive = _lastPanelMs != 0 && (now - _lastPanelMs) < FeedConfig.PanelIdleMs;
+        if (alive == _active) return;
+
+        _active = alive;
+        if (_active) Startup();
+        else Shutdown();
+    }
+
+    private static void Startup()
+    {
+        _cycles++;
+        RttLog.Line($"=== FEED GATE: ACTIVE (cycle {_cycles}). A tagged panel is ticking again. " +
+                    "Everything rebuilds from scratch: second ScreenBuffers, second " +
+                    "DrawContextManager, cascade set, LDR ring, panel binding. ===");
+        _everActive = true;
+    }
+
+    // Put the game back exactly as it would be without this mod loaded.
+    //
+    // Order matters: stop the things that ISSUE GPU work before releasing what that work
+    // reads, or a pass already in flight can be handed a disposed resource. Every step is
+    // independently guarded, because a shutdown that throws half way through is worse
+    // than either state.
+    private static void Shutdown()
+    {
+        RttLog.Line("=== FEED GATE: DORMANT. No tagged panel has ticked for " +
+                    $"{FeedConfig.PanelIdleMs} ms. Shutting every feature down — the game should now " +
+                    "render exactly as it does without this mod. Turn the panel back on to restart. ===");
+
+        // 1. Stop issuing work. The whole-scene route and the probe pass both gate on
+        //    Active, so they are already inert by the time this runs; these calls release
+        //    what they own.
+        Try("whole-scene teardown", WholeSceneRender.Reset);
+        Try("camera pass teardown", CameraRender.Reset);
+
+        // 2. Stop delivering frames to the panel.
+        Try("handover teardown", FeedHandover.Reset);
+        Try("blit teardown", BlitProbe.Reset);
+
+        // 3. Release the private context families.
+        Try("private cull contexts", PrivateCullContexts.Reset);
+        Try("own contexts", OwnContexts.Reset);
+        Try("custom cull job", CustomCullJob.Reset);
+        Try("camera CB swap", CameraCbSwap.Reset);
+        Try("dynamic exposure", DynamicExposure.Reset);
+
+        // 4. Undo the PERSISTENT engine mutations. These are the ones that would
+        //    otherwise survive a dormant gate and quietly invalidate the comparison:
+        //    the LCD material's emissive multiplier is a shared definition affecting
+        //    every panel in the world, and DimDistance reaches the engine's own probes.
+        Try("restore panel material", PanelBinding.RestoreEngineState);
+        Try("restore probe settings", CameraRender.RestoreEngineState);
+
+        // 5. Forget the panel, so coming back is a genuinely fresh discovery rather than
+        //    a resumption with stale state.
+        Try("forget panel", CameraFeed.Reset);
+
+        RttLog.Line("Feed gate: shutdown complete." +
+                    (_everActive ? "" : " (Nothing had been started yet.)"));
+    }
+
+    private static void Try(string what, Action a)
+    {
+        try { a(); }
+        catch (Exception e) { RttLog.Error("feed gate shutdown: " + what, e); }
+    }
+}

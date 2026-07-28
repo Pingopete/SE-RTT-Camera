@@ -64,6 +64,7 @@ internal static class PanelBinding
         {
             if (!_surveyed) { _surveyed = true; Survey(renderer, ctx); }
 
+            if (!FeedGate.Active) return;   // dormant: do not touch the panel's material
             if (_disarmed) return;
             if (!File.Exists(ArmPath)) return;
 
@@ -108,6 +109,27 @@ internal static class PanelBinding
     // anything, and binding our own extensions texture is mandatory rather than optional).
     private static double _emissivityApplied = double.NaN;
     private static bool _emissivityBlocked;
+    private static object _stockEmissivity, _emissiveMaterial;
+    private static System.Reflection.PropertyInfo _emissiveProp;
+
+    // Put the shared LCD material back exactly as the game shipped it. Called when the
+    // feed gate goes dormant, so a mod-free comparison really is mod-free.
+    public static void RestoreEngineState()
+    {
+        if (_stockEmissivity == null || _emissiveMaterial == null || _emissiveProp == null) return;
+        try
+        {
+            _emissiveProp.SetValue(_emissiveMaterial, _stockEmissivity);
+            RttLog.Line($"Panel material: EmissivityMultiplier restored to the stock {_stockEmissivity}.");
+        }
+        catch (Exception e) { RttLog.Error("restore panel emissivity", e); }
+        finally
+        {
+            _stockEmissivity = _emissiveMaterial = null;
+            _emissiveProp = null;
+            _emissivityApplied = double.NaN;   // so it re-applies cleanly on restart
+        }
+    }
 
     private static void ApplyEmissivity(object ctx)
     {
@@ -126,6 +148,13 @@ internal static class PanelBinding
             }
 
             var was = p.GetValue(material);
+
+            // Remember the STOCK value the first time, and remember WHERE it lives.
+            // LCDMaterialDefinition is shared by every panel in the world, so leaving our
+            // multiplier on it after the mod goes dormant would light the whole ship
+            // differently from vanilla and quietly invalidate any A/B comparison.
+            if (_stockEmissivity == null) { _stockEmissivity = was; _emissiveMaterial = material; _emissiveProp = p; }
+
             p.SetValue(material, (float)want);
             _emissivityApplied = want;
             RttLog.Line($"Emissivity: {material.GetType().Name}.EmissivityMultiplier {was} -> {want}. " +

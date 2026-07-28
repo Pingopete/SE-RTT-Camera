@@ -123,6 +123,7 @@ internal static class CameraRender
     public static void OnProbePass(object sds, object commandList)
     {
         if (commandList == null) return;
+        if (!FeedGate.Active) return;           // no tagged panel: issue no GPU work at all
         try
         {
             if (!_dryRunDone)
@@ -4403,6 +4404,31 @@ internal static class CameraRender
     // player's hull. Applied only when the configured value changes.
     private static double _dimApplied = double.NaN;
 
+    private static object _stockDimDistance;
+
+    // Undo the persistent probe mutation. Paired with FeedGate.Shutdown; everything else
+    // this class touches is either scoped per-pass or released by Reset().
+    public static void RestoreEngineState()
+    {
+        if (_stockDimDistance == null || _settings == null) return;
+        try
+        {
+            _environmentField ??= _settings.GetType().GetField("_environment", Any);
+            var ours = _environmentField?.GetValue(_settings);
+            var fProbe = ours?.GetType().GetField("ProbeSettings", Any);
+            var probe = fProbe?.GetValue(ours);
+            var fDim = probe?.GetType().GetField("DimDistance", Any);
+            if (fDim == null) return;
+
+            fDim.SetValue(probe, _stockDimDistance);
+            fProbe.SetValue(ours, probe);
+            _environmentField.SetValue(_settings, ours);
+            RttLog.Line($"Probe settings: DimDistance restored to the stock {_stockDimDistance}.");
+        }
+        catch (Exception e) { RttLog.Error("restore dim distance", e); }
+        finally { _stockDimDistance = null; _dimApplied = double.NaN; }
+    }
+
     private static void ApplyDimDistance()
     {
         double want = FeedConfig.DimDistance;
@@ -4417,6 +4443,9 @@ internal static class CameraRender
             if (fDim == null) { _dimApplied = want; RttLog.Line("Probe settings: DimDistance not found."); return; }
 
             var was = fDim.GetValue(probe);
+            // DimDistance reaches the engine's OWN probes, so it has to be put back when
+            // the feed gate goes dormant or the comparison is not against vanilla.
+            _stockDimDistance ??= was;
             fDim.SetValue(probe, (float)want);
             fProbe.SetValue(ours, probe);
             _environmentField.SetValue(_settings, ours);

@@ -311,6 +311,7 @@ internal static class FeedHandover
     public static void OnOffscreenUiDraw(object[] args)
     {
         if (args == null || args.Length == 0) return;
+        if (!FeedGate.Active) return;           // nothing parked, nothing to deliver
         try
         {
             LogRates();
