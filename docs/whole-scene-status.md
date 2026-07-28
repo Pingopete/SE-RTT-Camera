@@ -424,3 +424,75 @@ the rate is fine and the fix is a settling delay after `Reset()` before the firs
 render (the `StartupDelayMs` pattern). A crash means the rebuild hypothesis is dead too, and
 the next step is instrumenting `EnvProbesToUpdate.Count` per frame rather than inferring
 batch size from `OutstandingOps`.
+
+## The phantom bleed: mechanism identified (2026-07-28)
+
+Not fixed, but the search is now bounded. Everything below is from tests in the game, not
+from reading the call graph — which is the lesson of the day, since five plausible
+call-graph hypotheses were all wrong.
+
+### What it is
+
+The ghost is **our render target being SAMPLED by the player's materials**. Not a pass
+writing into the player's buffers, not a shared accumulator, not a compositing step.
+
+The deciding test: halving our render resolution (512 -> 256) made the ghost lower
+resolution to match. It is our texture.
+
+That also explains the two observations that never fitted anything else:
+
+* "not stuck in 3D like the wall surfaces, but most obvious where there are ship
+  walls/blocks" — it is mapped by each surface's own UVs, not projected through a camera.
+* it survives EVERY stage being switched off, because it is not any pass. It is the
+  binding layer underneath all of them.
+
+### Ruled out, each by test
+
+| suspect | test | result |
+|---|---|---|
+| IR cache / our GI trace | skip stage 17 | ghost unchanged |
+| ALL of GI (trace + ambient) | skip stage 18 | ghost unchanged |
+| geometry + lighting | skip 10, 11 (12/13 never fire) | ghost unchanged |
+| decals | skip 8 | ghost unchanged |
+| SSR | stage 29 | never fires — SSSR is off, patch inert |
+| the upsampler / FSR | remove stages 19 + 20 | ghost unchanged |
+| bloom | scope PostProcessSettings.Bloom off | ghost unchanged |
+| panel emissivity | stock is 10, we set 10 | a no-op |
+| delivery path (blit/ring/handover/binding) | wholeSceneToPanel = 0 | panel BLACK, ghost FULL |
+| the mod at all | gate dormant | ghost gone — it is ours |
+| the second render | wholeSceneRender = 0 | ghost gone |
+
+The `TemporalResource<>` enumeration is also complete and clean: StochasticTransparency,
+Water and RTGIContext all hang off our own DrawContextManager, CloudJob is fixed by stage
+26, and RaytraceGIResources has one consumer (LegacyRaytraceGIJob) which does not run.
+
+### The correction that unblocked it
+
+The "ordering caveat" was wrong, and it had silently restricted every search to persistent
+world-space structures. `Render12EngineComponent.<Draw>g__DrawInternal` shows roughly a
+third of the frame runs AFTER `SceneDrawSystem.Draw` returns — OnEndDraw,
+ExecuteAccelerationStructuresBuilding, the UI system, and the present copy. Our render sits
+in that gap, so a shared write of ours can reach the player's frame immediately.
+
+### Where to look next
+
+Our ScreenBuffers textures come from the SHARED pool:
+`BindableTextureManager.CreateRWResizableRenderTargetTexture` -> `GPUResourcePool.Borrow`
+-> `ResizableRWRenderTargetTexture.Initialize`, which takes descriptors.
+
+Pool ALIASING is already excluded — ResizableRWRenderTargetTextureKey includes
+MaxResolution, and ours is genuinely 512x512 (`InitializeBuffers(512x512)`,
+maxPreUpscale=512,512) against the player's 3840x2160.
+
+So the suspect is the DESCRIPTOR / bindless layer:
+`Keen.VRage.Render12.Resources.DescriptorHeap.DescriptorHeapPool` (with `Immediate` and a
+`Token` struct), and the `Texture2DTable` / `RWTexture2DTable` bindless tables. This
+project has hit that layer once before: planet-env v2 died on a descriptor-heap token
+collision from re-registering Texture2DTable/TextureCubeTable entries 20x/sec.
+
+Evidence against a purely random slot collision: the ghost has looked the same across many
+restarts, where allocation order would differ. So it is more likely a stable binding than a
+heap-cursor race.
+
+Next practical step is a GPU capture (PIX/RenderDoc) on one frame to see which descriptor
+the wall material samples — inference from the call graph has a 0/5 record on this bug.

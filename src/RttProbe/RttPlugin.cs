@@ -432,6 +432,45 @@ public sealed class RttPlugin : IPlugin
          "PrepareProbes"),                                                                  // 27
         ("Keen.VRage.Render12.LightingStage.LocalLightsManager, VRage.Render12",
          "FlushUpdates"),                                                                   // 28
+
+        // 29 — THE PHANTOM BLEED. Same blind spot as CloudJob (26).
+        //
+        // The user's description is what identified it: the ghost is not a vague imprint,
+        // it is "the scene from the feed camera including skybox, bright lights emanating
+        // from planets' edges, the ship's grid and asteroids", it "moves and is animated
+        // showing the perspective from that camera", and the speckles in it "are the
+        // skybox". That is a full colour image of OUR render appearing on the player's
+        // REFLECTIVE surfaces — which is screen-space reflections, not GI.
+        //
+        // Ruled out first, each by test rather than by argument:
+        //   * IR cache / our GI trace — skipping 17 left the bleed untouched.
+        //   * ALL of GI — skipping 18 (trace AND ambient) left it untouched too.
+        //   * Inheriting the engine's contexts — ours is a fresh Activator.CreateInstance,
+        //     and only DirectionalLightShadowResources and LensFlares are shared, both
+        //     deliberately.
+        //   * The gate A/B — fully dormant is clean, so it is definitely ours.
+        //
+        // ScreenSpaceReflections._dynamicResources is an INSTANCE field holding
+        // AverageRadianceHistory, VarianceHistory and SampleCountHistory — the temporal
+        // accumulation for the reflection denoiser. The job itself is
+        // SceneDrawSystem._screenSpaceReflectionsJob, and SceneDrawSystem is a singleton we
+        // do NOT swap. So that history is shared with the player, our render writes our
+        // scene's radiance into it, and the player's next frame denoises its reflections
+        // against our content.
+        //
+        // Being a temporal HISTORY is also why it can bleed at all. Within one engine frame
+        // our commands are recorded AFTER the player's, so a shared write can only reach
+        // them if it survives into the next frame. Accumulated history does exactly that —
+        // and it explains why the ghost lingered briefly after wholeSceneCamera was flipped
+        // to 0, which had looked like evidence the bleed was camera-independent.
+        //
+        // Cost to the feed: no screen-space reflections of its own. DoWork takes its
+        // destination as a parameter, so nothing downstream loses a resource — the same
+        // shape as CloudJob, which skipped cleanly. PrepareResources is deliberately NOT
+        // touched: like UpsamplingJob's (see 19) it ALLOCATES, and skipping an allocator
+        // is how that one removed the device.
+        ("Keen.VRage.Render12.PostProcessStage.ScreenSpaceReflection.ScreenSpaceReflections, VRage.Render12",
+         "DoWork"),                                                                         // 29
     };
 
     // Stage 20 is NOT a skip — it is a return-value override, so it lives outside the
@@ -611,6 +650,7 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage26() => Skip(26);
     private static bool SkipStage27() => Skip(27);
     private static bool SkipStage28() => Skip(28);
+    private static bool SkipStage29() => Skip(29);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the

@@ -363,6 +363,10 @@ internal static class WholeSceneRender
               "stage 2 already discards the queue)",
         28 => "LocalLightsManager.FlushUpdates — stop draining the SHARED local-light shadow " +
               "update queue in our render (the feed uses the player's local-light shadows)",
+        29 => "ScreenSpaceReflections.DoWork — THE PHANTOM BLEED. Stop writing our scene's " +
+              "radiance into the SHARED SSR temporal history (AverageRadianceHistory / " +
+              "VarianceHistory / SampleCountHistory live on SceneDrawSystem._screenSpaceReflectionsJob, " +
+              "which we do not swap), so the player's reflective surfaces stop showing the feed",
         _ => "unknown",
     };
 
@@ -978,6 +982,33 @@ internal static class WholeSceneRender
         if (FeedConfig.WholeSceneExposure != 0)
             ScopeSetValues("PostProcessSettings", $"feed exposure {FeedConfig.WholeSceneExposure:+0.##;-0.##} EV",
                 ("LuminanceExposure", (float)FeedConfig.WholeSceneExposure));
+
+        // BLOOM. Candidate for the phantom bleed, and the only remaining shared object in
+        // the composite tail.
+        //
+        // BloomJob holds _tmpBloomCascadeDown / _tmpBloomCascadeUp — arrays of BORROWED
+        // textures retained across calls — plus _tmpMaxCascadeResolutions, a cached
+        // per-cascade resolution. The job is SceneDrawSystem._bloomJob, the singleton we do
+        // not swap, so our 512x512 render and the player's 4K frame drive the same cascade
+        // set with different resolutions. That is the CloudJob shape, and bloom output is
+        // additive, blurry and full-screen — which is what the ghost looks like.
+        //
+        // Scoped rather than skipped, deliberately. ApplyBloom's signature is
+        // (..., out Borrowed bloom): skipping BloomJob.DoWork would leave that out-param
+        // unset, the same NRE that makes stage 4 unskippable. With this flag false the
+        // engine takes its OWN disabled path, which borrows a 1x1 black bloom — designed,
+        // and safe.
+        //
+        // Rule 11 says settings scopes leak. Checked first: PostProcessSettings.Bloom is a
+        // plain field read inside ApplyBloom and feeds no shader define (the only BLOOM
+        // strings in the assembly are shader FILE PATHS), so it cannot trigger the async
+        // PSO rebuild that made the RaytracingSettings scopes dangerous.
+        //
+        // Cost to the feed while on: no bloom in the feed.
+        if (FeedConfig.WholeSceneNoBloom)
+            ScopeSetValues("PostProcessSettings",
+                "feed bloom OFF (shared BloomJob retains its cascade borrows across renders)",
+                ("Bloom", false));
     }
 
 

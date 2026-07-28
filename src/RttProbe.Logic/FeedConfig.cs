@@ -188,6 +188,10 @@ internal static class FeedConfig
     // mode because bundling them CTD'd in the post chain: ScalingMode selects between
     // UpscaleTargetFSR and ApplyNonFSRUpscalingAndAA, which borrow differently-sized
     // targets against our fixed-geometry ScreenBuffers. The riskier half.
+    // Scope PostProcessSettings.Bloom off for our render only. BloomJob retains its
+    // cascade borrows on the SHARED SceneDrawSystem._bloomJob; see ScopeSharedState.
+    public static bool WholeSceneNoBloom { get; private set; }
+
     public static bool WholeSceneNativeScaling { get; private set; }
 
     // Feed exposure bias, in EV STOPS. Signed: +1 doubles brightness, -1 halves it.
@@ -464,6 +468,7 @@ internal static class FeedConfig
             WholeSceneAAMode        = Int(kv, "wholeSceneAAMode", WholeSceneAAMode);
             WholeSceneExposure      = Dbl(kv, "wholeSceneExposure", WholeSceneExposure);
             WholeSceneNativeScaling = Bool(kv, "wholeSceneNativeScaling", WholeSceneNativeScaling);
+            WholeSceneNoBloom       = Bool(kv, "wholeSceneNoBloom", WholeSceneNoBloom);
             WholeSceneOwnDrawContexts   = Bool(kv, "wholeSceneOwnDrawContexts", WholeSceneOwnDrawContexts);
             WholeSceneOwnShadows        = Int(kv, "wholeSceneOwnShadows", WholeSceneOwnShadows);
             WholeSceneCascadeResolution = Int(kv, "wholeSceneCascadeResolution", WholeSceneCascadeResolution);
@@ -507,7 +512,7 @@ internal static class FeedConfig
         string.Join("|", WholeSceneBuildBuffers, WholeSceneWidth, WholeSceneHeight,
                          WholeSceneCamera, WholeSceneIntervalMs, WholeSceneToPanel,
                          WholeSceneCameraRebuild, WholeSceneAAMode, WholeSceneExposure,
-                         WholeSceneNativeScaling, WholeSceneDisableRaytracing,
+                         WholeSceneNativeScaling, WholeSceneNoBloom, WholeSceneDisableRaytracing,
                          WholeSceneDisableEyeAdaptation, WholeSceneDisableProbeUpdates,
                          WholeSceneOwnDrawContexts, WholeSceneOwnShadows,
                          WholeSceneCascadeResolution, WholeSceneCascadeCount,
