@@ -350,6 +350,9 @@ internal static class WholeSceneRender
         22 => "CloudShadowJob.DoWork — stop writing the SHARED CloudShadowmap from our camera",
         23 => "CloudWeatherMapJob.DoWork — stop writing the SHARED weather map tables",
         24 => "AtmosphereLUTJob.DoWork — stop writing the SHARED per-planet atmosphere LUTs",
+        26 => "CloudJob.DoWork — stop disposing/recreating the SHARED CloudAccumulateLightAlpha " +
+              "temporal resource at our half-resolution (confirmed device removal; costs the feed " +
+              "volumetric clouds only, not planet atmospheres)",
         _ => "unknown",
     };
 

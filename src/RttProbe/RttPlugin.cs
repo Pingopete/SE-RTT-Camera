@@ -344,6 +344,49 @@ public sealed class RttPlugin : IPlugin
         ("Keen.VRage.Render12.LightingStage.CloudShadowJob, VRage.Render12",     "DoWork"),   // 22
         ("Keen.VRage.Render12.LightingStage.CloudWeatherMapJob, VRage.Render12", "DoWork"),   // 23
         ("Keen.VRage.Render12.LightingStage.AtmosphereLUTJob, VRage.Render12",   "DoWork"),   // 24
+
+        (null, null),                                        // 25 RESERVED — the exposure
+                                                             //    read-only override
+
+        // 26 — THE RESOLUTION-KEYED REALLOCATION. Confirmed cause of a device removal:
+        // DRED breadcrumb [15] ForwardAndPostPasses 20/255, EventStack
+        // [CloudShading, ForwardPasses, ForwardAndPostPasses], PageFaultVA 0x1B54406000
+        // (a REAL address — a use-after-free, not a null bind), and 360 allocation nodes
+        // in the dump of which every single one was CloudAccumulateLightAlpha.
+        //
+        // CloudJob.DoWork calls ValidateHalfResTemporalResource, which is:
+        //
+        //     var halfMax = CoreSystems.ScreenBuffers.MaxPreUpscaleResolution / 2;
+        //     if (resource.PeekNext().MaxResolution != halfMax) {
+        //         resource.Dispose();                                   // FREE
+        //         resource = new TemporalResource<>(() =>
+        //             BindableTextures.CreateRWResizableRenderTargetTexture(name, fmt, halfMax));
+        //     }
+        //
+        // It keys off CoreSystems.ScreenBuffers — the global our render SWAPS. Ours is
+        // 512x512 so halfMax is 256x256; the player's 3840x2160 gives 1920x1080. So every
+        // one of our renders disposes the player's cloud history and rebuilds it at 256,
+        // and the player's very next frame does it straight back. Twenty allocations and
+        // frees of a multi-hundred-MB resource per second, which is also the +/-151MB
+        // VRAM oscillation visible in every PERF line and a large share of the frame spike.
+        //
+        // This is the ONE resolution-keyed resource owner our DrawContextManager swap does
+        // not already cover. VolumeRenderingContext, RTGIContext, StochasticTransparency-
+        // Context and WaterContext all hang off DrawContextManager — which is ours — so
+        // they resize against our resolution harmlessly. CloudJob hangs off
+        // SceneDrawSystem._cloudPass, and SceneDrawSystem is a singleton we do not swap.
+        //
+        // Every other shared job that reads MaxPreUpscaleResolution (HBAOJob, HighlightJob,
+        // TerrainBlendingJob, AtmosphereAdditiveJob) only calls Resize() on a borrowed pool
+        // texture — the designed per-frame path, cheap and safe. CloudJob is alone in doing
+        // a genuine Dispose + Create keyed on MaxResolution. (It also retro-explains the
+        // undiagnosed stage-9 HBAO device removal: same family, same global.)
+        //
+        // Cost to the feed: no volumetric clouds of its own. User-confirmed as free —
+        // "i dont need actual clouds rendering in the feed, just the planet atmospheres",
+        // and the atmospheres come from AtmosphereAdditive/MultiplyJob plus the planet-env
+        // rebuild, none of which is touched here.
+        ("Keen.VRage.Render12.PostProcessStage.CloudJob, VRage.Render12", "DoWork"),         // 26
     };
 
     // Stage 20 is NOT a skip — it is a return-value override, so it lives outside the
@@ -520,6 +563,7 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage22() => Skip(22);
     private static bool SkipStage23() => Skip(23);
     private static bool SkipStage24() => Skip(24);
+    private static bool SkipStage26() => Skip(26);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the
