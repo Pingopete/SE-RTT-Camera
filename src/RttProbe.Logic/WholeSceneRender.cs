@@ -244,6 +244,12 @@ internal static class WholeSceneRender
         _settingsObj = null;
         _lastRenderMs = 0;
         _renderCount = 0;
+
+        // Arm the settle window. Reset is exactly the event that forces the shared probe
+        // manager to reprocess, so this is where the countdown belongs — it then covers a
+        // config save, a hot reload and a gate restart alike, not just the one case that
+        // happened to crash.
+        _settleFrames = SettleFrames;
     }
 
     // Clear the one-strike disable after a config change, WITHOUT throwing away the
@@ -402,6 +408,39 @@ internal static class WholeSceneRender
             // roughly halve the game's frame rate before we have learned anything from it.
             // The gate also means a fault costs one attempt per interval rather than one
             // per frame while we work out what happened.
+
+            // SETTLE AFTER A REBUILD, and this one cost a device removal to find.
+            //
+            // Reset() disposes and re-creates our ScreenBuffers and DrawContextManager, and
+            // creating a DrawContextManager trips the engine's context-reset path — which
+            // sets EnvironmentProbeManager._forceReprocess (OnResetContext is one of its two
+            // writers). The engine's next frame therefore force-reprocesses EVERY probe: the
+            // DRED dump from the crash showed a long queue of EnvProbe_Blending passes still
+            // outstanding, and the fault was a null bind (PageFaultVA 0x0, zero existing and
+            // zero freed allocations) inside that batch, while the probe cube textures were
+            // being recreated.
+            //
+            // Rendering a second whole scene inside that window is what faulted. The trigger
+            // was raising wholeSceneIntervalMs to 33 on a LIVE feed: at 100 ms there were
+            // ~3 engine frames of slack and we never landed in the window, at 33 ms we landed
+            // in it on the very first render — 2.1 s after the config save, at
+            // secondRenders=1. Proven not to be a rate problem by booting straight into 33 ms
+            // with no mid-session Reset: stable indefinitely at ~27 renders/sec.
+            //
+            // So: after any (re)build, let the engine have a few frames to itself. Frames,
+            // not milliseconds — the thing being waited for is engine frames completing, and
+            // during a mass probe reprocess those frames are long.
+            if (_settleFrames > 0)
+            {
+                _settleFrames--;
+                if (_settleFrames == 0)
+                    RttLog.Line($"Whole-scene: settled after the rebuild ({SettleFrames} frames); " +
+                                "second renders resume. This window exists because a rebuild forces the " +
+                                "shared EnvironmentProbeManager to reprocess every probe, and rendering " +
+                                "into that batch is a device removal.");
+                Perf.NoteFrame(false);
+                return;
+            }
 
             bool oursRan = false;
             if (FeedConfig.WholeSceneEnabled && _ourScreenBuffers != null
@@ -1456,6 +1495,12 @@ internal static class WholeSceneRender
     private static FieldInfo _sbField, _rvField;
     private static object _settingsObj;
     private static long _lastRenderMs;
+
+    // Engine frames to yield after a (re)build before the first second render. 30 is ~0.5 s
+    // at 60 fps and comfortably longer than the probe reprocess measured in the crash dump,
+    // while being invisible at a config save.
+    private const int SettleFrames = 30;
+    private static int _settleFrames;
     private static int _renderCount;
 
     // Construct the second DrawContextManager. One attempt per load, hot-reloadable,
