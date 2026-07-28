@@ -166,6 +166,20 @@ internal static class Perf
     private static long ReadVram(string which)
     {
         if (_vramState == -1) return 0;
+
+        // NEVER touch the engine before a frame has rendered.
+        //
+        // Reading a static field on CoreSystems forces its static constructor, and that
+        // cctor reads DeterministicRuntimeConfiguration — which does not exist until
+        // Render12EngineComponent.Init has loaded the configuration set. Forcing it
+        // earlier throws inside the cctor, .NET marks the type permanently failed, and
+        // the game dies on load with a stack trace that names the engine rather than us.
+        //
+        // _lastFrameTicks is only ever set from the whole-scene hook, which cannot fire
+        // until the renderer is fully up, so it is an honest "engine is ready" signal
+        // rather than a timer.
+        if (_lastFrameTicks == 0) return 0;
+
         try
         {
             if (_vramState == 0)

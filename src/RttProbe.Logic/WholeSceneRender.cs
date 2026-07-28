@@ -151,7 +151,22 @@ internal static class WholeSceneRender
         // throws once per reload silently costs a cascade set each time, and the only
         // symptom is the frame rate falling apart twenty minutes later when the residency
         // set goes over budget. Ask the question at the moment it can be answered.
-        long vramBefore = Perf.SampleVramMb();
+        // ONLY when there is something to release.
+        //
+        // Reading VRAM touches a static field on CoreSystems, and touching a static field
+        // FORCES that type's static constructor. Reset() is called from
+        // LogicEntry.Install(), which runs on plugin load — five seconds before
+        // Render12EngineComponent.Init loads the engine's configurations. CoreSystems's
+        // cctor reads DeterministicRuntimeConfiguration, so forcing it that early threw
+        // ConfigurationNotFoundException, .NET marked the type permanently failed, and
+        // every later touch got TypeInitializationException. Crash on game load, and the
+        // stack trace named the engine rather than us.
+        //
+        // Nothing has been built at Install() time, so gating on that is both the fix and
+        // the honest condition: a teardown with nothing to tear down should not be
+        // reaching into the engine at all.
+        bool haveResources = _ourScreenBuffers != null || _ourDrawContexts != null;
+        long vramBefore = haveResources ? Perf.SampleVramMb() : 0;
 
         if (_ourScreenBuffers is IDisposable d)
         {
@@ -182,7 +197,7 @@ internal static class WholeSceneRender
                              "everything it owns leaks on every reload.");
         }
 
-        long vramAfter = Perf.SampleVramMb();
+        long vramAfter = haveResources ? Perf.SampleVramMb() : 0;
         if (vramBefore > 0 && vramAfter > 0)
             RttLog.Line($"Whole-scene Reset: VRAM {vramBefore} MB -> {vramAfter} MB " +
                         $"({vramAfter - vramBefore:+#;-#;0} MB). Freeing should show a NEGATIVE delta; " +
