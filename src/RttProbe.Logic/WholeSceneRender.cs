@@ -222,11 +222,13 @@ internal static class WholeSceneRender
         _ownShadowsLogged = _cascadeSettingsLogged = false;
         _planetEnvGroup = null;
         _fPeFrustum = _fPeSetupsData = _fPeSetupsCbs = _fPeFirst = _fPeFirstData = null;
+        _fPeSpheres = _fPeSpheresData = null;
         _miPeFillSetups = _miPeFillSlim = _miPeSetMatrix = _miPeCreateCb = null;
         _pPeModifiersCtx = null;
         _peBufMgr = null;
+        _peSaved = null;
         _planetEnvState = 0;
-        _planetEnvLogged = _planetEnvCountsLogged = false;
+        _planetEnvLogged = _planetEnvCountsLogged = _peEmptyLogged = false;
         // Rearm() cleared these and Reset() did not, which is backwards: Reset is the
         // heavier path, taken precisely when the configuration changed.
         _scopeWarned.Clear();
@@ -1163,13 +1165,55 @@ internal static class WholeSceneRender
     // and never touch SortEntities or the table fills. Skipping the sort also PRESERVES
     // the player's planet order, which is what keeps setups[i] pointing at the right
     // AtmosphereLUTTables[i].
+    // v4, after v3 page-faulted at VA 0x0. Two defects found offline, no game harmed:
+    //
+    //   * THE EMPTY CASE. When the orbit camera's frustum culls ALL planets (it points
+    //     at the ship for most of the orbit), v3 wrote null into _planetEnvSetupFirst —
+    //     and a consumer reading a Nullable via GetValueOrDefault binds a DEFAULT
+    //     TransientConstantBuffer, i.e. GPU address zero. PageFaultVA 0x0, surfacing
+    //     frames later because the GPU executes behind the recorder. v4 never writes the
+    //     swap at all when our frustum yields no planets — no planets in view means the
+    //     misalignment is invisible anyway.
+    //
+    //   * OVERLOAD AMBIGUITY. CreateTransientConstantBuffer has TWO 2-param generic
+    //     overloads — (String, in TData) and (String, ReadOnlySpan<TData>) — and v3
+    //     picked whichever enumerated first. v4 selects the byref (in TData) one
+    //     explicitly.
+    //
+    //   * RESTORE IS NOW VERBATIM. v3 re-ran the fill under the player's view, which
+    //     mutated the weather-modifier fade state a second time and built a second batch
+    //     of CBs. v4 snapshots the six outputs (two lists, four fields) before touching
+    //     anything and puts the SAME values back — same frame, so the saved transient
+    //     CBs are still valid, and late readers see bit-identical state.
     private static object _planetEnvGroup;
     private static FieldInfo _fPeFrustum, _fPeSetupsData, _fPeSetupsCbs, _fPeFirst, _fPeFirstData;
+    private static FieldInfo _fPeSpheres, _fPeSpheresData;
     private static MethodInfo _miPeFillSetups, _miPeFillSlim, _miPeSetMatrix, _miPeCreateCb;
     private static System.Reflection.PropertyInfo _pPeModifiersCtx;
     private static object _peBufMgr;
     private static int _planetEnvState;      // 0 untried, 1 ok, -1 unavailable
-    private static bool _planetEnvLogged;
+    private static bool _planetEnvLogged, _peEmptyLogged;
+
+    // Snapshot of the player's planet-env outputs, restored verbatim in the finally.
+    private sealed class PeSaved
+    {
+        public object[] Cbs, Data;
+        public object First, FirstData, Spheres, SpheresData;
+    }
+    private static PeSaved _peSaved;
+
+    private static object[] SnapshotList(System.Collections.IList l)
+    {
+        var a = new object[l.Count];
+        l.CopyTo(a, 0);
+        return a;
+    }
+
+    private static void RefillList(System.Collections.IList l, object[] items)
+    {
+        l.Clear();
+        foreach (var it in items) l.Add(it);
+    }
 
     // AtmosphereAdditiveJob's loop indexes AtmosphereLUTTables[i] with the SETUPS index
     // (read from its IL), so the tables must never be shorter than the setups list. The
@@ -1228,6 +1272,8 @@ internal static class WholeSceneRender
                 _fPeSetupsCbs = gt.GetField("_allPlanetEnvironmentSetups", Any);
                 _fPeFirst = gt.GetField("_planetEnvSetupFirst", Any);
                 _fPeFirstData = gt.GetField("_planetEnvSetupFirstData", Any);
+                _fPeSpheres = gt.GetField("_allPlanetSpheres", Any);
+                _fPeSpheresData = gt.GetField("_allPlanetSpheresData", Any);
                 _miPeFillSetups = gt.GetMethod("FillPlanetEnvironmentSetups", Any);
                 _miPeFillSlim = gt.GetMethod("FillPlanetEnvironmentSlimSetup", Any);
                 _pPeModifiersCtx = gt.GetProperty("MainViewModifiersContext", Any);
@@ -1236,14 +1282,19 @@ internal static class WholeSceneRender
                 _peBufMgr = _coreType?.GetField("BindableBuffers", BindingFlags.Public | BindingFlags.Static)
                     ?.GetValue(null);
                 var setupType = _fPeSetupsData?.FieldType.GetGenericArguments().FirstOrDefault();
+                // TWO 2-param generic overloads exist: (String, in TData) and
+                // (String, ReadOnlySpan<TData>). The in-parameter one is byref; select it
+                // explicitly rather than by enumeration order.
                 var miCreate = _peBufMgr?.GetType().GetMethods(Any)
                     .FirstOrDefault(m => m.Name == "CreateTransientConstantBuffer" && m.IsGenericMethod
-                                      && m.GetParameters().Length == 2);
+                                      && m.GetParameters().Length == 2
+                                      && m.GetParameters()[1].ParameterType.IsByRef);
                 if (setupType != null && miCreate != null)
                     _miPeCreateCb = miCreate.MakeGenericMethod(setupType);
 
                 if (_fPeFrustum == null || _fPeSetupsData == null || _fPeSetupsCbs == null
                     || _fPeFirst == null || _fPeFirstData == null || _miPeFillSetups == null
+                    || _fPeSpheres == null || _fPeSpheresData == null
                     || _miPeFillSlim == null || _pPeModifiersCtx == null || _miPeSetMatrix == null
                     || _miPeCreateCb == null)
                 {
@@ -1270,9 +1321,9 @@ internal static class WholeSceneRender
         catch (Exception e) { _planetEnvState = -1; RttLog.Error("whole-scene planet env rebuild", e); return false; }
     }
 
-    // The shared core: rebuild the setup data + CBs + spheres from WHICHEVER view is
-    // installed in SettingsManager. Everything here is per-frame state the engine
-    // rebuilds itself next OnBeginDraw; the only allocations are transient CBs.
+    // Rebuild the setup data + CBs + spheres from the INSTALLED (our) view, after
+    // snapshotting the player's outputs for a verbatim restore. Returns false — with the
+    // player's state fully intact — when our frustum sees no planets.
     private static bool RebuildFromInstalledView(string label)
     {
         var settings = _coreType?.GetField("Settings", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
@@ -1284,41 +1335,61 @@ internal static class WholeSceneRender
         var viewProjD = proj?.GetType().GetProperty("ViewProjectionD", Any)?.GetValue(proj);
         if (viewD == null || viewProjD == null) return false;
 
+        var data = (System.Collections.IList)_fPeSetupsData.GetValue(_planetEnvGroup);
+        var cbs = (System.Collections.IList)_fPeSetupsCbs.GetValue(_planetEnvGroup);
+
+        // Snapshot BEFORE any mutation. The restore puts these exact values back — same
+        // frame, so the transient CBs inside are still live.
+        _peSaved = new PeSaved
+        {
+            Cbs = SnapshotList(cbs),
+            Data = SnapshotList(data),
+            First = _fPeFirst.GetValue(_planetEnvGroup),
+            FirstData = _fPeFirstData.GetValue(_planetEnvGroup),
+            Spheres = _fPeSpheres.GetValue(_planetEnvGroup),
+            SpheresData = _fPeSpheresData.GetValue(_planetEnvGroup),
+        };
+
         // The frustum is group-internal scratch, re-set by the engine every OnBeginDraw.
-        // CullingFrustumD may be a struct: mutate a box and write it back.
         var frustum = _fPeFrustum.GetValue(_planetEnvGroup);
         _miPeSetMatrix.Invoke(frustum, new[] { viewProjD });
         if (_fPeFrustum.FieldType.IsValueType) _fPeFrustum.SetValue(_planetEnvGroup, frustum);
 
-        // Static, (ref List setups, in MatrixD, in CullingFrustumD, ctx). It clears and
+        // Static: (ref List setups, in MatrixD, in CullingFrustumD, ctx). Clears and
         // refills the data list itself; write the ref slot back in case it reallocated.
         var fillArgs = new[]
         {
-            _fPeSetupsData.GetValue(_planetEnvGroup), viewD, frustum,
+            data, viewD, frustum,
             _pPeModifiersCtx.GetValue(_planetEnvGroup),
         };
         _miPeFillSetups.Invoke(null, fillArgs);
         _fPeSetupsData.SetValue(_planetEnvGroup, fillArgs[0]);
+        data = (System.Collections.IList)fillArgs[0];
 
-        // The CB list is append-only from the engine's side (cleared upstream once per
-        // frame) — cleared here so both directions are exactly one frame's worth.
-        var data = (System.Collections.IList)fillArgs[0];
-        var cbs = (System.Collections.IList)_fPeSetupsCbs.GetValue(_planetEnvGroup);
+        // THE EMPTY CASE — the page fault in v3. No planets in our frustum means no
+        // planet is visible in the feed, so the swap buys nothing: put the player's data
+        // back and leave every field untouched. NEVER write a null First — a consumer
+        // reading it via GetValueOrDefault binds a constant buffer at GPU address zero.
+        if (data.Count == 0)
+        {
+            RefillList(data, _peSaved.Data);
+            _peSaved = null;
+            if (!_peEmptyLogged)
+            {
+                _peEmptyLogged = true;
+                RttLog.Line("Planet env: orbit frustum sees no planets this render — swap skipped, " +
+                            "player state untouched. (Normal for the part of the orbit facing away.)");
+            }
+            return false;
+        }
+
         cbs.Clear();
         foreach (var item in data)
             cbs.Add(_miPeCreateCb.Invoke(_peBufMgr, new[] { "Planet Environment Setups", item }));
 
-        if (data.Count > 0)
-        {
-            _fPeFirstData.SetValue(_planetEnvGroup, data[0]);
-            _fPeFirst.SetValue(_planetEnvGroup,
-                _miPeCreateCb.Invoke(_peBufMgr, new[] { "planetEnvironmentSetup0", data[0] }));
-        }
-        else
-        {
-            _fPeFirstData.SetValue(_planetEnvGroup, null);
-            _fPeFirst.SetValue(_planetEnvGroup, null);
-        }
+        _fPeFirstData.SetValue(_planetEnvGroup, data[0]);
+        _fPeFirst.SetValue(_planetEnvGroup,
+            _miPeCreateCb.Invoke(_peBufMgr, new[] { "planetEnvironmentSetup0", data[0] }));
 
         // Writes _allPlanetSpheresData AND the _allPlanetSpheres CB itself.
         _miPeFillSlim.Invoke(_planetEnvGroup, new[] { viewD });
@@ -1327,14 +1398,23 @@ internal static class WholeSceneRender
         return true;
     }
 
-    // The symmetric half, for the finally — MUST run after RestoreCamera has put the
-    // player's view back, because it reads whatever view is installed.
+    // Verbatim put-back of the snapshot — no second fill, no second weather-culling
+    // mutation, no new CBs. Runs in the finally regardless of camera-restore order
+    // because it touches only the group's own outputs.
     private static void RestorePlanetEnv()
     {
         try
         {
-            if (_planetEnvState != 1) return;
-            RebuildFromInstalledView("player view restore");
+            if (_planetEnvState != 1 || _peSaved == null) return;
+            var s = _peSaved;
+            _peSaved = null;
+
+            RefillList((System.Collections.IList)_fPeSetupsCbs.GetValue(_planetEnvGroup), s.Cbs);
+            RefillList((System.Collections.IList)_fPeSetupsData.GetValue(_planetEnvGroup), s.Data);
+            _fPeFirst.SetValue(_planetEnvGroup, s.First);
+            _fPeFirstData.SetValue(_planetEnvGroup, s.FirstData);
+            _fPeSpheres.SetValue(_planetEnvGroup, s.Spheres);
+            _fPeSpheresData.SetValue(_planetEnvGroup, s.SpheresData);
         }
         catch (Exception e) { RttLog.Error("whole-scene planet env restore", e); }
     }
