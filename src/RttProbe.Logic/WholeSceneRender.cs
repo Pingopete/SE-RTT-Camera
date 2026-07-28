@@ -712,25 +712,47 @@ internal static class WholeSceneRender
         // AAMode: None=0, FXAA=1 (spatial-only, needs no motion vectors — the right AA
         // for this feed), FSR=2 (engine default). ScalingMode NativeAA=4 removes the
         // upscale entirely; sharpening off because it amplifies 512px artefacts.
-        // DRS IS NOT SAFELY SWITCHABLE PER-RENDER. Three CTDs now, all in
-        // ForwardAndPostPasses (178/255, 20/255, and the bundled one), all touching
-        // DRSSettings — first with AAMode+ScalingMode together, then with AAMode ALONE
-        // after they were split. That is enough repetition to call it.
+        // AA MODE — and the reason our render must NOT go through FSR.
         //
-        // The mechanism is the producer/consumer law again, one level up. AAMode and
-        // ScalingMode select between UpscaleTargetFSR and ApplyNonFSRUpscalingAndAA, and
-        // those are not interchangeable branches — UpscaleTargetFSR PRODUCES
-        // tempLDRBuffer / tempHDRBuffer / toneMappingInput / toneMappingOutput as
-        // out-params that the bloom and tonemap stages then consume. The engine picks a
-        // branch during ITS frame setup; switching branch for a nested render leaves the
-        // consumers reading buffers the other branch never populated.
+        // CORRECTION. This comment used to say DRS was not switchable per-render because
+        // AAMode "selects between UpscaleTargetFSR and ApplyNonFSRUpscalingAndAA" at the
+        // caller, making them non-interchangeable producer/consumer branches. That model
+        // was WRONG. ExecutePostPasses calls BOTH, unconditionally, in sequence:
         //
-        // So the ghosting fix has to come from CORRECT MOTION VECTORS (done — our view
-        // now carries our own previous orbit position instead of the player's), not from
-        // changing AA mode. Left switchable, defaulting off, because the knob is
-        // harmless when unused and the finding is worth keeping demonstrable.
+        //     PatchHoles -> ComputeExposure -> UpscaleTargetFSR -> ApplyBloom
+        //         -> ApplyToneMapping -> ApplyNonFSRUpscalingAndAA -> DrawUI
+        //
+        // Each self-gates internally. And UpscaleTargetFSR's own head is:
+        //
+        //     bool work = finalLDRBuffer.Resolution != ScreenBuffers.PreUpscaleResolution
+        //                 || Settings.IsFSREnabledAndAllowed;
+        //     tempLDRBuffer = default; tempHDRBuffer = default;
+        //     if (!work) { toneMappingOutput = finalLDRBuffer; toneMappingInput = lBuffer; return; }
+        //
+        // — an early-out that DOES set both out-params bloom and tonemap consume. Our
+        // final target and our ScreenBuffers are both 512x512, so the resolution term is
+        // false for us and this early-out is reachable the moment FSR is off.
+        //
+        // WHY IT MATTERS. IsFSREnabledAndAllowed is just `DRS.AAMode == 2 && debugViewOk`,
+        // read off the PLAYER's settings, so today our nested render takes the FSR path:
+        // it borrows a TempHDRBuffer at SwapChain.Resolution (the player's 4K, not ours)
+        // and dispatches the SHARED FSR3 upscaler. That upscaler is one instance —
+        // SceneDrawSystem._upsamplingJob holds a single FSR3_1, whose context, history,
+        // FSR3ReactiveMask and FSR3TransparencyCompositionMask are global. Two cameras,
+        // one temporal accumulator. The transparency-composition mask is exactly the
+        // mechanism by which opaque geometry gets composited as partly see-through, which
+        // is the reported "ship is semi-transparent and the skybox shows through it".
+        //
+        // AAMode: 0 none, 1 FXAA (spatial-only), 2 FSR (engine default). Anything but 2
+        // takes us off the shared upscaler entirely.
+        //
+        // Three earlier CTDs sat behind this knob and are NOT explained away by the
+        // above — but two were bundled with other changes, and the third was tested
+        // against this wrong model. Worth one clean attempt now that the structure is
+        // understood; if it faults again, the next suspect is ScreenBuffers.Update, which
+        // also reads IsFSREnabledAndAllowed and has never run on OUR instance.
         if (FeedConfig.WholeSceneAAMode >= 0)
-            ScopeSetValues("DRSSettings", "feed AA mode (UNSAFE — see comment)",
+            ScopeSetValues("DRSSettings", $"feed AA mode {FeedConfig.WholeSceneAAMode} (off the shared FSR upscaler)",
                 ("AAMode", FeedConfig.WholeSceneAAMode));
 
         if (FeedConfig.WholeSceneNativeScaling)
