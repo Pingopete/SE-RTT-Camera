@@ -407,6 +407,14 @@ internal static class FeedConfig
     // visible rebuild.
     public static string[] WholeSceneRtFlags { get; private set; } = Array.Empty<string>();
 
+    // Rebuild the planet environment (PlanetSpheres / PlanetEnvSetupFirst /
+    // AllPlanetEnvSetups) from OUR camera before our Draw, and again from the player's
+    // after. These per-frame CBs are built from the player's view in
+    // PlanetEnvironmentGroup.OnBeginDraw and inherited by a nested render — which is why
+    // the feed's planet atmosphere detached from the planet and moved with the player's
+    // aim. Twenty-six jobs read them, atmosphere and volumetrics included.
+    public static bool WholeScenePlanetEnv { get; private set; }
+
     // Give our render its own EyeAdaptationJob.
     //
     // ComputeExposure (stage 4) cannot be skipped — its out-params feed bloom and tonemap
@@ -933,6 +941,7 @@ internal static class FeedConfig
             int panelIdle = PanelIdleMs;
             int wsCascRes = WholeSceneCascadeResolution, wsCascCnt = WholeSceneCascadeCount;
             bool wsOwnExp = WholeSceneOwnExposure;
+            bool wsPlanetEnv = WholeScenePlanetEnv;
             string[] wsRtFlags = WholeSceneRtFlags;
             int[] wsSkip = WholeSceneSkipStages;
             int wsInterval = WholeSceneIntervalMs;
@@ -1103,6 +1112,9 @@ internal static class FeedConfig
                         break;
                     case "wholesceneownexposure":
                         wsOwnExp = val is "1" or "true" or "yes";
+                        break;
+                    case "wholesceneplanetenv":
+                        wsPlanetEnv = val is "1" or "true" or "yes";
                         break;
                     case "panelidlems":
                         if (int.TryParse(val, out var pim)) panelIdle = Math.Clamp(pim, 250, 30000);
@@ -1284,7 +1296,7 @@ internal static class FeedConfig
                         || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || clearGb != ClearGBufferBeforePass
                         || wsBuild != WholeSceneBuildBuffers || wsRender != WholeSceneEnabled
                         || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRtMode != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts || wsOwnShadow != WholeSceneOwnShadows || wsCascRes != WholeSceneCascadeResolution || wsCascCnt != WholeSceneCascadeCount || wsOwnExp != WholeSceneOwnExposure || !wsRtFlags.SequenceEqual(WholeSceneRtFlags) || wsStrip != WholeSceneStripProbe
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRtMode != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts || wsOwnShadow != WholeSceneOwnShadows || wsCascRes != WholeSceneCascadeResolution || wsCascCnt != WholeSceneCascadeCount || wsOwnExp != WholeSceneOwnExposure || wsPlanetEnv != WholeScenePlanetEnv || !wsRtFlags.SequenceEqual(WholeSceneRtFlags) || wsStrip != WholeSceneStripProbe
                         || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
@@ -1307,7 +1319,7 @@ internal static class FeedConfig
             // it rather than leave it allocated.
             bool wsChanged = wsBuild != WholeSceneBuildBuffers
                              || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRtMode != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts || wsOwnShadow != WholeSceneOwnShadows || wsCascRes != WholeSceneCascadeResolution || wsCascCnt != WholeSceneCascadeCount || wsOwnExp != WholeSceneOwnExposure || !wsRtFlags.SequenceEqual(WholeSceneRtFlags);
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRtMode != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts || wsOwnShadow != WholeSceneOwnShadows || wsCascRes != WholeSceneCascadeResolution || wsCascCnt != WholeSceneCascadeCount || wsOwnExp != WholeSceneOwnExposure || wsPlanetEnv != WholeScenePlanetEnv || !wsRtFlags.SequenceEqual(WholeSceneRtFlags);
 
             WholeSceneEnabled = wsRender;
             WholeSceneBuildBuffers = wsBuild;
@@ -1334,6 +1346,7 @@ internal static class FeedConfig
             WholeSceneCascadeResolution = wsCascRes;
             WholeSceneCascadeCount = wsCascCnt;
             WholeSceneOwnExposure = wsOwnExp;
+            WholeScenePlanetEnv = wsPlanetEnv;
             WholeSceneRtFlags = wsRtFlags;
 
             // A resolution or buffer-mode change needs a full rebuild; anything else
