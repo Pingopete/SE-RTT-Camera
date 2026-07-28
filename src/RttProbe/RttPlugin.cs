@@ -201,6 +201,7 @@ public sealed class RttPlugin : IPlugin
 
         PatchSkippableStages(harmony, sds);
         PatchFsrGate(harmony);
+        PatchExposureGate(harmony);
     }
 
     // __0 is the ResizableRWRenderTargetTexture the engine just rendered the player's
@@ -389,6 +390,68 @@ public sealed class RttPlugin : IPlugin
     {
         try { if (RttBridge.SkipStageHook?.Invoke(FsrDisableId) == true) __result = false; }
         catch { }
+    }
+
+    // Id 25 — THE EXPOSURE BLEED FIX. A return-value override like 20, not a plain skip.
+    //
+    // Confirmed at a 2 s feed interval: the player's whole world darkens the instant our
+    // render fires, then slowly re-adapts, and the bleed imprint rides the dark phase.
+    // ComputeExposure runs in our nested Draw (stage 4 — not skippable, its out-params
+    // feed bloom and tonemap, and skipping it NRE'd when tried). With EyeAdaptation
+    // scoped off for our render it takes the ConstantExposure branch, and
+    // ConstantExposure.hlsl writes float2(ConstantLuminance = a FIXED 1.0, exposure)
+    // into the SHARED EyeAdaptationJob._autoExposures ping-pong — a constant stamped
+    // into the player's adaptation history ten times a second. It also Resets and
+    // re-primes the shared readback buffers while it is at it.
+    //
+    // The fix: for OUR render only, skip the method body entirely and hand back the
+    // job's EXISTING Exposure view. Read, never write. No new job (async PSO compile
+    // raced the recorder — device removed), no new render targets (outside the engine's
+    // AutoResourceState tracking — device removed). This creates nothing, so there is
+    // nothing to race and no lifecycle to get wrong.
+    //
+    // MUST return a valid view when skipping: ComputeExposure's callers consume the
+    // out-param, so a null here is the same NRE as skipping stage 4. Hence fail-open —
+    // if the getter yields nothing, the original runs and we keep today's bug over a
+    // crash.
+    //
+    // Known trade, accepted: the feed's brightness now follows the player's live
+    // adaptation rather than a constant, and the wholeSceneExposure EV knob is inert
+    // while this is on (it fed the branch we now skip).
+    private const int ExposureReadOnlyId = 25;
+    private static MethodInfo _miExposureGetter;
+
+    private static void PatchExposureGate(HarmonyLib.Harmony harmony)
+    {
+        const BindingFlags Any = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        try
+        {
+            var t = Type.GetType("Keen.VRage.Render12.PostProcessStage.EyeAdaptationJob, VRage.Render12");
+            var mi = t?.GetMethod("ConstantExposure", Any);
+            _miExposureGetter = t?.GetProperty("Exposure", Any)?.GetGetMethod(true);
+            if (mi == null || _miExposureGetter == null)
+            {
+                Log("EyeAdaptationJob.ConstantExposure/Exposure not found — exposure gate unavailable.");
+                return;
+            }
+
+            var pre = typeof(RttPlugin).GetMethod(nameof(ConstantExposurePrefix),
+                BindingFlags.Static | BindingFlags.NonPublic);
+            harmony.Patch(mi, prefix: new HarmonyLib.HarmonyMethod(pre));
+            Log($"Patched EyeAdaptationJob.ConstantExposure as read-only override id {ExposureReadOnlyId}.");
+        }
+        catch (Exception e) { Log($"Patching the exposure gate FAILED: {e.Message}"); }
+    }
+
+    private static bool ConstantExposurePrefix(object __instance, ref object __result)
+    {
+        try
+        {
+            if (RttBridge.SkipStageHook?.Invoke(ExposureReadOnlyId) != true) return true;
+            __result = _miExposureGetter?.Invoke(__instance, null);
+            return __result == null;    // no view -> fail open: run the original
+        }
+        catch { return true; }
     }
 
     private static void PatchSkippableStages(HarmonyLib.Harmony harmony, Type sds)
