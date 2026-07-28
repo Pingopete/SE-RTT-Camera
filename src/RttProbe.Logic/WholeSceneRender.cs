@@ -134,7 +134,22 @@ internal static class WholeSceneRender
         // this project.
         _panelSourceTex = null;
 
-        if (_ourScreenBuffers is IDisposable d) { try { d.Dispose(); } catch { } }
+        // EVERY FAILURE HERE IS LOGGED, and the VRAM is measured across the whole reset.
+        //
+        // These catches used to be bare `catch { }`. That is how a leak stays invisible:
+        // our DrawContextManager owns a full cascade set (hundreds of MB at the player's
+        // shadow settings) plus visibility, occlusion and geometry buffers ranged to the
+        // whole scene, and the logic assembly reloads on every build. A Dispose that
+        // throws once per reload silently costs a cascade set each time, and the only
+        // symptom is the frame rate falling apart twenty minutes later when the residency
+        // set goes over budget. Ask the question at the moment it can be answered.
+        long vramBefore = Perf.SampleVramMb();
+
+        if (_ourScreenBuffers is IDisposable d)
+        {
+            try { d.Dispose(); }
+            catch (Exception e) { RttLog.Error("whole-scene Reset: dispose our ScreenBuffers LEAKED", e); }
+        }
         _ourScreenBuffers = null;
         _sbBuilt = _sbLogged = false;
         if (_ourDrawContexts != null)
@@ -147,9 +162,23 @@ internal static class WholeSceneRender
                     _ourDrawContexts.GetType().GetProperty("DirectionalLightShadowResources", Any)
                         ?.SetValue(_ourDrawContexts, _ourFreshShadowResources);
             }
-            catch { }
-            if (_ourDrawContexts is IDisposable dc) { try { dc.Dispose(); } catch { } }
+            catch (Exception e) { RttLog.Error("whole-scene Reset: restore our shadow resources", e); }
+
+            if (_ourDrawContexts is IDisposable dc)
+            {
+                try { dc.Dispose(); }
+                catch (Exception e) { RttLog.Error("whole-scene Reset: dispose our DrawContextManager LEAKED " +
+                                                   "(cascade set + scene-sized culling buffers)", e); }
+            }
+            else RttLog.Line("Whole-scene Reset: our DrawContextManager is NOT IDisposable — " +
+                             "everything it owns leaks on every reload.");
         }
+
+        long vramAfter = Perf.SampleVramMb();
+        if (vramBefore > 0 && vramAfter > 0)
+            RttLog.Line($"Whole-scene Reset: VRAM {vramBefore} MB -> {vramAfter} MB " +
+                        $"({vramAfter - vramBefore:+#;-#;0} MB). Freeing should show a NEGATIVE delta; " +
+                        "a flat or positive one across repeated reloads is the leak.");
         _ourDrawContexts = null;
         _ourFreshShadowResources = null;
         _dcBuilt = false;
@@ -297,12 +326,19 @@ internal static class WholeSceneRender
             // roughly halve the game's frame rate before we have learned anything from it.
             // The gate also means a fault costs one attempt per interval rather than one
             // per frame while we work out what happened.
+            bool oursRan = false;
             if (FeedConfig.WholeSceneEnabled && _ourScreenBuffers != null
                 && Clock.Ms - _lastRenderMs >= Math.Max(33, FeedConfig.WholeSceneIntervalMs))
             {
                 _lastRenderMs = Clock.Ms;
+                oursRan = true;
                 RunSecondRender(sceneDrawSystem);
             }
+
+            // Split the frame-interval histogram by whether we rendered this frame. Same
+            // thread, same loop — so the difference between the two buckets IS our cost,
+            // and if both are equally bad the cost is somewhere else entirely.
+            Perf.NoteFrame(oursRan);
 
             long now = Clock.Ms;
             if (now - _lastLogMs >= 5000)
@@ -442,7 +478,10 @@ internal static class WholeSceneRender
                                 $"into our own {FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight} " +
                                 $"ScreenBuffers. Camera is {(camSwapped ? "OURS" : "the player's")}. ===");
 
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 _miDraw.Invoke(sceneDrawSystem, new[] { ourLdr });
+                Perf.NoteOurDraw((System.Diagnostics.Stopwatch.GetTimestamp() - t0)
+                                 * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
                 _renderCount++;
 
                 // The image now sits in our FinalLDRTexture. Delivery to the panel is
@@ -570,6 +609,34 @@ internal static class WholeSceneRender
         catch { return false; }
     }
 
+    // Set one field on a boxed settings struct, following a dotted path into nested
+    // structs. Same shape as ClearBool: a struct field read through reflection is a COPY,
+    // so every level has to be written back on the way out or the mutation is discarded.
+    private static bool SetPath(object box, string path, object value)
+    {
+        if (box == null) return false;
+        int dot = path.IndexOf('.');
+        if (dot < 0)
+        {
+            var f = box.GetType().GetField(path, Any);
+            if (f == null) return false;
+            object v = value;
+            if (f.FieldType.IsEnum && value is int iv) v = Enum.ToObject(f.FieldType, iv);
+            else if (f.FieldType == typeof(float)) v = System.Convert.ToSingle(value);
+            else if (f.FieldType == typeof(int)) v = System.Convert.ToInt32(value);
+            else if (!f.FieldType.IsInstanceOfType(value)) return false;
+            f.SetValue(box, v);
+            return true;
+        }
+
+        var outer = box.GetType().GetField(path.Substring(0, dot), Any);
+        if (outer == null) return false;
+        var inner = outer.GetValue(box);
+        if (inner == null || !SetPath(inner, path.Substring(dot + 1), value)) return false;
+        outer.SetValue(box, inner);
+        return true;
+    }
+
     // Same box-copy-restore as ScopeOff, but SETS values — enums, floats, bools — so a
     // settings group can be retuned for our render rather than only having flags
     // cleared. Chained boxes compose: a group already scoped this pass is re-boxed from
@@ -600,17 +667,7 @@ internal static class WholeSceneRender
             int applied = 0;
             foreach (var (name, value) in sets)
             {
-                var f = ours.GetType().GetField(name, Any);
-                if (f == null) continue;
-                try
-                {
-                    object v = value;
-                    if (f.FieldType.IsEnum && value is int iv) v = Enum.ToObject(f.FieldType, iv);
-                    else if (f.FieldType == typeof(float)) v = System.Convert.ToSingle(value);
-                    else if (!f.FieldType.IsInstanceOfType(value)) continue;
-                    f.SetValue(ours, v);
-                    applied++;
-                }
+                try { if (SetPath(ours, name, value)) applied++; }
                 catch { }
             }
             if (applied == 0)
@@ -817,6 +874,29 @@ internal static class WholeSceneRender
         {
             var dcType = _ourDrawContexts.GetType();
 
+            // CASCADE COST. Our cascade set is sized from the PLAYER'S graphics settings —
+            // CascadesCount cascades at CascadeShadowResolution squared, each a full depth
+            // texture, allocated the moment our CascadeShadowsContext was constructed. At
+            // 4096 x 8 that is half a gigabyte of VRAM and eight full geometry passes per
+            // second render, to shade a 512x512 panel.
+            //
+            // Scoped, not global: our context only ever flushes during our render, so it
+            // resizes itself to these values on the first flush and the engine's own set
+            // keeps the player's settings. The two contexts are independent — that is the
+            // whole point of owning them.
+            if (FeedConfig.WholeSceneCascadeResolution > 0 || FeedConfig.WholeSceneCascadeCount > 0)
+            {
+                var sets = new System.Collections.Generic.List<(string, object)>();
+                if (FeedConfig.WholeSceneCascadeResolution > 0)
+                    sets.Add(("DirectionalLight.CascadeShadowResolution", FeedConfig.WholeSceneCascadeResolution));
+                if (FeedConfig.WholeSceneCascadeCount > 0)
+                    sets.Add(("DirectionalLight.CascadesCount", FeedConfig.WholeSceneCascadeCount));
+                LogCascadeSettings();
+                ScopeSetValues("ShadowSettings",
+                    $"feed cascades {FeedConfig.WholeSceneCascadeResolution}px x {FeedConfig.WholeSceneCascadeCount}",
+                    sets.ToArray());
+            }
+
             // Mode 2: make every cascade re-render every time we do. The engine's policy
             // (CascadesUpdateCount per draw, priority-sorted) assumes a 60fps continuous
             // camera; ours moves in 100ms steps, so a round-robin can leave a far cascade
@@ -894,7 +974,39 @@ internal static class WholeSceneRender
     }
 
     private static FieldInfo _cascFld, _charCascFld;
-    private static bool _ownShadowsLogged;
+    private static bool _ownShadowsLogged, _cascadeSettingsLogged;
+
+    // Print what the player's shadow settings actually are, and what our set costs at
+    // them, so the size of the knob is a measured number rather than an assumption.
+    private static void LogCascadeSettings()
+    {
+        if (_cascadeSettingsLogged) return;
+        _cascadeSettingsLogged = true;
+        try
+        {
+            var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            var settings = core?.GetField("Settings", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var shadow = settings?.GetType().GetProperty("Shadow", Any)?.GetValue(settings);
+            var dl = shadow?.GetType().GetField("DirectionalLight", Any)?.GetValue(shadow);
+            if (dl == null) { RttLog.Line("Whole-scene: could not read ShadowSettings.DirectionalLight."); return; }
+
+            object res = dl.GetType().GetField("CascadeShadowResolution", Any)?.GetValue(dl);
+            object cnt = dl.GetType().GetField("CascadesCount", Any)?.GetValue(dl);
+            object upd = dl.GetType().GetField("CascadesUpdateCount", Any)?.GetValue(dl);
+            object always = dl.GetType().GetField("CascadesAlwaysUpdated", Any)?.GetValue(dl);
+
+            double mb = 0;
+            if (res != null && cnt != null)
+                mb = System.Convert.ToDouble(res) * System.Convert.ToDouble(res)
+                     * System.Convert.ToDouble(cnt) * 4.0 / 1048576.0;
+
+            RttLog.Line($"Whole-scene cascades: player's settings are {res}px x {cnt} cascades " +
+                        $"(update {upd}/draw, {always} always) = ~{mb:F0} MB of depth textures for OUR " +
+                        "set alone, plus that many geometry passes per second render — to shade a " +
+                        $"{FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight} panel.");
+        }
+        catch (Exception e) { RttLog.Error("log cascade settings", e); }
+    }
 
     // The camera half, stage 3b. Writes SettingsManager._renderView, which is the same
     // field CameraRender.InstallOurCamera uses — a proven mechanism, not a new one.
