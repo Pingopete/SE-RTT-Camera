@@ -306,6 +306,7 @@ internal static class WholeSceneRender
         16 => "DrawUI",
         17 => "RaytraceGIJob.DoWork (the ray trace itself; ambient still runs)",
         18 => "ComputeGI (ray trace AND ambient)",
+        19 => "UpsamplingJob.PrepareResources (stops us disposing the player's FSR history)",
         _ => "unknown",
     };
 

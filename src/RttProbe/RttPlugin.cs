@@ -259,6 +259,31 @@ public sealed class RttPlugin : IPlugin
         // 18 — the whole GI stage, ambient included. Blunter than 17; the feed's
         // shadowed areas go black. Kept as the fallback if 17 is not enough.
         (null, "ComputeGI"),                                 // 18
+
+        // 19 — DO NOT LET OUR RENDER DESTROY THE PLAYER'S FSR HISTORY.
+        //
+        // ScenePreparation calls UpsamplingJob.PrepareResources, which is:
+        //
+        //     switch (Settings.DRS.AAMode) {
+        //       case Bilinear: _bilinear.PrepareResources(); _fsr3_1.DisposeResources();
+        //       case FSR:      _fsr3_1.PrepareResources(maxRes, displayRes); ...
+        //     }
+        //
+        // We scope DRSSettings.AAMode to 0 for our render — which was the correct fix
+        // for the shared FSR3 transparency-composition mask making our geometry
+        // see-through — but ScenePreparation runs INSIDE our render, so that scope also
+        // sends it down the non-FSR branch and it disposes the SHARED FSR3 resources.
+        // Ten times a second. The player's next frame recreates the context from
+        // nothing, so their TAA restarts every frame and never accumulates.
+        //
+        // That is the "shimmering on fine detail, one-pixel bright lines wobbling, noise
+        // on detailed surfaces" — TAA with no history. Caused by our own AA fix.
+        //
+        // Skipping it costs us nothing: our final target and our ScreenBuffers are both
+        // 512x512, so UpscaleTargetFSR takes its early-out and nothing upscales in our
+        // render either way.
+        ("Keen.VRage.Render12.PostProcessStage.Upsampling.UpsamplingJob, VRage.Render12",
+         "PrepareResources"),                                // 19
     };
 
     private static void PatchSkippableStages(HarmonyLib.Harmony harmony, Type sds)
@@ -321,6 +346,7 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage16() => Skip(16);
     private static bool SkipStage17() => Skip(17);
     private static bool SkipStage18() => Skip(18);
+    private static bool SkipStage19() => Skip(19);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the
