@@ -99,6 +99,7 @@ internal static class WholeSceneRender
     // like ScreenBuffers.
     private static object _ourDrawContexts;
     private static object _ourFreshShadowResources;
+    private static object _ourFreshFlares;
     private static bool _dcBuilt;
     private static object _panelSourceTex;
     private static bool _cbSwapLogged;
@@ -187,6 +188,16 @@ internal static class WholeSceneRender
             }
             catch (Exception e) { RttLog.Error("whole-scene Reset: restore our shadow resources", e); }
 
+            // Same dispose-safety for the flares context: our manager's Dispose would
+            // otherwise dispose the ENGINE'S live one.
+            try
+            {
+                if (_ourFreshFlares != null)
+                    _ourDrawContexts.GetType().GetProperty("LensFlares", Any)
+                        ?.SetValue(_ourDrawContexts, _ourFreshFlares);
+            }
+            catch (Exception e) { RttLog.Error("whole-scene Reset: restore our flares context", e); }
+
             if (_ourDrawContexts is IDisposable dc)
             {
                 try { dc.Dispose(); }
@@ -204,6 +215,7 @@ internal static class WholeSceneRender
                         "a flat or positive one across repeated reloads is the leak.");
         _ourDrawContexts = null;
         _ourFreshShadowResources = null;
+        _ourFreshFlares = null;
         _dcBuilt = false;
         _dcField = null;
         _cascFld = _charCascFld = null;
@@ -323,6 +335,7 @@ internal static class WholeSceneRender
         18 => "ComputeGI (ray trace AND ambient)",
         19 => "UpsamplingJob.PrepareResources — DO NOT USE, page-faults Upsampling",
         20 => "force IsFSREnabledAndAllowed false for our render (no state change)",
+        21 => "RenderFlares (we share the engine's FlaresContext; never advance its readback)",
         _ => "unknown",
     };
 
@@ -1155,6 +1168,37 @@ internal static class WholeSceneRender
                 _ourFreshShadowResources = resProp.GetValue(_ourDrawContexts);
                 if (!ownShadows && engineDc != null)
                     resProp.SetValue(_ourDrawContexts, resProp.GetValue(engineDc));
+            }
+
+            // SHARE THE ENGINE'S FLARES CONTEXT, and skip the flare pass (stage 21).
+            //
+            // Flare registration goes through the GLOBAL, not through whoever owns the
+            // context: PointLightEntityComponent.Init / SetParameters / OnRemovedFromScene,
+            // the spot and particle equivalents, and SceneManager.UpdateFlareDefinitions
+            // all read CoreSystems.DrawContexts.LensFlares. Our nested Draw swaps that
+            // global ten times a second, so a light created, retuned or removed inside one
+            // of those windows talks to OUR context — and a SetParameters that lands on
+            // the wrong one leaves the engine's copy holding stale parameters. A flare
+            // stuck where the light no longer is.
+            //
+            // That is the best candidate for "the planet's atmosphere appears, completely
+            // unattached to the planet". Sharing removes the window: whichever manager is
+            // installed, registration reaches the same context.
+            //
+            // Sharing WITHOUT skipping stage 21 would be worse than the disease, because
+            // RenderFlares calls ProcessFinishedFrame and PrepareReadback — the flare
+            // occlusion readback, which integrates across frames. We read the
+            // definitions; we never advance the state.
+            //
+            // Our own context is kept for the dispose swap. It was always empty: created
+            // by CreateInitialContexts and never given a single definition, because
+            // registration goes through the global and the global belongs to the engine
+            // whenever a light is actually created. So the feed loses nothing it had.
+            var flareProp = t.GetProperty("LensFlares", Any);
+            if (flareProp != null && engineDc != null)
+            {
+                _ourFreshFlares = flareProp.GetValue(_ourDrawContexts);
+                flareProp.SetValue(_ourDrawContexts, flareProp.GetValue(engineDc));
             }
 
             RttLog.Line("Whole-scene: SECOND DrawContextManager built — its ctor runs " +

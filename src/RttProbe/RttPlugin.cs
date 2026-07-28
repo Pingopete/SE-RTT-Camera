@@ -292,6 +292,33 @@ public sealed class RttPlugin : IPlugin
         // it. See stage 20.
         ("Keen.VRage.Render12.PostProcessStage.Upsampling.UpsamplingJob, VRage.Render12",
          "PrepareResources"),                                // 19  DO NOT USE
+
+        // 21 — the flare pass. Paired with sharing the engine's FlaresContext.
+        //
+        // Every light in the world registers its flare through the GLOBAL:
+        // PointLightEntityComponent.Init / SetParameters / OnRemovedFromScene, the spot
+        // and particle equivalents, and SceneManager.UpdateFlareDefinitions all read
+        // CoreSystems.DrawContexts.LensFlares. Our nested Draw swaps that global ten
+        // times a second, so any light created, retuned or removed inside one of those
+        // windows talks to OUR context instead of the engine's — and a SetParameters
+        // that lands on the wrong context leaves the engine's copy holding stale
+        // parameters, i.e. a flare stuck at a position the light no longer occupies.
+        //
+        // That is the reported "planet's atmosphere appears, completely unattached to
+        // the planet". Sharing the engine's context removes the window entirely.
+        //
+        // But sharing alone would be worse than the disease: RenderFlares calls
+        // ProcessFinishedFrame and PrepareReadback, which advance the flare OCCLUSION
+        // readback across frames. Running that twice per frame against one shared
+        // context would corrupt the player's flare occlusion. So share the context AND
+        // skip the pass — we read the definitions, we never advance the state.
+        //
+        // Costs the feed nothing it had: our own FlaresContext was created empty and
+        // never received a single definition, because registration goes through the
+        // global and the global is the engine's whenever a light is actually created.
+        (null, null),                                        // 20 RESERVED — the FSR gate
+                                                             //    (an override, not a skip)
+        (null, "RenderFlares"),                              // 21
     };
 
     // Stage 20 is NOT a skip — it is a return-value override, so it lives outside the
@@ -346,6 +373,7 @@ public sealed class RttPlugin : IPlugin
         for (int i = 0; i < SkippableStages.Length; i++)
         {
             var (typeName, name) = SkippableStages[i];
+            if (name == null) continue;     // reserved id, patched elsewhere
             try
             {
                 var owner = sds;
@@ -401,6 +429,7 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage17() => Skip(17);
     private static bool SkipStage18() => Skip(18);
     private static bool SkipStage19() => Skip(19);
+    private static bool SkipStage21() => Skip(21);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the
