@@ -387,6 +387,51 @@ public sealed class RttPlugin : IPlugin
         // and the atmospheres come from AtmosphereAdditive/MultiplyJob plus the planet-env
         // rebuild, none of which is touched here.
         ("Keen.VRage.Render12.PostProcessStage.CloudJob, VRage.Render12", "DoWork"),         // 26
+
+        // 27-28 — THE TWO GLOBALS INSIDE DrawContextManager.OnBeginDraw.
+        //
+        // Owning the DrawContextManager covers almost everything, but OnBeginDraw is:
+        //
+        //   (LocalLightsToUpdate, ShadowMasksToUpdate) = CoreSystems.LocalLights.FlushUpdates();
+        //   CascadesToUpdate          = DrawContexts.CascadeShadows.FlushUpdates();
+        //   CharacterCascadesToUpdate = DrawContexts.CharacterShadows.FlushUpdates();
+        //   DrawContexts.DirectionalLightShadowResources.OnBeginDraw();
+        //   EnvProbesToUpdate         = CoreSystems.EnvironmentProbeManager.PrepareProbes();
+        //
+        // The middle three read CoreSystems.DrawContexts, which is OURS during our render.
+        // The first and last read CoreSystems statics, which are the ENGINE'S, and both are
+        // drain/advance operations — so our nested Draw runs each of them a second time per
+        // frame against shared state.
+        //
+        // 27 is a CONFIRMED device removal at wholeSceneIntervalMs=33 (2026-07-28): DRED
+        // breadcrumb [13] "ScenePreparation + Render" 1010/1475, EventStack
+        // [EnvironmentProbes, ScenePreparation + Render], dying on the Resourcebarrier just
+        // after EnvProbe_Blending, PageFaultVA 0x0 with ExistingAllocations 0 and
+        // RecentFreedAllocations 0 — a NULL BIND, the opposite signature to the CloudJob
+        // use-after-free. PrepareProbes stores _lastSettings, _forceReprocess and _state,
+        // calls UpdateLocalLightAmbient, and can DisposeTextures + RecreateProbes. Our
+        // render advancing that state machine and then skipping stage 2 leaves the player's
+        // ExecuteEnvironmentProbeUpdate binding a probe face that was never produced. At
+        // 10 fps it desynced rarely enough to survive; at 30 fps it is every frame.
+        //
+        // Cost to the feed: NONE. Stage 2 (RenderEnvironmentProbe) is already skipped, so we
+        // never consumed EnvProbesToUpdate in the first place — we were paying the shared
+        // state mutation for a queue we then threw away.
+        //
+        // 28 is the same shape and is Rule 8's other named global, but is NOT in the default
+        // skip list: it has no crash attached to it yet. Patched so it can be turned on from
+        // the config without a rebuild if the probe fix alone is not enough. Its cost is that
+        // the feed stops updating local-light shadows of its own and uses the player's.
+        //
+        // Both are parameterless and return STRUCTS (Buffer<Request>, and a ValueTuple of two
+        // Buffers). A Harmony prefix returning false skips the original and leaves __result at
+        // default(T) — which is a zero-count Buffer that iterates safely. That is Rule 8's
+        // corollary, established when an unassigned LocalLightsToUpdate turned out to be a
+        // missing feature rather than a crash. So these need no __result handling at all.
+        ("Keen.VRage.Render12.LightingStage.EnvironmentProbeManager, VRage.Render12",
+         "PrepareProbes"),                                                                  // 27
+        ("Keen.VRage.Render12.LightingStage.LocalLightsManager, VRage.Render12",
+         "FlushUpdates"),                                                                   // 28
     };
 
     // Stage 20 is NOT a skip — it is a return-value override, so it lives outside the
@@ -564,6 +609,8 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage23() => Skip(23);
     private static bool SkipStage24() => Skip(24);
     private static bool SkipStage26() => Skip(26);
+    private static bool SkipStage27() => Skip(27);
+    private static bool SkipStage28() => Skip(28);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the

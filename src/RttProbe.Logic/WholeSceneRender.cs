@@ -352,6 +352,11 @@ internal static class WholeSceneRender
         26 => "CloudJob.DoWork — stop disposing/recreating the SHARED CloudAccumulateLightAlpha " +
               "temporal resource at our half-resolution (confirmed device removal; costs the feed " +
               "volumetric clouds only, not planet atmospheres)",
+        27 => "EnvironmentProbeManager.PrepareProbes — stop advancing the SHARED probe state " +
+              "machine a second time per frame (confirmed device removal at 30fps; costs nothing, " +
+              "stage 2 already discards the queue)",
+        28 => "LocalLightsManager.FlushUpdates — stop draining the SHARED local-light shadow " +
+              "update queue in our render (the feed uses the player's local-light shadows)",
         _ => "unknown",
     };
 
