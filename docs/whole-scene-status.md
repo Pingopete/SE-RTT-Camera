@@ -188,6 +188,45 @@ cannot reach backwards into it. A shared write can only bleed if the resource is
 **progressive, scrolled, or accumulated across frames**. This should be established for
 a given resource before any work is done to stop writing it.
 
+### Do not bisect by removing pipeline stages
+
+Skipping stage 11 to see whether the bleed carried image data CTD'd immediately:
+`RenderMainView` populates the GBuffer and every consumer of it still runs. Our render
+is a *pipeline* — almost every stage produces something, so removing one to see what
+changes will usually break a consumer rather than answer the question.
+
+**Bisect by changing PARAMETERS.** `wholeSceneIntervalMs` removes nothing and makes the
+bleed's *timing* observable, which no hypothesis had tested:
+
+- phantom updates in discrete steps in lockstep with the feed → our **output** is being
+  written where the player's frame samples it (a buffer we write and they read)
+- phantom shimmers continuously between our renders → our **presence** perturbs
+  something temporal that then evolves on its own (an accumulator we disturb)
+
+Those need entirely different fixes, and every theory so far assumed the first.
+
+### RT in the feed is a bounded change, not an open problem
+
+`RTGIContext` holds `TemporalResources` (the ReSTIR reservoirs), `PreviousScreenDepth`,
+`PreviousScreenNormals`, `DiffuseProbes`, `Specular`, `DiffuseDirect` — the entire RT
+temporal state — and it lives on `DrawContextManager.RTGIContext`, **which we already
+own**. `RaytraceGIJob.TryPrepareWork` does its `ResizeAndSwap` ping-ponging on whichever
+context is passed in, and during our render that is ours. **The reservoirs were never
+shared.**
+
+The only shared RT state is `IRCacheResourcesManager`, which sits under `Core.Systems`
+rather than `DrawContexts` — a global world-space irradiance cache. Scoping
+`EnableIRCache` + `EnableIRCacheScrolling` covers it, and both were in the mode-2 set
+already proven not to cause the bright flashing.
+
+So: un-skip 17, scope those two flags, leave everything else alone.
+
+### Stage 24 never fired
+
+`AtmosphereLUTJob.DoWork` only runs for atmospheres flagged dirty (`GetAndClearDirty`),
+which is rare. We were never writing those LUTs. The atmosphere-LUT bleed theory is dead
+rather than untested.
+
 ### The job-skip rule does not generalise
 
 "Skip the JOB, not the STAGE" works for `RaytraceGIJob` (17): `ComputeGI` borrows the
