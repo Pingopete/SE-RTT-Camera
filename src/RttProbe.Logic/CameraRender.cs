@@ -4032,9 +4032,37 @@ internal static class CameraRender
             if (want == null) { LogScreenResOnce("could not construct Vector2"); return; }
 
             fRes.SetValue(screen, want);
+
+            // PrevResolution, and it is the same bug one field over. ScreenSettings
+            // carries Resolution, PrevResolution and JitterUVDelta; this stamp only ever
+            // fixed the first, so PrevResolution stayed at the PLAYER'S 3840x2160 while we
+            // rasterise 512x512. Anything scaling a previous-frame lookup by it — every
+            // temporal reprojection, RT history included — was out by 7.5x in each axis,
+            // which is indistinguishable from having no history at all.
+            //
+            // Our render is a fixed 512x512 every time, so previous == current by
+            // construction. JitterUVDelta goes to zero for the same reason our projection
+            // has no jitter (mode 2 zeroes JitteredProjection): a non-zero delta would
+            // reproject against a sub-pixel offset that is not in our matrices.
+            string extra = "";
+            var fPrev = screen.GetType().GetField("PrevResolution", Any);
+            if (fPrev != null)
+            {
+                extra += $" PrevResolution {fPrev.GetValue(screen)} -> {want}.";
+                fPrev.SetValue(screen, want);
+            }
+            var fJitter = screen.GetType().GetField("JitterUVDelta", Any);
+            if (fJitter != null)
+            {
+                var wasJ = fJitter.GetValue(screen);
+                var zero = MakeVector2(0, 0);
+                if (zero != null) { fJitter.SetValue(screen, zero); extra += $" JitterUVDelta {wasJ} -> 0."; }
+            }
+
             fScreen.SetValue(tracked, screen);
             LogScreenResOnce($"Screen.Resolution {was} -> {want} " +
-                             "(the engine's value is the player's screen; every ScreenToUV was scaled by the ratio)");
+                             "(the engine's value is the player's screen; every ScreenToUV was scaled by the ratio)." +
+                             extra);
         }
         catch (Exception e) { LogScreenResOnce("threw: " + e.Message); }
     }

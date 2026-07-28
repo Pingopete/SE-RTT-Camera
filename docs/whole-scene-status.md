@@ -227,6 +227,49 @@ So: un-skip 17, scope those two flags, leave everything else alone.
 which is rare. We were never writing those LUTs. The atmosphere-LUT bleed theory is dead
 rather than untested.
 
+### Ray tracing in the feed — what it took
+
+**RTGIContext is ours already.** It holds `TemporalResources` (the ReSTIR reservoirs),
+`PreviousScreenDepth`, `PreviousScreenNormals`, `DiffuseProbes`, `Specular`,
+`DiffuseDirect` — the whole RT temporal state — and lives on
+`DrawContextManager.RTGIContext`. `RaytraceGIJob.TryPrepareWork` does its
+`ResizeAndSwap` on whichever context is passed in. The reservoirs were never shared.
+
+**Never scope `RaytracingSettings` at all.** `EnableIRCache` is a field of `RTGISettings`
+— the struct `RaytraceGIJob` keys its `LazyJobSnapshotHandler` on — and
+`BuildTraceShaderDefines` turns it into the define `ENABLE_IRCACHE`. Flipping it per
+render means `LazyJobSnapshotHandler.Update` → `CreateSnapshotAsync`, an **async PSO
+compile**, twenty times a second. That is the bright-flashing mechanism *and* the
+async-races-the-recorder shape that removed the device twice. Any temporal accumulator
+running against a snapshot in perpetual rebuild cannot converge.
+
+**And the guard was unnecessary.** `IRCacheTraceJob.DoWork` is the only caller of
+`SwapDataBuffers`/`SwapIrradianceBuffers` (the shared world-space cache ping-pong), and
+it is invoked from `SceneDrawSystem.RaytracingPrepare` inside
+`ExecuteRaytracingPrepareAndSceneFinalize` — **stage 1, which we already skip**. Our
+render never runs the IR cache. It samples the one the player's frame maintains, free
+and consistent.
+
+So: un-skip 17, leave `wholeSceneRtFlags` **empty**, keep stage 1 skipped. Done.
+
+### The camera CB's previous-view matrix was ZERO
+
+`TrackedCameraSettings.PreviousCamera` is written by exactly two methods:
+`SettingsGroup.CreateCameraSettings` and one surfel job. Our CB is built through
+`CameraSettings.op_Explicit`, which is neither — so `PreviousCamera_.ViewTransform` was
+`default`, i.e. the zero matrix, on every render the feed has ever done.
+
+Everything doing temporal reprojection reads it. `SkyboxMotionVectorsPixel.hlsl`:
+`mul(positionWorld, (float3x3) MatrixFromWorldTransform(PreviousCamera_.ViewTransform))`.
+The RT denoiser reprojects the same way. Through a zero matrix nothing lands where it
+should, history never matches, and the accumulator discards it every frame — a
+permanent-noise machine, not a converging one.
+
+Fixed by holding the `PreviousCameraSettings` built from OUR view last render, stamping
+it into this render's CB, then recording this render's for next time. The engine pairs
+consecutive frames; ours pairs consecutive *second renders*, which is the right interval
+for our own history. See `CameraRender.StampPreviousCamera`.
+
 ### The job-skip rule does not generalise
 
 "Skip the JOB, not the STAGE" works for `RaytraceGIJob` (17): `ComputeGI` borrows the
