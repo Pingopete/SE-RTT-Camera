@@ -71,10 +71,50 @@ internal static class CameraFeed
         _targetSurfaces.Add(ctx);
     }
 
+    // Is any surface of this panel actually powered?
+    //
+    // LcdPanelSurfaceRenderComponent._surfaces is LcdPanelSurfaceContext[], and each
+    // carries a public CurrentMaterialState field (PowerOff=0, DefaultScreen=1,
+    // CustomRender=2). Fails OPEN: if the shape ever changes and we cannot read it, treat
+    // the panel as powered, because a mod that silently refuses to run is harder to
+    // diagnose than one that runs when it should not.
+    private static string _powerLog;
+
+    private static bool IsPanelPowered(object renderComponent)
+    {
+        try
+        {
+            if (renderComponent.GetType().GetField("_surfaces", Any)?.GetValue(renderComponent)
+                is not System.Collections.IEnumerable surfaces) return true;
+
+            bool sawAny = false, anyOn = false;
+            foreach (var s in surfaces)
+            {
+                if (s == null) continue;
+                var f = s.GetType().GetField("CurrentMaterialState", Any);
+                if (f == null) return true;                 // unknown shape: fail open
+                sawAny = true;
+                if (Convert.ToInt32(f.GetValue(s)) != 0) { anyOn = true; break; }
+            }
+            if (!sawAny) return true;
+
+            string state = anyOn ? "POWERED" : "PowerOff";
+            if (state != _powerLog)
+            {
+                _powerLog = state;
+                RttLog.Line($"Tagged panel is {state} (LcdPanelSurfaceContext.CurrentMaterialState). " +
+                            (anyOn ? "The feed may run." : "The feed will go dormant."));
+            }
+            return anyOn;
+        }
+        catch { return true; }
+    }
+
     public static void Reset()
     {
         _target = null;
         EverFound = false;
+        _powerLog = null;
         _boundsGrid = null; _boundsAt = 0; _boundsDiag = _orbitLogged = false; _closedTryGet = null;
         _findLogs = _errLogs = 0;
         _seenNames.Clear();
@@ -104,12 +144,19 @@ internal static class CameraFeed
 
             if (!name.Contains(Tag, StringComparison.OrdinalIgnoreCase)) return;
 
-            // THE LIVENESS SIGNAL for the whole mod. This runs from the engine's LCD
-            // render component, so a panel that is switched off, unpowered, destroyed or
-            // simply not being drawn stops arriving here — and the absence of the signal
-            // is what puts the mod to sleep. Stamped before the position lookup, because
-            // a tagged panel that ticks but whose transform cannot be resolved is still
-            // very much alive.
+            // THE LIVENESS SIGNAL for the whole mod.
+            //
+            // The first version stamped unconditionally here, on the assumption that
+            // switching a panel off stops its render component ticking. IT DOES NOT — the
+            // component keeps ticking to draw the powered-off screen, so the mod never
+            // went dormant and a whole A/B test was run against a fully active mod. The
+            // absence of a tick is not the absence of a panel.
+            //
+            // The engine states it explicitly instead: every surface carries
+            // CurrentMaterialState, an LcdPanelRenderState of PowerOff=0, DefaultScreen=1
+            // or CustomRender=2. A panel is alive to us only while at least one of its
+            // surfaces is out of PowerOff.
+            if (!IsPanelPowered(renderComponent)) return;
             FeedGate.NotePanelAlive();
 
             var pos = WorldPositionOf(entity);

@@ -333,7 +333,7 @@ internal static class WholeSceneRender
         16 => "DrawUI",
         17 => "RaytraceGIJob.DoWork (the ray trace itself; ambient still runs)",
         18 => "ComputeGI (ray trace AND ambient)",
-        19 => "UpsamplingJob.PrepareResources — DO NOT USE, page-faults Upsampling",
+        19 => "UpsamplingJob.PrepareResources (stops us re-preparing FSR at 512 and wiping the player's TAA history)",
         20 => "force IsFSREnabledAndAllowed false for our render (no state change)",
         21 => "RenderFlares (we share the engine's FlaresContext; never advance its readback)",
         _ => "unknown",
@@ -1195,10 +1195,17 @@ internal static class WholeSceneRender
             // registration goes through the global and the global belongs to the engine
             // whenever a light is actually created. So the feed loses nothing it had.
             var flareProp = t.GetProperty("LensFlares", Any);
+            string flareState = "NOT shared — LensFlares unreachable, flare registration during our " +
+                                "render window still lands in our empty context";
             if (flareProp != null && engineDc != null)
             {
                 _ourFreshFlares = flareProp.GetValue(_ourDrawContexts);
-                flareProp.SetValue(_ourDrawContexts, flareProp.GetValue(engineDc));
+                var engineFlares = flareProp.GetValue(engineDc);
+                flareProp.SetValue(_ourDrawContexts, engineFlares);
+                flareState = ReferenceEquals(flareProp.GetValue(_ourDrawContexts), engineFlares)
+                    ? "SHARED from the engine (registration cannot land in the wrong context; " +
+                      "stage 21 keeps us from advancing its occlusion readback)"
+                    : "SHARE FAILED — the property did not take the engine's context";
             }
 
             RttLog.Line("Whole-scene: SECOND DrawContextManager built — its ctor runs " +
@@ -1210,7 +1217,8 @@ internal static class WholeSceneRender
                             ? $"OURS — own cascades, mode {FeedConfig.WholeSceneOwnShadows}, fitted around the orbit camera."
                             : engineDc != null
                                 ? "SHARED from the engine (read-only in the mask draw)."
-                                : "NOT shared — engine manager unreachable."));
+                                : "NOT shared — engine manager unreachable.") +
+                        " LensFlares " + flareState + ".");
         }
         catch (Exception e) { RttLog.Error("build second DrawContextManager", e); }
     }
