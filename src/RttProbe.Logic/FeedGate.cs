@@ -176,6 +176,14 @@ internal static class FeedGate
         Try("camera CB swap", CameraCbSwap.Reset);
         Try("dynamic exposure", DynamicExposure.Reset);
 
+        // 3b. Reset the panel BINDING, not just the material. Found the hard way: without
+        //     this, _bound stays true across a gate cycle, so on restart BlitProbe builds
+        //     a fresh offscreen target, the handover copies frames into it — every
+        //     counter healthy — and the panel's screen material still points at the OLD
+        //     target from the previous cycle. A black screen with park/copy rates
+        //     climbing is exactly this signature.
+        Try("panel binding teardown", PanelBinding.Reset);
+
         // 4. Undo the PERSISTENT engine mutations. These are the ones that would
         //    otherwise survive a dormant gate and quietly invalidate the comparison:
         //    the LCD material's emissive multiplier is a shared definition affecting
