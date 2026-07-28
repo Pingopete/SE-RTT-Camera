@@ -132,6 +132,71 @@ constraint is to clear the buffer ourselves** rather than turn RT back on. Not y
   into the per-context object instead.
 - ONE change per test. Bundling has cost this project three CTDs it could not attribute.
 
+## Bleed into the player's world — the current hunt
+
+**Established by measurement, not argument.** The feed gate (see below) makes a
+mod-free frame one panel toggle away. With the panel off the main world is *completely*
+stable; with it on, jittering aliasing and phantom images of the feed return. It is us.
+
+**The gate itself had to be fixed first.** It inferred "panel alive" from the LCD render
+component ticking — but switching a panel off does not stop it ticking, it keeps ticking
+to draw the powered-off screen. The gate never fired and an entire A/B was run against a
+fully active mod. It now reads `LcdPanelSurfaceContext.CurrentMaterialState`
+(`PowerOff=0` / `DefaultScreen=1` / `CustomRender=2`), which the engine states outright.
+
+### Fixed
+
+- **Jittering aliasing** — `ScenePreparation` runs inside our Draw and calls
+  `UpsamplingJob.PrepareResources`, which calls
+  `_fsr3_1.PrepareResources(maxRenderResolution, displayResolution)` with OUR 512×512.
+  `TryCreateContext` recreates the FSR context when dimensions change, destroying its
+  temporal history — ours at 512, the player's at 4K, ten times a second. Skip stage 19.
+  Safe only because our final target and our `ScreenBuffers` are both 512×512, so
+  `UpscaleTargetFSR` early-outs and `ApplyNonFSRUpscalingAndAA`'s
+  `resolution != PreUpscaleResolution` gate is false. An earlier attempt page-faulted
+  because `AAMode` was scoped to 0 then, sending us down the bilinear path whose
+  resources the skip never allocated.
+
+### Ruled out (do not re-check)
+
+- **Environment probes / IBL.** `RenderEnvironmentProbe` (stage 2, skipped) is the ONLY
+  caller of `ExecuteEnvironmentProbeUpdate` and `RenderPendingIBL`.
+- **Pooled-texture aliasing.** `ResizableRWRenderTargetTextureKey` includes
+  `MaxResolution` and excludes the debug name, so our 512 borrows and the player's 4K
+  borrows land in different buckets and cannot alias.
+- **Panel emissive light.** The bleed appears everywhere, with no relation to line of
+  sight to the panel.
+
+### Open
+
+- **Phantom feed images on world surfaces.** Still unexplained. `CommonResourcesManager`
+  owns the remaining shared surfaces — `CloudShadowmap`, `WeatherMapTables`,
+  `AtmosphereLUTTables`, `SkyboxIBL`, `PlanetSpheres`, `PlanetEnvSetup*`. **But note the
+  ordering caveat below before building anything on them.**
+- **The feed's planet atmosphere is positioned by the PLAYER's aim.** `PlanetSpheres`
+  and `PlanetEnvSetupFirst` are built from the player's camera in `CommonResources`'
+  `OnBeginDraw`, before our Draw, and our nested render inherits them. Identical bug
+  class to the camera constant buffer — that one was fixed, these were never touched.
+  Fixing it is also a prerequisite for good RT ambient in the feed, since the GI solve
+  reads the environment setup.
+
+### THE ORDERING CAVEAT (check this before blaming any shared write)
+
+Within one engine frame our commands are recorded AFTER the player's. So the player's
+consumer reads the resource their own producer just wrote, and our later overwrite
+cannot reach backwards into it. A shared write can only bleed if the resource is
+**progressive, scrolled, or accumulated across frames**. This should be established for
+a given resource before any work is done to stop writing it.
+
+### The job-skip rule does not generalise
+
+"Skip the JOB, not the STAGE" works for `RaytraceGIJob` (17): `ComputeGI` borrows the
+buffer itself and `AmbientLightJob` reads it either way. It FAILED for the cloud path —
+skipping `CloudShadowJob.DoWork` page-faulted in `CloudShading` at
+`PageFaultVA 0x3A7206000`, the same site as skipping stage 14. That job is not merely a
+writer of shared state, it is the producer of the per-frame resource its consumer reads.
+Establish who produces what before skipping anything.
+
 ## Dead ends, recorded
 
 - **HBAO (stage 9)** — unskipping removed the device within two seconds
