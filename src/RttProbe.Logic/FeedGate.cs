@@ -169,12 +169,8 @@ internal static class FeedGate
         Try("handover teardown", FeedHandover.Reset);
         Try("blit teardown", BlitProbe.Reset);
 
-        // 3. Release the private context families.
-        Try("private cull contexts", PrivateCullContexts.Reset);
-        Try("own contexts", OwnContexts.Reset);
-        Try("custom cull job", CustomCullJob.Reset);
+        // 3. Release the camera constant-buffer swap.
         Try("camera CB swap", CameraCbSwap.Reset);
-        Try("dynamic exposure", DynamicExposure.Reset);
 
         // 3b. Reset the panel BINDING, not just the material. Found the hard way: without
         //     this, _bound stays true across a gate cycle, so on restart BlitProbe builds

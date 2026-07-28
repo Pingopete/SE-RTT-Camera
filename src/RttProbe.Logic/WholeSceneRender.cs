@@ -74,7 +74,7 @@ internal static class WholeSceneRender
     // texture and the pre-upscale resolution, so owning one separates most of the
     // per-view state in a single move.
     private static object _ourScreenBuffers;
-    private static bool _sbBuilt, _sbLogged;
+    private static bool _sbBuilt;
 
     // Our own DrawContextManager — the OTHER global family, and the one the stage
     // bisect pointed at by elimination.
@@ -175,7 +175,7 @@ internal static class WholeSceneRender
             catch (Exception e) { RttLog.Error("whole-scene Reset: dispose our ScreenBuffers LEAKED", e); }
         }
         _ourScreenBuffers = null;
-        _sbBuilt = _sbLogged = false;
+        _sbBuilt = false;
         if (_ourDrawContexts != null)
         {
             // Put OUR fresh shadow resources back before disposing, so Dispose releases
@@ -233,7 +233,6 @@ internal static class WholeSceneRender
         // heavier path, taken precisely when the configuration changed.
         _scopeWarned.Clear();
         _skippedLogged.Clear();
-        OwnExposure.Reset();
         _state = 0;
         _hookCount = 0;
         _lastLogMs = 0;
@@ -398,12 +397,6 @@ internal static class WholeSceneRender
             // roughly halve the game's frame rate before we have learned anything from it.
             // The gate also means a fault costs one attempt per interval rather than one
             // per frame while we work out what happened.
-            // Built HERE, outside the nested Draw, and deliberately. The previous attempt
-            // at owning exposure constructed an EyeAdaptationJob inside the Draw bracket
-            // and its async PSO compilation raced the render thread into a device
-            // removal. This creates only two 1x1 render targets, but the placement rule
-            // stands regardless: engine resources get made outside our nested render.
-            OwnExposure.Prime(sceneDrawSystem);
 
             bool oursRan = false;
             if (FeedConfig.WholeSceneEnabled && _ourScreenBuffers != null
@@ -485,7 +478,6 @@ internal static class WholeSceneRender
             var savedSb = _sbField.GetValue(null);
             object savedCam = null, savedDc = null;
             object[] savedCb = null;
-            object savedExposure = null;
             bool camSwapped = false, ownShadows = false, planetEnvSwapped = false;
 
             _inOurRender = true;
@@ -557,9 +549,12 @@ internal static class WholeSceneRender
                 // ours by now for the rebuild to mean anything.
                 if (camSwapped) planetEnvSwapped = RebuildPlanetEnv();
 
-                // And our own exposure job, so ComputeExposure — which we cannot skip —
-                // stops trampling the player's auto-exposure history every render.
-                savedExposure = OwnExposure.Install();
+                // The exposure bleed is handled by the stage-25 Harmony override
+                // (ConstantExposure becomes read-only for our render), not by owning a
+                // second EyeAdaptationJob. Two attempts at owning one removed the device:
+                // constructing the job ran InitializeAsync's PSO compile against the live
+                // recorder, and creating 1x1 targets put resources outside the engine's
+                // AutoResourceState tracking. Both are recorded in docs/whole-scene-status.md.
 
                 if (_renderCount == 0)
                     RttLog.Line($"=== WHOLE-SCENE RENDER: calling SceneDrawSystem.Draw a second time, " +
@@ -591,7 +586,6 @@ internal static class WholeSceneRender
                 // must go back inside this same frame bracket — OnEndDraw disposes
                 // whatever is in the field), then camera, scoped settings groups, and
                 // both global families the engine's next frame renders through.
-                OwnExposure.Restore(savedExposure);
                 if (ownShadows) EndOwnShadows();
                 if (savedCb != null) { try { CameraCbSwap.Restore(savedCb); } catch (Exception e) { RttLog.Error("whole-scene CB restore", e); } }
                 if (camSwapped) RestoreCamera(savedCam);

@@ -12,13 +12,9 @@ public static class LogicEntry
         {
             FeedGate.Reset();
             BlitProbe.Reset();
-            SceneDrawRecon.Reset();
+            ScenePassHook.Reset();
             CameraRender.Reset();
             CameraFeed.Reset();
-            OwnContexts.Reset();
-            DynamicExposure.Reset();
-            PrivateCullContexts.Reset();
-            CustomCullJob.Reset();
             WholeSceneRender.Reset();
             CameraCbSwap.Reset();
             FeedHandover.Reset();
@@ -32,7 +28,7 @@ public static class LogicEntry
             }
             bridge.GetField("TickHook")?.SetValue(null, (Action<object>)BlitProbe.OnTick);
             bridge.GetField("PanelRenderHook")?.SetValue(null, (Action<object, object, object>)BlitProbe.OnPanelRender);
-            bridge.GetField("SceneDrawHook")?.SetValue(null, (Action<object, object, int>)SceneDrawRecon.OnSceneDraw);
+            bridge.GetField("SceneDrawHook")?.SetValue(null, (Action<object, object, int>)ScenePassHook.OnSceneDraw);
             bridge.GetField("OffscreenUiDrawHook")?.SetValue(null, (Action<object[]>)FeedHandover.OnOffscreenUiDraw);
 
             // The whole-scene route. Null on an older bootstrap, which is the expected
