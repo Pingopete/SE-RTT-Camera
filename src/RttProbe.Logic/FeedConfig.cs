@@ -760,7 +760,17 @@ internal static class FeedConfig
     //    buffer before its bloom and tonemap, so this is the display-side gain — the one
     //    axis that can put the feed above white. Live-tunable: change it and the material
     //    is updated in place, so a sweep costs a file save.
-    public static double Emissivity { get; private set; } = 500.0;
+    //
+    //    DEFAULT IS STOCK (10), and deliberately. It was 500 — a 50x gain from when the
+    //    feed was dim and needed rescuing at the display end — and because these statics
+    //    live in the collectible load context, EVERY hot reload reset it to 500 and
+    //    ApplyEmissivity ran with that value before the first Poll(). So a config of 10
+    //    still produced a 50x floodlight for the first frames after every reload. A
+    //    default that overrides the config file until the config is read is a bug, not a
+    //    convenience: this is a SHARED LCDMaterialDefinition, so it applies to every LCD
+    //    panel in the world, and the panel's emissive term lands in the MAIN view's HDR
+    //    buffer before bloom and tonemap.
+    public static double Emissivity { get; private set; } = 10.0;
 
     // 5a. EnvironmentProbeSettings.EnableRecursiveReflections ships FALSE, which makes
     //     IndirectEnvironmentPassJob bind a flat default cubemap instead of the real
