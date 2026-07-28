@@ -103,6 +103,11 @@ internal static class CameraRender
         _screenResLog = null;
         _cbRenderView = null; _miCreateNonjittered = _miRvSetCamera = _miRvSetResolution = null;
         _fullCbBlocked = _fullCbLogged = false;
+        // Previous-camera history must not survive a reload: the orbit may have been
+        // rebuilt, and a stale "previous" is worse than none — it reprojects into a view
+        // that never existed. One noisy render after a reload, then correct.
+        _wsPrevCameraSettings = null; _miPrevCamFromView = null; _fTrackedPrevCam = null;
+        _prevCamState = 0; _prevCamLogged = false;
         _environmentField = null; _probeSettingsBlocked = _probeSettingsLogged = false;
         _dimApplied = double.NaN;
 
@@ -3915,9 +3920,85 @@ internal static class CameraRender
         if (tracked == null) return null;
 
         if (FeedConfig.FixScreenRes) StampScreenResolution(tracked, res);
+        StampPreviousCamera(tracked);
 
         return _miCreateCb.MakeGenericMethod(_tTrackedCam)
             .Invoke(_bufMgr, new object[] { "rttCameraSettings", tracked });
+    }
+
+    // TrackedCameraSettings.PreviousCamera — the field nothing on our path ever wrote.
+    //
+    // Only TWO methods in the engine write it: SettingsGroup.CreateCameraSettings (the
+    // per-frame CB build, which reads SettingsManager.PreviousRenderView) and one surfel
+    // job. Our CB goes through CameraSettings.op_Explicit, which is neither — so
+    // PreviousCamera_.ViewTransform has been sitting at the ZERO MATRIX in every camera
+    // constant buffer this feed has ever rendered with.
+    //
+    // Anything doing temporal reprojection reads it. SkyboxMotionVectorsPixel.hlsl builds
+    // its motion vector as
+    //     mul(positionWorld, (float3x3) MatrixFromWorldTransform(PreviousCamera_.ViewTransform))
+    // and the RT denoiser reprojects last frame's samples the same way. Through a zero
+    // matrix every reprojection lands nowhere, history never matches, and the accumulator
+    // discards it — which is a permanent-noise machine, not a converging one. That is the
+    // ray-traced ambient "wobbling around" in the feed.
+    //
+    // Fixing it is bookkeeping: hold the value built from OUR view last render, stamp it
+    // into this render's CB, then compute this render's value for next time. The engine
+    // does exactly this with SettingsManager.PreviousRenderView, one frame apart; ours are
+    // one SECOND-RENDER apart, which is the correct pairing for our own history.
+    //
+    // First render has no previous, so it keeps the zero — one noisy frame, then correct.
+    private static object _wsPrevCameraSettings;
+    private static MethodInfo _miPrevCamFromView;
+    private static FieldInfo _fTrackedPrevCam;
+    private static int _prevCamState;          // 0 untried, 1 ok, -1 unavailable
+    private static bool _prevCamLogged;
+
+    private static void StampPreviousCamera(object tracked)
+    {
+        if (_prevCamState == -1) return;
+        try
+        {
+            if (_prevCamState == 0)
+            {
+                _prevCamState = -1;
+                _fTrackedPrevCam = _tTrackedCam?.GetField("PreviousCamera", Any);
+                var prevType = _fTrackedPrevCam?.FieldType;
+                // op_Implicit(in RenderView) -> PreviousCameraSettings. RenderView, not
+                // RenderViewSlim: it reads ViewD/InvViewD, which only the full view has.
+                _miPrevCamFromView = prevType?.GetMethods(Any)
+                    .FirstOrDefault(m => m.Name == "op_Implicit" && m.ReturnType == prevType
+                                      && m.GetParameters().Length == 1);
+                if (_fTrackedPrevCam == null || _miPrevCamFromView == null)
+                {
+                    RttLog.Line("Previous camera: TrackedCameraSettings.PreviousCamera or its " +
+                                "op_Implicit not found — the feed's temporal reprojection keeps " +
+                                "reading a zero matrix and RT ambient will not converge.");
+                    return;
+                }
+                _prevCamState = 1;
+            }
+
+            // Stamp LAST render's value into THIS render's buffer.
+            if (_wsPrevCameraSettings != null)
+            {
+                _fTrackedPrevCam.SetValue(tracked, _wsPrevCameraSettings);
+                if (!_prevCamLogged)
+                {
+                    _prevCamLogged = true;
+                    RttLog.Line("=== PREVIOUS CAMERA stamped into the feed's camera CB. It was the ZERO " +
+                                "matrix on every previous render — CameraSettings.op_Explicit does not " +
+                                "set PreviousCamera, and only the engine's own CreateCameraSettings " +
+                                "does. Temporal reprojection (RT history, skybox motion vectors) now " +
+                                "has a real previous view to project through. ===");
+                }
+            }
+
+            // Then record THIS render's view as next render's previous.
+            if (_wsRenderView != null)
+                _wsPrevCameraSettings = _miPrevCamFromView.Invoke(null, new[] { _wsRenderView });
+        }
+        catch (Exception e) { _prevCamState = -1; RttLog.Error("stamp previous camera", e); }
     }
 
     // CameraSettings -> TrackedCameraSettings (op_Explicit) stamps
