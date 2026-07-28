@@ -1,0 +1,141 @@
+# ============================================================================
+# KNOWN-GOOD CONFIG — snapshot taken 2026-07-28 at commit c364f6c.
+#
+# This is the state the 30 fps feed was verified in: stage 26 (CloudJob) on,
+# the settle window in place, RT ambient in the feed and stable, planet-env on,
+# own shadow cascades on.
+#
+# Measured: ~125 second renders per 5 s window, ours p50 27-30 ms, idle p50
+# ~9-11 ms, ZERO frames over 50 ms, ~50 fps overall, zero errors.
+#
+# output/ is gitignored, so the live config is not in version control. Copy this
+# over output/feed-config.txt to get back to a known-good state.
+#
+# NOT in this snapshot, deliberately: stage 17 (RaytraceGIJob.DoWork). Skipping
+# it was tested as a fix for the phantom bleed on 2026-07-28 and FAILED — the
+# bleed persisted AND in-feed bloom began to flicker. Do not re-add it without a
+# new reason.
+# ============================================================================
+
+# RTT camera feed — edit and save; picked up within ~2s, no restart.
+#
+# Rewritten 2026-07-28 alongside the code tidy-up. The previous file was 1217 lines,
+# 1063 of them comments, and most of the knobs it documented no longer exist: they
+# were bisect switches for the probe scene render, which has been deleted. That file
+# is preserved as feed-config.prev.txt if you want the history.
+#
+# Every knob below has a live consumer. Missing or malformed values fall back to the
+# default, so a half-written file cannot break the feed.
+#
+# CAUTION on wholeSceneSkipStages: it is NOT a free-form tuning knob. Stages produce
+# resources later stages consume, and dropping a producer is a device removal, not a
+# missing effect. Add an id only with a reason. See docs/whole-scene-status.md.
+
+
+# =============================================================================
+# THE WHOLE-SCENE ROUTE — this is the renderer that feeds the panel
+# =============================================================================
+
+wholeSceneRender     = 1     # master switch for the second SceneDrawSystem.Draw
+wholeSceneToPanel    = 1     # deliver its image to the panel
+wholeSceneBuildBuffers = 1   # build our own ScreenBuffers (required)
+wholeSceneWidth      = 512
+wholeSceneHeight     = 512
+
+# Render period. 100 = ~10 fps. This is the single biggest lever on the main-world
+# frame spike: our render costs ~44ms and lands as one long frame at this cadence,
+# so the game alternates ~90fps and ~18fps. Raising it makes the world smoother and
+# the feed choppier.
+wholeSceneIntervalMs = 33
+
+wholeSceneCamera        = 1  # render from the orbit camera, not the player's
+wholeSceneCameraRebuild = 2  # 2 = bake the 1:1 aspect into the projection
+
+# Our own DrawContextManager. This is what makes VolumeRenderingContext, RTGIContext,
+# StochasticTransparencyContext and WaterContext resize against OUR resolution instead
+# of fighting the player's — they all hang off it. CloudJob does not, which is why it
+# needs skip id 26 instead.
+wholeSceneOwnDrawContexts = 1
+
+# Our own shadow cascades. 1 = adaptive, 2 = force all. Requires stage 3 to run; the
+# code force-runs it and logs why if you try to skip it.
+wholeSceneOwnShadows        = 1
+wholeSceneCascadeCount      = 3
+wholeSceneCascadeResolution = 1024
+
+# Rebuild PlanetEnvironmentGroup's setup CBs from the orbit camera. Fixes the
+# detached-atmosphere bug (the atmosphere rendering at the player's aim angle rather
+# than on the planet).
+wholeScenePlanetEnv = 1
+
+wholeSceneAAMode        = -1  # -1 = do not scope DRS.AAMode at all (see stage 19/20)
+wholeSceneNativeScaling = 0
+wholeSceneExposure      = 0   # inert while skip id 25 is on; the feed follows the
+                              # player's live adaptation instead
+
+# Ray tracing in the feed. 0 = leave RaytracingSettings completely alone.
+# rtFlags is deliberately EMPTY: scoping any RTGISettings field rebuilds the job
+# snapshot, which is an async PSO compile, 10x/sec. An empty value here means "no
+# flags", not "missing" — the parser treats it as an empty list on purpose.
+wholeSceneDisableRaytracing = 0
+wholeSceneRtFlags =
+
+# Stages suppressed inside our nested Draw only. Each id has a documented reason in
+# src/RttProbe/RttPlugin.cs next to the table entry.
+#
+#   0,1   raytracing TLAS + prepare — world-space shared, camera-dependent
+#   2     RenderEnvironmentProbe    — shared probe atlas
+#   5     UpdateSurfels             — water surfels
+#   7     ProcessParticles          — particle simulation state
+#   9     ExecuteHBAO               — confirmed device removal
+#   16    DrawUI                    — keeps the player's HUD out of the feed
+#   19,20 FSR: 20 forces IsFSREnabledAndAllowed false (no state change); 19 stops us
+#         re-preparing FSR at 512 and wiping the player's TAA history
+#   21    RenderFlares              — we share the engine's FlaresContext, never
+#                                     advance its occlusion readback
+#   24    AtmosphereLUTJob.DoWork   — shared per-planet LUTs
+#   25    ConstantExposure          — read-only override; stops us stamping a constant
+#                                     into the player's eye-adaptation history
+#   26    CloudJob.DoWork           — shared CloudAccumulateLightAlpha is disposed and
+#                                     recreated at our half-resolution 20x/sec.
+#                                     CONFIRMED device removal (DRED page fault in
+#                                     CloudShading). Costs the feed volumetric clouds
+#                                     only; planet atmospheres are unaffected.
+wholeSceneSkipStages = 0,1,2,5,7,9,16,19,20,21,24,25,26
+
+
+# =============================================================================
+# CAMERA PASS — orbit transform and delivery
+# =============================================================================
+
+intervalMs     = 33      # camera-pass period; drives the orbit and the panel blit
+panelMs        = 0       # panel update period; 0 = follow intervalMs
+startupDelayMs = 2000    # hold off issuing GPU work this long after load
+panelIdleMs    = 1500    # no tagged panel ticking for this long -> gate goes dormant
+perfReportMs   = 5000    # PERF line period
+
+orbitRadius    = 100     # metres from the panel
+orbitPeriod    = 30      # seconds per revolution
+orbitHeight    = 15      # metres above the panel
+orbitClearance = 2.2     # multiplier on the grid's bounding radius
+orbitGrid      = 1       # orbit the whole grid rather than the panel alone
+
+copyEnabled       = 1
+srcTransition     = 1
+destTransition    = 0
+retireTestPattern = 1
+blitAlpha         = 0    # alpha is METALNESS on the panel material — leave off
+passOnFrameHook   = 0    # 0 = probe hook, 1 = per-frame hook
+
+swapCamera   = 0
+swapCameraCb = 1
+fixScreenRes = 1
+fullCameraCb = 1
+
+
+# =============================================================================
+# PANEL / WORLD
+# =============================================================================
+
+emissivity  = 10         # LCD material emissive multiplier (shared definition)
+dimDistance = -1         # -1 = leave the engine's probe DimDistance alone
