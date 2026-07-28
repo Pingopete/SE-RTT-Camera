@@ -184,7 +184,8 @@ internal static class WholeSceneRender
         _dcBuilt = false;
         _dcField = null;
         _cascFld = _charCascFld = null;
-        _ownShadowsLogged = false;
+        _ownShadowsLogged = _cascadeSettingsLogged = false;
+        OwnExposure.Reset();
         _state = 0;
         _hookCount = 0;
         _lastLogMs = 0;
@@ -406,6 +407,7 @@ internal static class WholeSceneRender
             var savedSb = _sbField.GetValue(null);
             object savedCam = null, savedDc = null;
             object[] savedCb = null;
+            object savedExposure = null;
             bool camSwapped = false, ownShadows = false;
 
             _inOurRender = true;
@@ -473,6 +475,10 @@ internal static class WholeSceneRender
                 // the resource rebuild walks CoreSystems.DrawContexts (ours).
                 ownShadows = BeginOwnShadows();
 
+                // And our own exposure job, so ComputeExposure — which we cannot skip —
+                // stops trampling the player's auto-exposure history every render.
+                savedExposure = OwnExposure.Install(sceneDrawSystem);
+
                 if (_renderCount == 0)
                     RttLog.Line($"=== WHOLE-SCENE RENDER: calling SceneDrawSystem.Draw a second time, " +
                                 $"into our own {FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight} " +
@@ -503,6 +509,7 @@ internal static class WholeSceneRender
                 // must go back inside this same frame bracket — OnEndDraw disposes
                 // whatever is in the field), then camera, scoped settings groups, and
                 // both global families the engine's next frame renders through.
+                OwnExposure.Restore(sceneDrawSystem, savedExposure);
                 if (ownShadows) EndOwnShadows();
                 if (savedCb != null) { try { CameraCbSwap.Restore(savedCb); } catch (Exception e) { RttLog.Error("whole-scene CB restore", e); } }
                 if (camSwapped) RestoreCamera(savedCam);
