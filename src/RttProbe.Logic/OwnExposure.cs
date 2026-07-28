@@ -1,206 +1,174 @@
 using System;
-using System.Collections;
 using System.Linq;
 using System.Reflection;
 
 namespace RttProbe;
 
-// A second EyeAdaptationJob, so our render stops overwriting the player's exposure.
+// Give our render its own auto-exposure targets, so it stops overwriting the player's.
 //
-// THE MECHANISM, from IL rather than inference. ComputeExposure is stage 4 and is NOT
-// skippable — its out-params feed bloom and tonemap, and skipping it NREs. Scoping
-// PostProcessSettings.EyeAdaptation off (which we already do) only chooses WHICH branch
-// runs; both branches run on the same shared object:
+// THE MECHANISM, and it was reported before it was understood. At a 2 s feed interval the
+// symptom is unmistakable: "every time the frame updates, the whole main world darkens
+// for a moment, then slowly gets lighter, like it's readjusting" — a step change in
+// exposure followed by gradual adaptation, once per second render.
 //
-//     EyeAdaptationJob.ConstantExposure(commandList):
-//         _outputBuffers.Reset(commandList)           <- SHARED readback buffers
-//         SetRTV(_autoExposures[...]); ScreenQuadJob.Draw(...)   <- SHARED ping-pong pair
-//         CopySubresource(... _outputBuffers.StatsBuffer ...)
-//         _outputBuffers.PrepareReadback(commandList)
+// ComputeExposure is stage 4 and is NOT skippable (its out-params feed bloom and
+// tonemap). We scope PostProcessSettings.EyeAdaptation off for our render, which only
+// chooses the branch — and the constant branch is the damaging one:
 //
-// SceneDrawSystem holds exactly ONE _eyeAdaptationJob, built in its constructor. So ten
-// times a second our 512x512 orbit view overwrites the auto-exposure textures the
-// player's DynamicExposure ping-pongs against, and re-primes the readback the player's
-// histogram is read from. Their next frame then adapts to the luminance of a completely
-// different camera.
+//     ConstantExposure.hlsl:  return float2(Post_.ConstantLuminance, exposure)
 //
-// That is the whole-image brightness oscillation reported as "flashing in the main
-// world", and it is why it reads as ambient or reflection: everything moves together,
-// because exposure is a global multiplier.
+// ConstantLuminance is a FIXED 1.0. So our render does not merely write a different
+// scene's luminance into the shared history, it writes a CONSTANT. The player's next
+// frame's DynamicExposure adapts toward the exposure for luminance 1.0, then crawls back
+// over the following frames. Exactly the reported step-then-recover.
 //
-// The fix is the own-the-object pattern this project has now used for ScreenBuffers,
-// DrawContextManager, the culling contexts, the geometry buffers and the shadow
-// cascades. The constructor is public and self-contained — it creates its own
-// _autoExposures, _histogram and _outputBuffers — so a second instance owns a second set
-// of everything that was being trampled.
+// SceneDrawSystem holds one _eyeAdaptationJob, and its _autoExposures is the ping-pong
+// pair both branches write and the tonemapper reads.
 //
-// THIS CTD'D ON ITS FIRST ATTEMPT, and the failure is instructive. Device removed ~700ms
-// after "SECOND EyeAdaptationJob built ... waiting on 1 initialisation task(s)" — and the
-// install line never printed, so the job was never swapped in. The fault came from
-// CONSTRUCTING it. DRED: PageFaultVA 0x0, breadcrumb 971/1432 in "ScenePreparation +
-// Render", stopping at the ClearRenderTargetView after EnvProbe_Blending, i.e. inside the
-// PLAYER'S frame, not ours.
+// WHY NOT A SECOND JOB. That was the first attempt and it CTD'd on construction:
+// EyeAdaptationJob's constructor calls InitializeAsync() and hands the task back, so
+// pipeline states compile on another thread while the render thread is recording. The
+// engine builds it at startup and waits on the task list before drawing anything; we
+// built it inside the Draw bracket. Device removed, PageFaultVA 0x0, inside the PLAYER's
+// frame.
 //
-// What makes this constructor different from every other object this project owns:
+// So this creates NO job and compiles NOTHING. It makes two 1x1 render targets — the
+// same call the engine's own constructor makes, synchronous, no PSOs, no async half —
+// and swaps only the array field for the duration of our render. There is nothing here
+// that can race a recorder.
 //
-//     EyeAdaptationJob..ctor(List<Task> initializationTasks):
-//         ... CreateRenderTarget / CreateRWBuffer / StatReadbackBuffers ...
-//         InitializeAsync()            <- compiles pipeline states on ANOTHER THREAD
-//         initializationTasks.Add(that task)
+// The targets are created OUTSIDE our nested Draw (Prime is called from the hook before
+// RunSecondRender), which keeps even the cheap allocation off the nested path.
 //
-// The engine builds this in SceneDrawSystem's constructor, at startup, and waits on the
-// task list before any frame is drawn. We build it inside the Draw bracket, so PSO
-// compilation runs concurrently with the render thread recording the player's frame. The
-// waiting logic below is correct as far as it goes — it just cannot help, because the
-// damage is done by the time there is anything to wait for.
+// AND IT STILL CTD'D. PageFaultVA 0x0, "ScenePreparation + Render" 371/831, last ops
+// EnvProbe_Blending -> ClearRenderTargetView -> Resourcebarrier — inside the PLAYER's
+// frame, at a resource barrier. The targets were created fine (the log confirms two 1x1
+// R32G32_Float ones) and the swap installed fine; binding them is what fell over.
 //
-// RULE: objects whose constructor kicks off async initialisation cannot be built inside
-// a Draw. ScreenBuffers and DrawContextManager have no async half, which is exactly why
-// building those mid-frame has always been safe and this was not.
+// The reading that fits: a texture from CreateRenderTarget is not yet part of the
+// engine's per-frame resource-state machinery. RenderTargetTexture carries an
+// AutoResourceState and the engine's barriers are emitted from tracked state; a target
+// created outside that lifecycle and then bound as an RTV produces a transition from a
+// state nothing tracks.
 //
-// The diagnosis in the header stands; the construction path is what needs redesigning.
-// Two options, neither built yet:
-//   1. Construct once from a hook outside the Draw bracket, and install only after the
-//      init task has been complete for several frames.
-//   2. Do not construct a job at all: swap only the shared job's _autoExposures array
-//      (and its _outputBuffers) for targets borrowed from BindableTexturePool — the same
-//      pool path CameraRender has used safely every frame for weeks. Cheaper, and it
-//      never compiles anything.
-// Option 2 is the better shape: it needs no PSOs, so it has no async half to race.
+// SO: STOP CREATING GPU RESOURCES. That is now twice — once constructing a job whose
+// async init raced the recorder, once creating render targets outside the resource
+// lifecycle. Both looked cheap and both removed the device. This whole file is the wrong
+// shape for the problem.
 //
-// STILL LEAKING, and not fixable from here: ComputeExposure ends with
-// RenderOutputContracts.ExposureChanged(exposureData), which Game2.Client's
-// ToggleStatByExposureComponent subscribes to. Our render therefore still publishes its
-// exposure to a gameplay component ten times a second. Suppressing that needs a Harmony
-// patch on ComputeExposure itself — a bootstrap change, hence a restart — and it is a
-// gameplay signal rather than a rendering one, so it is recorded, not chased.
+// THE RIGHT SHAPE, not yet built: a Harmony prefix on EyeAdaptationJob.ConstantExposure
+// that sets __result to the job's existing Exposure view and returns false. Our render
+// then reads the player's current exposure and writes nothing at all — no new textures,
+// no new job, no lifecycle to get wrong, and nothing to race. It needs a bootstrap
+// change, which is the only reason it is not already here.
+//
+// LEFT DISABLED. The diagnosis is confirmed and valuable; this implementation of it is
+// not safe.
 internal static class OwnExposure
 {
     private const BindingFlags Any =
         BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
 
-    private static object _ourJob;
-    private static FieldInfo _field;        // SceneDrawSystem._eyeAdaptationJob
-    private static IList _initTasks;
-    private static int _state;              // 0 untried, 1 built, -1 unavailable
-    private static bool _readyLogged, _installLogged;
+    private static FieldInfo _jobField;          // SceneDrawSystem._eyeAdaptationJob
+    private static FieldInfo _autoField;         // EyeAdaptationJob._autoExposures
+    private static object _job;
+    private static Array _ourTargets;
+    private static int _state;                   // 0 untried, 1 ready, -1 unavailable
+    private static bool _installLogged;
 
     public static void Reset()
     {
-        // Holds render targets, an RWBuffer and readback buffers. Dropping it on a hot
-        // reload without disposing is exactly the leak that cost a session's frame rate.
-        if (_ourJob is IDisposable d)
-        {
-            try { d.Dispose(); }
-            catch (Exception e) { RttLog.Error("own exposure: dispose LEAKED", e); }
-        }
-        _ourJob = null;
-        _field = null;
-        _initTasks = null;
+        // The targets come from BindableTextureManager.CreateRenderTarget, which is a
+        // plain creation rather than a pool borrow, so there is no Return to make. They
+        // are 1x1; letting them go on a reload costs two pixels, and calling a Dispose we
+        // have not verified would be the riskier choice.
+        _jobField = _autoField = null;
+        _job = null;
+        _ourTargets = null;
         _state = 0;
-        _readyLogged = _installLogged = false;
+        _installLogged = false;
     }
 
-    // Build once. Returns true when the job exists AND its async initialisation has
-    // finished — using it before the PSOs compile would bind a null pipeline state.
-    private static bool Ensure(object sceneDrawSystem)
+    // Build our exposure targets. MUST be called outside the nested Draw.
+    public static void Prime(object sceneDrawSystem)
     {
-        if (_state == -1) return false;
+        if (_state != 0 || sceneDrawSystem == null) return;
+        if (!FeedConfig.WholeSceneOwnExposure) return;
+        _state = -1;
         try
         {
-            if (_state == 0)
+            _jobField = sceneDrawSystem.GetType().GetFields(Any)
+                .FirstOrDefault(f => f.Name == "_eyeAdaptationJob");
+            _job = _jobField?.GetValue(sceneDrawSystem);
+            if (_job == null) { RttLog.Line("Own exposure: _eyeAdaptationJob not reachable."); return; }
+
+            _autoField = _job.GetType().GetFields(Any).FirstOrDefault(f => f.Name == "_autoExposures");
+            if (_autoField?.GetValue(_job) is not Array theirs || theirs.Length == 0)
             {
-                _state = -1;
-                _field = sceneDrawSystem.GetType().GetFields(Any)
-                    .FirstOrDefault(f => f.Name == "_eyeAdaptationJob");
-                if (_field == null)
-                {
-                    RttLog.Line("Own exposure: SceneDrawSystem._eyeAdaptationJob not found — " +
-                                "the player's exposure stays shared with our render.");
-                    return false;
-                }
-
-                var jobType = _field.FieldType;
-                var ctor = jobType.GetConstructors(Any).FirstOrDefault(c => c.GetParameters().Length == 1);
-                if (ctor == null)
-                {
-                    RttLog.Line($"Own exposure: no single-argument constructor on {jobType.Name}.");
-                    return false;
-                }
-
-                // List<Keen.VRage.Library.Threading.Task>, NOT System.Threading.Tasks.Task.
-                // Assuming the BCL type here is what made the custom culling job throw an
-                // ArgumentException from inside Invoke, so read it off the signature.
-                var listType = ctor.GetParameters()[0].ParameterType;
-                _initTasks = Activator.CreateInstance(listType) as IList;
-                if (_initTasks == null)
-                {
-                    RttLog.Line($"Own exposure: could not construct {listType.Name} for the init tasks.");
-                    return false;
-                }
-
-                _ourJob = ctor.Invoke(new object[] { _initTasks });
-                _state = 1;
-                RttLog.Line($"Own exposure: SECOND {jobType.Name} built — its constructor creates its own " +
-                            "auto-exposure ping-pong targets, histogram buffer and readback buffers, so our " +
-                            "render stops overwriting the player's. Waiting on " +
-                            $"{_initTasks.Count} initialisation task(s).");
+                RttLog.Line("Own exposure: _autoExposures not reachable or empty.");
+                return;
             }
 
-            if (_ourJob == null) return false;
+            // Mirror the engine's own targets rather than assuming their shape: read the
+            // format and resolution off the live ones.
+            var sample = theirs.GetValue(0);
+            if (sample == null) { RttLog.Line("Own exposure: engine's exposure targets are null."); return; }
+            var st = sample.GetType();
+            object fmt = st.GetProperty("Format", Any)?.GetValue(sample);
+            object res = st.GetProperty("Resolution", Any)?.GetValue(sample);
+            object clear = st.GetProperty("D3DClearColor", Any)?.GetValue(sample);
+            if (fmt == null || res == null) { RttLog.Line("Own exposure: could not read target format/resolution."); return; }
 
-            // Poll the init tasks reflectively; the element type is the engine's own Task.
-            for (int i = 0; i < _initTasks.Count; i++)
-            {
-                var t = _initTasks[i];
-                if (t == null) continue;
-                var done = t.GetType().GetProperty("IsCompleted", Any)?.GetValue(t);
-                if (done is bool b && !b) return false;
-            }
+            var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            var texMgr = core?.GetFields(BindingFlags.Public | BindingFlags.Static)
+                .FirstOrDefault(f => f.FieldType.Name == "BindableTextureManager")?.GetValue(null);
+            var create = texMgr?.GetType().GetMethod("CreateRenderTarget", Any);
+            if (create == null) { RttLog.Line("Own exposure: BindableTextureManager.CreateRenderTarget not found."); return; }
 
-            if (!_readyLogged)
-            {
-                _readyLogged = true;
-                RttLog.Line("Own exposure: initialisation complete — our exposure job is live.");
-            }
-            return true;
+            // (debugName, format, resolution, Nullable<Color> clearColor, AllocationGroup)
+            var ps = create.GetParameters();
+            var clearArg = clear == null ? null : Activator.CreateInstance(ps[3].ParameterType, clear);
+
+            var ours = Array.CreateInstance(st, theirs.Length);
+            for (int i = 0; i < theirs.Length; i++)
+                ours.SetValue(create.Invoke(texMgr,
+                    new[] { "RttFeedAutoExposure" + i, fmt, res, clearArg, null }), i);
+
+            _ourTargets = ours;
+            _state = 1;
+            RttLog.Line($"Own exposure: created {theirs.Length} private auto-exposure target(s) " +
+                        $"({res}, format {fmt}). Our render will no longer stamp its constant " +
+                        "luminance into the player's adaptation history.");
         }
-        catch (Exception e)
-        {
-            _state = -1;
-            RttLog.Error("own exposure: build", e);
-            return false;
-        }
+        catch (Exception e) { RttLog.Error("own exposure: prime", e); }
     }
 
-    // Swap for the duration of our render. Returns the engine's job so the caller can
-    // put it back, or null if we are not taking over this pass.
-    public static object Install(object sceneDrawSystem)
+    // Swap for the duration of our render. Returns the engine's array to restore, or null.
+    public static object Install()
     {
-        if (!FeedConfig.WholeSceneOwnExposure || sceneDrawSystem == null) return null;
-        if (!Ensure(sceneDrawSystem)) return null;
+        if (_state != 1 || !FeedConfig.WholeSceneOwnExposure) return null;
         try
         {
-            var saved = _field.GetValue(sceneDrawSystem);
-            if (ReferenceEquals(saved, _ourJob)) return null;   // already ours: do not stack
-            _field.SetValue(sceneDrawSystem, _ourJob);
+            var saved = _autoField.GetValue(_job);
+            if (ReferenceEquals(saved, _ourTargets)) return null;   // already ours
+            _autoField.SetValue(_job, _ourTargets);
 
             if (!_installLogged)
             {
                 _installLogged = true;
-                RttLog.Line("=== OWN EXPOSURE ACTIVE: ComputeExposure now writes OUR auto-exposure targets " +
-                            "and OUR readback buffers. The player's adaptation history is no longer " +
-                            "overwritten ten times a second by a 512x512 view of somewhere else. ===");
+                RttLog.Line("=== OWN EXPOSURE ACTIVE: ComputeExposure now writes OUR auto-exposure " +
+                            "targets. The player's adaptation history is no longer stamped with a " +
+                            "constant luminance ten times a second. ===");
             }
             return saved;
         }
         catch (Exception e) { RttLog.Error("own exposure: install", e); return null; }
     }
 
-    public static void Restore(object sceneDrawSystem, object saved)
+    public static void Restore(object saved)
     {
-        if (saved == null || _field == null || sceneDrawSystem == null) return;
-        try { _field.SetValue(sceneDrawSystem, saved); }
+        if (saved == null || _autoField == null || _job == null) return;
+        try { _autoField.SetValue(_job, saved); }
         catch (Exception e) { RttLog.Error("own exposure: restore", e); }
     }
 }

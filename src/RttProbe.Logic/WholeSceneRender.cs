@@ -384,6 +384,13 @@ internal static class WholeSceneRender
             // roughly halve the game's frame rate before we have learned anything from it.
             // The gate also means a fault costs one attempt per interval rather than one
             // per frame while we work out what happened.
+            // Built HERE, outside the nested Draw, and deliberately. The previous attempt
+            // at owning exposure constructed an EyeAdaptationJob inside the Draw bracket
+            // and its async PSO compilation raced the render thread into a device
+            // removal. This creates only two 1x1 render targets, but the placement rule
+            // stands regardless: engine resources get made outside our nested render.
+            OwnExposure.Prime(sceneDrawSystem);
+
             bool oursRan = false;
             if (FeedConfig.WholeSceneEnabled && _ourScreenBuffers != null
                 && Clock.Ms - _lastRenderMs >= Math.Max(33, FeedConfig.WholeSceneIntervalMs))
@@ -534,7 +541,7 @@ internal static class WholeSceneRender
 
                 // And our own exposure job, so ComputeExposure — which we cannot skip —
                 // stops trampling the player's auto-exposure history every render.
-                savedExposure = OwnExposure.Install(sceneDrawSystem);
+                savedExposure = OwnExposure.Install();
 
                 if (_renderCount == 0)
                     RttLog.Line($"=== WHOLE-SCENE RENDER: calling SceneDrawSystem.Draw a second time, " +
@@ -566,7 +573,7 @@ internal static class WholeSceneRender
                 // must go back inside this same frame bracket — OnEndDraw disposes
                 // whatever is in the field), then camera, scoped settings groups, and
                 // both global families the engine's next frame renders through.
-                OwnExposure.Restore(sceneDrawSystem, savedExposure);
+                OwnExposure.Restore(savedExposure);
                 if (ownShadows) EndOwnShadows();
                 if (savedCb != null) { try { CameraCbSwap.Restore(savedCb); } catch (Exception e) { RttLog.Error("whole-scene CB restore", e); } }
                 if (camSwapped) RestoreCamera(savedCam);

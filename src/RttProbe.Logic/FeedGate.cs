@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 
 namespace RttProbe;
 
@@ -27,7 +28,10 @@ namespace RttProbe;
 // the engine runs its own code with our patches present but inert.
 internal static class FeedGate
 {
+    private static readonly string PausePath = Path.Combine(RttLog.OutDir, "feed-paused.marker");
+
     private static long _lastPanelMs;
+    private static bool _paused;
     private static bool _active;
     private static bool _everActive;
     private static long _lastPollMs;
@@ -47,7 +51,13 @@ internal static class FeedGate
         _cycles = 0;
         _teardownIn = -1;
         _pendingStartupLog = false;
+        _paused = false;
     }
+
+    // For the health watcher: a one-line machine-readable state dump.
+    public static string StatusLine =>
+        $"gate={(_paused ? "PAUSED" : _active ? "ACTIVE" : "dormant")} cycles={_cycles} " +
+        $"teardownIn={_teardownIn}";
 
     // Called from CameraFeed whenever a panel carrying the tag is seen ticking.
     public static void NotePanelAlive() => _lastPanelMs = Clock.Ms;
@@ -71,7 +81,27 @@ internal static class FeedGate
         if (now - _lastPollMs < 250) return;
         _lastPollMs = now;
 
-        bool alive = _lastPanelMs != 0 && (now - _lastPanelMs) < FeedConfig.PanelIdleMs;
+        // THE PAUSE MARKER. A file is the right mechanism here precisely because it is
+        // outside the game: it can be created before a rebuild, by a script, or by a
+        // human, and it takes effect without the config parser, the panel, or anything
+        // else in the mod having to be healthy.
+        //
+        // The workflow it exists for: pause -> wait for DORMANT in the log -> swap the
+        // DLL or edit anything risky -> unpause. A hot reload that lands while our nested
+        // Draw is recording has caused several of tonight's crashes, and a dormant mod
+        // has nothing in flight to land on.
+        bool paused = false;
+        try { paused = File.Exists(PausePath); } catch { }
+        if (paused != _paused)
+        {
+            _paused = paused;
+            RttLog.Line(paused
+                ? "=== FEED PAUSED by marker (output/feed-paused.marker). Going dormant; safe to " +
+                  "rebuild or edit anything. Delete the marker to resume. ==="
+                : "=== FEED UNPAUSED (marker removed). Resuming. ===");
+        }
+
+        bool alive = !paused && _lastPanelMs != 0 && (now - _lastPanelMs) < FeedConfig.PanelIdleMs;
         if (alive == _active) return;
 
         _active = alive;
