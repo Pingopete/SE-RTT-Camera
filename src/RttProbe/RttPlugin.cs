@@ -200,6 +200,7 @@ public sealed class RttPlugin : IPlugin
         catch (Exception e) { Log("Patching SceneDrawSystem.Draw FAILED: " + e.Message); }
 
         PatchSkippableStages(harmony, sds);
+        PatchFsrGate(harmony);
     }
 
     // __0 is the ResizableRWRenderTargetTexture the engine just rendered the player's
@@ -260,31 +261,84 @@ public sealed class RttPlugin : IPlugin
         // shadowed areas go black. Kept as the fallback if 17 is not enough.
         (null, "ComputeGI"),                                 // 18
 
-        // 19 — DO NOT LET OUR RENDER DESTROY THE PLAYER'S FSR HISTORY.
+        // 19 — DO NOT USE. Kept so the ids below do not shift.
         //
-        // ScenePreparation calls UpsamplingJob.PrepareResources, which is:
+        // The idea was to stop our render disposing the player's FSR history:
         //
-        //     switch (Settings.DRS.AAMode) {
-        //       case Bilinear: _bilinear.PrepareResources(); _fsr3_1.DisposeResources();
-        //       case FSR:      _fsr3_1.PrepareResources(maxRes, displayRes); ...
-        //     }
+        //     UpsamplingJob.PrepareResources:
+        //       switch (Settings.DRS.AAMode) {
+        //         case Bilinear: _bilinear.PrepareResources(); _fsr3_1.DisposeResources();
+        //         case FSR:      _fsr3_1.PrepareResources(maxRes, displayRes);
+        //                        _bilinear.DisposeResources();
+        //       }
         //
-        // We scope DRSSettings.AAMode to 0 for our render — which was the correct fix
-        // for the shared FSR3 transparency-composition mask making our geometry
-        // see-through — but ScenePreparation runs INSIDE our render, so that scope also
-        // sends it down the non-FSR branch and it disposes the SHARED FSR3 resources.
-        // Ten times a second. The player's next frame recreates the context from
-        // nothing, so their TAA restarts every frame and never accumulates.
+        // With DRSSettings.AAMode scoped to 0 for our render, ScenePreparation takes the
+        // Bilinear branch and disposes the SHARED FSR3 resources — ten times a second —
+        // so the player's TAA restarts every frame and never accumulates. That much was
+        // right, and it IS the fine-detail shimmer.
         //
-        // That is the "shimmering on fine detail, one-pixel bright lines wobbling, noise
-        // on detailed surfaces" — TAA with no history. Caused by our own AA fix.
+        // But skipping it is not the fix, because PrepareResources does not only
+        // dispose: each branch ALLOCATES its own side. Skip it and our render runs the
+        // bilinear path with nothing allocated, because the player's frame disposed
+        // bilinear when it prepared FSR. Device removed inside Upsampling, PageFaultVA
+        // 0x0, on world load.
         //
-        // Skipping it costs us nothing: our final target and our ScreenBuffers are both
-        // 512x512, so UpscaleTargetFSR takes its early-out and nothing upscales in our
-        // render either way.
+        // Only ONE resource set is alive at a time, chosen by AAMode. That is also the
+        // real mechanism behind the three original wholeSceneAAMode CTDs, which is worth
+        // saying plainly: the model that got retracted as "wrong" was pointing here.
+        //
+        // The answer is not to skip anything in Upsampling — it is to stop scoping
+        // AAMode at all, and disable FSR for our render at the only place that decides
+        // it. See stage 20.
         ("Keen.VRage.Render12.PostProcessStage.Upsampling.UpsamplingJob, VRage.Render12",
-         "PrepareResources"),                                // 19
+         "PrepareResources"),                                // 19  DO NOT USE
     };
+
+    // Stage 20 is NOT a skip — it is a return-value override, so it lives outside the
+    // table above.
+    //
+    // IsFSREnabledAndAllowed is `DRS.AAMode == 2 && debugViewOk`, and it is what
+    // UpscaleTargetFSR, ExecuteForwardPasses and RenderMainView consult to decide
+    // whether to run FSR and write its masks. Forcing it FALSE for the duration of our
+    // render gets us off the shared upsampler — which is what stopped our geometry being
+    // composited see-through — while changing NO state at all:
+    //
+    //   * AAMode keeps the player's value, so PrepareResources stays on the FSR branch
+    //     and the FSR resources are neither disposed nor left unallocated.
+    //   * UpscaleTargetFSR takes its own early-out, which correctly sets the
+    //     toneMappingInput/toneMappingOutput out-params bloom and tonemap consume.
+    //   * Nothing is written back, so nothing can leak into a stage we did not consider.
+    //
+    // Three settings scopes in a row leaked into code they were not aimed at (Enabled ->
+    // RaytraceGIJob's shader defines, RaytracedDiffuseGI -> the same, AAMode ->
+    // UpsamplingJob's resource lifetime). A patch that only changes what one caller SEES,
+    // and only while our render is on the stack, cannot do that.
+    private const int FsrDisableId = 20;
+
+    private static void PatchFsrGate(HarmonyLib.Harmony harmony)
+    {
+        const BindingFlags Any = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        try
+        {
+            var sm = Type.GetType("Keen.VRage.Render12.Core.Systems.SettingsManager, VRage.Render12");
+            var mi = sm?.GetMethod("get_IsFSREnabledAndAllowed", Any);
+            if (mi == null) { Log("IsFSREnabledAndAllowed not found — FSR gate unavailable."); return; }
+
+            var post = typeof(RttPlugin).GetMethod(nameof(FsrAllowedPostfix),
+                BindingFlags.Static | BindingFlags.NonPublic);
+            harmony.Patch(mi, postfix: new HarmonyLib.HarmonyMethod(post));
+            Log($"Patched SettingsManager.IsFSREnabledAndAllowed as override id {FsrDisableId}.");
+        }
+        catch (Exception e) { Log($"Patching the FSR gate FAILED: {e.Message}"); }
+    }
+
+    // Fail-open in the strictest sense: if the hook throws or is absent, the engine's own
+    // answer stands.
+    private static void FsrAllowedPostfix(ref bool __result)
+    {
+        try { if (RttBridge.SkipStageHook?.Invoke(FsrDisableId) == true) __result = false; }
+        catch { }
+    }
 
     private static void PatchSkippableStages(HarmonyLib.Harmony harmony, Type sds)
     {
