@@ -292,3 +292,88 @@ Establish who produces what before skipping anything.
 - **`mainViewCulling` as a swap** — malformed by construction (disjoint pass groups).
 - **Material-state shader swap** — needs a coherent whole-state change, and it is a
   game-install edit, not shippable.
+
+## CloudJob: the resolution-keyed reallocation (2026-07-28, CONFIRMED)
+
+The most consequential finding since the route started working, because it is at once a
+crash cause, a performance cost, and a shared-state leak of exactly the shape the bleed
+hunt was looking for.
+
+`CloudJob.DoWork` calls `ValidateHalfResTemporalResource`, which decompiles to:
+
+```csharp
+var halfMax = CoreSystems.ScreenBuffers.MaxPreUpscaleResolution / 2;
+if (resource.PeekNext().MaxResolution != halfMax) {
+    resource.Dispose();                                   // free the player's history
+    resource = new TemporalResource<ResizableRWRenderTargetTexture>(
+        () => BindableTextures.CreateRWResizableRenderTargetTexture(name, format, halfMax),
+        (cl, a) => a.Resize(cl, CoreSystems.ScreenBuffers.PreUpscaleResolution / 2));
+}
+```
+
+It keys off `CoreSystems.ScreenBuffers` — the global our render swaps. Ours is 512x512 so
+`halfMax` is 256x256; the player's 3840x2160 gives 1920x1080. Every one of our renders
+therefore disposes the player's cloud accumulation buffer and rebuilds it at 256, and the
+player's very next frame does it straight back.
+
+Evidence, from DRED rather than inference:
+
+- breadcrumb `[15] ForwardAndPostPasses: 20/255`
+- `EventStack: [CloudShading, ForwardPasses, ForwardAndPostPasses]`
+- `PageFaultVA: 0x1B54406000` — a **real address**, so a use-after-free. Every previous
+  device removal on this project faulted at `0x0`, a null bind. Different family.
+- 360 allocation nodes in the dump, **every one of them `CloudAccumulateLightAlpha`**
+- the `+/-151MB` VRAM oscillation visible in every PERF line is this, not a leak
+
+### Why owning DrawContextManager did not already cover it
+
+Every other resolution-keyed context hangs off `DrawContextManager`, which we swap:
+
+| context | owner | our render |
+|---|---|---|
+| `VolumeRenderingContext` | `DrawContextManager` | ours — safe |
+| `RTGIContext` | `DrawContextManager` | ours — safe |
+| `StochasticTransparencyContext` | `DrawContextManager` | ours — safe |
+| `WaterContext` | `DrawContextManager` | ours — safe |
+| **`CloudJob`** | **`SceneDrawSystem._cloudPass`** | **shared — thrashes** |
+
+`SceneDrawSystem` is a singleton we do not swap, so its ~60 job fields are all shared with
+the player. `CloudJob` is the only one of them that owns a resource keyed on
+`MaxResolution`.
+
+### The shape to grep for
+
+Reading `MaxPreUpscaleResolution` is harmless. Thirty-eight methods do it. The dangerous
+shape is **`Dispose()` + `Create*` keyed on `MaxResolution`**. Checked and cleared:
+`HBAOJob.DoWork`, `HighlightJob.DoWork`, `TerrainBlendingJob.DoWork`,
+`AtmosphereAdditiveJob.DoWork` — all only call `Resize(commandList, res)` on a borrowed
+pool texture, which is the designed per-frame path. `CloudJob` is alone.
+
+This also retro-explains the undiagnosed **stage-9 HBAO** device removal above: same
+family, same global, and `HBAOJob` is likewise a `SceneDrawSystem` field.
+
+### The fix and its cost
+
+Skip id 26 (`PostProcessStage.CloudJob.DoWork`) inside our render only. Costs the feed its
+own volumetric clouds; it uses whatever the player's frame last accumulated. User confirmed
+this is free — planet atmospheres come from `AtmosphereAdditiveJob` / `AtmosphereMultiplyJob`
+and the planet-env rebuild, none of which this touches.
+
+Note this is a *different* type from stages 22/23, which were backed out:
+`PostProcessStage.CloudJob` vs `LightingStage.CloudShadowJob` / `CloudWeatherMapJob`.
+
+## Reading the frame-time numbers
+
+The average is misleading and has been quoted misleadingly. Measured 2026-07-28 at
+`wholeSceneIntervalMs = 100`:
+
+```
+ours n=49 mean=52.1 p50=54.7 p95=59.4 >50ms=40 | idle n=203 mean=12.3 p50=10.8 >50ms=0
+```
+
+Ten frames a second take ~55ms; the rest take ~11ms. "50 fps" is the arithmetic mean of a
+bimodal distribution — the game is alternating ~90fps and ~18fps, and that is what reads as
+choppy. `ourDraw(cpu submit)` accounts for ~21ms of the 55; the remainder is GPU.
+
+So the levers are the *cost* of one render or the *rate* of them, not anything that would
+move the average. Re-measure after stage 26, since the CloudJob thrash inflated both.
