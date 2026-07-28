@@ -319,6 +319,30 @@ public sealed class RttPlugin : IPlugin
         (null, null),                                        // 20 RESERVED — the FSR gate
                                                              //    (an override, not a skip)
         (null, "RenderFlares"),                              // 21
+
+        // 22-24 — THE SHARED WORLD-SPACE WRITES.
+        //
+        // CommonResourcesManager owns CloudShadowmap, the per-planet AtmosphereLUTTables
+        // and the WeatherMapTables. All three are world-space, shared, and written from
+        // whatever camera happens to be rendering. Stages 14 (ComputeCloudShadows) and 15
+        // (UpdateAtmosphere) run in our nested Draw, so ten times a second we recompute
+        // the player's cloud shadows, weather maps and atmosphere LUTs FROM THE ORBIT
+        // CAMERA. A cloud shadowmap is a pattern projected onto world surfaces, which is
+        // very close to the reported "projection of what the camera is seeing, on the
+        // walls of my ship".
+        //
+        // Skipping the STAGES was tried early on and page-faulted: each stage also
+        // produces per-frame transients its own later consumers need. So skip the JOBS
+        // instead — the stage still runs, still borrows, still clears, still produces its
+        // transients, and only the write to the shared world-space resource is dropped.
+        // Same shape as stage 17 for RaytraceGIJob, which worked.
+        //
+        // Cost to the feed: no cloud shadows and no atmosphere LUT refresh of its own —
+        // it uses whatever the player's frame last computed. That is the RIGHT trade
+        // while these are shared: an approximate feed beats a corrupted world.
+        ("Keen.VRage.Render12.LightingStage.CloudShadowJob, VRage.Render12",     "DoWork"),   // 22
+        ("Keen.VRage.Render12.LightingStage.CloudWeatherMapJob, VRage.Render12", "DoWork"),   // 23
+        ("Keen.VRage.Render12.LightingStage.AtmosphereLUTJob, VRage.Render12",   "DoWork"),   // 24
     };
 
     // Stage 20 is NOT a skip — it is a return-value override, so it lives outside the
@@ -430,6 +454,9 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage18() => Skip(18);
     private static bool SkipStage19() => Skip(19);
     private static bool SkipStage21() => Skip(21);
+    private static bool SkipStage22() => Skip(22);
+    private static bool SkipStage23() => Skip(23);
+    private static bool SkipStage24() => Skip(24);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the

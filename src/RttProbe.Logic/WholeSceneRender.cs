@@ -336,6 +336,9 @@ internal static class WholeSceneRender
         19 => "UpsamplingJob.PrepareResources (stops us re-preparing FSR at 512 and wiping the player's TAA history)",
         20 => "force IsFSREnabledAndAllowed false for our render (no state change)",
         21 => "RenderFlares (we share the engine's FlaresContext; never advance its readback)",
+        22 => "CloudShadowJob.DoWork — stop writing the SHARED CloudShadowmap from our camera",
+        23 => "CloudWeatherMapJob.DoWork — stop writing the SHARED weather map tables",
+        24 => "AtmosphereLUTJob.DoWork — stop writing the SHARED per-planet atmosphere LUTs",
         _ => "unknown",
     };
 
