@@ -377,3 +377,50 @@ choppy. `ourDraw(cpu submit)` accounts for ~21ms of the 55; the remainder is GPU
 
 So the levers are the *cost* of one render or the *rate* of them, not anything that would
 move the average. Re-measure after stage 26, since the CloudJob thrash inflated both.
+
+## Correction: stages 27/28 are inert (2026-07-28)
+
+Recorded because the reasoning was plausible, took a game restart to disprove, and would
+otherwise be re-derived from the same evidence.
+
+At `wholeSceneIntervalMs = 33` the player's frame took a device removal in
+`ExecuteEnvironmentProbeUpdate`: breadcrumb `ScenePreparation + Render` 1010/1474,
+`EventStack: [EnvironmentProbes, ScenePreparation + Render]`, `PageFaultVA 0x0` with
+`ExistingAllocations 0` and `RecentFreedAllocations 0` — a null bind, the opposite signature
+to the CloudJob use-after-free, so a distinct bug.
+
+`DrawContextManager.OnBeginDraw` reads two `CoreSystems` globals
+(`LocalLights.FlushUpdates()`, `EnvironmentProbeManager.PrepareProbes()`), and
+`PrepareProbes` stores `_lastSettings` / `_forceReprocess` / `_state` and can
+`DisposeTextures()` + `RecreateProbes()`. That looked exactly like the CloudJob shape, so
+skip ids 27 and 28 were built for them.
+
+**They never fire.** `OnBeginDraw`'s only caller is
+`Render12EngineComponent.<Draw>g__DrawInternal` — the engine's OUTER loop, once per frame,
+BEFORE `SceneDrawSystem.Draw`. Our nested Draw starts below it and never reaches it. Proof
+is cheap and conclusive: `ShouldSkipStage(27)` was invoked zero times across a whole session
+with 27 in the live skip list, while 20/21/25/26 logged normally.
+
+**Lesson: confirm a call path is inside our render before building a stage for it.** The
+skip log answers that in one session, and `eq callers <method>` answers it offline in
+seconds — `-- 1 callers` naming a type outside `SceneDrawSystem` is the tell.
+
+### What the evidence actually points at
+
+The crash came 2.1 s after the config change, with `secondRenders=1` — the FIRST second
+render after `WholeSceneRender.Reset()` rebuilt our ScreenBuffers and DrawContextManager,
+not after any accumulation. And the DRED `OutstandingOps` showed a LARGE queued batch of
+`EnvProbe_Blending` passes, i.e. the probe system mid mass-reprocess. `_forceReprocess` has
+exactly two writers: `PrepareProbes` and `OnResetContext`.
+
+So the working hypothesis is a REBUILD TRANSIENT, not a rate problem: the rebuild trips a
+context reset, the shared probe manager force-reprocesses every probe, and at a 33 ms
+interval our second render lands inside that batch while the cube textures are being
+recreated. At 100 ms there are ~3 engine frames of slack and we never land in the window.
+
+Discriminating test, no code required: put `wholeSceneIntervalMs = 33` in the config BEFORE
+launching, so it is the boot value and no mid-session `Reset()` ever happens. Stable means
+the rate is fine and the fix is a settling delay after `Reset()` before the first second
+render (the `StartupDelayMs` pattern). A crash means the rebuild hypothesis is dead too, and
+the next step is instrumenting `EnvProbesToUpdate.Count` per frame rather than inferring
+batch size from `OutstandingOps`.
