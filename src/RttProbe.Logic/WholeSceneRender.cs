@@ -114,7 +114,15 @@ internal static class WholeSceneRender
     {
         get
         {
-            if (!FeedConfig.WholeSceneToPanel || _state != 1 || _ourScreenBuffers == null || _renderCount == 0)
+            // WholeSceneEnabled is checked here, not just at render time. Without it,
+            // turning the route off left this returning our last FinalLDRTexture — which
+            // kept the probe strip engaged, so the probe pipeline stayed switched off and
+            // the panel froze on a stale frame instead of falling back. The claim that
+            // the strip is "self-disabling" was only true for a route that had errored,
+            // not for one deliberately switched off, which is exactly the case a bisect
+            // needs. A frozen picture costs a test round-trip to diagnose.
+            if (!FeedConfig.WholeSceneEnabled || !FeedConfig.WholeSceneToPanel
+                || _state != 1 || _ourScreenBuffers == null || _renderCount == 0)
                 return null;
             try
             {
@@ -185,6 +193,10 @@ internal static class WholeSceneRender
         _dcField = null;
         _cascFld = _charCascFld = null;
         _ownShadowsLogged = _cascadeSettingsLogged = false;
+        // Rearm() cleared these and Reset() did not, which is backwards: Reset is the
+        // heavier path, taken precisely when the configuration changed.
+        _scopeWarned.Clear();
+        _skippedLogged.Clear();
         OwnExposure.Reset();
         _state = 0;
         _hookCount = 0;
@@ -292,6 +304,8 @@ internal static class WholeSceneRender
         14 => "ComputeCloudShadows",
         15 => "UpdateAtmosphere",
         16 => "DrawUI",
+        17 => "RaytraceGIJob.DoWork (the ray trace itself; ambient still runs)",
+        18 => "ComputeGI (ray trace AND ambient)",
         _ => "unknown",
     };
 
@@ -575,7 +589,13 @@ internal static class WholeSceneRender
             field.SetValue(settings, ours);
             _scoped.Add((field, saved));
 
-            if (_scopeWarned.Add(settingsTypeName + ":ok"))
+            // Key on the LABEL as well as the type. Keying on the type alone meant two
+            // different scopes of the same settings group shared one "already logged"
+            // entry — so switching wholeSceneDisableRaytracing from mode 1 to mode 2
+            // silently reused mode 1's key and printed nothing, while the config bisect
+            // it was there to document was the entire point of the exercise. A log that
+            // cannot distinguish the thing under test is worse than no log.
+            if (_scopeWarned.Add(settingsTypeName + "|" + label + ":ok"))
                 RttLog.Line($"Whole-scene: {label} disabled for our render ({set}/{flags.Length} flags " +
                             $"cleared on {settingsTypeName}).");
         }
@@ -731,7 +751,20 @@ internal static class WholeSceneRender
         // only the accumulators that integrate in world space across frames — which were
         // the actual cause of the player's-view GI going patchy. Best of both, in theory:
         // stable feed ambient, player's history still frozen.
-        if (FeedConfig.WholeSceneDisableRaytracing == 1)
+        // An explicit flag list beats the presets, which only ever reached six of the
+        // twenty booleans on RaytracingSettings. Mode 1 (clearing Enabled) turned out to
+        // cause the BRIGHT flashing all by itself — RaytraceGIJob keys a
+        // LazyJobSnapshotHandler<RTGISettings, RTGISnapshot> off these settings and builds
+        // shader defines from them, so toggling the wrong one forces a pipeline rebuild
+        // ten times a second. Mode 2 removed that, but left the subtle per-light flicker,
+        // which points at flags no preset touches: LocalLightsInIRCache,
+        // LocalLightsInRTXGI, and the EnableReSTIR master that still lets candidates be
+        // written into the shared reservoirs.
+        if (FeedConfig.WholeSceneRtFlags.Length > 0)
+            ScopeOff("RaytracingSettings",
+                     "raytracing flags [" + string.Join(",", FeedConfig.WholeSceneRtFlags) + "]",
+                     FeedConfig.WholeSceneRtFlags);
+        else if (FeedConfig.WholeSceneDisableRaytracing == 1)
             ScopeOff("RaytracingSettings", "raytracing (full, incl. Enabled)",
                      "Enabled", "EnableTemporalReSTIR", "EnableSpatialReSTIR",
                      "EnableTemporalFilter", "EnableIRCache", "EnableIRCacheScrolling");

@@ -220,25 +220,45 @@ public sealed class RttPlugin : IPlugin
     //
     // The id is positional and is what the logic side switches on; keep the order
     // stable or the config's stage list silently means something else.
-    private static readonly string[] SkippableStages =
+    // Type == null means SceneDrawSystem; anything else is an assembly-qualified name.
+    //
+    // Ids 17+ reach methods on OTHER types, and that is not decoration. The RT settings
+    // route to "no ray tracing in our render" is CLOSED: RaytraceGIJob keys a
+    // LazyJobSnapshotHandler<RTGISettings, RTGISnapshot> off RaytracingSettings and builds
+    // SHADER DEFINES from it, so toggling any flag that reaches a define rebuilds
+    // pipelines — ten times a second, which shows up as bright flashing across the
+    // player's whole world. Confirmed for Enabled, and again for
+    // RaytracedDiffuseGI/RaytracedSpecularGI. A Harmony prefix mutates nothing and is the
+    // only lever that reaches the work without touching the settings.
+    private static readonly (string Type, string Method)[] SkippableStages =
     {
-        "ExecuteAccelerationStructuresBuilding",     // 0  raytracing scene / TLAS
-        "ExecuteRaytracingPrepareAndSceneFinalize",  // 1  raytracing prepare
-        "RenderEnvironmentProbe",                    // 2  shared probe atlas (ambient + reflections)
-        "RenderShadows",                             // 3  shadow cascades
-        "ComputeExposure",                           // 4  auto-exposure history  (UNSAFE: out params)
-        "UpdateSurfels",                             // 5  water surfels
-        "PrepareClusters",                           // 6  light cluster grid
-        "ProcessParticles",                          // 7  particle SIMULATION state
-        "RenderDecals",                              // 8  decal atlas
-        "ExecuteHBAO",                               // 9  ambient occlusion
-        "ExecuteLighting",                           // 10 whole lighting stage (our image dies without it)
-        "RenderMainView",                            // 11 the geometry pass (ditto)
-        "ComputeDirectionalLighting",                // 12 sun light + shadow mask
-        "ComputeLocalLights",                        // 13 clustered point/spot lights
-        "ComputeCloudShadows",                       // 14 writes SHARED CommonResources.CloudShadowmap
-        "UpdateAtmosphere",                          // 15 atmosphere LUT updates
-        "DrawUI",                                    // 16 the player's HUD, baked into the feed otherwise
+        (null, "ExecuteAccelerationStructuresBuilding"),     // 0  raytracing scene / TLAS
+        (null, "ExecuteRaytracingPrepareAndSceneFinalize"),  // 1  raytracing prepare
+        (null, "RenderEnvironmentProbe"),                    // 2  shared probe atlas (ambient + reflections)
+        (null, "RenderShadows"),                             // 3  shadow cascades
+        (null, "ComputeExposure"),                           // 4  auto-exposure history  (UNSAFE: out params)
+        (null, "UpdateSurfels"),                             // 5  water surfels
+        (null, "PrepareClusters"),                           // 6  light cluster grid
+        (null, "ProcessParticles"),                          // 7  particle SIMULATION state
+        (null, "RenderDecals"),                              // 8  decal atlas
+        (null, "ExecuteHBAO"),                               // 9  ambient occlusion
+        (null, "ExecuteLighting"),                           // 10 whole lighting stage (our image dies without it)
+        (null, "RenderMainView"),                            // 11 the geometry pass (ditto)
+        (null, "ComputeDirectionalLighting"),                // 12 sun light + shadow mask
+        (null, "ComputeLocalLights"),                        // 13 clustered point/spot lights
+        (null, "ComputeCloudShadows"),                       // 14 writes SHARED CommonResources.CloudShadowmap
+        (null, "UpdateAtmosphere"),                          // 15 atmosphere LUT updates
+        (null, "DrawUI"),                                    // 16 the player's HUD, baked into the feed otherwise
+
+        // 17 — the ray trace itself, and nothing else. ComputeGI runs
+        // _raytraceGiJob.DoWork behind a settings gate and then _ambientLightJob.DoWork
+        // unconditionally, so skipping HERE removes the RT work and KEEPS the feed's
+        // ambient term. Skipping ComputeGI (18) would take both.
+        ("Keen.VRage.Render12.LightingStage.RaytraceGIJob, VRage.Render12", "DoWork"),   // 17
+
+        // 18 — the whole GI stage, ambient included. Blunter than 17; the feed's
+        // shadowed areas go black. Kept as the fallback if 17 is not enough.
+        (null, "ComputeGI"),                                 // 18
     };
 
     private static void PatchSkippableStages(HarmonyLib.Harmony harmony, Type sds)
@@ -246,11 +266,18 @@ public sealed class RttPlugin : IPlugin
         const BindingFlags Any = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
         for (int i = 0; i < SkippableStages.Length; i++)
         {
-            var name = SkippableStages[i];
+            var (typeName, name) = SkippableStages[i];
             try
             {
-                var mi = sds.GetMethod(name, Any);
-                if (mi == null) { Log($"Skippable stage {name} not found."); continue; }
+                var owner = sds;
+                if (typeName != null)
+                {
+                    owner = Type.GetType(typeName);
+                    if (owner == null) { Log($"Skippable stage {typeName} not found."); continue; }
+                }
+
+                var mi = owner.GetMethod(name, Any);
+                if (mi == null) { Log($"Skippable stage {owner.Name}.{name} not found."); continue; }
 
                 // One prefix per id. Harmony cannot pass extra arguments to a shared
                 // prefix, so each stage gets its own tiny method rather than a lookup by
@@ -260,7 +287,7 @@ public sealed class RttPlugin : IPlugin
                 if (pre == null) { Log($"No SkipStage{i} prefix for {name}."); continue; }
 
                 harmony.Patch(mi, prefix: new HarmonyLib.HarmonyMethod(pre));
-                Log($"Patched SceneDrawSystem.{name} as skippable stage {i}.");
+                Log($"Patched {owner.Name}.{name} as skippable stage {i}.");
             }
             catch (Exception e) { Log($"Patching skippable stage {name} FAILED: {e.Message}"); }
         }
@@ -292,6 +319,8 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage14() => Skip(14);
     private static bool SkipStage15() => Skip(15);
     private static bool SkipStage16() => Skip(16);
+    private static bool SkipStage17() => Skip(17);
+    private static bool SkipStage18() => Skip(18);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the

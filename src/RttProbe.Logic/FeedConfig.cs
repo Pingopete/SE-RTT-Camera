@@ -388,6 +388,25 @@ internal static class FeedConfig
     // at a sunlit planet needs to come DOWN more often than up.
     public static double WholeSceneExposure { get; private set; }
 
+    // Explicit list of RaytracingSettings flags to clear during our render. Empty = use
+    // the wholeSceneDisableRaytracing preset instead.
+    //
+    // RaytracingSettings has TWENTY booleans and the presets only ever touched six. The
+    // symptom we are chasing ("subtle flashing that seems to come from light sources")
+    // has two flags named for it — LocalLightsInIRCache and LocalLightsInRTXGI — that no
+    // preset clears, and there is a master EnableReSTIR that the accumulator preset also
+    // misses, so candidates keep getting written into the shared reservoirs.
+    //
+    // Bisecting twenty flags by editing an enum and rebuilding is the wrong shape. This
+    // makes each hypothesis a config edit against a running game.
+    //
+    // CAUTION: RaytraceGIJob holds a LazyJobSnapshotHandler<RTGISettings, RTGISnapshot>
+    // and builds SHADER DEFINES from those settings. Flags that feed a define will force
+    // a pipeline rebuild when toggled — which is the mechanism behind the bright flashing
+    // that clearing Enabled produced. Expect some flags to be free and others to cost a
+    // visible rebuild.
+    public static string[] WholeSceneRtFlags { get; private set; } = Array.Empty<string>();
+
     // Give our render its own EyeAdaptationJob.
     //
     // ComputeExposure (stage 4) cannot be skipped — its out-params feed bloom and tonemap
@@ -905,6 +924,7 @@ internal static class FeedConfig
             int perfMs = PerfReportMs;
             int wsCascRes = WholeSceneCascadeResolution, wsCascCnt = WholeSceneCascadeCount;
             bool wsOwnExp = WholeSceneOwnExposure;
+            string[] wsRtFlags = WholeSceneRtFlags;
             int[] wsSkip = WholeSceneSkipStages;
             int wsInterval = WholeSceneIntervalMs;
 
@@ -1065,6 +1085,12 @@ internal static class FeedConfig
                         break;
                     case "wholescenestripprobe":
                         wsStrip = val is "1" or "true" or "yes";
+                        break;
+                    case "wholescenertflags":
+                        wsRtFlags = val.Split(new[] { (char)44 }, StringSplitOptions.RemoveEmptyEntries)
+                                       .Select(s => s.Trim())
+                                       .Where(s => s.Length > 0)
+                                       .ToArray();
                         break;
                     case "wholesceneownexposure":
                         wsOwnExp = val is "1" or "true" or "yes";
@@ -1246,7 +1272,7 @@ internal static class FeedConfig
                         || lodMain != LodMainView || fixScreen != FixScreenRes || fullCam != FullCameraCb || effectGeom != EffectGeomBuffers || rangeCull != RangeCulling || swapCb != SwapCameraCb || atmoMul != AtmosphereMultiply || bloomN != BloomEveryN || sunPass != SunPass || sunDepth != SunPassDepth || dbgGb != DebugGBuffer || defTex != DeferredTexturing || autoExp != AutoExposure || mvCull != MainViewCulling || cull2 != CullSecondPass || noOcc != DisableOcclusionCulling || privCtx != PrivateCullContexts || privGeom != PrivateGeomBuffers || coCull != CoCullMainView || clearGb != ClearGBufferBeforePass
                         || wsBuild != WholeSceneBuildBuffers || wsRender != WholeSceneEnabled
                         || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRtMode != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts || wsOwnShadow != WholeSceneOwnShadows || wsCascRes != WholeSceneCascadeResolution || wsCascCnt != WholeSceneCascadeCount || wsOwnExp != WholeSceneOwnExposure || wsStrip != WholeSceneStripProbe
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRtMode != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts || wsOwnShadow != WholeSceneOwnShadows || wsCascRes != WholeSceneCascadeResolution || wsCascCnt != WholeSceneCascadeCount || wsOwnExp != WholeSceneOwnExposure || !wsRtFlags.SequenceEqual(WholeSceneRtFlags) || wsStrip != WholeSceneStripProbe
                         || !coGroups.SequenceEqual(CoCullPassGroups) || expDown != AutoExposureDownSpeed || expUp != AutoExposureUpSpeed || expMin != AutoExposureMin || expMax != AutoExposureMax || expBias != AutoExposureBias || expSun != AutoExposureSunRange
                         || emissive != Emissivity || recursive != RecursiveReflections || dimDist != DimDistance
                         || geomHead != GeomRangeHeadroom || geomFloor != GeomRangeFloor
@@ -1269,7 +1295,7 @@ internal static class FeedConfig
             // it rather than leave it allocated.
             bool wsChanged = wsBuild != WholeSceneBuildBuffers
                              || wsW != WholeSceneWidth || wsH != WholeSceneHeight
-                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRtMode != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts || wsOwnShadow != WholeSceneOwnShadows || wsCascRes != WholeSceneCascadeResolution || wsCascCnt != WholeSceneCascadeCount || wsOwnExp != WholeSceneOwnExposure;
+                        || wsCam != WholeSceneCamera || wsInterval != WholeSceneIntervalMs || wsPanel != WholeSceneToPanel || wsCamRebuild != WholeSceneCameraRebuild || wsAa != WholeSceneAAMode || wsExp != WholeSceneExposure || wsNative != WholeSceneNativeScaling || wsNoRtMode != WholeSceneDisableRaytracing || wsNoEye != WholeSceneDisableEyeAdaptation || wsNoProbe != WholeSceneDisableProbeUpdates || !wsSkip.SequenceEqual(WholeSceneSkipStages) || wsOwnDc != WholeSceneOwnDrawContexts || wsOwnShadow != WholeSceneOwnShadows || wsCascRes != WholeSceneCascadeResolution || wsCascCnt != WholeSceneCascadeCount || wsOwnExp != WholeSceneOwnExposure || !wsRtFlags.SequenceEqual(WholeSceneRtFlags);
 
             WholeSceneEnabled = wsRender;
             WholeSceneBuildBuffers = wsBuild;
@@ -1295,6 +1321,7 @@ internal static class FeedConfig
             WholeSceneCascadeResolution = wsCascRes;
             WholeSceneCascadeCount = wsCascCnt;
             WholeSceneOwnExposure = wsOwnExp;
+            WholeSceneRtFlags = wsRtFlags;
 
             // A resolution or buffer-mode change needs a full rebuild; anything else
             // just needs the one-strike disable cleared, so an experiment is a config
