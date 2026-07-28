@@ -45,14 +45,26 @@ internal static class FeedGate
         _everActive = false;
         _lastPollMs = 0;
         _cycles = 0;
+        _teardownIn = -1;
+        _pendingStartupLog = false;
     }
 
     // Called from CameraFeed whenever a panel carrying the tag is seen ticking.
     public static void NotePanelAlive() => _lastPanelMs = Clock.Ms;
 
-    // Called from the per-frame hooks. Cheap enough to call from several of them — the
-    // work is rate-limited here rather than at each call site, so no caller has to know
-    // whether another one already polled this frame.
+    // Safe from ANY hook, on any thread. It only flips a bool and arms a countdown; it
+    // never touches a GPU resource.
+    //
+    // The first version called Shutdown() straight from here, and here is reached from
+    // BlitProbe.OnTick — the LCD tick. That disposed our ScreenBuffers and
+    // DrawContextManager while the frame referencing them was still being recorded, and
+    // the game died with PageFaultVA 0x0 partway through ScenePreparation + Render. A
+    // dropped tick during any hitch was enough to trigger it, which makes it a bug that
+    // fires exactly when the game is already struggling.
+    //
+    // Flipping Active is enough to STOP all work immediately, everywhere, because every
+    // hook gates on it. Releasing what that work owned is a separate question and has to
+    // happen somewhere it cannot race the recorder.
     public static void Poll()
     {
         long now = Clock.Ms;
@@ -63,8 +75,38 @@ internal static class FeedGate
         if (alive == _active) return;
 
         _active = alive;
-        if (_active) Startup();
-        else Shutdown();
+        if (_active)
+        {
+            _teardownIn = -1;              // cancel a pending teardown: we are back
+            _pendingStartupLog = true;
+        }
+        else
+        {
+            // Work has already stopped, this frame. Give the frames that were mid-flight
+            // when it stopped time to be submitted and retired before anything is freed.
+            _teardownIn = TeardownDelayFrames;
+            RttLog.Line("=== FEED GATE: DORMANT. No tagged panel has ticked for " +
+                        $"{FeedConfig.PanelIdleMs} ms. All work has stopped; releasing resources in " +
+                        $"{TeardownDelayFrames} frames. ===");
+        }
+    }
+
+    // Called ONLY from the whole-scene hook, which is the SceneDrawSystem.Draw postfix on
+    // the render thread — the same place a config change has been safely disposing and
+    // rebuilding these objects all session. This is where anything owning GPU memory is
+    // allowed to be released.
+    private const int TeardownDelayFrames = 30;
+    private static int _teardownIn = -1;
+    private static bool _pendingStartupLog;
+
+    public static void PumpRenderThread()
+    {
+        if (_pendingStartupLog) { _pendingStartupLog = false; Startup(); }
+
+        if (_teardownIn < 0) return;
+        if (--_teardownIn > 0) return;
+        _teardownIn = -1;
+        Shutdown();
     }
 
     private static void Startup()
@@ -84,9 +126,8 @@ internal static class FeedGate
     // than either state.
     private static void Shutdown()
     {
-        RttLog.Line("=== FEED GATE: DORMANT. No tagged panel has ticked for " +
-                    $"{FeedConfig.PanelIdleMs} ms. Shutting every feature down — the game should now " +
-                    "render exactly as it does without this mod. Turn the panel back on to restart. ===");
+        RttLog.Line("Feed gate: releasing resources now. The game should render exactly as it does " +
+                    "without this mod. Turn the panel back on to restart.");
 
         // 1. Stop issuing work. The whole-scene route and the probe pass both gate on
         //    Active, so they are already inert by the time this runs; these calls release

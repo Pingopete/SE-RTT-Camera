@@ -320,6 +320,9 @@ internal static class WholeSceneRender
         // frame regardless of what else is switched on. Polled before the disabled-state
         // check so a dormant mod still notices the panel coming back.
         FeedGate.Poll();
+        // The render thread is the only place the gate is allowed to RELEASE anything —
+        // disposing from the LCD tick raced the frame recorder and page-faulted.
+        FeedGate.PumpRenderThread();
         if (!FeedGate.Active) return;
 
         if (_state == -1) return;
