@@ -80,3 +80,27 @@ mid-frame serial position) is promoted from optimisation to THE fix for the drif
 It hides the induced gaps under the next frame's ~15ms CPU record window. Risk
 unchanged (frame-span lifetime across the present boundary); deserves a fresh
 session with crash patience.
+
+## Design note for start-of-frame-submit (parked ready, 2026-07-28)
+
+The refined position: a PREFIX on SceneDrawSystem.Draw — NOT post-present.
+
+    postfix (today):  [prep][player record][OUR record][present copy]
+                       GPU: player -> OURS -> present   (present waits for us)
+    prefix (the fix): [prep][OUR record][player record][present copy]
+                       GPU: OURS runs while CPU records the player
+                       (present waits for the player only; our gaps hide
+                        under the player's ~15ms record window)
+
+Why prefix beats post-present: at the prefix moment the engine has finished ALL
+frame prep (transient CBs, descriptor tiles, the OnBeginDraw chain) — everything
+our nested Draw consumes is valid, same frame, same span. Post-present crosses
+the frame-end boundary where spans close and transients recycle — the
+device-removal family. Same overlap benefit, a fraction of the risk.
+
+Implementation sketch (bootstrap + logic, restart to adopt):
+- RttBridge.WholeSceneEarlyHook; bootstrap adds a prefix to the SAME Draw patch
+  site firing it (re-entrancy guarded — our nested Draw triggers it too).
+- Logic: config flag wholeSceneSubmitEarly routes WHICH hook runs
+  RunSecondRender; the postfix keeps gate/Poll/Perf bookkeeping either way.
+  The flag is outside the rebuild signature -> flipping it is a live A/B.
