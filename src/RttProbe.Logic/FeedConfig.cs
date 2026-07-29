@@ -199,6 +199,10 @@ internal static class FeedConfig
     // Live-tunable; not part of the rebuild signature.
     public static double WholeSceneFarClip { get; private set; }
 
+    // A/B gate on the FinalLDR resize (the phantom-bleed fix). In the rebuild signature
+    // so flipping it forces the rebuild that re-runs (or skips) the one-shot resize.
+    public static bool WholeSceneLdrResize { get; private set; } = true;
+
     public static bool WholeSceneNativeScaling { get; private set; }
 
     // Feed exposure bias, in EV STOPS. Signed: +1 doubles brightness, -1 halves it.
@@ -476,6 +480,7 @@ internal static class FeedConfig
             WholeSceneExposure      = Dbl(kv, "wholeSceneExposure", WholeSceneExposure);
             WholeSceneNativeScaling = Bool(kv, "wholeSceneNativeScaling", WholeSceneNativeScaling);
             WholeSceneNoBloom       = Bool(kv, "wholeSceneNoBloom", WholeSceneNoBloom);
+            WholeSceneLdrResize     = Bool(kv, "wholeSceneLdrResize", WholeSceneLdrResize);
             WholeSceneFarClip       = Dbl(kv, "wholeSceneFarClip", WholeSceneFarClip);
             WholeSceneOwnDrawContexts   = Bool(kv, "wholeSceneOwnDrawContexts", WholeSceneOwnDrawContexts);
             WholeSceneOwnShadows        = Int(kv, "wholeSceneOwnShadows", WholeSceneOwnShadows);
@@ -520,7 +525,7 @@ internal static class FeedConfig
         string.Join("|", WholeSceneBuildBuffers, WholeSceneWidth, WholeSceneHeight,
                          WholeSceneCamera, WholeSceneIntervalMs, WholeSceneToPanel,
                          WholeSceneCameraRebuild, WholeSceneAAMode, WholeSceneExposure,
-                         WholeSceneNativeScaling, WholeSceneNoBloom, WholeSceneDisableRaytracing,
+                         WholeSceneNativeScaling, WholeSceneNoBloom, WholeSceneLdrResize, WholeSceneDisableRaytracing,
                          WholeSceneDisableEyeAdaptation, WholeSceneDisableProbeUpdates,
                          WholeSceneOwnDrawContexts, WholeSceneOwnShadows,
                          WholeSceneCascadeResolution, WholeSceneCascadeCount,

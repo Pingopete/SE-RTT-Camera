@@ -230,6 +230,47 @@ internal static class PanelBinding
         catch (Exception e) { RttLog.Error("survey write", e); }
     }
 
+    private static WeakReference _boundRenderer, _boundCtx;
+
+    // Put the panel back on its STOCK screen material through the engine's own path.
+    //
+    // The game's deferred-assert log showed "Can't remove material <guid>. It is not
+    // present in material system." at gate shutdown, timestamp-matched to our teardown.
+    // SetNewScreenMaterialHandle is ReleaseScreenMaterialHandle() + CreateRuntimeLcdMaterial
+    // + store — so after our bind, the panel's _screenMaterialHandle holds OUR runtime
+    // material, and across gate cycles both the LCD system's own lifecycle and the next
+    // rebind can try to release the same instance: the second release asserts.
+    //
+    // Calling the same method once more with the stock DefaultScreenMaterial and NO
+    // colorMetalOverride releases our handle exactly once, via the designed path, and
+    // leaves the panel owning a fresh stock material whose lifecycle the LCD system
+    // manages normally. Nothing left dangling for anyone to double-release.
+    //
+    // Render thread only (FeedGate.Shutdown runs there, same thread the bind ran on).
+    public static void Unbind()
+    {
+        var renderer = _boundRenderer?.Target;
+        var ctx = _boundCtx?.Target;
+        _boundRenderer = _boundCtx = null;
+        if (renderer == null || ctx == null) return;   // never bound, or panel destroyed
+
+        try
+        {
+            var mi = ctx.GetType().GetMethods(Any).FirstOrDefault(m => m.Name == "SetNewScreenMaterialHandle");
+            var def = Prop(ctx, "Definition");
+            var baseMaterial = Prop(def, "DefaultScreenMaterial");
+            var aspect = Prop(def, "AspectRatio");
+            var orientation = Prop(Prop(ctx, "State"), "Orientation");
+            if (mi == null || baseMaterial == null) return;
+
+            mi.Invoke(ctx, new[] { renderer, baseMaterial, aspect, orientation, null });
+            RttLog.Line("Panel material: rebound to the STOCK screen material (no override) — our runtime " +
+                        "material released through the engine's own path, so nothing dangles for the " +
+                        "\"Can't remove material\" double-release.");
+        }
+        catch (Exception e) { RttLog.Error("panel unbind", e); }
+    }
+
     // Rebuild the panel's screen material so it samples OUR render target.
     //
     //   ctx.SetNewScreenMaterialHandle(renderer,
@@ -249,6 +290,12 @@ internal static class PanelBinding
 
             var mi = ctx.GetType().GetMethods(Any).FirstOrDefault(m => m.Name == "SetNewScreenMaterialHandle");
             if (mi == null) { RttLog.Line("Phase 2: SetNewScreenMaterialHandle not found."); return; }
+
+            // Remembered for Unbind. Weak, because the panel can be destroyed (world
+            // unload, block grinding) while we hold these, and a strong reference would
+            // keep dead render objects alive.
+            _boundRenderer = new WeakReference(renderer);
+            _boundCtx = new WeakReference(ctx);
 
             var def = Prop(ctx, "Definition");
             var baseMaterial = Prop(def, "DefaultScreenMaterial");

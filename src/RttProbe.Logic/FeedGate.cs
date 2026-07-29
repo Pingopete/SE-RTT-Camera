@@ -172,6 +172,12 @@ internal static class FeedGate
         // 3. Release the camera constant-buffer swap.
         Try("camera CB swap", CameraCbSwap.Reset);
 
+        // 3a. Release our runtime screen material through the engine's own path BEFORE
+        //     forgetting the binding — this is what stops the "Can't remove material"
+        //     deferred assert at every gate cycle. Must precede PanelBinding.Reset, which
+        //     drops the weak references Unbind needs.
+        Try("panel material unbind", PanelBinding.Unbind);
+
         // 3b. Reset the panel BINDING, not just the material. Found the hard way: without
         //     this, _bound stays true across a gate cycle, so on restart BlitProbe builds
         //     a fresh offscreen target, the handover copies frames into it — every

@@ -93,6 +93,13 @@ internal static class WholeSceneRender
 
     public static void EnsureFinalLdrSize(object commandList)
     {
+        // A/B gate. The resize killed the phantom bleed, but frame times stepped worse at
+        // the same moment (>50ms frames 5-9 -> 28-34 per window, CPU submit UNCHANGED — so
+        // GPU-side). Flipping this off on a live feed re-runs the rebuild at swapchain
+        // size, which separates "the resize costs GPU somehow" from "something else
+        // drifted". If off turns out faster AND the ghost stays gone, the ghost was the
+        // upscale WRITE, not the texture size — worth knowing either way.
+        if (!FeedConfig.WholeSceneLdrResize) return;
         if (_ldrResized || _ourScreenBuffers == null || commandList == null) return;
         _ldrResized = true;
         try
