@@ -37,6 +37,87 @@ A camera feed is that same sequence with a 2D target, a camera-derived
 - [`docs/feasibility.md`](docs/feasibility.md) — the full evidence chain, including
   what *isn't* possible through the public API
 
+---
+
+## ★ Reference build — "every-frame baseline", 2026-07-29
+
+Branch `reference/every-frame-baseline`, tag `ref-every-frame-2026-07-29`.
+
+**Best performance produced so far, and the first build with no sign of the progressive
+GPU-starvation drift** — roughly 15 minutes of continuous play, clean. That drift had
+dominated an entire session and had three proposed explanations, all retracted.
+
+```
+66 fps world and feed | ours p50 15.2ms  p95 18.0ms  >50ms = 0
+                      | CPU submit 2.1 ms  (was 13-15 ms)
+```
+
+The mod-side change credited with it: `wholeSceneIntervalMs = 0` — render **every** engine
+frame. Removing the throttle cut CPU submit 6-7×; each throttled wake had been paying a
+cold-start tax on stale temporal history and evicted caches.
+
+- [`docs/reference-build.md`](docs/reference-build.md) — binary hashes, config, open issues
+- [`docs/feed-render-layers.md`](docs/feed-render-layers.md) — complete layer inventory:
+  what the feed runs, what it skips, what each skip costs
+
+### In-game graphics settings in force for that measurement
+
+**Important context, and possibly load-bearing.** These are reduced from the settings used
+earlier in the session, and they were reduced *before* the drift stopped being observed. So
+the absence of GPU starvation may be down to `wholeSceneIntervalMs = 0`, down to these
+settings, or both. **It has not been separated.** Transcribed here so the two variables can
+be untangled later instead of guessed at.
+
+| Setting | Value |
+|---|---|
+| Preset | **Custom** |
+| Performance vs. Quality | Quality |
+| Scaling Mode | **NativeAA** |
+| Texture Quality | **Low** |
+| Sun Shadow Quality | Low |
+| Local Light Shadow Quality | **Extreme** |
+| Lighting Quality | Medium |
+| Parallax Mapping Quality | Low |
+| Particles Quality | Medium |
+| Armor Bevel | Enabled |
+| Terrain Quality | Medium |
+| Rendering Distance | Medium |
+| Anti-Aliasing Mode | **FSR** |
+| Raytracing | **Low** |
+| Grass | High |
+| Clouds | High |
+| Decals | Medium |
+
+Transcribed from two screenshots; the list may continue past *Decals*.
+
+**What these interact with, mod-side:**
+
+- **Texture Quality: Low** is the strongest candidate for a settings-side contribution to
+  the drift disappearing. The earliest drift investigation (memory Rule 10) found VRAM
+  residency thrashing — ±442 MB evict/reload per 5 s — presenting exactly as a rendering
+  bug. Low texture quality lowers `StreamingSettings.TexturePreset` and
+  `MinTextureStreamingBytes`, which relieves precisely that pressure. **Worth isolating: raise
+  texture quality alone, keep `wholeSceneIntervalMs = 0`, and watch for the drift.**
+- **Texture Quality: Low is also the leading suspect for the missing skybox.** The sky is a
+  cubemap texture (`CommonResources._skyboxIBL`); if it isn't resident it can't be sampled.
+  This fits the otherwise-unexplained constant ~1.13 GiB `Missing` in `RenderSceneStats`,
+  which is *absent assets*, not evictions. Ruled out as the cause:
+  `RenderSettingsManipulator.ApplyMinimalisticVisuals`, the only code path that sets
+  `EnvironmentSettings.HideSkybox`, is gated on `AutoTestConfiguration.SkipRender`.
+- **Anti-Aliasing Mode: FSR** means `DRSSettings.AAMode == 2`, which is exactly what skip id
+  20 neutralises for the feed by forcing `IsFSREnabledAndAllowed` false. Consequence: the
+  feed very likely gets **no AA at all**. See `docs/feed-render-layers.md` §4.
+- **Scaling Mode: NativeAA** is `ScalingMode == 4` — the same value the unused
+  `wholeSceneNativeScaling` knob would set. The player's render is therefore not upscaled,
+  so swapchain resolution and pre-upscale resolution coincide. Relevant to
+  `UpscaleTargetFSR`'s early-out and to the whole phantom-bleed family. Note the
+  *Performance vs. Quality* slider is what writes `ScalingMode`
+  (`RenderSettingsManipulator.ApplyVisualPreference`).
+- **Raytracing: Low** — RT is on, and the feed runs the full RT path with nothing scoped
+  off. Part of why the feed is currently cheap.
+- **Clouds: High** in the world, none in the feed: skip id 26 (`CloudJob.DoWork`) is a
+  confirmed device-removal fix, and the trade was accepted deliberately.
+
 ## Layout
 
 | Path | What it is |

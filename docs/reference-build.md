@@ -52,6 +52,13 @@ and retracted. Measured with **reduced in-game graphics settings**; the feed was
 fidelity, and the reduced settings are also why the world (and therefore the feed) had no
 skybox. Not a max-settings number.
 
+**The exact in-game graphics settings are transcribed in the README**, under
+*Reference build → In-game graphics settings in force for that measurement*, together with
+what each one interacts with mod-side. They matter because they were reduced *before* the
+drift stopped being observed, so the credit between `wholeSceneIntervalMs = 0` and the
+settings themselves **has not been separated**. The single cheapest experiment to separate
+them: raise Texture Quality alone, keep `wholeSceneIntervalMs = 0`, and watch for the drift.
+
 ## What this build contains
 
 - The rate-limit removal (`wholeSceneIntervalMs = 0`) — the change credited with both the
