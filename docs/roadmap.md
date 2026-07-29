@@ -242,7 +242,13 @@ times the feed rate AND raises world fps at the same time, with the stutter gone
 | interval | world fps | feed fps | frame p50 | p95 | max | >50ms |
 |---|---|---|---|---|---|---|
 | 33ms (30fps target) | 43 | 24 | 29.5 | 47.9 | 51.5 | 1-2 |
-| **0 (every frame)** | **72** | **72** | **13.6** | **16.9** | **19.1** | **0** |
+| 0 (every frame) — RETRACTED, frozen panel | 72 | 72 | 13.6 | 16.9 | 19.1 | 0 |
+| **0 (every frame) — verified LIVE panel** | **66** | **66** | **15.2** | **18.0** | **20.4-25.5** | **0** |
+
+CORRECTION: the 72 fps row was measured with a FROZEN PANEL and must not be quoted.
+The gate was cycled to restore a confirmed-live feed and the result held, at 66 fps
+with ourDraw (CPU submit) at 2.1ms. Use the live row. Verify the panel is live before
+trusting any number — the frozen reading looked like the better result.
 
 Reproduced across three consecutive clean 5s windows, while the player MOVED.
 IDLE n=0 — there is no longer any such thing as a cheap frame, because every frame
@@ -275,3 +281,74 @@ throttling is what makes a render expensive — so the naive budget would make e
 feed pay the cold-start tax. Any scheduler must keep each feed's temporal state warm,
 or amortise differently (e.g. round-robin at full rate rather than rate-limiting all
 feeds). Measure before designing.
+
+## Hypothesis 2026-07-29: WHY the GPU starvation is gone
+
+Status: **hypothesis, not proven.** Two candidate causes are confounded (see the caveat
+at the end). Written down because the starvation was the most serious bug this project
+had — Task Manager GPU dropping to 65-70% with the feed on, and the feed bleeding fps the
+longer a session ran — and after ~15 minutes on the every-frame build it is not
+reproducible. Identifying the mechanism matters more than the fix, because multiple feeds
+will re-run whatever the mechanism was.
+
+### The observation that constrains everything
+
+**CPU submit fell 13-15 ms to 2.1 ms while the amount of rendering work stayed
+identical.** Same stages, same resolution, same scene, same skip list. The only variable
+was cadence.
+
+So those missing 11-13 ms were never draw-call recording. They were WAITING. And a CPU
+thread that is waiting is not feeding the GPU — which is precisely what a GPU sitting at
+70% looks like from outside.
+
+This also settles the older measurement that nobody could explain: `gpuWork` was FLAT at
+~19.3 ms while frame time climbed. The growth was pure GPU **idle**. Bubbles, not
+workload. (It also retracts the "our true GPU work is only ~3 ms" figure — that measured
+a cold render, and the ~30 ms it appeared to cost was mostly the wait, not the work.)
+
+### The proposed mechanism: resource-churn stalls
+
+A throttled render must re-acquire, on every wake, everything that was returned to a pool
+or evicted during the gap — pooled textures, descriptor state, resource-state transitions.
+**Freeing and reallocating GPU memory makes the driver wait for outstanding work to drain.
+That is a fence wait, and a fence wait is a bubble by definition.**
+
+`CloudJob` was the extreme, measured case: dispose + recreate a multi-hundred-MB resource
+20x/sec, visible as the +/-151 MB VRAM oscillation in every PERF line. Stage 26 removed
+that one specifically. But the general shape was never addressed, only that instance of it.
+
+Render every frame and none of it happens. Resources stay borrowed, resident and hot;
+there is nothing to reacquire and nothing to wait on.
+
+### Why this explains what every previous model failed to explain
+
+The drift tracked **scene load, not session time.** As VRAM filled, the probability that a
+returned resource had been evicted rather than kept went up, so the re-acquire cost grew.
+That accounts for all three of the failures:
+
+- **Time-decay model failed** — the user was stationary and dead flat for 12 minutes; the
+  step coincided with movement, i.e. with new scene content streaming in.
+- **A full teardown of everything we own did NOT reset it, but a game restart DID** — the
+  aged state was allocator/residency state, which our teardown does not touch.
+- **The player's own frames were never affected in the early phase** — they were not the
+  ones doing the reacquiring.
+
+### The confound, stated plainly
+
+In-game graphics settings were lowered at roughly the same time as `intervalMs` went to 0,
+**Texture Quality to Low especially**, which independently cuts VRAM pressure and therefore
+eviction probability. The available data cannot split the two. The earliest drift work
+(memory Rule 10) had already found VRAM residency thrashing at +/-442 MB evict/reload per
+5 s presenting exactly as a rendering bug, so this is a live second candidate, not a
+formality.
+
+### The experiment that splits it
+
+Raise Texture Quality back up; keep `wholeSceneIntervalMs = 0`; hold player position; run
+long enough for scene load to build.
+
+- Drift stays away -> the rate limit was the whole story.
+- Drift returns -> VRAM pressure is a real second factor, and it must be designed for
+  before multiple feeds run, because N feeds multiply resident footprint.
+
+Grade the TAIL (p95, >50 ms) and total fps, not p50 — p50 hid this the first time.
