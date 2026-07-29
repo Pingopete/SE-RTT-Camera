@@ -57,8 +57,76 @@ frame. Removing the throttle cut CPU submit 6-7×; each throttled wake had been 
 cold-start tax on stale temporal history and evicted caches.
 
 - [`docs/reference-build.md`](docs/reference-build.md) — binary hashes, config, open issues
-- [`docs/feed-render-layers.md`](docs/feed-render-layers.md) — complete layer inventory:
-  what the feed runs, what it skips, what each skip costs
+- [`docs/feed-render-layers.md`](docs/feed-render-layers.md) — the same inventory as below,
+  plus *why* each skip exists and what it cost to learn
+
+### Render layers running in the feed
+
+Skip list `0,1,2,5,7,9,16,19,20,21,24,25,26`.
+
+**Geometry**
+
+- Depth pre-pass
+- GBuffer — blocks, asteroids, terrain
+- Deferred texturing
+- Terrain blending
+- Grass
+- Decals
+
+**Shadows**
+
+- Sun cascades — **own set**, 2 × 512, fitted to the orbit camera
+- Character shadows
+
+**Lighting**
+
+- Directional sun + shadow mask
+- Local lights — point, spot, capsule, area (clustered)
+- Light cluster grid
+- **Raytraced GI** — full RT path, nothing scoped off
+- Ambient / IBL
+
+**Atmosphere**
+
+- Atmosphere multiply + additive
+- Planet environment
+- Cloud shadows
+
+**Transparency / forward**
+
+- Unlit pass
+- Transparent pass
+- Water — prepass, mesh, shading
+- Volumetrics
+- Stochastic transparency resolve
+- Holograms
+- Highlights
+- OIT resolve
+
+**Post**
+
+- Bloom
+- Tone mapping
+- Hole patching
+- Exposure — read-only, follows the player's frame
+- Skybox motion vectors
+
+#### Not running
+
+- Environment probe rendering
+- HBAO (ambient occlusion)
+- Lens flares
+- Volumetric clouds
+- Own atmosphere LUTs — uses the player's
+- Water surfels
+- Screen-space reflections — off in the player's settings
+- HUD
+- FSR / upscaling → **effectively no AA at all**
+- RT acceleration-structure build + prepare — reuses the player's from the same frame
+
+**Two nuances.** Particle *simulation* is skipped but particles still render, using the
+player's frame's simulated state. And the skybox is absent only because the test world had
+none — that layer is not disabled on our side.
 
 ### In-game graphics settings in force for that measurement
 
