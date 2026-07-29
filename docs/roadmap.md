@@ -104,3 +104,17 @@ Implementation sketch (bootstrap + logic, restart to adopt):
 - Logic: config flag wholeSceneSubmitEarly routes WHICH hook runs
   RunSecondRender; the postfix keeps gate/Poll/Perf bookkeeping either way.
   The flag is outside the rebuild signature -> flipping it is a live A/B.
+
+## Addendum 2026-07-29: start-of-frame submission LIVE — first evidence
+
+Adopted on a fresh boot (one unrelated world-load crash in the game's replication
+layer first — KeyNotFoundException on EntityObjectBuilder, no render involvement).
+Flipped live under the pause protocol. Immediate result, first sample:
+
+    end-of-frame (last night, feed on):  gpuFrame ~29-30ms, gpuWork ~19.3ms  -> ~10ms bubbles
+    START-of-frame (now, feed on):       gpuFrame 20.40ms,  gpuWork 20.20ms -> 0.2ms
+
+The frame-vs-work gap with the feed RUNNING now matches what previously required
+the feed to be OFF. p50 unchanged vs baseline on a fresh session (~27-29ms), as
+predicted — the verdict metric is the SLOPE over session age (last night:
++0.7ms/min to p50 48 at ~50min). Slope watch armed.
