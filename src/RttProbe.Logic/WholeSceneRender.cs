@@ -335,6 +335,25 @@ internal static class WholeSceneRender
         // config save, a hot reload and a gate restart alike, not just the one case that
         // happened to crash.
         _settleFrames = SettleFrames;
+
+        // DO NOT force a panel rebind from here. Tried 2026-07-29 and it CRASHED THE GAME:
+        // the panel showed its test pattern (a fresh target, rebound before any feed frame
+        // had landed) and then the process died.
+        //
+        // Why it is unsafe: this Reset runs from FeedConfig.Poll on the RENDER THREAD, and
+        // clearing PanelBinding._bound makes the next panel tick call
+        // SetNewScreenMaterialHandle — which is ReleaseScreenMaterialHandle plus
+        // CreateRuntimeLcdMaterial, i.e. destroying and building a runtime material from
+        // inside the frame. That is the same family as every other "create engine resources
+        // mid-frame" fault this project has recorded (Rule 11).
+        //
+        // The freeze it was meant to fix is real but NOT diagnosed — the causal link to
+        // this Reset was inferred, never proven, and the crash suggests the inference was
+        // wrong. A gate cycle clears it; that is the workaround until it is understood.
+        // Suspects to test properly: whether BlitProbe.FeedTarget actually changes across a
+        // WholeSceneRender.Reset (it should not — the panel binds to that, not to our
+        // ScreenBuffers), and whether CameraRender's cached _feedTexture/_resolvedPanelId
+        // go stale independently.
     }
 
     // Clear the one-strike disable after a config change, WITHOUT throwing away the
