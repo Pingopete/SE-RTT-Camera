@@ -1,22 +1,3 @@
-# ============================================================================
-# KNOWN-GOOD CONFIG — snapshot taken 2026-07-28 at commit c364f6c.
-#
-# This is the state the 30 fps feed was verified in: stage 26 (CloudJob) on,
-# the settle window in place, RT ambient in the feed and stable, planet-env on,
-# own shadow cascades on.
-#
-# Measured: ~125 second renders per 5 s window, ours p50 27-30 ms, idle p50
-# ~9-11 ms, ZERO frames over 50 ms, ~50 fps overall, zero errors.
-#
-# output/ is gitignored, so the live config is not in version control. Copy this
-# over output/feed-config.txt to get back to a known-good state.
-#
-# NOT in this snapshot, deliberately: stage 17 (RaytraceGIJob.DoWork). Skipping
-# it was tested as a fix for the phantom bleed on 2026-07-28 and FAILED — the
-# bleed persisted AND in-feed bloom began to flicker. Do not re-add it without a
-# new reason.
-# ============================================================================
-
 # RTT camera feed — edit and save; picked up within ~2s, no restart.
 #
 # Rewritten 2026-07-28 alongside the code tidy-up. The previous file was 1217 lines,
@@ -42,11 +23,8 @@ wholeSceneBuildBuffers = 1   # build our own ScreenBuffers (required)
 wholeSceneWidth      = 512
 wholeSceneHeight     = 512
 
-# Render period. 100 = ~10 fps. This is the single biggest lever on the main-world
-# frame spike: our render costs ~44ms and lands as one long frame at this cadence,
-# so the game alternates ~90fps and ~18fps. Raising it makes the world smoother and
-# the feed choppier.
-wholeSceneIntervalMs = 33
+# Render period, ms between feed renders. NO FLOOR: 0 = render every engine frame
+wholeSceneIntervalMs = 0
 
 wholeSceneCamera        = 1  # render from the orbit camera, not the player's
 wholeSceneCameraRebuild = 2  # 2 = bake the 1:1 aspect into the projection
@@ -60,8 +38,8 @@ wholeSceneOwnDrawContexts = 1
 # Our own shadow cascades. 1 = adaptive, 2 = force all. Requires stage 3 to run; the
 # code force-runs it and logs why if you try to skip it.
 wholeSceneOwnShadows        = 1
-wholeSceneCascadeCount      = 3
-wholeSceneCascadeResolution = 1024
+wholeSceneCascadeCount      = 2
+wholeSceneCascadeResolution = 512
 
 # Rebuild PlanetEnvironmentGroup's setup CBs from the orbit camera. Fixes the
 # detached-atmosphere bug (the atmosphere rendering at the player's aim angle rather
@@ -139,3 +117,24 @@ fullCameraCb = 1
 
 emissivity  = 10         # LCD material emissive multiplier (shared definition)
 dimDistance = -1         # -1 = leave the engine's probe DimDistance alone
+
+# Scope PostProcessSettings.Bloom off for our render only. BloomJob retains its
+# cascade borrows on the SHARED SceneDrawSystem._bloomJob.
+wholeSceneNoBloom = 0
+
+# Far plane for the FEED VIEW only, metres. 0 = player's far plane. The render's
+# cost is CPU submit (draw count), so this is the main perf lever. VeryFarClipping
+# is untouched: planets and their atmospheres still render. Try 3000-5000.
+wholeSceneFarClip = 2500
+
+# A/B gate on the FinalLDR resize (the phantom-bleed fix). 1 = resize to feed size
+# (default). 0 = leave it at swapchain size — re-tests the pre-fix behaviour.
+wholeSceneLdrResize = 1
+
+# START-OF-FRAME SUBMISSION — the targeted fix for the session drift.
+# 1 = record our render in Draw's PREFIX, before the player's frame, so our GPU work
+#     executes while the CPU is still recording theirs (the drift is induced GPU idle,
+#     not workload: our true GPU cost is ~3ms of a ~30ms ours-frame).
+# 0 = legacy end-of-frame position.
+# Costs one frame of feed latency. Live A/B — no rebuild, no settle window.
+wholeSceneSubmitEarly = 0

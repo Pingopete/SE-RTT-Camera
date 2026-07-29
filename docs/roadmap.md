@@ -233,3 +233,45 @@ Methodology rules earned the hard way, now three deep:
 - CONTROL PLAYER POSITION. An uncontrolled camera makes scene load masquerade as
   time-based decay, which cost a whole night's theorising and one built-and-
   disproved architecture change.
+
+## THE BREAKTHROUGH 2026-07-29: the RATE LIMIT was the bug
+
+Setting wholeSceneIntervalMs = 0 (render the feed EVERY engine frame) three-and-a-half
+times the feed rate AND raises world fps at the same time, with the stutter gone:
+
+| interval | world fps | feed fps | frame p50 | p95 | max | >50ms |
+|---|---|---|---|---|---|---|
+| 33ms (30fps target) | 43 | 24 | 29.5 | 47.9 | 51.5 | 1-2 |
+| **0 (every frame)** | **72** | **72** | **13.6** | **16.9** | **19.1** | **0** |
+
+Reproduced across three consecutive clean 5s windows, while the player MOVED.
+IDLE n=0 — there is no longer any such thing as a cheap frame, because every frame
+does the same work, so there is nothing left to alternate between.
+
+### Why throttling was expensive
+
+Every render at a 33ms gap paid a COLD-START tax: temporal history stale (GI
+reprojection, ReSTIR reservoirs, denoiser accumulation all rebuilding from nothing),
+caches and resources evicted between renders. Rendering every frame keeps all of it
+warm and each render costs 13.6ms instead of 29.5ms. The route was never slow — the
+rate gate was forcing it down its own worst-case path, and the harder we throttled
+the more we paid per render.
+
+### What this retracts
+
+- "Our true GPU work is ~3ms of a ~30ms ours-frame" — that measured a COLD render.
+- The "session drift" — largely the cold-start tax growing as the scene got heavier,
+  which is why it tracked scene load and never touched the player's own frames.
+- The entire start-of-frame-submission investigation was built on the cold-render
+  cost model. (Null result anyway; kept as a live A/B switch and the scheduling hook.)
+- The bimodal "choppiness" framing from the very start of this work: the fix was
+  never to make the expensive frames cheaper, it was to stop having two kinds of frame.
+
+### Consequence for the roadmap
+
+Multi-feed budgeting (goal 3) needs rethinking from the ground up. The assumption was
+that each feed costs a fixed slice, so N feeds must share a budget by throttling. But
+throttling is what makes a render expensive — so the naive budget would make every
+feed pay the cold-start tax. Any scheduler must keep each feed's temporal state warm,
+or amortise differently (e.g. round-robin at full rate rather than rate-limiting all
+feeds). Measure before designing.
