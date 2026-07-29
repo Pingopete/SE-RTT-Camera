@@ -203,6 +203,19 @@ internal static class FeedConfig
     // so flipping it forces the rebuild that re-runs (or skips) the one-shot resize.
     public static bool WholeSceneLdrResize { get; private set; } = true;
 
+    // START-OF-FRAME SUBMISSION. Record our render in Draw's PREFIX (before the player's
+    // frame) instead of its postfix (between the player's frame and the present copy), so
+    // our GPU work executes while the CPU is still recording the player's frame.
+    //
+    // The targeted fix for the session drift: our render's true GPU work is ~3ms, but an
+    // ours-frame costs ~30ms because the GPU idles waiting, and that idle grows with engine
+    // session age. This moves the waiting somewhere it costs nothing.
+    //
+    // Deliberately NOT in the rebuild signature: no resources change, so flipping it needs
+    // no rebuild and no settle window — it is a clean live A/B. Costs one frame of feed
+    // latency. Off by default so adopting the new bootstrap is inert until asked.
+    public static bool WholeSceneSubmitEarly { get; private set; }
+
     public static bool WholeSceneNativeScaling { get; private set; }
 
     // Feed exposure bias, in EV STOPS. Signed: +1 doubles brightness, -1 halves it.
@@ -481,6 +494,7 @@ internal static class FeedConfig
             WholeSceneNativeScaling = Bool(kv, "wholeSceneNativeScaling", WholeSceneNativeScaling);
             WholeSceneNoBloom       = Bool(kv, "wholeSceneNoBloom", WholeSceneNoBloom);
             WholeSceneLdrResize     = Bool(kv, "wholeSceneLdrResize", WholeSceneLdrResize);
+            WholeSceneSubmitEarly   = Bool(kv, "wholeSceneSubmitEarly", WholeSceneSubmitEarly);
             WholeSceneFarClip       = Dbl(kv, "wholeSceneFarClip", WholeSceneFarClip);
             WholeSceneOwnDrawContexts   = Bool(kv, "wholeSceneOwnDrawContexts", WholeSceneOwnDrawContexts);
             WholeSceneOwnShadows        = Int(kv, "wholeSceneOwnShadows", WholeSceneOwnShadows);

@@ -45,6 +45,27 @@ public static class RttBridge
     // again, and the handler must return immediately when it does.
     public static volatile Action<object, object> WholeSceneHook;
 
+    // (sceneDrawSystem, finalLDRBuffer) — fires at the TOP of Draw, BEFORE the player's
+    // frame is recorded. The start-of-frame submission position.
+    //
+    // Same patch site as WholeSceneHook, opposite end. Recording our render here puts our
+    // GPU work ahead of the player's in the queue, so it EXECUTES while the CPU is still
+    // recording the player's frame — instead of sitting between the player's work and the
+    // present copy, where it delays the swap by its full duration.
+    //
+    // Safe because Draw's prefix is downstream of ALL of DrawInternal's frame prep:
+    // FinalizeResources, UpdateImmediateHeap, CreateDirectCommandList, RefreshTables,
+    // Settings.OnBeginDraw, CommonResources.OnBeginDraw, ScreenBuffers.Update and
+    // DrawContextManager.OnBeginDraw have all run by the time we get here (verified
+    // against DrawInternal's call order — Draw is the 86th call, that prep is calls
+    // 13-73). Everything a nested Draw consumes is live, same frame, same frame span.
+    // That is what makes this cheaper in risk than the post-present position, which
+    // crosses the boundary where spans close and transients recycle.
+    //
+    // Re-entrancy: our own nested Draw fires this too, so the handler must return
+    // immediately when it does — same rule as WholeSceneHook.
+    public static volatile Action<object, object> WholeSceneEarlyHook;
+
     // TRUE while the logic side is inside its nested second Draw. Read by the log-only
     // probes (CopyJob / ScreenBuffers.InitializeBuffers) so their lines say which render
     // an engine call fired in. Absent/null on an old logic assembly — probes then log
@@ -199,9 +220,19 @@ public sealed class RttPlugin : IPlugin
             {
                 var post = typeof(RttPlugin).GetMethod(nameof(WholeScenePostfix),
                     BindingFlags.Static | BindingFlags.NonPublic);
-                harmony.Patch(draw, postfix: new HarmonyLib.HarmonyMethod(post));
+                var pre = typeof(RttPlugin).GetMethod(nameof(WholeScenePrefix),
+                    BindingFlags.Static | BindingFlags.NonPublic);
+
+                // BOTH ends of the same method. The postfix always runs the bookkeeping
+                // (gate, buffers, Perf, logging); which end runs the RENDER is the logic
+                // side's choice, live-switchable via wholeSceneSubmitEarly. Patching both
+                // unconditionally keeps that a config flip rather than a restart.
+                harmony.Patch(draw,
+                    prefix: new HarmonyLib.HarmonyMethod(pre),
+                    postfix: new HarmonyLib.HarmonyMethod(post));
                 Log($"Patched SceneDrawSystem.Draw({string.Join(", ", draw.GetParameters().Select(p => p.ParameterType.Name))}) " +
-                    "— the whole-scene render hook.");
+                    "— the whole-scene render hook, BOTH ends (prefix = start-of-frame submission, " +
+                    "postfix = bookkeeping and the legacy render position).");
             }
         }
         catch (Exception e) { Log("Patching SceneDrawSystem.Draw FAILED: " + e.Message); }
@@ -217,6 +248,14 @@ public sealed class RttPlugin : IPlugin
     private static void WholeScenePostfix(object __instance, object __0)
     {
         try { RttBridge.WholeSceneHook?.Invoke(__instance, __0); } catch { }
+    }
+
+    // VOID prefix — it can never skip the original. Harmony only honours a skip from a
+    // prefix returning bool, and making this one bool-returning would put the player's
+    // entire frame one typo away from not being drawn.
+    private static void WholeScenePrefix(object __instance, object __0)
+    {
+        try { RttBridge.WholeSceneEarlyHook?.Invoke(__instance, __0); } catch { }
     }
 
     // Draw sub-stages that a second render must be able to skip.

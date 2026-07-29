@@ -45,6 +45,24 @@ public static class LogicEntry
                 wholeScene.SetValue(null, (Action<object, object>)WholeSceneRender.OnWholeScene);
                 RttLog.Line("Whole-scene hook registered (SceneDrawSystem.Draw postfix).");
 
+                // The start-of-frame submission position. Null on an older bootstrap, in
+                // which case the postfix keeps doing the render and wholeSceneSubmitEarly
+                // is simply inert — worth saying out loud, because a silently ignored flag
+                // is how an A/B gets misread.
+                var early = bridge.GetField("WholeSceneEarlyHook");
+                if (early != null)
+                {
+                    early.SetValue(null, (Action<object, object>)WholeSceneRender.OnWholeSceneEarly);
+                    RttLog.Line("Start-of-frame hook registered (SceneDrawSystem.Draw PREFIX) — " +
+                                "set wholeSceneSubmitEarly=1 to move the render there and overlap our " +
+                                "GPU work with the player's frame recording.");
+                }
+                else
+                {
+                    RttLog.Line("WholeSceneEarlyHook not on this bootstrap — restart to adopt it. " +
+                                "wholeSceneSubmitEarly will have NO EFFECT until then.");
+                }
+
                 var skip = bridge.GetField("SkipStageHook");
                 if (skip != null)
                 {

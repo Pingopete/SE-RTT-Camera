@@ -327,6 +327,7 @@ internal static class WholeSceneRender
         _lastRenderMs = 0;
         _lastLdrRes = null;
         _ldrResized = false;
+        _earlyRan = _earlyOwnsThisFrame = false;
         _renderCount = 0;
 
         // Arm the settle window. Reset is exactly the event that forces the shared probe
@@ -497,7 +498,80 @@ internal static class WholeSceneRender
             // The gate also means a fault costs one attempt per interval rather than one
             // per frame while we work out what happened.
 
-            // SETTLE AFTER A REBUILD, and this one cost a device removal to find.
+            // Which end of Draw owns the render was decided by the prefix at the top of
+            // THIS frame (see OnWholeSceneEarly). Read the recorded decision rather than
+            // the config: FeedConfig.Poll runs from the camera pass, which fires INSIDE
+            // the player's Draw — i.e. between our prefix and our postfix — so re-reading
+            // the flag here could see it flip mid-frame and render twice in one frame.
+            bool oursRan = _earlyRan;
+            _earlyRan = false;
+            if (!_earlyOwnsThisFrame) oursRan = TryRender(sceneDrawSystem);
+
+            Perf.NoteFrame(oursRan);
+
+            long now = Clock.Ms;
+            if (now - _lastLogMs >= 5000)
+            {
+                _lastLogMs = now;
+                RttLog.Line($"Whole-scene hook: {_hookCount} frame(s), " +
+                            $"ourScreenBuffers={(_ourScreenBuffers == null ? "not built" : "BUILT")}, " +
+                            $"secondRenders={_renderCount}, camera={(FeedConfig.WholeSceneCamera ? "OURS" : "player's")}, " +
+                            $"submit={(_earlyOwnsThisFrame ? "START-of-frame" : "end-of-frame")}.");
+            }
+        }
+        catch (Exception e) { _state = -1; RttLog.Error("whole-scene hook", e); }
+    }
+
+    // Set by the prefix each frame; read by the postfix. Not ThreadStatic — both hooks
+    // fire on the render thread, and the prefix always precedes the postfix within a frame.
+    private static bool _earlyRan, _earlyOwnsThisFrame;
+
+    // START-OF-FRAME SUBMISSION. The targeted fix for the session drift.
+    //
+    // Measured 2026-07-28: our render's true GPU work is only ~3 ms, but an ours-frame
+    // costs ~30 ms because the GPU sits IDLE waiting — and that idle grows with engine
+    // session age (10 ms of bubbles at ~50 min, none when dormant) and survives a full
+    // teardown of everything we own. Only a process restart resets it, so the reservoir is
+    // engine-side; our render is just the thing that pays for it, because it sits between
+    // the player's recorded work and the present copy.
+    //
+    // Recording our render HERE instead puts our commands ahead of the player's, so the
+    // GPU executes them while the CPU is still recording the player's frame — time the GPU
+    // spent idle anyway. It does not shrink the bubbles; it moves them somewhere they cost
+    // nothing. Today's ~10-13 ms of gaps fit inside the player's ~15 ms record window.
+    //
+    // The feed image is one frame older than it would otherwise be. At 30 fps that is
+    // ~33 ms of extra latency on a slowly orbiting camera — irrelevant.
+    public static void OnWholeSceneEarly(object sceneDrawSystem, object finalLdrBuffer)
+    {
+        if (_inOurRender) return;               // our own nested Draw
+
+        // Cleared HERE, at frame start, not just after the postfix reads it. If the postfix
+        // bails early — gate went dormant mid-frame, _state faulted — a stale true would
+        // survive into the next frame and mis-bucket a Perf sample. That histogram is the
+        // instrument this whole change is judged by, so it does not get to lie.
+        _earlyRan = false;
+
+        // Recorded unconditionally, before any early-out, so the postfix always has a
+        // coherent answer for this frame even when we decline to render.
+        _earlyOwnsThisFrame = FeedConfig.WholeSceneSubmitEarly;
+        if (!_earlyOwnsThisFrame) return;       // the postfix owns it
+
+        // The gate is polled and the buffers are built by the POSTFIX. On the very first
+        // frames that leaves nothing to render from, so we simply decline and pick it up
+        // next frame — one frame of startup latency, no special case.
+        if (!FeedGate.Active || _state == -1 || _ourScreenBuffers == null) return;
+
+        try { _earlyRan = TryRender(sceneDrawSystem); }
+        catch (Exception e) { _state = -1; RttLog.Error("whole-scene early hook", e); }
+    }
+
+    // The settle countdown, the rate gate and the render itself. Called from EXACTLY ONE
+    // of the two hooks per engine frame — whichever owns this frame — because both the
+    // countdown and the rate stamp are per-frame state that must not tick twice.
+    private static bool TryRender(object sceneDrawSystem)
+    {
+        // SETTLE AFTER A REBUILD, and this one cost a device removal to find.
             //
             // Reset() disposes and re-creates our ScreenBuffers and DrawContextManager, and
             // creating a DrawContextManager trips the engine's context-reset path — which
@@ -526,41 +600,19 @@ internal static class WholeSceneRender
                                 "second renders resume. This window exists because a rebuild forces the " +
                                 "shared EnvironmentProbeManager to reprocess every probe, and rendering " +
                                 "into that batch is a device removal.");
-                Perf.NoteFrame(false);
-                return;
-            }
-
-            bool oursRan = false;
-            if (FeedConfig.WholeSceneEnabled && _ourScreenBuffers != null
-                // No hard floor any more (was Math.Max(33, ...)). The 30fps cap was a
-                // safety rail from the era when a fault cost a CTD per attempt; the route
-                // is stable now and the cost model is a straight trade — every ours-frame
-                // costs ~28ms, so intervalMs=0 renders every frame and pins feed fps ==
-                // world fps (~35/35 today), while 33 keeps ~25/50. The slider is the
-                // user's. Multi-feed budgeting (see docs/roadmap.md) will sit on top of
-                // this same gate later.
-                && Clock.Ms - _lastRenderMs >= FeedConfig.WholeSceneIntervalMs)
-            {
-                _lastRenderMs = Clock.Ms;
-                oursRan = true;
-                RunSecondRender(sceneDrawSystem);
-            }
-
-            // Split the frame-interval histogram by whether we rendered this frame. Same
-            // thread, same loop — so the difference between the two buckets IS our cost,
-            // and if both are equally bad the cost is somewhere else entirely.
-            Perf.NoteFrame(oursRan);
-
-            long now = Clock.Ms;
-            if (now - _lastLogMs >= 5000)
-            {
-                _lastLogMs = now;
-                RttLog.Line($"Whole-scene hook: {_hookCount} frame(s), " +
-                            $"ourScreenBuffers={(_ourScreenBuffers == null ? "not built" : "BUILT")}, " +
-                            $"secondRenders={_renderCount}, camera={(FeedConfig.WholeSceneCamera ? "OURS" : "player's")}.");
-            }
+            return false;
         }
-        catch (Exception e) { _state = -1; RttLog.Error("whole-scene hook", e); }
+
+        // No hard floor any more (was Math.Max(33, ...)). The 30fps cap was a safety rail
+        // from the era when a fault cost a CTD per attempt; the route is stable now and the
+        // cost model is a straight trade, so the slider is the user's. Multi-feed budgeting
+        // (see docs/roadmap.md) will sit on top of this same gate later.
+        if (!FeedConfig.WholeSceneEnabled || _ourScreenBuffers == null) return false;
+        if (Clock.Ms - _lastRenderMs < FeedConfig.WholeSceneIntervalMs) return false;
+
+        _lastRenderMs = Clock.Ms;
+        RunSecondRender(sceneDrawSystem);
+        return true;
     }
 
     // STAGE 3: swap the globals, run a whole second frame, put them back.
