@@ -168,3 +168,30 @@ Next tests: (a) does "Missing" grow with session age — sample it over an hour;
 only (note SamplerManager.GetSamplerLODBias in DrawInternal, and the deleted
 lodMainView knob's history) would demand smaller mips and overlap better with what
 is already resident. (b) is the candidate real fix if (a) confirms.
+
+## Addendum 2026-07-29c: the LDR resize is NOT the drift, and the knee is reproducible
+
+The ghost fix was suspected because a >50ms step coincided with its deploy. Tested
+by A/B at constant session age (~22 min):
+
+| resize | fps | p50 | p95 | >50ms |
+|---|---|---|---|---|
+| ON (ghost fixed) | 38.8-39.4 | 33.7-34.5 | 53-54 | 28-30 |
+| OFF (ghost back) | 38.5-38.8 | 33.6-34.1 | 54-55 | 35-36 |
+
+Identical, marginally worse without it. Exonerated; kept on.
+
+The coincidence explained: the >50ms count has a KNEE at ~16-20 minutes of session
+age, and it reproduces across two different builds on two different boots:
+
+    2026-07-28 boot 22:11 -> 16min: >50ms 5-9    22min: 28-34
+    2026-07-29 boot 17:44 -> 13min: >50ms 2-4    16min: 28-30   22min: 35-36
+
+Same age, same knee, different code. That is strong evidence the drift is
+ENVIRONMENTAL (VRAM/streaming state) rather than anything we deploy — and it is
+why deploy-time correlations have been misleading all along. Always A/B at equal
+session age.
+
+Three suspects now eliminated by controlled test: submission position, the LDR
+resize, and (last night) our own resource teardown. The residency hypothesis
+stands untested.
