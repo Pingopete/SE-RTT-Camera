@@ -118,3 +118,53 @@ The frame-vs-work gap with the feed RUNNING now matches what previously required
 the feed to be OFF. p50 unchanged vs baseline on a fresh session (~27-29ms), as
 predicted — the verdict metric is the SLOPE over session age (last night:
 +0.7ms/min to p50 48 at ~50min). Slope watch armed.
+
+## Addendum 2026-07-29b: start-of-frame submission is a NULL RESULT
+
+Paired A/B at CONSTANT session age (~17 min), which is the only valid comparison:
+
+| position | fps | ours p50 | ours p95 |
+|---|---|---|---|
+| START-of-frame | 41.6 | 29.6 | 49.3 |
+| END-of-frame   | 41.6 | 30.7-31.1 | 49.4-51.1 |
+
+Identical. The submission position does not affect the drift.
+
+Why the theory was wrong: the GPU is ONE serial queue, so moving our submission
+within a frame cannot take it off that frame's critical path to present. The
+overlap only ever hides work while it fits under the CPU record window, and it
+does not address the growth at all.
+
+Methodology lesson: the first "success" reading compared the new position at
+minute 13 against the old at minute 2 — confounded by the very drift being
+measured. And p50 was picked as the verdict metric in advance while the user's
+felt experience tracked p95 (34.5 -> 49.3) and total fps (53 -> 42). Choppiness
+lives in the TAIL. Grade tails, and A/B at equal session age.
+
+Kept anyway: the prefix hook, the shared TryRender() and the live flag are a
+permanent capability (a zero-cost A/B switch, and the submission-scheduling point
+multi-feed budgeting needs). Default is 0 = end-of-frame, the proven position.
+
+## The drift, localised (2026-07-29)
+
+| | fresh (min 2) | aged (min 19) |
+|---|---|---|
+| our CPU submit | 15.6ms | 13.1ms (flat/down) |
+| idle frames | 11.2ms | 8.2ms (FASTER) |
+| ours frames | 26.6ms | 35.8ms (+9ms) |
+
+So it is NOT CPU submit, and NOT the player's own work — which improves. It is a
+GPU-side wait attached specifically to OUR frames.
+
+LEADING HYPOTHESIS (one sample, unproven): texture residency. VRAM at 89.1% with
+"Missing: 1.14Gi" in RenderSceneStats. The orbit camera's working set differs from
+the player's first-person view, so as the session streams the world in, OUR set is
+what gets evicted, and each of our renders stalls re-fetching over PCIe. Fits every
+observation including why the player's frames get faster (their set stays cached)
+and why only a process restart resets it.
+
+Next tests: (a) does "Missing" grow with session age — sample it over an hour;
+(b) does shrinking our working set help — a texture MIP/LOD bias for our render
+only (note SamplerManager.GetSamplerLODBias in DrawInternal, and the deleted
+lodMainView knob's history) would demand smaller mips and overlap better with what
+is already resident. (b) is the candidate real fix if (a) confirms.
