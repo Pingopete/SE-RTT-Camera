@@ -59,3 +59,24 @@ Sketch on top of the existing gate:
    overlaps the next frame's CPU record instead of delaying the swap. Recovers most of
    the ours-frame cost from the main world. Bootstrap change; frame-span lifetime at
    present is the hazard; needs its own careful session.
+
+## Addendum 2026-07-28: the session drift, characterised
+
+Controlled experiment (90s sampling of the engine's live Stats log + a panel-off
+dormant phase) on a ~50-minute session:
+
+| phase | gpuFrame | gpuWork | verdict |
+|---|---|---|---|
+| feed on, aged | 29-30.6ms | ~19.3ms flat | ~10ms GPU idle per frame |
+| feed OFF | 16.6ms | 16.5ms | bubbles vanish entirely |
+| feed back on | p50 lands at 48 | — | teardown does NOT reset the aging |
+
+Conclusions: our render's true GPU work is ~3ms; its apparent cost is dominated by
+induced pipeline gaps; the gaps grow with ENGINE session age and only a game restart
+resets them; GC stalls accrue equally while dormant (exonerated as driver).
+
+Consequence: backlog item 5 (submit the feed render at start-of-frame, outside the
+mid-frame serial position) is promoted from optimisation to THE fix for the drift.
+It hides the induced gaps under the next frame's ~15ms CPU record window. Risk
+unchanged (frame-span lifetime across the present boundary); deserves a fresh
+session with crash patience.
