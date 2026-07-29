@@ -73,7 +73,7 @@ internal static class CameraRender
         _armed = _disarmed = false;
         _lastRender = _lastArmCheck = _lastDisarmCheck = 0; _errors = 0;
         Array.Clear(_ldrRing, 0, _ldrRing.Length); _ldrReady = null; _ringIndex = -1;
-        _resolvedPanelId = null; _blitLogged = false;
+        _resolvedPanelId = null; _blitLogged = _blitResLogged = false; _farClipLogged = double.NaN;
         _baseViewSnapshot = null; _baseViewMismatches = 0; _mismatchLogged = false;
         _viewSkips = _viewSkipLogs = 0;
         _firstPassAt = 0; _startupLogged = _startupDoneLogged = false;
@@ -305,6 +305,12 @@ internal static class CameraRender
             // Persistent and self-gating on change — see ApplyDimDistance for why it
             // cannot be part of a scoped swap.
             ApplyDimDistance();
+
+            // One-shot per rebuild: shrink our FinalLDR from the swapchain size its ctor
+            // gave it down to the feed size. Here because this hook has what Resize needs
+            // — the render thread and a live DirectCommandList (a CopyCommandList by
+            // inheritance). See WholeSceneRender.EnsureFinalLdrSize for the full story.
+            WholeSceneRender.EnsureFinalLdrSize(commandList);
 
             // Advances the orbit. The return value is only checked for failure; the side
             // effect on _lastCamWorld / _lastViewD is what the whole-scene route reads.
@@ -555,6 +561,22 @@ internal static class CameraRender
                     var srcRes = Prop2(Prop2(wsSource ?? rtBorrow, "Resource") ?? wsSource ?? rtBorrow, "Resolution");
                     if (srcRes != null) crop = MakeRect(_miCopyDoWork.GetParameters()[7].ParameterType, srcRes);
 
+                    // Identity log for the copy probe: the bootstrap's [copyprobe] lines
+                    // print every unique CopyJob src->dst pair with the same #hash format,
+                    // so OUR blit can be matched against any OTHER copy consuming the same
+                    // resource. Also settles whether the engine's deferred assert
+                    // "Source and destination should have the same resolution" is this
+                    // call (ours legitimately rescales) or someone else's.
+                    if (!_blitResLogged)
+                    {
+                        _blitResLogged = true;
+                        var srcResource = Prop2(wsSource, "Resource") ?? wsSource;
+                        var dstResource = Prop2(_feedTexture, "Resource") ?? _feedTexture;
+                        RttLog.Line($"Feed blit identity: src={srcRes}#{(srcResource == null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(srcResource)):x8} " +
+                                    $"dst={Prop2(dstResource, "Resolution")}#{(dstResource == null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(dstResource)):x8} " +
+                                    "— match these hashes against [copyprobe] lines to find any foreign consumer of our image.");
+                    }
+
                     var channels = (FeedConfig.BlitAlpha ? _channelAll : _channelRgb) ?? _channelAll;
                     _miCopyDoWork.Invoke(_copyJob, new object[]
                         { commandList, dstRtv, blitSrc, null, null, channels, null, crop });
@@ -596,6 +618,27 @@ internal static class CameraRender
     private static object _ldrReady;                             // the slot handed to the UI stage
     private static int _ringIndex = -1;
     private static bool _blitLogged;
+    private static bool _blitResLogged;
+
+    // The far-clip lever, and its one-shot log. Kept next to the blit fields because both
+    // are per-session latches cleared by Reset().
+    private static double _farClipLogged = double.NaN;
+
+    private static float FarClip(float engineFar)
+    {
+        double clip = FeedConfig.WholeSceneFarClip;
+        return clip > 0 && engineFar > clip ? (float)clip : engineFar;
+    }
+
+    private static void LogFarClipOnce(float far, float veryFar)
+    {
+        if (_farClipLogged.Equals((double)far)) return;
+        _farClipLogged = far;
+        RttLog.Line(FeedConfig.WholeSceneFarClip > 0
+            ? $"Feed far clip: {far:F0} m (veryFar {veryFar:F0} m untouched — planets/sky still render). " +
+              "Watch ourDraw(cpu submit) in PERF for the draw-count saving."
+            : $"Feed far clip: engine value {far:F0} m (wholeSceneFarClip=0, no override).");
+    }
     private static long _firstPassAt;
     private static bool _startupLogged, _startupDoneLogged;
 
@@ -745,8 +788,18 @@ internal static class CameraRender
             var projOff   = Prop2(_wsRenderView, "ProjectionOffset");
             bool ortho    = System.Convert.ToBoolean(Prop2(_wsRenderView, "IsOrthographic") ?? false);
 
+            // Far-clip override, OUR view only. The second render's cost is CPU submit —
+            // command-building for every culled-in draw — so the draw COUNT is the lever,
+            // and FarClipping is what the culling reads. VeryFarClipping is deliberately
+            // untouched: the planet/sky layer renders through it, so distant planets and
+            // their atmospheres survive while asteroid/grid geometry beyond the clip is
+            // dropped. Applied identically to the camera CB build below, so culling and
+            // shaders agree on the projection.
+            far = FarClip(far);
+
             _miRvSetCamera.Invoke(_wsRenderView, new object[]
                 { _lastCamWorld, fovH, near, far, veryFar, projOff, /* smooth */ true, ortho });
+            LogFarClipOnce(far, veryFar);
 
             // Kill TAA jitter for our render: the inherited jitter phase was computed for
             // the player's 4K target, and sub-pixel offsets that large at 512x512 are a
@@ -1144,7 +1197,7 @@ internal static class CameraRender
 
             float fovH      = System.Convert.ToSingle(Prop2(_cbRenderView, "FovH") ?? 0f);
             float near      = System.Convert.ToSingle(Prop2(_cbRenderView, "NearClipping") ?? 0f);
-            float far       = System.Convert.ToSingle(Prop2(_cbRenderView, "FarClipping") ?? 0f);
+            float far       = FarClip(System.Convert.ToSingle(Prop2(_cbRenderView, "FarClipping") ?? 0f));
             float veryFar   = System.Convert.ToSingle(Prop2(_cbRenderView, "VeryFarClipping") ?? 0f);
             var projOffset  = Prop2(_cbRenderView, "ProjectionOffset");
             bool ortho      = System.Convert.ToBoolean(Prop2(_cbRenderView, "IsOrthographic") ?? false);

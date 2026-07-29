@@ -45,6 +45,12 @@ public static class RttBridge
     // again, and the handler must return immediately when it does.
     public static volatile Action<object, object> WholeSceneHook;
 
+    // TRUE while the logic side is inside its nested second Draw. Read by the log-only
+    // probes (CopyJob / ScreenBuffers.InitializeBuffers) so their lines say which render
+    // an engine call fired in. Absent/null on an old logic assembly — probes then log
+    // inOurRender=false, which is still useful.
+    public static volatile Func<bool> InOurRenderHook;
+
     // Returns TRUE to skip a Draw sub-stage entirely. The int identifies which — see
     // RttPlugin.SkippableStages.
     //
@@ -117,6 +123,7 @@ public sealed class RttPlugin : IPlugin
 
             PatchSceneDraw(harmony);
             PatchOffscreenUi(harmony);
+            PatchGhostProbes(harmony);
         }
         catch (Exception e) { Log("Patching FAILED: " + e); }
     }
@@ -568,6 +575,101 @@ public sealed class RttPlugin : IPlugin
             Log($"Patched EyeAdaptationJob.ConstantExposure as read-only override id {ExposureReadOnlyId}.");
         }
         catch (Exception e) { Log($"Patching the exposure gate FAILED: {e.Message}"); }
+    }
+
+    // ------------------------------------------------------------- ghost probes
+    //
+    // LOG-ONLY Harmony prefixes, hunting the phantom bleed. The bleed is proven to be our
+    // render target reaching the player's frame (it scales with our render resolution and
+    // survives every stage skip, all delivery paths, and the panel binding), so the leak
+    // is in whatever MOVES or REBUILDS texture content — and CopyJob is the engine's
+    // converting blit. The game's own deferred-assert log already shows
+    // "Source and destination should have the same resolution" (CopyJob.DoWork) and
+    // "_usedMaxResolution == Vector2.Zero" (ScreenBuffers.InitializeBuffers) firing while
+    // the feed runs, so both sites get identity logging.
+    //
+    // Neither prefix changes behaviour: no skips, no result overrides. Each unique
+    // src->dst pair logs once, capped, so the cost after warm-up is one HashSet lookup.
+    private static readonly HashSet<string> _copyProbeSeen = new();
+    private static int _copyProbeLines;
+
+    private static void PatchGhostProbes(HarmonyLib.Harmony harmony)
+    {
+        const BindingFlags Any = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+        try
+        {
+            var copy = Type.GetType("Keen.VRage.Render12.PostProcessStage.CopyJob, VRage.Render12");
+            var doWork = copy?.GetMethods(Any).FirstOrDefault(m => m.Name == "DoWork" && m.GetParameters().Length == 8);
+            if (doWork != null)
+            {
+                var pre = typeof(RttPlugin).GetMethod(nameof(CopyProbePrefix), BindingFlags.Static | BindingFlags.NonPublic);
+                harmony.Patch(doWork, prefix: new HarmonyLib.HarmonyMethod(pre));
+                Log("[probe] Patched CopyJob.DoWork — every unique src->dst copy logs once as [copyprobe].");
+            }
+            else Log("[probe] CopyJob.DoWork(8 args) not found — copy probe unavailable.");
+
+            var sb = Type.GetType("Keen.VRage.Render12.Core.Systems.ScreenBuffers, VRage.Render12");
+            var init = sb?.GetMethod("InitializeBuffers", Any);
+            if (init != null)
+            {
+                var pre = typeof(RttPlugin).GetMethod(nameof(InitBuffersProbePrefix), BindingFlags.Static | BindingFlags.NonPublic);
+                harmony.Patch(init, prefix: new HarmonyLib.HarmonyMethod(pre));
+                Log("[probe] Patched ScreenBuffers.InitializeBuffers — every (re)initialisation logs as [initprobe].");
+            }
+            else Log("[probe] ScreenBuffers.InitializeBuffers not found — init probe unavailable.");
+        }
+        catch (Exception e) { Log("[probe] Patching the ghost probes FAILED: " + e.Message); }
+    }
+
+    // args: (commandList, destination IRenderTargetView, source ITexture2DView, ...)
+    private static void CopyProbePrefix(object[] __args)
+    {
+        try
+        {
+            if (_copyProbeLines >= 80) return;
+            string src = ProbeDescribe(__args.Length > 2 ? __args[2] : null);
+            string dst = ProbeDescribe(__args.Length > 1 ? __args[1] : null);
+            bool ours = false;
+            try { ours = RttBridge.InOurRenderHook?.Invoke() == true; } catch { }
+
+            string key = (ours ? "O|" : "P|") + src + ">" + dst;
+            lock (_copyProbeSeen)
+            {
+                if (!_copyProbeSeen.Add(key)) return;
+                if (++_copyProbeLines == 80) { Log("[copyprobe] cap reached; further unique pairs unlogged."); return; }
+            }
+            Log($"[copyprobe] inOurRender={ours} src={src} dst={dst}");
+        }
+        catch { }
+    }
+
+    private static void InitBuffersProbePrefix(object __instance, object[] __args)
+    {
+        try
+        {
+            bool ours = false;
+            try { ours = RttBridge.InOurRenderHook?.Invoke() == true; } catch { }
+            Log($"[initprobe] ScreenBuffers.InitializeBuffers({(__args != null && __args.Length > 0 ? __args[0] : null)}) " +
+                $"instance=#{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(__instance):x8} inOurRender={ours}");
+        }
+        catch { }
+    }
+
+    // "{X:512 Y:512}#1a2b3c4d" — resolution plus the RESOURCE object's identity hash, the
+    // same format the logic side prints for its own blit, so lines correlate across the
+    // two logs. Uncached reflection is fine: the cap check above makes the probe free once
+    // 80 unique pairs have been seen.
+    private static string ProbeDescribe(object view)
+    {
+        if (view == null) return "null";
+        try
+        {
+            const BindingFlags Any = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            var res = view.GetType().GetProperty("Resource", Any)?.GetValue(view) ?? view;
+            var r = res.GetType().GetProperty("Resolution", Any)?.GetValue(res);
+            return $"{r}#{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(res):x8}";
+        }
+        catch { return "?"; }
     }
 
     private static bool ConstantExposurePrefix(object __instance, ref object __result)

@@ -63,6 +63,81 @@ internal static class WholeSceneRender
     // able to clear another thread's guard.
     [ThreadStatic] private static bool _inOurRender;
 
+    // For the bootstrap's log-only probes (CopyJob / InitializeBuffers): lets a patched
+    // engine method say whether it fired inside our nested Draw. ThreadStatic read is
+    // correct — the probes fire on the render thread, same as the guard.
+    public static bool InOurRender => _inOurRender;
+
+    // Last observed FinalLDR "Resolution|MaxResolution", for the resolution tripwire.
+    private static string _lastLdrRes;
+
+    // ---- the FinalLDR resize -----------------------------------------------------
+    //
+    // The ScreenBuffers CTOR sizes FinalLDRTexture from the player's swapchain, and our
+    // InitializeBuffers(512) re-initialises only the pre-upscale chain — so our "512"
+    // render has been upscaling 512 -> 3840x2160 into a display-resolution texture every
+    // frame since the route first worked, and the panel blit then scaled it back down.
+    // Caught by the blit identity log (src=3840, 2160 on a 512 build).
+    //
+    // Resize is the engine's own designed per-frame path for these textures (HighlightJob
+    // and friends resize borrowed targets mid-frame routinely), so this creates nothing.
+    // It fixes the wasted 4K upscale and the engine's deferred
+    // "Source and destination should have the same resolution" assert. NOTE the limit:
+    // Resize changes the CURRENT resolution, not MaxResolution — the pool key — so if the
+    // ghost is pool-key aliasing this alone will not clear it. The tripwire above and the
+    // bootstrap probes decide that question.
+    //
+    // Called from the probe hook (render thread, live DirectCommandList — which IS a
+    // CopyCommandList by inheritance). One attempt per rebuild.
+    private static bool _ldrResized;
+
+    public static void EnsureFinalLdrSize(object commandList)
+    {
+        if (_ldrResized || _ourScreenBuffers == null || commandList == null) return;
+        _ldrResized = true;
+        try
+        {
+            var ldr = _ourScreenBuffers.GetType().GetProperty("FinalLDRTexture", Any)?.GetValue(_ourScreenBuffers);
+            if (ldr == null) return;
+
+            var resProp = ldr.GetType().GetProperty("Resolution", Any);
+            var cur = resProp?.GetValue(ldr);
+            int w = FeedConfig.WholeSceneWidth, h = FeedConfig.WholeSceneHeight;
+            if (cur != null && cur.ToString().Contains($"X:{w}") && cur.ToString().Contains($"Y:{h}"))
+                return;     // already right — nothing to log, nothing to do
+
+            var v2i = cur?.GetType();                 // Vector2I, taken from the live value
+            var target = v2i == null ? null : Activator.CreateInstance(v2i);
+            v2i?.GetField("X")?.SetValue(target, w);
+            v2i?.GetField("Y")?.SetValue(target, h);
+
+            var resize = ldr.GetType().GetMethod("Resize", Any);
+            if (target == null || resize == null)
+            {
+                RttLog.Line("FinalLDR resize: Resize/Vector2I unreachable — the 4K upscale stays.");
+                return;
+            }
+
+            resize.Invoke(ldr, new[] { commandList, target });
+            RttLog.Line($"FinalLDR resized: {cur} -> {w}x{h}. Our render now upscales 512->512 instead of " +
+                        $"512->3840x2160, and the panel blit is 1:1. MaxResolution (the pool key) is unchanged " +
+                        "by design — watch the tripwire for Draw resizing it back.");
+        }
+        catch (Exception e) { RttLog.Error("FinalLDR resize", e); }
+    }
+
+    private static string LdrRes(object ldr)
+    {
+        try
+        {
+            var t = ldr.GetType();
+            var res = t.GetProperty("Resolution", Any)?.GetValue(ldr);
+            var max = t.GetProperty("MaxResolution", Any)?.GetValue(ldr);
+            return $"{res}|max {max}";
+        }
+        catch { return "?"; }
+    }
+
     private static int _state;              // 0 untried, 1 observed, -1 unavailable
     private static long _lastLogMs;
     private static int _hookCount;
@@ -243,6 +318,8 @@ internal static class WholeSceneRender
         _sbField = _rvField = null;
         _settingsObj = null;
         _lastRenderMs = 0;
+        _lastLdrRes = null;
+        _ldrResized = false;
         _renderCount = 0;
 
         // Arm the settle window. Reset is exactly the event that forces the shared probe
@@ -609,11 +686,30 @@ internal static class WholeSceneRender
                                 $"into our own {FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight} " +
                                 $"ScreenBuffers. Camera is {(camSwapped ? "OURS" : "the player's")}. ===");
 
+                // RESOLUTION TRIPWIRE. The blit identity log caught our FinalLDRTexture at
+                // 3840x2160 — the PLAYER'S resolution — after being built at 512. If that
+                // resize happens across ONE nested Draw, our own Draw's upscale tail is
+                // doing it from player display state; if it happens elsewhere, an engine
+                // path is touching our instance. Either way this names the frame it flips.
+                // MaxResolution is logged too because it is the POOL KEY: the moment ours
+                // says 3840x2160 our textures share borrow keys with the player's pool,
+                // and the aliasing that was "excluded" is excluded no longer.
+                string before = LdrRes(ourLdr);
+
                 long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 _miDraw.Invoke(sceneDrawSystem, new[] { ourLdr });
                 Perf.NoteOurDraw((System.Diagnostics.Stopwatch.GetTimestamp() - t0)
                                  * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
                 _renderCount++;
+
+                string after = LdrRes(ourLdr);
+                if (before != after || (_lastLdrRes != null && _lastLdrRes != before))
+                    RttLog.Line($"!!! FinalLDR resolution moved: lastRender='{_lastLdrRes ?? "n/a"}' " +
+                                $"beforeDraw='{before}' afterDraw='{after}' (render #{_renderCount}). " +
+                                (before != after
+                                    ? "OUR nested Draw resized it — the upscale tail is using player display state."
+                                    : "It moved BETWEEN our renders — an engine-side path touched our instance."));
+                _lastLdrRes = after;
 
                 // The image now sits in our FinalLDRTexture. Delivery to the panel is
                 // NOT done here — parking it directly was tried and CTD'd:

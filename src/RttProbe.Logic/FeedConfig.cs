@@ -192,6 +192,13 @@ internal static class FeedConfig
     // cascade borrows on the SHARED SceneDrawSystem._bloomJob; see ScopeSharedState.
     public static bool WholeSceneNoBloom { get; private set; }
 
+    // Far plane for OUR view only, metres. 0 = keep the player's far plane. The second
+    // render's measured cost is CPU submit (draw-command building), so culled-in draw
+    // COUNT is the lever — not pixels. VeryFarClipping is untouched, so the planet/sky
+    // layer still renders and only asteroid/grid geometry beyond the clip is dropped.
+    // Live-tunable; not part of the rebuild signature.
+    public static double WholeSceneFarClip { get; private set; }
+
     public static bool WholeSceneNativeScaling { get; private set; }
 
     // Feed exposure bias, in EV STOPS. Signed: +1 doubles brightness, -1 halves it.
@@ -469,6 +476,7 @@ internal static class FeedConfig
             WholeSceneExposure      = Dbl(kv, "wholeSceneExposure", WholeSceneExposure);
             WholeSceneNativeScaling = Bool(kv, "wholeSceneNativeScaling", WholeSceneNativeScaling);
             WholeSceneNoBloom       = Bool(kv, "wholeSceneNoBloom", WholeSceneNoBloom);
+            WholeSceneFarClip       = Dbl(kv, "wholeSceneFarClip", WholeSceneFarClip);
             WholeSceneOwnDrawContexts   = Bool(kv, "wholeSceneOwnDrawContexts", WholeSceneOwnDrawContexts);
             WholeSceneOwnShadows        = Int(kv, "wholeSceneOwnShadows", WholeSceneOwnShadows);
             WholeSceneCascadeResolution = Int(kv, "wholeSceneCascadeResolution", WholeSceneCascadeResolution);

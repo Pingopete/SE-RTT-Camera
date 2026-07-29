@@ -31,6 +31,10 @@ public static class LogicEntry
             bridge.GetField("SceneDrawHook")?.SetValue(null, (Action<object, object, int>)ScenePassHook.OnSceneDraw);
             bridge.GetField("OffscreenUiDrawHook")?.SetValue(null, (Action<object[]>)FeedHandover.OnOffscreenUiDraw);
 
+            // For the bootstrap's log-only probes: whether an engine call fired inside our
+            // nested Draw. Null-safe on an older bootstrap.
+            bridge.GetField("InOurRenderHook")?.SetValue(null, (Func<bool>)(() => WholeSceneRender.InOurRender));
+
             // The whole-scene route. Null on an older bootstrap, which is the expected
             // state until the game is restarted to adopt the new one — the field is
             // looked up rather than assumed so a stale bootstrap degrades to "this
