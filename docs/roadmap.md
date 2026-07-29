@@ -282,6 +282,116 @@ feed pay the cold-start tax. Any scheduler must keep each feed's temporal state 
 or amortise differently (e.g. round-robin at full rate rather than rate-limiting all
 feeds). Measure before designing.
 
+## 4. Fidelity restoration — four layers, easiest first (agreed 2026-07-29)
+
+User-agreed goals. Work them in this order; each is independently shippable and
+independently revertible. Ordering is by implementation difficulty, NOT by value —
+the most valuable one (probes) is deliberately last because it needs the most groundwork.
+
+Every one of these changes WHICH ENGINE CODE RUNS, so every one is subject to Rule 14 and
+Rule 17: pause the feed first, even the config-only ones.
+
+### 4.1 Atmosphere LUTs — config-only (skip id 24)
+
+**Change:** remove `24` from `wholeSceneSkipStages`.
+**Adds:** the feed computes its own atmosphere scattering tables — sky colour, haze, the
+glow at a planet's limb — instead of inheriting whatever the player's frame last computed.
+**Cost:** small, a few compute dispatches on small LUTs.
+**Expected visual gain right now: near zero**, because the orbit camera sits ~100 m from the
+player, so the player's tables are already essentially correct for it. The gain is real only
+once cameras are FAR from the player — different altitude, different planet, opposite side of
+a world — which is the actual end goal.
+**Risk:** `AtmosphereLUTJob` writes the SHARED per-planet `AtmosphereLUTTables` on
+`CommonResourcesManager`, from our camera. That is why it was skipped. It ran without any
+observed problem before being skipped, and it was skipped preventively during the ghost hunt
+— which then turned out to be `FinalLDRTexture`, not this.
+**Test:** enable, then watch the PLAYER'S sky and planet limbs, not the feed. A wrong shared
+LUT shows up in the world, not in the camera.
+**Why first:** one number in a config file, a known-clean prior run, and an unambiguous
+failure signature.
+
+### 4.2 Anti-aliasing — FXAA for the feed
+
+**Why it matters:** the feed currently gets **no AA at all**, which at 512x512 is the single
+largest source of visible aliasing. `UpscaleTargetFSR` early-outs (our target resolution
+equals our ScreenBuffers resolution, and skip id 20 forces `IsFSREnabledAndAllowed` false),
+and `AAMode` is left at the player's FSR, so `ApplyNonFSRUpscalingAndAA` self-gates to
+nothing as well.
+**Change:** scope `DRSSettings.AAMode = 1` (FXAA) for the duration of our render. FXAA is
+spatial-only and needs no motion vectors, which is the right AA for a camera whose temporal
+history is weak.
+**Cost:** one fullscreen pass at 512x512. Sub-millisecond; will not show up in PERF.
+
+**Verified offline already (`tools/EngineQuery`):**
+
+- `FXAAJob` is constructed once in `SceneDrawSystem`'s ctor and its only initialisation is
+  that ctor's `InitializeAsync` (PSO compile). **It does NOT depend on
+  `UpsamplingJob.PrepareResources`** — so skipping stage 19 cannot starve it. This was the
+  main safety worry and it is answered.
+- The known crash mechanism behind `AAMode` — `PrepareResources` allocating one branch while
+  disposing the other — **cannot fire**, because stage 19 already skips `PrepareResources`
+  inside our render. This is what makes the retry informed rather than blind.
+
+**Watch item:** `ApplyNonFSRUpscalingAndAA` borrows a `RenderTargetTexture` at
+**`SwapChain.Resolution`** — the player's 4K, not ours. It is a pool borrow (the designed,
+cheap path, not the dangerous Dispose+Create shape), but a 4K intermediate inside our render
+is exactly the family that produced the phantom bleed. Log its live resolution before
+trusting it, per Rule 20.
+**History to respect:** three CTDs sit behind this knob. Pause protocol, one change, verify.
+
+### 4.3 Lens flares — needs plumbing (skip id 21)
+
+**Adds:** sun and light glare in the feed. Worth having for a camera that can point near a
+star.
+**Cost:** near zero — a small additive pass.
+**Blocker, and it is not performance:** our own `FlaresContext` is **empty**. Every light
+registers its flare through the global `CoreSystems.DrawContexts.LensFlares`
+(`PointLightEntityComponent.Init` / `SetParameters` / `OnRemovedFromScene`, the spot and
+particle equivalents, `SceneManager.UpdateFlareDefinitions`), and the global is the engine's
+whenever a light is actually created. So simply unskipping the pass renders nothing.
+Meanwhile running the pass against the SHARED context is worse than nothing:
+`RenderFlares` calls `ProcessFinishedFrame` and `PrepareReadback`, which advance the flare
+OCCLUSION readback across frames — doing that twice per frame against one context corrupts
+the player's flare occlusion. That combination is the confirmed cause of the old "planet's
+atmosphere appears, completely unattached to the planet" bug.
+**Two possible approaches, both unbuilt:**
+1. Mirror flare definitions from the engine's context into ours each frame, keep our own
+   readback state. Read-only against the engine's data.
+2. Own the registration path (patch the three registration sites to write both contexts).
+   More invasive; more likely to leak.
+**Do 4.1 and 4.2 first** — this one needs a design pass, not just a config edit.
+
+### 4.4 Environment probes — hardest, and the most important long-term (skip id 2)
+
+**Why the user wants it, and the reasoning is right:** this is a REMOTE camera. The feed
+currently samples the player's probe atlas, which is centred on the PLAYER — so its
+reflections and ambient bounce are correct for where the player is standing, not where the
+camera is. At 100 m that is subtle. At real remote-camera distances it will be visibly
+wrong, and it will get worse the further the camera goes. This is a correctness problem
+disguised as a fidelity problem.
+**Cost: the highest on the list by a wide margin.** A probe render is six cube faces of
+scene geometry — which is precisely why the engine amortises it round-robin across frames
+rather than doing it in one go. Own probes could cost a multiple of our current render.
+**Blockers:**
+- `RenderEnvironmentProbe` iterates `DrawContexts.EnvProbesToUpdate`, and OUR
+  `DrawContextManager`'s copy is never populated: it is filled in
+  `DrawContextManager.OnBeginDraw`, which runs in `DrawInternal` on the ENGINE'S context,
+  before `Draw`. So unskipping stage 2 today iterates an empty buffer and does nothing
+  useful, while still running `EnvironmentProbeExposureJob` against the shared `CloseIBL`.
+- Filling our own queue means driving `EnvironmentProbeManager.PrepareProbes()` — a method
+  on a GLOBAL manager, which is Rule 8 territory, and which also stores `_lastSettings`,
+  `_forceReprocess` and `_state` and can `DisposeTextures` + `RecreateProbes`.
+- **Records contradict each other and must be reconciled first.** The stage-27 dossier in
+  `RttPlugin.cs` calls `PrepareProbes` a CONFIRMED device removal at
+  `wholeSceneIntervalMs=33`, with a full DRED breadcrumb. It was LATER proven that stage 27
+  never executes at all (`OnBeginDraw` is not reached from `Draw`). Both cannot be true.
+  Resolve that before designing anything here.
+- Amortisation is mandatory, not optional: at minimum one face per feed render, and the
+  round-robin must be fitted to the orbit camera.
+**Also note:** Rule 19 — creating our own probe resources trips `_forceReprocess` and a mass
+reprocess, and rendering into that batch is a device removal. The 30-frame settle window
+exists because of exactly this.
+
 ## Hypothesis 2026-07-29: WHY the GPU starvation is gone
 
 Status: **hypothesis, not proven.** Two candidate causes are confounded (see the caveat
