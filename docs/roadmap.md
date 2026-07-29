@@ -339,6 +339,61 @@ is exactly the family that produced the phantom bleed. Log its live resolution b
 trusting it, per Rule 20.
 **History to respect:** three CTDs sit behind this knob. Pause protocol, one change, verify.
 
+#### ATTEMPT 1 FAILED — CTD number FOUR behind this knob (2026-07-29)
+
+`wholeSceneAAMode = 1` crashed the game ~2 s after the first feed render. Config reverted to
+`-1`. **Do not retry as-is.**
+
+DRED breadcrumb, and it is unambiguous:
+
+```
+EventStack:    [Upsampling, Post Passes, ForwardAndPostPasses]
+CompletedOps:  ... Beginevent (Upsampling), Resourcebarrier, Resourcebarrier]
+OutstandingOps:[Dispatch, ... Endevent (Upsampling), Beginevent (FXAA), ...]
+PageFaultVA: 0x0   ExistingAllocations: 0   RecentFreedAllocations: 0
+```
+
+It died on the first `Dispatch` inside **Upsampling** — before FXAA was ever reached. Zero
+existing AND zero freed allocations with `PageFaultVA 0x0` is a **NULL BIND**: something was
+bound that had never been allocated.
+
+**The mechanism, now complete.** `ApplyNonFSRUpscalingAndAA` calls `UpsamplingJob.DoWork`
+FIRST, and only afterwards checks `AAMode == 1` to run FXAA. `DoWork` selects its branch from
+`AAMode`:
+
+- `AAMode == FSR` (the player's value, i.e. today) -> dispatches **FSR3**, whose resources
+  the player's frame allocated in `PrepareResources`. Safe, which is why the current build
+  works.
+- `AAMode == FXAA or None` (what we scoped) -> dispatches **Bilinear**, whose resources
+  **nobody ever allocated** — because we skip `PrepareResources` (stage 19) and the player's
+  frame *disposed* bilinear when it prepared FSR. Null bind. Device removed.
+
+**This is the vice the stage-19 comment already described, reached from the other side.**
+Skipping `PrepareResources` is unsafe if we change `AAMode`; un-skipping it is unsafe because
+it would dispose the player's FSR3 and re-prepare bilinear at our resolution. Both doors are
+locked, and `AAMode` is the handle on both.
+
+**Second finding, and it matters more broadly:** the Upsampling block did NOT gate itself out
+for our render, though I asserted it would. Its gate is a resolution comparison OR'd with
+`IsFSREnabledAndAllowed` — and **skip id 20, which forces that flag false, is part of what
+opens the bilinear door.** The two existing workarounds (19 and 20) are only mutually safe
+while `AAMode` stays at the player's value. Worth re-examining independently of AA: our
+`finalLDR.Resolution` and our `ScreenBuffers.PreUpscaleResolution` apparently differ, which
+is probably the same `MaxResolution == 3840` residue the phantom-bleed fix left behind, and
+the `!!! FinalLDR resolution moved` tripwire that fires on every gate cycle.
+
+**My analysis error, recorded so it is not repeated.** I verified that `FXAAJob` does not
+depend on `UpsamplingJob.PrepareResources` — true, and irrelevant. I never checked the call
+that runs *before* FXAA in the same method, even though `UpsamplingJob.DoWork` was sitting in
+the callee list I had already printed. **Reading a callee list is not the same as reading it
+in order.** The crash was fully predictable from evidence already on screen.
+
+**Attempt 2, the clean route (unbuilt):** add a skip stage for `UpsamplingJob.DoWork` so the
+upsampling block never executes during our render, leaving FXAA to run after it. Check first
+whether `DoWork` has out-params or writes a target its callers consume — if it does, this is
+the stage-4 problem and needs an override rather than a skip. Do that check offline, on a
+closed game, before touching the config again.
+
 ### 4.3 Lens flares — needs plumbing (skip id 21)
 
 **Adds:** sun and light glare in the feed. Worth having for a camera that can point near a
