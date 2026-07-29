@@ -195,3 +195,41 @@ session age.
 Three suspects now eliminated by controlled test: submission position, the LDR
 resize, and (last night) our own resource teardown. The residency hypothesis
 stands untested.
+
+## Addendum 2026-07-29d: the "session drift" is LOAD-dependent, not time-dependent
+
+Controlled run: lower texture settings (VRAM 52% instead of 89%) AND the player
+holding a fixed position looking at the test panel.
+
+    18:17 -> 18:27  stationary   65 fps  p50 24-26  >50ms 0  gap 1-2ms
+    18:29           moved        45 fps  p50 27.7   >50ms 2
+
+TWELVE MINUTES FLAT — no degradation whatsoever, the best sustained window ever
+measured on this route. The step down coincides exactly with the player moving for
+the first time.
+
+This retracts the time-decay characterisation in addendum 2026-07-28. Every earlier
+measurement was taken while playing/moving (I asked for "play normally"), so what
+read as session aging was most likely SCENE LOAD — what is in view from the
+player's position and the orbit camera's. It appeared monotonic and irreversible
+because exploration moves you into denser surroundings and you stay there; a
+process restart "fixed" it because it returns you to the spawn point.
+
+Also settled: "Missing" in RenderSceneStats is a CONSTANT (~1.13Gi at both 52% and
+89% VRAM) — it is unfetchable/absent assets, not evictions. Useless as a residency
+gauge; do not use it as one.
+
+Caveat on attribution: two variables changed at once (texture settings AND player
+movement), so the improvement cannot yet be split between them. The flat 12 minutes
+is solid; the cause is not.
+
+Next test, to separate them: stationary with the ORIGINAL texture settings. If it
+is also flat, texture settings were incidental and position is everything. If it
+drifts, VRAM headroom matters after all.
+
+Methodology rules earned the hard way, now three deep:
+- A/B only at equal session age.
+- Grade the TAIL (p95, >50ms), not p50 — the user feels the tail.
+- CONTROL PLAYER POSITION. An uncontrolled camera makes scene load masquerade as
+  time-based decay, which cost a whole night's theorising and one built-and-
+  disproved architecture change.
