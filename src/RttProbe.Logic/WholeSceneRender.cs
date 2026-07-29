@@ -532,7 +532,14 @@ internal static class WholeSceneRender
 
             bool oursRan = false;
             if (FeedConfig.WholeSceneEnabled && _ourScreenBuffers != null
-                && Clock.Ms - _lastRenderMs >= Math.Max(33, FeedConfig.WholeSceneIntervalMs))
+                // No hard floor any more (was Math.Max(33, ...)). The 30fps cap was a
+                // safety rail from the era when a fault cost a CTD per attempt; the route
+                // is stable now and the cost model is a straight trade — every ours-frame
+                // costs ~28ms, so intervalMs=0 renders every frame and pins feed fps ==
+                // world fps (~35/35 today), while 33 keeps ~25/50. The slider is the
+                // user's. Multi-feed budgeting (see docs/roadmap.md) will sit on top of
+                // this same gate later.
+                && Clock.Ms - _lastRenderMs >= FeedConfig.WholeSceneIntervalMs)
             {
                 _lastRenderMs = Clock.Ms;
                 oursRan = true;
