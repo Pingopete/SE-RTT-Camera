@@ -28,6 +28,10 @@ internal static class BlitProbe
     private static UISystem _ui;
     private static bool _resolveTried;
 
+    // The stats panel needs UISystem.GetFont, and this is the only place the UISystem is
+    // resolved. Exposed rather than re-resolved so there is exactly one owner of it.
+    internal static UISystem Ui => _ui;
+
     private static OffscreenRenderTarget? _rt;
     private static bool _rtTried;
 
@@ -95,6 +99,10 @@ internal static class BlitProbe
 
             // Locate the [RTC] panel this tick belongs to, if any.
             CameraFeed.OnLcdTick(component);
+
+            // And any [RTS] stats panel. Separate call because OnLcdTick returns early for
+            // anything not carrying the feed tag, so a stats panel would never be seen.
+            StatsPanel.OnLcdTick(component);
 
             ResolveContracts(component);
             if (_contracts == null || _ui == null) return;
@@ -300,6 +308,15 @@ internal static class BlitProbe
             {
                 _panelHookLogs++;
                 RttLog.Line($"Panel render hook firing (text=\"{text}\", rt={_rt != null}).");
+            }
+
+            // THE STATS PANEL, checked before the feed tag and returning immediately.
+            // A surface is one or the other; the stats panel draws into the panel's own
+            // batch and touches none of the feed machinery.
+            if (text != null && text.Contains(StatsPanel.Tag, StringComparison.OrdinalIgnoreCase))
+            {
+                StatsPanel.Draw(batch, ctx);
+                return;
             }
 
             // DrawImage with a render-target-backed handle is fatal: UISystemComponent

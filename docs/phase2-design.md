@@ -336,3 +336,34 @@ the budget lock, binding on the phase-E implementation:
 4. **Smoothness is an exit-gate metric.** Phase E's invariant now includes: the p95-p50
    gap and the >50ms count at N=1,2,3 stay at the single-feed baseline values, not merely
    "total cost flat".
+
+### THE COLD-START TAX, MEASURED DIRECTLY (2026-07-30, phase A2 side-effect)
+
+The A2 gate test — change `wholeSceneIntervalMs` live and prove no rebuild follows —
+incidentally produced the cleanest measurement of the throttling penalty this project has:
+
+| interval | ours n | ours mean | **CPU submit** | idle n | >50ms |
+|---|---|---|---|---|---|
+| 0 (every frame) | 281 | 17.8 | **2.2-2.4 ms** | 0 | 0 |
+| 100 ms | 48-49 | 32.6-34.3 | **22.5-22.6 ms** | 238-242 | 1-2 |
+| back to 0 | 271 | 18.5 | **2.3 ms** | 0 | 0 |
+
+**Submit cost rose ~10x — 2.2 ms to 22.6 ms — purely from throttling the same render.**
+Reverting restored it immediately, so this is the cadence, not scene load or session age.
+The bimodal split reappeared exactly as the choppiness history describes (ours 32.6 vs
+idle 14.1) and frames over 50 ms went from zero to 1-2 per window.
+
+Consequences:
+
+- **The smoothness constraint is now measured, not argued.** A budget that skips frames
+  to repay overruns would push renders toward this regime; "slot, not meter" is the right
+  call by an order of magnitude.
+- **It sharpens the phase-D hypothesis rather than settling it.** This is the GLOBALLY
+  COLD case — one feed, nothing rendering our workload in the gaps. Interleaved feeds keep
+  the pipeline hot every frame, which is precisely why D1 must compare two interleaved
+  feeds against one feed at every-2nd-frame. If interleaving lands near 2.2 ms the credit
+  model works as designed; if it lands near 22 ms, N>1 is far more expensive than assumed
+  and CCTV slots get promoted from fallback to default. **This measurement raises the
+  stakes on D1 — it is now the single most important experiment in the plan.**
+- It also re-confirms the every-frame default is not a tuning preference but a ~10x
+  correctness issue for cost.

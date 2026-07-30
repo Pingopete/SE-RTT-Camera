@@ -15,6 +15,7 @@ public static class LogicEntry
             ScenePassHook.Reset();
             CameraRender.Reset();
             CameraFeed.Reset();
+            StatsPanel.Reset();
             WholeSceneRender.Reset();
             CameraCbSwap.Reset();
             FeedHandover.Reset();

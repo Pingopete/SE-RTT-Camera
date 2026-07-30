@@ -85,6 +85,27 @@ internal static class Perf
     private static long _vramAtLastReport = -1;
     private static bool _headerLogged;
 
+    // THE PUBLISHED SNAPSHOT — what the stats panel reads.
+    //
+    // Published in Report(), immediately BEFORE the buckets are cleared, so the panel
+    // shows exactly the window the log line shows: same numbers, same period, no second
+    // sampling path to disagree with the first. Reading the live buckets instead would
+    // give a partial window whose percentiles change under the reader, and would put a
+    // second consumer on state that Report() wipes.
+    //
+    // A plain immutable field swap: the render/UI side reads a reference that never
+    // mutates in place, so there is no tearing to reason about across threads.
+    internal sealed class Stats
+    {
+        public double Fps, OursP50, OursP95, OursMax, SubmitMean, SubmitP95;
+        public int OursOver50, IdleOver50, OursCount, IdleCount;
+        public double VramGb, VramDeltaMb, AvailGb;
+        public long StampMs;
+    }
+
+    private static volatile Stats _latest;
+    internal static Stats Latest => _latest;
+
     // Set by RunSecondRender around the Draw invoke.
     public static void NoteOurDraw(double ms) => _ourDraw.Add(ms);
 
@@ -126,10 +147,11 @@ internal static class Perf
 
             long used = ReadVram("UsedVRAM"), avail = ReadVram("AvailableVRAM");
             string vram;
+            double delta = 0;   // hoisted: the snapshot below publishes it too
             if (used > 0)
             {
                 double gb = used / 1073741824.0;
-                double delta = _vramAtLastReport > 0 ? (used - _vramAtLastReport) / 1048576.0 : 0;
+                delta = _vramAtLastReport > 0 ? (used - _vramAtLastReport) / 1048576.0 : 0;
                 _vramAtLastReport = used;
                 vram = $"VRAM={gb:F2}GB ({(delta >= 0 ? "+" : "")}{delta:F0}MB) avail={avail / 1073741824.0:F2}GB";
                 if (avail <= 0)
@@ -148,6 +170,25 @@ internal static class Perf
                 $"p95={_idle.Pct(0.95):F1} max={_idle.Max:F1} >50ms={_idle.Over(50)} | " +
                 $"ourDraw(cpu submit) n={_ourDraw.Count} mean={_ourDraw.Mean:F1} " +
                 $"p95={_ourDraw.Pct(0.95):F1} max={_ourDraw.Max:F1} | {vram}");
+
+            // Publish BEFORE clearing — see the Stats comment.
+            _latest = new Stats
+            {
+                Fps         = fps,
+                OursP50     = _oursRan.Pct(0.50),
+                OursP95     = _oursRan.Pct(0.95),
+                OursMax     = _oursRan.Max,
+                OursOver50  = _oursRan.Over(50),
+                IdleOver50  = _idle.Over(50),
+                OursCount   = _oursRan.Count,
+                IdleCount   = _idle.Count,
+                SubmitMean  = _ourDraw.Mean,
+                SubmitP95   = _ourDraw.Pct(0.95),
+                VramGb      = used > 0 ? used / 1073741824.0 : 0,
+                VramDeltaMb = delta,
+                AvailGb     = avail > 0 ? avail / 1073741824.0 : 0,
+                StampMs     = Environment.TickCount64,
+            };
 
             _oursRan.Clear(); _idle.Clear(); _ourDraw.Clear();
         }

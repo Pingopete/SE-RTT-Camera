@@ -400,6 +400,27 @@ internal static class FeedConfig
     // finding the right value a live sweep instead of a series of gate cycles.
     public static double WholeSceneFlareIntensity { get; private set; } = -1;
 
+    // THE STATS PANEL (goal 9 / plan phase A1). Tag a panel [RTS] to get perf numbers on
+    // it in world. Draws into the panel's OWN batch — no target, no binding, no handover —
+    // so it is independent of the feed and cannot interfere with it.
+    public static bool StatsPanel { get; private set; } = true;
+
+    // Repaint period. The panel is re-recorded by marking its content dirty, so this is
+    // how often that happens. 500 ms is plenty for numbers and keeps the rebuild cost
+    // (and its FSR-mask re-arm) negligible.
+    public static int StatsPanelMs { get; private set; } = 500;
+
+    // THE BUDGET CONSTANT (design: budget lock v2). The measured warm cost of ONE render
+    // at the current global quality preset — the per-frame slice the whole phase-2
+    // scheduler holds constant. The stats panel flags sustained submit above it.
+    //
+    // Default is today's measured reference (~2.1-2.5 ms at 1024 with probes and flares
+    // on). Phase B replaces this with a per-preset table. It is a TRIPWIRE THRESHOLD and a
+    // calibration number, never a per-frame gate — enforcement is structural (one render
+    // slot per engine frame), because metering with skip-to-repay would manufacture the
+    // bimodal frame pattern that this project already identified as the felt choppiness.
+    public static double RttBudgetMs { get; private set; } = 2.5;
+
     // Hold the tagged panel in FSR's REACTIVE mask. Default ON — it fixes a real, long-lived
     // visual bug and the whole change is one float property plus one int field per tick.
     //
@@ -667,6 +688,9 @@ internal static class FeedConfig
             WholeSceneOwnFlares         = Bool(kv, "wholeSceneOwnFlares", WholeSceneOwnFlares);
             PanelFsrMask                = Bool(kv, "panelFsrMask", PanelFsrMask);
             PanelMipRegen               = Bool(kv, "panelMipRegen", PanelMipRegen);
+            StatsPanel                  = Bool(kv, "statsPanel", StatsPanel);
+            StatsPanelMs                = Int(kv, "statsPanelMs", StatsPanelMs);
+            RttBudgetMs                 = Dbl(kv, "rttBudgetMs", RttBudgetMs);
             WholeSceneFlareIntensity    = Dbl(kv, "wholeSceneFlareIntensity", WholeSceneFlareIntensity);
             WholeSceneOwnProbes         = Bool(kv, "wholeSceneOwnProbes", WholeSceneOwnProbes);
             WholeSceneDisableRaytracing    = Int(kv, "wholeSceneDisableRaytracing", WholeSceneDisableRaytracing);
@@ -705,7 +729,15 @@ internal static class FeedConfig
     // Everything the second ScreenBuffers / DrawContexts build depends on.
     private static string WholeSceneSignature() =>
         string.Join("|", WholeSceneBuildBuffers, WholeSceneWidth, WholeSceneHeight,
-                         WholeSceneCamera, WholeSceneIntervalMs, WholeSceneToPanel,
+                         // WholeSceneIntervalMs is deliberately ABSENT (plan phase A2).
+                         // Its only consumer is TryRender's rate gate, which reads
+                         // FeedConfig fresh every frame, so a change needs no rebuild:
+                         // nothing about buffer or context IDENTITY depends on the render
+                         // period. Leaving it in the signature meant every cadence tweak
+                         // cost a full gate cycle plus a 30-frame settle — and cadence is
+                         // exactly what the phase-E slot scheduler will be tuning, so it
+                         // has to be free to change. Class (a), verified by consumer.
+                         WholeSceneCamera, WholeSceneToPanel,
                          WholeSceneCameraRebuild, WholeSceneAAMode, WholeSceneExposure,
                          WholeSceneNativeScaling, WholeSceneNoBloom, WholeSceneLdrResize, WholeSceneDisableRaytracing,
                          WholeSceneDisableEyeAdaptation, WholeSceneDisableProbeUpdates,
