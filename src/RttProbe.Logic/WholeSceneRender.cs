@@ -391,9 +391,33 @@ internal static class WholeSceneRender
         // So the manager is queued and freed from the LCD tick instead — the game thread,
         // outside any frame we are recording. Same discipline as every other "do not create
         // or destroy engine resources mid-frame" rule, applied to the teardown side.
-        if (_ourProbes != null) _probesPendingDispose = _ourProbes;
-        _ourProbes = null; _probeField = null; _envProbesToUpdateField = null;
-        _miPrepareProbes = null; _probeState = 0; _probeLogged = false;
+        // ...and the conclusion, after THREE device removals, is that it must not be
+        // disposed on a config change AT ALL.
+        //
+        // Attempt 1 disposed it here, on the render thread inside the player's frame.
+        // Attempt 2 deferred that to the LCD tick — off the render thread, which is a real
+        // improvement and is kept — but the render thread is still rendering concurrently,
+        // so "not on the render thread" is NOT the same as "outside a frame". Same DRED
+        // both times: EventStack [CullingProxies, MainViewCulling[FirstPass]], PageFaultVA
+        // 0x0, zero existing and zero freed — a null bind in the PLAYER'S culling pass.
+        // Attempt 2 did fix a real and separate bug (the NRE that left our manager
+        // installed), which is why the third crash arrived with a clean mod log.
+        //
+        // There is no safe moment to free these while the renderer is live, so the manager
+        // is simply KEPT. It costs nothing to keep: it is independent of the ScreenBuffers
+        // and DrawContextManager this Reset rebuilds, its textures are sized by
+        // ProbeSettings rather than by our resolution, and constructing it was always free.
+        // Turning the feature off just stops InstallProbes swapping it in.
+        //
+        // The cost is honest and bounded: with own-probes off, eight cube textures stay
+        // resident until the game restarts. That is VRAM, not correctness, and it is the
+        // right trade against a device removal. WholeSceneOwnProbes is also out of the
+        // rebuild signature now, so flipping it no longer triggers this teardown at all.
+        //
+        // If the memory ever needs reclaiming, the only defensible place is a genuinely
+        // quiesced renderer — gate shutdown with the feed already dormant — not "some other
+        // thread".
+        _probeState = 0; _probeLogged = false;
         _dcBuilt = false;
         _dcField = null;
         _cascFld = _charCascFld = null;
@@ -2242,7 +2266,13 @@ internal static class WholeSceneRender
                 // Parameterless ctor that allocates nothing. Deliberately created HERE rather
                 // than in the DrawContextManager build: it costs nothing, so there is no
                 // reason to widen that function's failure surface for it.
-                _ourProbes = Activator.CreateInstance(mgrType, nonPublic: true);
+                //
+                // REUSED across resets when one already exists. Reset() deliberately keeps
+                // the manager (it cannot be disposed safely while the renderer is live), so
+                // constructing unconditionally here would orphan the previous one — and its
+                // eight cube textures with it — on every config change. That is Rule 10's
+                // leak, arriving through the door opened to avoid a device removal.
+                _ourProbes ??= Activator.CreateInstance(mgrType, nonPublic: true);
                 if (_ourProbes == null)
                 {
                     _probeState = -1;

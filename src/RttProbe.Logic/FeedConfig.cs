@@ -743,7 +743,8 @@ internal static class FeedConfig
                          WholeSceneDisableEyeAdaptation, WholeSceneDisableProbeUpdates,
                          WholeSceneOwnDrawContexts, WholeSceneOwnShadows,
                          WholeSceneCascadeResolution, WholeSceneCascadeCount,
-                         WholeScenePlanetEnv, WholeSceneOwnFlares, WholeSceneOwnProbes,
+                         // WholeSceneOwnProbes is deliberately ABSENT — see below.
+                         WholeScenePlanetEnv, WholeSceneOwnFlares,
                          string.Join(",", WholeSceneSkipStages),
                          string.Join(",", WholeSceneRtFlags));
 
