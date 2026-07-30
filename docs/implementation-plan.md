@@ -79,11 +79,34 @@ The enabling work for everything after it. A1 has already rehearsed the shape.
 | # | item | test / exit evidence |
 |---|---|---|
 | C1a | **Inventory the statics** (ScreenBuffers, DrawContextManager, cascade set, probe manager, flares mirror + originals, LDR ring, orbit/camera state, panel binding, gate state) -> `FeedInstance`. **DONE 2026-07-30** | compiles; instance count = 1 |
-| C2 | **Single-instance parity** — one FeedInstance must equal the current build | PERF within noise of the reference build; same visuals; 3 teardown cycles; 15-min soak. Pin as reference |
+| C2 | **Single-instance parity** — one FeedInstance must equal the current build | PERF within noise of the **pre-C1a build at the SAME config** (see below); same visuals; 3 teardown cycles; 15-min soak. Pin as reference |
 | C1b | **The render-thread pump** — `Feeds.Cur` becomes a per-thread ambient the pump sets around each feed's work; teardown per instance under Rule-25 (dispose only what the instance allocated) | pump selects instance 0 explicitly; parity holds a second time |
 | C3 | **Second unique feed** — second tagged panel, second camera (offset orbit), simple alternator (A on even frames, B on odd) as the placeholder scheduler | both feeds live and correct; destroy/power-off panel A -> feed B unaffected; teardown matrix per feed; 15-min two-feed soak |
 
 Exit gate: two independent feeds, independently killable, no cross-contamination.
+
+**THE C2 BASELINE IS NOT `reference/every-frame-baseline`.** That pin is 512x512 with no flares,
+no own probes and no atmosphere LUTs — a materially cheaper build. Grading today's 1024 SSAA
+full-fidelity build against its 66 fps / 2.1 ms would show a large "regression" that is entirely
+the configuration and nothing to do with instancing. Comparing across configs is how a refactor
+gets blamed for a feature's cost.
+
+The correct baseline is the **pre-C1a build at TODAY's config**, whose warm figure was
+`ourDraw ~2.2 ms` with `>50ms = 0`.
+
+Measured on the C1a build, 2026-07-30 18:25, steady state after ~25 s warm-up, one live panel:
+
+```
+PERF 49.1-49.4 fps | ours n=246-247 mean=20.3-20.4 p50=20.3 p95=22.0-22.5 max=24.9-33.4
+                   | >50ms=0 | idle n=0 (every engine frame, intervalMs=0)
+                   | ourDraw (CPU submit) mean=2.4 p95=2.7-2.8 max=3.2-3.7
+                   | VRAM=12.23 GB, flat across four consecutive windows
+```
+
+Submit is within noise of the 2.2 ms baseline, the smoothness invariant holds (`>50ms = 0`, and
+the p95-p50 gap is ~2 ms), and VRAM is flat — so the instance allocation leaks nothing. **This is
+a strong signal, NOT a pass.** The gate also requires three teardown cycles, a 15-minute soak and
+a visual check, and none of those are done from 30 seconds of steady state.
 
 **C1 was split into C1a/C1b deliberately, with C2 BETWEEN them.** The seam (state moves onto an
 instance) and the selection (a pump chooses which instance) are independent changes with
