@@ -27,9 +27,16 @@ internal static class FeedHandover
 
     // The converted (LDR, panel-format) frame waiting to be handed over, plus the
     // pool borrow that owns it. Parked by the camera pass, consumed in the UI stage.
-    private static volatile object _pendingFrame;      // Borrowed<T>
-    private static volatile object _pendingResource;   // the texture itself
-    private static string _panelHandleText;
+    // PER-FEED (phase C1a). One parked frame PER FEED: with a single slot, feed B's
+    // park would displace feed A's before the UI stage consumed it, and the symptom
+    // would be a panel showing the other camera's picture for a frame. The backing
+    // fields stay volatile — parked on the camera pass, read in the UI stage.
+    private static object _pendingFrame                // Borrowed<T>
+    { get => Feeds.Cur.PendingFrame; set => Feeds.Cur.PendingFrame = value; }
+    private static object _pendingResource             // the texture itself
+    { get => Feeds.Cur.PendingResource; set => Feeds.Cur.PendingResource = value; }
+    private static string _panelHandleText
+    { get => Feeds.Cur.PanelHandleText; set => Feeds.Cur.PanelHandleText = value; }
 
     private static bool _argsLogged, _disarmed, _armed;
     private static long _lastArmCheck;
@@ -194,7 +201,11 @@ internal static class FeedHandover
     // copying out of it. The producer now simply never writes the parked slot — see
     // the ring in CameraRender.CopyToFeed.
     public static object ParkedResource => _pendingResource;
-    private static int _parkGeneration;
+
+    // PER-FEED: bumped when this feed's parked slot is replaced, so a late consumer can
+    // tell "still the frame I was promised" from "a newer one landed".
+    private static int _parkGeneration
+    { get => Feeds.Cur.ParkGeneration; set => Feeds.Cur.ParkGeneration = value; }
 
     public static void ParkFrame(object borrowed, object resource)
     {

@@ -34,7 +34,13 @@ internal static class PanelBinding
     private static readonly string ArmPath = Path.Combine(RttLog.OutDir, "bind-armed.marker");
     private static readonly string LivePath = Path.Combine(RttLog.OutDir, "bind-live.marker");
 
-    private static bool _surveyed, _bound, _disarmed;
+    // PER-FEED: whether THIS feed's panel is bound to our material. The survey and the
+    // disarm marker stay process-global — one describes the engine's LCD types, the
+    // other is a file on disk that switches the whole route off.
+    private static bool _bound
+    { get => Feeds.Cur.Bound; set => Feeds.Cur.Bound = value; }
+
+    private static bool _surveyed, _disarmed;
 
     // The bind happens inside the content-render hook, which an idle panel never
     // enters. While this is true the tick hook drives repaints to get us in there.
@@ -350,7 +356,12 @@ internal static class PanelBinding
         catch (Exception e) { RttLog.Error("survey write", e); }
     }
 
-    private static WeakReference _boundRenderer, _boundCtx;
+    // PER-FEED: the renderer and surface context THIS feed bound, held weakly so a
+    // destroyed panel does not keep its LCD material alive through us.
+    private static WeakReference _boundRenderer
+    { get => Feeds.Cur.BoundRenderer; set => Feeds.Cur.BoundRenderer = value; }
+    private static WeakReference _boundCtx
+    { get => Feeds.Cur.BoundCtx; set => Feeds.Cur.BoundCtx = value; }
 
     // Put the panel back on its STOCK screen material through the engine's own path.
     //

@@ -89,7 +89,9 @@ internal static class WholeSceneRender
     //
     // Called from the probe hook (render thread, live DirectCommandList — which IS a
     // CopyCommandList by inheritance). One attempt per rebuild.
-    private static bool _ldrResized;
+    // PER-FEED (phase C1a): one resize attempt per feed per rebuild.
+    private static bool _ldrResized
+    { get => Feeds.Cur.LdrResized; set => Feeds.Cur.LdrResized = value; }
 
     public static void EnsureFinalLdrSize(object commandList)
     {
@@ -149,7 +151,12 @@ internal static class WholeSceneRender
         catch { return "?"; }
     }
 
-    private static int _state;              // 0 untried, 1 observed, -1 unavailable
+    // PER-FEED (phase C1a): 0 untried, 1 observed, -1 unavailable. This is the route's
+    // health, and per-feed is the graceful-cut contract (goal 7): one feed faulting
+    // must mark ITSELF unavailable and leave the others rendering.
+    private static int _state
+    { get => Feeds.Cur.RouteState; set => Feeds.Cur.RouteState = value; }
+
     private static long _lastLogMs;
     private static int _hookCount;
     private static bool _describedTarget;
@@ -159,8 +166,12 @@ internal static class WholeSceneRender
     // parameterless constructor, and it owns depth, the GBuffer array, the final LDR
     // texture and the pre-upscale resolution, so owning one separates most of the
     // per-view state in a single move.
-    private static object _ourScreenBuffers;
-    private static bool _sbBuilt;
+    // PER-FEED (phase C1a). Rule 25 governs every object below: our teardown may
+    // dispose only what THIS instance allocated.
+    private static object _ourScreenBuffers
+    { get => Feeds.Cur.OurScreenBuffers; set => Feeds.Cur.OurScreenBuffers = value; }
+    private static bool _sbBuilt
+    { get => Feeds.Cur.SbBuilt; set => Feeds.Cur.SbBuilt = value; }
 
     // Our own DrawContextManager — the OTHER global family, and the one the stage
     // bisect pointed at by elimination.
@@ -183,11 +194,21 @@ internal static class WholeSceneRender
     // DrawContextManager..ctor() is public, parameterless, and calls
     // CreateInitialContexts itself — so construction is one Activator call, exactly
     // like ScreenBuffers.
-    private static object _ourDrawContexts;
-    private static object _ourFreshShadowResources;
-    private static object _ourFreshFlares;
-    private static bool _dcBuilt;
-    private static object _panelSourceTex;
+    private static object _ourDrawContexts
+    { get => Feeds.Cur.OurDrawContexts; set => Feeds.Cur.OurDrawContexts = value; }
+
+    // The fresh objects our manager's ctor made, kept so the dispose swap puts each
+    // side's own back before anything is released.
+    private static object _ourFreshShadowResources
+    { get => Feeds.Cur.OurFreshShadowResources; set => Feeds.Cur.OurFreshShadowResources = value; }
+    private static object _ourFreshFlares
+    { get => Feeds.Cur.OurFreshFlares; set => Feeds.Cur.OurFreshFlares = value; }
+
+    private static bool _dcBuilt
+    { get => Feeds.Cur.DcBuilt; set => Feeds.Cur.DcBuilt = value; }
+    private static object _panelSourceTex
+    { get => Feeds.Cur.PanelSourceTex; set => Feeds.Cur.PanelSourceTex = value; }
+
     private static bool _cbSwapLogged;
     private static int _cbSwapErrs;
 
@@ -372,51 +393,42 @@ internal static class WholeSceneRender
                                   // applied to a NEW context would write another context's
                                   // objects into it, which is this same bug wearing a hat
 
-        // OUR PROBE MANAGER — HANDED OFF, NOT DISPOSED HERE. See DisposePendingProbes.
+        // OUR PROBE MANAGER — KEPT. NOT DISPOSED, NOT QUEUED, NOT HANDED ANYWHERE.
         //
-        // It owns eight cube textures once RecreateProbes has run, so dropping it silently
-        // would leak a set per hot reload (Rule 10: ~8 reloads once grew VRAM 13.2 -> 16.5
-        // GB, and the residency thrashing looked exactly like a rendering bug). But
-        // disposing it HERE is worse: Reset() runs from FeedConfig.Poll on the RENDER
-        // THREAD, inside the player's frame, and freeing GPU textures mid-frame is the
-        // fault family this project has recorded more than any other.
+        // THREE device removals bought this one sentence, on 2026-07-30, all from flipping
+        // wholeSceneOwnProbes on a live feed, and all with the same DRED breadcrumb:
+        // EventStack [CullingProxies, MainViewCulling[FirstPass], ScenePreparation +
+        // Render], PageFaultVA 0x0, zero existing AND zero freed allocations — a NULL BIND
+        // in the PLAYER'S culling pass. Steady-state own-probes had already soaked an hour
+        // clean before any of them, so the feature was never the problem; the teardown was.
         //
-        // CONFIRMED, expensively, 2026-07-30: flipping wholeSceneOwnProbes live removed the
-        // device. DRED breadcrumb EventStack [CullingProxies, MainViewCulling[FirstPass],
-        // ScenePreparation + Render] with PageFaultVA 0x0 and zero existing AND zero freed
-        // allocations — a NULL BIND, in the PLAYER'S culling pass, on the rebuild that this
-        // disposal rode along with. Steady-state own-probes had already soaked an hour
-        // clean, so it was the teardown, not the feature.
+        //   Attempt 1 — dispose here. Reset() runs from FeedConfig.Poll on the RENDER
+        //     THREAD, inside the player's frame. Freeing GPU textures mid-frame is the
+        //     fault family this project has recorded more than any other.
+        //   Attempt 2 — defer it to the LCD tick, off the render thread. Same crash. It
+        //     did fix a real and SEPARATE bug (the NRE that left our manager installed
+        //     after Reset nulled the finally blocks' statics — that fix is kept, see the
+        //     deferred-Reset guard at the top of this method), which is why attempt 3
+        //     arrived with a clean mod log and nothing to blame.
+        //   Attempt 3 — same crash again, and the conclusion: OFF THE RENDER THREAD IS NOT
+        //     THE SAME AS OUTSIDE A FRAME. The LCD tick runs while the render thread is
+        //     rendering. There is no safe moment to free these while the renderer is live.
         //
-        // So the manager is queued and freed from the LCD tick instead — the game thread,
-        // outside any frame we are recording. Same discipline as every other "do not create
-        // or destroy engine resources mid-frame" rule, applied to the teardown side.
-        // ...and the conclusion, after THREE device removals, is that it must not be
-        // disposed on a config change AT ALL.
+        // So it is simply kept, and keeping it costs nothing structural: the manager is
+        // independent of the ScreenBuffers and DrawContextManager this Reset rebuilds, its
+        // textures are sized by ProbeSettings rather than by our resolution, and
+        // constructing it was always free. Turning the feature off just stops InstallProbes
+        // swapping it in. WholeSceneOwnProbes is out of the rebuild signature too, so
+        // flipping it no longer reaches this path at all.
         //
-        // Attempt 1 disposed it here, on the render thread inside the player's frame.
-        // Attempt 2 deferred that to the LCD tick — off the render thread, which is a real
-        // improvement and is kept — but the render thread is still rendering concurrently,
-        // so "not on the render thread" is NOT the same as "outside a frame". Same DRED
-        // both times: EventStack [CullingProxies, MainViewCulling[FirstPass]], PageFaultVA
-        // 0x0, zero existing and zero freed — a null bind in the PLAYER'S culling pass.
-        // Attempt 2 did fix a real and separate bug (the NRE that left our manager
-        // installed), which is why the third crash arrived with a clean mod log.
-        //
-        // There is no safe moment to free these while the renderer is live, so the manager
-        // is simply KEPT. It costs nothing to keep: it is independent of the ScreenBuffers
-        // and DrawContextManager this Reset rebuilds, its textures are sized by
-        // ProbeSettings rather than by our resolution, and constructing it was always free.
-        // Turning the feature off just stops InstallProbes swapping it in.
-        //
-        // The cost is honest and bounded: with own-probes off, eight cube textures stay
-        // resident until the game restarts. That is VRAM, not correctness, and it is the
-        // right trade against a device removal. WholeSceneOwnProbes is also out of the
-        // rebuild signature now, so flipping it no longer triggers this teardown at all.
+        // The cost is honest and bounded: eight cube textures stay resident until the game
+        // restarts. That is VRAM, not correctness, and it is the right trade against a
+        // device removal.
         //
         // If the memory ever needs reclaiming, the only defensible place is a genuinely
-        // quiesced renderer — gate shutdown with the feed already dormant — not "some other
-        // thread".
+        // QUIESCED renderer — gate shutdown with the feed already dormant — not "some other
+        // thread". Phase C1b inherits this rule verbatim: a destroyed feed's probe manager
+        // is retired to its FeedInstance and released at gate shutdown, never at teardown.
         _probeState = 0; _probeLogged = false;
         _dcBuilt = false;
         _dcField = null;
@@ -1920,14 +1932,25 @@ internal static class WholeSceneRender
     private static Type _coreType;
     private static FieldInfo _sbField, _rvField;
     private static object _settingsObj;
-    private static long _lastRenderMs;
+
+    // PER-FEED (phase C1a): this feed's rate stamp. The phase E slot scheduler replaces
+    // the comparison against WholeSceneIntervalMs with "is it my turn", but the stamp
+    // itself stays exactly here, one per feed.
+    private static long _lastRenderMs
+    { get => Feeds.Cur.LastRenderMs; set => Feeds.Cur.LastRenderMs = value; }
 
     // Engine frames to yield after a (re)build before the first second render. 30 is ~0.5 s
     // at 60 fps and comfortably longer than the probe reprocess measured in the crash dump,
     // while being invisible at a config save.
     private const int SettleFrames = 30;
-    private static int _settleFrames;
-    private static int _renderCount;
+
+    // PER-FEED (phase C1a). Per-feed settling is also what phase E3 needs: a global
+    // quality change with N feeds live rebuilds them STAGGERED, one settle window each,
+    // rather than dropping every feed into the same probe-reprocess window at once.
+    private static int _settleFrames
+    { get => Feeds.Cur.SettleFrames; set => Feeds.Cur.SettleFrames = value; }
+    private static int _renderCount
+    { get => Feeds.Cur.RenderCount; set => Feeds.Cur.RenderCount = value; }
 
     // Construct the second DrawContextManager. One attempt per load, hot-reloadable,
     // falls back to the shared one (current behaviour) on any failure rather than
@@ -2062,7 +2085,13 @@ internal static class WholeSceneRender
         "_flareDefinitionsAllocator",  // SimpleIndexAllocator — index -> buffer slot
     };
 
-    private static object _engineFlares;
+    // PER-FEED (phase C1a): the engine's context, BORROWED. Per-feed because each
+    // instance's mirror is paired with its own OurFreshFlares and its own originals —
+    // and mixing those pairs across feeds is precisely the Rule-25 mistake that
+    // disposed the engine's flare buffer twice.
+    private static object _engineFlares
+    { get => Feeds.Cur.EngineFlares; set => Feeds.Cur.EngineFlares = value; }
+
     private static bool _flareMirrorLogged;
 
     // THE INVARIANT THAT WAS MISSING, and it cost a CTD on 2026-07-29.
@@ -2081,7 +2110,8 @@ internal static class WholeSceneRender
     // a flare definition buffer right now. Stage 21 consults this, so a mirror that fails
     // for any reason degrades to the old behaviour — no flares in the feed — instead of
     // taking the process down.
-    private static bool _flaresReady;
+    private static bool _flaresReady
+    { get => Feeds.Cur.FlaresReady; set => Feeds.Cur.FlaresReady = value; }
 
     // Re-read the definition members from the engine's context into ours. Called before
     // EVERY render, not once at build time, deliberately: UpdateFlaresBuffer REPLACES
@@ -2094,7 +2124,8 @@ internal static class WholeSceneRender
     // dictionaries and the allocator the ctor built. ScrubMirroredFlareRefs writes them
     // back before our DrawContextManager is disposed. Nulling instead would NRE inside
     // Dispose — it iterates _flaresByGuid unguarded (verified in IL).
-    private static object[] _flareOriginals;
+    private static object[] _flareOriginals
+    { get => Feeds.Cur.FlareOriginals; set => Feeds.Cur.FlareOriginals = value; }
 
     private static void ScrubMirroredFlareRefs()
     {
@@ -2189,40 +2220,34 @@ internal static class WholeSceneRender
     // our queue is permanently empty unless we assign it. PrepareProbes() returns
     // Buffer<Request> and EnvProbesToUpdate is a field of that type, so this is one
     // assignment — and calling it on OUR instance is not Rule 8, which is about globals.
-    private static object _ourProbes;
+    // PER-FEED (phase C1a): probes are centred on the CAMERA, which is the whole reason
+    // goal 4.4 exists — the player's atlas is right for where the player stands, not
+    // where this feed looks. Two feeds at two places need two atlases, so this is
+    // per-feed by definition rather than by convenience. NOT disposed on a config
+    // change; three device removals settled that (see Reset).
+    private static object _ourProbes
+    { get => Feeds.Cur.OurProbes; set => Feeds.Cur.OurProbes = value; }
 
-    // Set by Reset(), drained by DisposePendingProbes() from the LCD tick. Volatile because
-    // the writer is the render thread and the reader is the game thread.
-    private static volatile object _probesPendingDispose;
-
-    // Free a retired probe manager's cube textures from the GAME thread. Called from the
-    // LCD tick, which is where this mod already makes contracts calls, and which is never
-    // inside a frame we are recording.
+    // THE DEFERRED-DISPOSE QUEUE IS GONE — deleted 2026-07-30 during the C1 static
+    // inventory, and worth recording rather than silently dropping.
     //
-    // A single-shot swap so a second call cannot double-free, and it never throws upward:
-    // this runs on the tick that also drives panel discovery, and taking that down would
-    // cost far more than a leaked texture set.
-    internal static void DisposePendingProbes()
-    {
-        var probes = _probesPendingDispose;
-        if (probes == null) return;
-        _probesPendingDispose = null;
-        try
-        {
-            var mi = probes.GetType().GetMethod("DisposeTextures", Any);
-            if (mi != null) mi.Invoke(probes, null);
-            else if (probes is IDisposable d) d.Dispose();
-            RttLog.Line("Own probes: retired probe manager's textures released from the LCD tick " +
-                        "(game thread), not from Reset on the render thread — see the comment in " +
-                        "Reset for the device removal that bought this rule.");
-        }
-        catch (Exception e) { RttLog.Error("dispose retired probe textures", e); }
-    }
+    // It was attempt 2 of three: Reset() queued the retired probe manager here and an
+    // LCD-tick drain (DisposePendingProbes) freed its cube textures from the game thread.
+    // Attempt 3 crashed identically, the manager became KEPT rather than retired, and
+    // nothing has written this slot since — so the drain ran every tick, found null every
+    // time, and did nothing.
+    //
+    // Dead code that describes a live safety mechanism is worse than no code: it says the
+    // textures ARE being reclaimed off the render thread, which is the opposite of the
+    // rule that actually holds (see Reset). Rule 26 — a mechanism is only real if it has
+    // been observed firing — applies to teardown paths as much as to fixes.
 
     private static FieldInfo _probeField, _envProbesToUpdateField;
     private static MethodInfo _miPrepareProbes;
-    private static int _probeState;        // 0 = untried, 1 = ready, -1 = unavailable
-    private static bool _probeLogged;
+    private static int _probeState         // 0 = untried, 1 = ready, -1 = unavailable
+    { get => Feeds.Cur.ProbeState; set => Feeds.Cur.ProbeState = value; }
+    private static bool _probeLogged
+    { get => Feeds.Cur.ProbeLogged; set => Feeds.Cur.ProbeLogged = value; }
 
     // Install our manager and fill our queue. Returns the manager that was there before, or
     // null if nothing was swapped — the caller restores it in the finally either way.

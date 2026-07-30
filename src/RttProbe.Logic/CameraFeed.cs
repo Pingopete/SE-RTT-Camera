@@ -34,7 +34,11 @@ internal static class CameraFeed
         public double Extent;          // half-diagonal of the grid, 0 if unknown
         public string Name;
     }
-    private static volatile Target _target;
+    // PER-FEED (phase C1a): WHAT this feed is pointed at. Once feeds are independent
+    // this is the single most feed-defining value in the mod — it is the camera's
+    // subject. The backing field stays volatile for the tick/render publish above.
+    private static Target _target
+    { get => Feeds.Cur.Target; set => Feeds.Cur.Target = value; }
     public static Target Current => _target;
 
     // Latched: once a panel has been found, the render pass must never fall back to
@@ -292,9 +296,16 @@ internal static class CameraFeed
     // that looks like a bounding volume, so a miss is one log line away from a fix
     // instead of a guessing session.
     private static bool _boundsDiag;
-    private static object _boundsGrid;
-    private static (Vector3D Centre, double Extent) _boundsCache;
-    private static long _boundsAt;
+
+    // PER-FEED (phase C1a): the memoised bounds of THIS feed's grid. Keyed on the grid
+    // object and a timestamp, so two feeds orbiting two different grids must not share
+    // one slot — that would hand feed B feed A's orbit radius for a whole cache window.
+    private static object _boundsGrid
+    { get => Feeds.Cur.BoundsGrid; set => Feeds.Cur.BoundsGrid = value; }
+    private static (Vector3D Centre, double Extent) _boundsCache
+    { get => Feeds.Cur.BoundsCache; set => Feeds.Cur.BoundsCache = value; }
+    private static long _boundsAt
+    { get => Feeds.Cur.BoundsAt; set => Feeds.Cur.BoundsAt = value; }
 
     private static (Vector3D Centre, double Extent) GridBounds(object entity, Vector3D fallback)
     {
@@ -601,7 +612,9 @@ internal static class CameraFeed
     // kills the game), and no forced repaints. Deliberately NOT repainting is what
     // keeps our image on screen: the panel's own content would otherwise overwrite
     // it, and LCD content only repaints when marked dirty.
-    private static object _panelRt;          // boxed OffscreenRenderTarget
+    // PER-FEED (phase C1a): boxed OffscreenRenderTarget belonging to THIS feed's panel.
+    private static object _panelRt
+    { get => Feeds.Cur.PanelRt; set => Feeds.Cur.PanelRt = value; }
     public static object PanelRenderTarget => _panelRt;
 
     // Called by the camera pass when it finds the target has been evicted. The tick

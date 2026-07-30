@@ -30,12 +30,23 @@ internal static class FeedGate
 {
     private static readonly string PausePath = Path.Combine(RttLog.OutDir, "feed-paused.marker");
 
-    private static long _lastPanelMs;
+    // PER-FEED (phase C1a). Liveness is the definition of a feed: "panel A was ground
+    // down, feed B is untouched" is this gate and nothing else. See FeedInstance.cs for
+    // why these are properties rather than instance fields reached through a parameter.
+    private static long _lastPanelMs
+    { get => Feeds.Cur.LastPanelMs; set => Feeds.Cur.LastPanelMs = value; }
+    private static bool _active
+    { get => Feeds.Cur.GateActive; set => Feeds.Cur.GateActive = value; }
+    private static bool _everActive
+    { get => Feeds.Cur.GateEverActive; set => Feeds.Cur.GateEverActive = value; }
+    private static int _cycles
+    { get => Feeds.Cur.GateCycles; set => Feeds.Cur.GateCycles = value; }
+
+    // PROCESS-GLOBAL. The pause marker is a file on disk that stops the WHOLE mod — it
+    // is the safety protocol's lever, not a per-feed property — and the poll cadence is
+    // one filesystem stat shared by everyone.
     private static bool _paused;
-    private static bool _active;
-    private static bool _everActive;
     private static long _lastPollMs;
-    private static int _cycles;
 
     // True while a tagged panel is alive and the mod should be doing its work.
     // Starts FALSE: until a tagged panel has ticked at least once, there is nothing to
@@ -126,7 +137,12 @@ internal static class FeedGate
     // rebuilding these objects all session. This is where anything owning GPU memory is
     // allowed to be released.
     private const int TeardownDelayFrames = 30;
-    private static int _teardownIn = -1;
+
+    // PER-FEED: each feed counts down to its own teardown. -1 = not armed. The default
+    // lives on FeedInstance so a newly created feed starts disarmed like this one did.
+    private static int _teardownIn
+    { get => Feeds.Cur.TeardownIn; set => Feeds.Cur.TeardownIn = value; }
+
     private static bool _pendingStartupLog;
 
     public static void PumpRenderThread()

@@ -32,18 +32,28 @@ internal static class BlitProbe
     // resolved. Exposed rather than re-resolved so there is exactly one owner of it.
     internal static UISystem Ui => _ui;
 
-    private static OffscreenRenderTarget? _rt;
-    private static bool _rtTried;
+    // PER-FEED (phase C1a). The target and the batch that paints it are the most
+    // obviously per-feed things in the mod — two feeds means two targets — and the
+    // stats panel (A1) already rehearsed exactly this shape on a second surface.
+    private static OffscreenRenderTarget? _rt
+    { get => Feeds.Cur.Rt; set => Feeds.Cur.Rt = value; }
+    private static bool _rtTried
+    { get => Feeds.Cur.RtTried; set => Feeds.Cur.RtTried = value; }
 
     // The camera feed renders into this same target, so the render side needs a
     // handle on it. Boxed, because CameraRender works in reflection terms.
     public static object FeedTarget => _rt.HasValue ? (object)_rt.Value : null;
 
     // Once the camera pass is copying real frames in, the 2D test pattern would
-    // just overwrite them.
-    public static volatile bool FeedOwnsTarget;
-    private static PersistentDrawBatch _persistentBatch;
-    private static bool _batchRetired;
+    // just overwrite them. The backing field is volatile: written on the tick side,
+    // read on the render side, and a property over it keeps those semantics.
+    public static bool FeedOwnsTarget
+    { get => Feeds.Cur.FeedOwnsTarget; set => Feeds.Cur.FeedOwnsTarget = value; }
+
+    private static PersistentDrawBatch _persistentBatch
+    { get => Feeds.Cur.PersistentBatch; set => Feeds.Cur.PersistentBatch = value; }
+    private static bool _batchRetired
+    { get => Feeds.Cur.BatchRetired; set => Feeds.Cur.BatchRetired = value; }
     private static long _lastPaint;
     private static int _paintCount;
 
@@ -104,11 +114,11 @@ internal static class BlitProbe
             // anything not carrying the feed tag, so a stats panel would never be seen.
             StatsPanel.OnLcdTick(component);
 
-            // Free anything a render-thread Reset retired but could not safely destroy
-            // there. This tick is the game thread and is outside any frame we record, which
-            // is exactly what freeing GPU resources requires.
-            WholeSceneRender.DisposePendingProbes();
-
+            // The DisposePendingProbes drain used to run here, on the premise that this
+            // tick is the game thread and therefore outside any frame we record. The second
+            // half of that premise is FALSE — the render thread renders concurrently with
+            // this tick — and it cost a third device removal to establish. Both the drain
+            // and its queue are gone; see the probe-manager comment in WholeSceneRender.Reset.
             ResolveContracts(component);
             if (_contracts == null || _ui == null) return;
 

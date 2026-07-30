@@ -31,7 +31,12 @@ internal static class CameraRender
 
     private static bool _armed;
     private static bool _disarmed;
-    private static long _lastRender;
+
+    // PER-FEED (phase C1a): this feed's camera-pass cadence stamp. Two feeds run on two
+    // clocks — that is what "feed fps divides by N" means at the scheduler.
+    private static long _lastRender
+    { get => Feeds.Cur.LastRender; set => Feeds.Cur.LastRender = value; }
+
     private static long _lastArmCheck, _lastDisarmCheck;
     private const long ArmPollMs = 2000;
     private static int _errors;
@@ -55,15 +60,27 @@ internal static class CameraRender
 
     // The orbit transform. This pair is the ONLY thing the whole-scene route takes from
     // the camera pass: WholeSceneRenderView reads them to build its view.
-    private static object _lastCamWorld, _lastViewD;
+    //
+    // PER-FEED (phase C1a), and the pair that makes a feed a distinct VIEW at all. Goal
+    // 5's caller-driven camera lands exactly here: a consumer supplying its own
+    // transform provider writes this instance's pair and nothing else's.
+    private static object _lastCamWorld
+    { get => Feeds.Cur.LastCamWorld; set => Feeds.Cur.LastCamWorld = value; }
+    private static object _lastViewD
+    { get => Feeds.Cur.LastViewD; set => Feeds.Cur.LastViewD = value; }
 
     // Orbit continuity, for the eye-jump warning in OrbitViewSlim.
-    private static Keen.VRage.Library.Mathematics.Vector3D _lastEye;
-    private static bool _haveLastEye;
+    private static Keen.VRage.Library.Mathematics.Vector3D _lastEye
+    { get => Feeds.Cur.LastEye; set => Feeds.Cur.LastEye = value; }
+    private static bool _haveLastEye
+    { get => Feeds.Cur.HaveLastEye; set => Feeds.Cur.HaveLastEye = value; }
     private static int _eyeJumpLogs;
 
     // ---- feed delivery -----------------------------------------------------------
-    private static string _resolvedPanelId;   // panel target the feed is currently sized for
+    // PER-FEED: the panel target THIS feed is currently sized for. A stale value here
+    // is what silently broke every live resolution change before the Reset fix.
+    private static string _resolvedPanelId
+    { get => Feeds.Cur.ResolvedPanelId; set => Feeds.Cur.ResolvedPanelId = value; }
     private static long _lastResolveAttempt, _lastResolveFailLog;
     private static int _resolveFailLogs;
 
@@ -363,10 +380,20 @@ internal static class CameraRender
     // counterpart lives in OffscreenTargetManager._registeredTextures, keyed by
     // handle. Copying into that texture is how our pixels become something a panel
     // can display.
-    private static object _feedTexture;
-    private static object _feedRes, _feedFormat;   // dictate our render target's shape
-    private static object _feedComponent;          // Render12 OffscreenRenderTargetComponent
-    private static int _feedState;      // 0 untried, 1 ready, -1 unavailable
+    // PER-FEED (phase C1a): the destination and its shape. Per-feed is what makes
+    // "many LCD panel sizes and aspect ratios" tractable — each feed resolves its own
+    // panel's resolution and format, and phase E2's shared-source crop then sits on top
+    // for the case where several panels want ONE camera.
+    private static object _feedTexture
+    { get => Feeds.Cur.FeedTexture; set => Feeds.Cur.FeedTexture = value; }
+    private static object _feedRes                 // dictates our render target's shape
+    { get => Feeds.Cur.FeedRes; set => Feeds.Cur.FeedRes = value; }
+    private static object _feedFormat
+    { get => Feeds.Cur.FeedFormat; set => Feeds.Cur.FeedFormat = value; }
+    private static object _feedComponent           // Render12 OffscreenRenderTargetComponent
+    { get => Feeds.Cur.FeedComponent; set => Feeds.Cur.FeedComponent = value; }
+    private static int _feedState       // 0 untried, 1 ready, -1 unavailable
+    { get => Feeds.Cur.FeedState; set => Feeds.Cur.FeedState = value; }
     private static int _copyLogs;
 
     // Separately gated from the render. The camera pass alone has run for 17
@@ -678,14 +705,21 @@ internal static class CameraRender
     private static object _copyJob;
     private static MethodInfo _miCopyDoWork;
     private static object _channelAll, _channelRgb;
-    private static readonly object[] _ldrRing = new object[3];   // session-owned; see CopyToFeed
+    // PER-FEED (phase C1a): the LDR ring. session-owned; see CopyToFeed. Get-only —
+    // the array is allocated once per instance and only ever indexed, never reassigned.
+    // This is also the biggest per-feed VRAM item, so it is the thing D3 measures when
+    // it puts a number on the max-resident-feeds constant.
+    private static object[] _ldrRing => Feeds.Cur.LdrRing;
 
     // Mip levels the ring was allocated with, matched to the panel. Read by FeedHandover to
     // decide how many subresources to generate and copy. 1 = no chain, old behaviour.
     internal static int LdrMips => _ldrMips;
-    private static int _ldrMips = 1;
-    private static object _ldrReady;                             // the slot handed to the UI stage
-    private static int _ringIndex = -1;
+    private static int _ldrMips
+    { get => Feeds.Cur.LdrMips; set => Feeds.Cur.LdrMips = value; }
+    private static object _ldrReady                              // the slot handed to the UI stage
+    { get => Feeds.Cur.LdrReady; set => Feeds.Cur.LdrReady = value; }
+    private static int _ringIndex
+    { get => Feeds.Cur.RingIndex; set => Feeds.Cur.RingIndex = value; }
     private static bool _blitLogged;
     private static bool _blitResLogged;
 
@@ -1005,11 +1039,22 @@ internal static class CameraRender
         catch (Exception e) { RttLog.Error("whole-scene camera CB", e); return null; }
     }
 
-    private static object _wsRenderView, _wsResolution;
+    // PER-FEED (phase C1a). _wsResolution in particular: as a static it was cached once
+    // and never cleared, which silently broke EVERY live resolution change and cost a
+    // day of misdiagnosis ("1024 is broken", which it was not). With N feeds at N sizes
+    // a shared slot would not be a subtle bug — it would be the wrong size on purpose.
+    private static object _wsRenderView
+    { get => Feeds.Cur.WsRenderView; set => Feeds.Cur.WsRenderView = value; }
+    private static object _wsResolution
+    { get => Feeds.Cur.WsResolution; set => Feeds.Cur.WsResolution = value; }
+
     private static bool _wsRvLogged;
     private static int _wsRvErrs;
     private static long _wsDiagMs;
-    private static object _wsPrevCamPos;
+
+    // PER-FEED: previous-frame camera position for motion vectors.
+    private static object _wsPrevCamPos
+    { get => Feeds.Cur.WsPrevCamPos; set => Feeds.Cur.WsPrevCamPos = value; }
 
     private static object MField(object o, string name)
     {
@@ -1075,7 +1120,11 @@ internal static class CameraRender
     // one SECOND-RENDER apart, which is the correct pairing for our own history.
     //
     // First render has no previous, so it keeps the zero — one noisy frame, then correct.
-    private static object _wsPrevCameraSettings;
+    // PER-FEED (phase C1a): feed B's previous frame is not feed A's, and pairing them
+    // across feeds is a motion-vector smear by construction.
+    private static object _wsPrevCameraSettings
+    { get => Feeds.Cur.WsPrevCameraSettings; set => Feeds.Cur.WsPrevCameraSettings = value; }
+
     private static MethodInfo _miPrevCamFromView;
     private static FieldInfo _fTrackedPrevCam;
     private static int _prevCamState;          // 0 untried, 1 ok, -1 unavailable
@@ -1217,7 +1266,11 @@ internal static class CameraRender
     // the PLAYER's camera position into MainViewCameraPos, which SpherizationCommon.hlsli
     // (planet horizon curvature) and TriplanarSingle/MultiVertex.hlsl (voxel surface
     // texturing) both sample. CreateNonjitteredCameraSettings sets it to zero.
-    private static object _cbRenderView;
+    // PER-FEED (phase C1a): the RenderView this feed's camera constant buffer is built
+    // from. It carries this feed's resolution, so it cannot be shared across sizes.
+    private static object _cbRenderView
+    { get => Feeds.Cur.CbRenderView; set => Feeds.Cur.CbRenderView = value; }
+
     private static MethodInfo _miCreateNonjittered, _miRvSetCamera, _miRvSetResolution;
     private static bool _fullCbBlocked, _fullCbLogged;
 
@@ -1614,7 +1667,10 @@ internal static class CameraRender
     // ours — projection and far plane are copied from the live main view, so the
     // engine's own conventions (handedness, reversed-Z, infinite far) carry over
     // instead of being guessed at.
-    private static long _feedStartTicks;
+    // PER-FEED (phase C1a): the orbit's time origin. Per-feed is what lets C3's second
+    // camera sit at an OFFSET orbit rather than shadowing the first one exactly.
+    private static long _feedStartTicks
+    { get => Feeds.Cur.FeedStartTicks; set => Feeds.Cur.FeedStartTicks = value; }
 
     // Why the last null, for the skip log. Nulls here used to be silently papered
     // over by the main-view fallback, so nothing ever recorded the reason.
