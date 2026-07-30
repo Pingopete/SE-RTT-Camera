@@ -172,7 +172,7 @@ count (~2.1ms per warm feed per frame). Budget in submit-ms. The revised option 
 - **B. Coarse-quantum rotation — the user's round-robin at the RIGHT timescale.** The
   cold-start tax is per WAKE: per-frame rotation pays it every render (pathological);
   multi-second slots pay ~0.2-1s of re-warm once, then render warm for the rest. 10s slots
-  ~= 90% warm efficiency,每 live feed at FULL quality and cadence during its slot; standby
+  ~= 90% warm efficiency, each live feed at FULL quality and cadence during its slot; standby
   feeds hold their last frame. CCTV-multiplexer shape. Budget decides HOW MANY are live,
   never how good a live feed looks.
 - **C. Perceptual budgeting.** Off-screen panels dormant (absence-of-ticking, test
