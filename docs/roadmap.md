@@ -801,3 +801,29 @@ scoping it off would silently make the whole feature a no-op.
 
 Next session, in order: fix the flares lifetime bug (it is the smaller, better-understood of
 the two), then exercise probes on a clean launch with nothing else changing.
+
+## Goal 4.4 EXERCISED AND SOAKED CLEAN (2026-07-29, 21:26-21:47)
+
+First run of the own-probes code, on a fresh launch with nothing else changing, enabled by
+config flip under the pause protocol. Everything held:
+
+    Own probes: OUR EnvironmentProbeManager installed ... EnvProbesToUpdate filled from
+                its own PrepareProbes()
+    stage 2 (RenderEnvironmentProbe) ... running it anyway
+
+It survived, in order: manager construction, the first PrepareProbes (RecreateProbes — the
+eight cube textures, inside the settle window as designed), and stage 2 executing against
+our queue. Then a 15-minute automated soak: **no crash, no errors, no drift** —
+53.0/52.8 fps at minute 15 vs 52.8 at minute 1, ours p50 18.9-19.0, p95 20.6-20.9, zero
+frames >50ms, VRAM dead flat (+0MB on consecutive windows).
+
+Measured cost of the "most expensive feature on the roadmap": **~0.1-0.2 ms of CPU submit**
+(2.1 vs 1.9-2.0 baseline). The engine's round-robin amortisation carries the feed exactly as
+hoped — honouring EnvProbesToUpdate means inheriting the engine's own cost-spreading.
+
+Remaining for 4.4: the user's visual verdict (reflections/ambient should now be centred on
+the orbit camera), and a check of the PLAYER'S view for regressions — the design goal is
+that the player's atlas is untouched, so anything odd on the player's side is a finding.
+
+Also worth recording: the drift criterion holds with probes on. 15+ minutes, stable fps,
+flat VRAM, on the every-frame config.

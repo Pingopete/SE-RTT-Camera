@@ -126,9 +126,13 @@ internal static class WholeSceneRender
             }
 
             resize.Invoke(ldr, new[] { commandList, target });
-            RttLog.Line($"FinalLDR resized: {cur} -> {w}x{h}. Our render now upscales 512->512 instead of " +
-                        $"512->3840x2160, and the panel blit is 1:1. MaxResolution (the pool key) is unchanged " +
-                        "by design — watch the tripwire for Draw resizing it back.");
+            // The prose used to hardcode "512->512", written when 512 was the only
+            // resolution — misleading log text is how the ghost hunt lost a day, so it
+            // prints the live values now.
+            RttLog.Line($"FinalLDR resized: {cur} -> {w}x{h}. Our render now runs {w}x{h}->{w}x{h} " +
+                        "(no upscale) instead of ->3840x2160, and the panel blit scales from that. " +
+                        "MaxResolution (the pool key) is unchanged by design — watch the tripwire " +
+                        "for Draw resizing it back.");
         }
         catch (Exception e) { RttLog.Error("FinalLDR resize", e); }
     }
@@ -280,6 +284,18 @@ internal static class WholeSceneRender
             }
             catch (Exception e) { RttLog.Error("whole-scene Reset: restore our flares context", e); }
 
+            // And the FIELD-level version of the same hazard, which the context-level
+            // restore above cannot see: with wholeSceneOwnFlares the mirrored DEFINITION
+            // members inside _ourFreshFlares are the ENGINE'S objects, and FlaresContext.
+            // Dispose reaches all of them — it disposes _flaresBuffer (null-checked, but the
+            // mirror made it non-null), iterates _flaresByGuid calling
+            // _flareDefinitionsAllocator.Free per entry, and walks _texturePinsByGuid.
+            // Two CTDs on 2026-07-29 came from exactly this: the teardown freed the
+            // player's flare buffer and the engine's next flare pass dereferenced it.
+            // Restoring the ctor originals (captured at first mirror) makes Dispose release
+            // precisely what our context allocated and nothing else.
+            ScrubMirroredFlareRefs();
+
             if (_ourDrawContexts is IDisposable dc)
             {
                 try { dc.Dispose(); }
@@ -302,6 +318,9 @@ internal static class WholeSceneRender
         // would point at a disposed context after a rebuild, and a surviving
         // _flareMirrorLogged would swallow the log line that proves the mirror took.
         _engineFlares = null; _flareMirrorLogged = false; _flaresReady = false;
+        _flareOriginals = null;   // belt-and-braces: scrub self-clears, but a stale capture
+                                  // applied to a NEW context would write another context's
+                                  // objects into it, which is this same bug wearing a hat
 
         // OUR PROBE MANAGER. Disposed rather than dropped: it owns eight cube textures once
         // RecreateProbes has run, and leaking a set per hot reload is Rule 10's failure mode
@@ -814,7 +833,8 @@ internal static class WholeSceneRender
                         {
                             _cbSwapLogged = true;
                             RttLog.Line("Whole-scene camera CB: swapped in for our render — shaders now " +
-                                        "read the orbit camera's projection, sky rotation and 512x512 " +
+                                        "read the orbit camera's projection, sky rotation and " +
+                                        $"{FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight} " +
                                         "Screen.Resolution instead of inheriting the player's frame CB.");
                         }
                     }
@@ -1967,6 +1987,34 @@ internal static class WholeSceneRender
     // _flaresBuffer on whichever context is installed, so a one-shot copy could go stale
     // and stay stale. Re-reading makes the worst case "one frame behind", not "wrong
     // forever". Returns how many members were successfully shared.
+    // The ctor-original values of the four mirrored fields, captured before the FIRST
+    // overwrite. These are what FlaresContext.Dispose is entitled to see at teardown:
+    // _flaresBuffer null (the ctor never writes it; Dispose null-checks it), the empty
+    // dictionaries and the allocator the ctor built. ScrubMirroredFlareRefs writes them
+    // back before our DrawContextManager is disposed. Nulling instead would NRE inside
+    // Dispose — it iterates _flaresByGuid unguarded (verified in IL).
+    private static object[] _flareOriginals;
+
+    private static void ScrubMirroredFlareRefs()
+    {
+        _flaresReady = false;
+        if (_ourFreshFlares == null || _flareOriginals == null) { _flareOriginals = null; return; }
+        try
+        {
+            var ft = _ourFreshFlares.GetType();
+            for (int i = 0; i < FlareDefFields.Length; i++)
+            {
+                var f = ft.GetField(FlareDefFields[i], Any);
+                f?.SetValue(_ourFreshFlares, _flareOriginals[i]);
+            }
+            RttLog.Line("Whole-scene flares: mirrored ENGINE references scrubbed from our context " +
+                        "(ctor originals restored) before its dispose — the teardown can no longer " +
+                        "free the player's flare buffer or drain its definition allocator.");
+        }
+        catch (Exception e) { RttLog.Error("scrub mirrored flare refs", e); }
+        finally { _flareOriginals = null; }
+    }
+
     private static int MirrorFlareDefinitions()
     {
         _flaresReady = false;
@@ -1976,6 +2024,17 @@ internal static class WholeSceneRender
         try
         {
             var ft = _ourFreshFlares.GetType();
+
+            // Capture the ctor originals ONCE, before anything is overwritten. Not per
+            // render — after the first mirror these fields hold the engine's objects, and
+            // capturing those as "originals" would defeat the entire scrub.
+            if (_flareOriginals == null)
+            {
+                _flareOriginals = new object[FlareDefFields.Length];
+                for (int i = 0; i < FlareDefFields.Length; i++)
+                    _flareOriginals[i] = ft.GetField(FlareDefFields[i], Any)?.GetValue(_ourFreshFlares);
+            }
+
             foreach (var name in FlareDefFields)
             {
                 var f = ft.GetField(name, Any);
