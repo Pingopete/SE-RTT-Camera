@@ -226,3 +226,23 @@ cascades, eight probe cubes each; the 2048 run showed the wall). Second constant
 max warm-feed count (resident resources); beyond it, extra feeds are fully torn down until
 rotated in. The whole system is two constants — submit-ms per frame, feeds resident — both
 fixed regardless of world content.
+
+### Quality is GLOBAL across all feeds (user decision, 2026-07-29)
+
+The feed render-quality setting applies to ALL feeds at once — it is deliberately the
+user's VRAM/resource throttle, not a per-feed property. Consequences, mostly simplifying:
+
+- **One knob drives both axes.** The quality preset scales per-feed VRAM (render
+  resolution, cascade count/res, probes on/off, RT buffers) AND per-render submit cost —
+  so lowering it both fits more resident feeds under the VRAM ceiling and makes each
+  render credit buy more fps. Exactly the "throttle to taste" intent.
+- **Per-feed policy shrinks to share WEIGHTING only** (priority = more credits). No
+  per-feed quality axis exists; perceptual budgeting (C) modulates cadence/dormancy only.
+  Simpler API, simpler UX: the camera-mod UI gets one global quality control.
+- **Implementation is cheaper than per-feed quality:** FeedConfig is already global; the
+  quality knobs simply STAY global-scoped when instancing happens, instead of migrating
+  into per-feed state.
+- **One design point to respect:** a preset change that touches class (c) knobs
+  (resolution, cascade allocation) implies rebuilding EVERY feed. Stagger those rebuilds
+  (one feed per settle window) rather than rebuilding N feeds in one frame, or a quality
+  change becomes a hitch that scales with feed count.
