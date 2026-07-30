@@ -31,9 +31,36 @@ The measuring tools everything later depends on, plus experiments that cost seco
 | A1 | **Stats panel v1** — `[RTS]` tag scan, font survey (3 routes, one-shot log), persistent batch with ~6 DrawString lines re-recorded every 500ms. Include the **budget tripwire** from day one: a line showing rolling p50 submit vs `rttBudgetMsPerFrame` (the measured reference constant), flagged when >20% over for a minute | stats visible in game; feed panel untouched; 3 teardown cycles clean. THIS IS THE INSTANCING PATHFINDER — it forces target/binding/batch out of single-panel statics on a surface where failure = broken numbers, not broken feed |
 | A2 | **`intervalMs` out of the rebuild signature** (trivially class (a)) | live change 0->33->0 with NO gate cycle in the log; rate follows within one poll |
 | A3 | **Ten-second experiments**: (i) FSR smear discriminator — player AA off FSR, look at distant panel; (ii) visibility dormancy — walk the panel out of view, watch for DORMANT; (iii) `ownProbes` live flip both directions | each answered with one log line + user observation; findings recorded |
-| A4 | **Class (a) knob A/B sweep** — one knob at a time under pause protocol, per the classification table | verified live-switch list; any knob that misbehaves demoted with evidence |
+| A4 | ~~**Class (a) knob A/B sweep**~~ — **CANCELLED 2026-07-30**, see below | — |
 
-Exit gate: perf numbers readable in game; knob classes verified by test, not reading.
+Exit gate: perf numbers readable in game. **MET** (A1, A2 done; A3 partially, A4 cancelled).
+
+**A4 CANCELLED, and the reasoning is worth keeping.** A3(iii) — the `ownProbes` live flip — cost
+THREE device removals in a row. A4 was the same activity generalised to every knob, so its
+expected cost was "several more crashes" and its entire payoff was that a preset change could be
+instant rather than costing a ~2 s gate cycle. That is a UX detail bought with device removals on
+the user's machine, and one of the earlier CTDs in this family did damage outside the game.
+
+The trade is simply bad, so preset changes are now ALLOWED to cost a gate cycle — which the phase
+E3 design already tolerates (staggered rebuilds, one feed per settle window). Any knob is
+"live-switchable" only if it is already out of `WholeSceneSignature()`; nothing new gets promoted
+by experiment. `wholeSceneOwnProbes` is classified **restart/gate-cycle**, permanently.
+
+**A3 outcomes:**
+
+- (iii) `ownProbes` live flip — **answered, expensively.** Not live-flippable. Three crashes, one
+  real bug found and fixed along the way (Reset() running INSIDE our render, nulling the statics
+  every `finally` block needs — latent for as long as `Poll()` has been called from there, and it
+  would have bitten every restore path eventually, not just probes). Manager is now KEPT; knob is
+  out of the rebuild signature.
+- (i) FSR smear discriminator — **overtaken by events. NOT RUN, and does not need to be.** The
+  user reports the star smear is GONE. Three candidate fixes landed between the last sighting and
+  the report — the panel mip-chain fix, the FSR reactive mask, and own probes — and no discriminator
+  was run between them, so **the cause is unattributed and this is recorded as an observation, not
+  a diagnosis.** It cannot be re-run cheaply now that the symptom is absent. Phase F6 ("act on the
+  A3(i) finding") is therefore reduced to: watch for recurrence, and if it returns, bisect those
+  three. Claiming a specific fix for it would be exactly the Rule-26 mistake.
+- (ii) visibility dormancy — not run, still cheap, folded into phase F1 where it belongs.
 
 ## Phase B — presets and cheap wins (1 session)
 
@@ -51,11 +78,38 @@ The enabling work for everything after it. A1 has already rehearsed the shape.
 
 | # | item | test / exit evidence |
 |---|---|---|
-| C1 | **Inventory the statics** (ScreenBuffers, DrawContextManager, cascade set, probe manager, flares mirror + originals, LDR ring, orbit/camera state, panel binding, gate state) -> `FeedInstance`; one global render-thread pump; teardown per instance uses the Rule-25 discipline (dispose only what the instance allocated) | compiles; instance count = 1 |
+| C1a | **Inventory the statics** (ScreenBuffers, DrawContextManager, cascade set, probe manager, flares mirror + originals, LDR ring, orbit/camera state, panel binding, gate state) -> `FeedInstance`. **DONE 2026-07-30** | compiles; instance count = 1 |
 | C2 | **Single-instance parity** — one FeedInstance must equal the current build | PERF within noise of the reference build; same visuals; 3 teardown cycles; 15-min soak. Pin as reference |
+| C1b | **The render-thread pump** — `Feeds.Cur` becomes a per-thread ambient the pump sets around each feed's work; teardown per instance under Rule-25 (dispose only what the instance allocated) | pump selects instance 0 explicitly; parity holds a second time |
 | C3 | **Second unique feed** — second tagged panel, second camera (offset orbit), simple alternator (A on even frames, B on odd) as the placeholder scheduler | both feeds live and correct; destroy/power-off panel A -> feed B unaffected; teardown matrix per feed; 15-min two-feed soak |
 
 Exit gate: two independent feeds, independently killable, no cross-contamination.
+
+**C1 was split into C1a/C1b deliberately, with C2 BETWEEN them.** The seam (state moves onto an
+instance) and the selection (a pump chooses which instance) are independent changes with
+independent failure modes, and only the second one can alter threading behaviour. Proving parity
+after C1a means `Feeds.Cur` is still a constant, both threads still see the same object, and a
+parity failure can only be the field mapping. Doing both at once would have left a numbers
+regression ambiguous between "wrong field moved" and "wrong feed selected" — on a build whose
+whole value is that it currently works.
+
+**The C1a technique, recorded because it is reusable.** Per-feed state was ~55 fields across seven
+files read from several hundred call sites. Rather than thread an instance parameter through all
+of them, each per-feed FIELD became a same-named static PROPERTY over a `FeedInstance` field:
+
+```csharp
+private static object _ourScreenBuffers;                              // before
+private static object _ourScreenBuffers                               // after
+{ get => Feeds.Cur.OurScreenBuffers; set => Feeds.Cur.OurScreenBuffers = value; }
+```
+
+Every call site compiles and behaves identically, untouched; the diff is "delete a field, add a
+property" per item, reviewable field by field. The compiler then verifies completeness from both
+directions: a dropped static errors at its use sites, and an orphaned instance field warns CS0649
+— so **a clean build with zero warnings is real evidence that the mapping is total**, not just
+that it typechecks. What it cannot check, and what was checked by hand: crossed get/set pairs, and
+mutating calls or member writes on struct-typed properties, which would silently land on a
+temporary copy.
 
 ## Phase D — the decisive experiments (0.5 session; needs C)
 
