@@ -102,3 +102,58 @@ costs one gate cycle — acceptable if presets differ mainly in layers, not reso
 2. One-knob-at-a-time live-flip tests for the class (a) table, logged.
 3. `wholeSceneOwnProbes` live-flip test both directions (suspected (a) already).
 4. THEN define the three presets from `docs/feed-render-layers.md` + measured costs.
+
+## Multi-feed display and scheduling (user design questions, 2026-07-29 late)
+
+### One render, many panels: shared source + per-panel crop — ADOPTED
+
+User proposal: default the scene render to a fixed square resolution and CROP per panel
+(sides or verticals) to match each panel's aspect, so the same camera feeds any number of
+panels without re-rendering. Verdict: right, and mostly already built.
+
+- The CopyJob blit already takes a SOURCE RECTANGLE and scales to the destination — the
+  1024->512 supersampling path is this exact call. Aspect cropping is the same call with a
+  different rectangle. The per-panel work is: compute the centered sub-rect of the source
+  matching the panel's aspect, blit into that panel's own ring/target (which is already
+  sized from the panel).
+- Cost structure (measured today): the render is CPU-SUBMIT-bound (~2.1ms); blits are
+  unmeasurable. So one render -> N same-camera panels = 1x submit + N free blits.
+  **The scheduler's unit is the UNIQUE CAMERA, not the panel.** Six monitors showing two
+  cameras is two renders.
+- Amendment to the proposal: default the shared source to **1024x1024, not 512** — pixels
+  are free (proven at 4x) and cropping EATS resolution: a 2:1 panel cropped from a square
+  source keeps half the vertical pixels. From 1024, wide-panel crops still land with ~2x
+  supersampling; from 512 they arrive under-sampled.
+- Semantics: cropping narrows each panel's effective FOV (sensor-crop behaviour). Natural
+  for camera feeds; a letterbox option flag (full FOV, bars) can come later per feed.
+- Composition detail: the per-panel mip-regeneration already keys off each panel target's
+  own mip count, so mixed panel sizes compose with the mip fix as-is.
+
+### Scheduling N unique feeds: round-robin REJECTED as default, kept as fallback
+
+User proposal: cycle the frame allocation A -> B -> C -> A, one feed rendered per frame.
+
+This is the classic scheduler, but it is precisely the shape today's headline measurement
+killed: each feed rendering every Nth frame IS throttling, and throttling made a single
+feed 6-7x more expensive per render (cold temporal history, denoiser/GI restart). We even
+have a direct proxy measurement of the proposed cadence: intervalMs=33 at ~50fps was
+"render every 2nd-3rd frame" — p50 29.5ms per render vs 15.2 warm, plus visible temporal
+degradation. Round-robin would give each feed that cold cost AND 1/Nth the feed rate.
+
+The pattern that measurably works is the one own-probes proved: **amortise WITHIN each
+feed at full cadence, never ACROSS feeds by skipping frames.** Scheduler design:
+
+1. Every active feed renders every frame — temporal state stays warm.
+2. The budget trims LAYERS, not cadence: under pressure, feeds drop through the goal-8
+   presets (class-(a) knobs switch live), amortise cascades/probe faces harder, pull far
+   clip in.
+3. Visibility dormancy for free: the gate's "absence of ticking IS the signal", and the
+   LCD component only ticks panels it draws — so off-screen panels likely take their feeds
+   dormant with zero scheduler code. NEEDS ONE TEST to confirm ticking really stops when
+   a panel leaves the frustum.
+4. Round-robin kept as the measured last resort if N warm feeds exceed budget even at the
+   low preset. The burden of proof sits on throttling now.
+
+Honest limit: at some N, N x 2.1ms of submit is real (3 feeds ~ 6ms). Whether
+warm-at-low-preset beats cold-at-high-preset there is a MEASUREMENT, scheduled for when
+two feeds exist.
