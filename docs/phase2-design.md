@@ -308,3 +308,31 @@ Net: the global quality knob now serves all three stated intents at once — VRA
 uniform quality across feeds, and the whole-game frame-rate lever. The tripwire (A1)
 compares rolling p50 submit against the CURRENT preset's constant, so preset changes move
 the guard automatically.
+
+### THE SMOOTHNESS CONSTRAINT: the budget must be a slot, not a meter (user concern, 2026-07-30)
+
+Premise correction that strengthens the concern: the current build renders EVERY world
+frame (intervalMs=0), and that is precisely why it is hitchless. The project's own record
+proves the mechanism: the old choppiness was a BIMODAL frame distribution (expensive
+ours-frames alternating with cheap idle-frames), and the fix was making every frame
+identical — "variance is what is felt; a tighter distribution beats a lower mean."
+
+**A naive ms-budget WOULD lose the smoothness.** The hazardous version is grant-while-
+budget-lasts with skip-to-repay: every skip manufactures a cheap frame next to expensive
+ones — the bimodal pattern reintroduced by the protection mechanism itself. Amendments to
+the budget lock, binding on the phase-E implementation:
+
+1. **Structural, not reactive.** At most ONE render slot per engine frame, feeds in strict
+   cyclic rotation. Per-frame cost is constant at any N; feed fps = engine/N emerges; no
+   frame differs from its neighbours. The ms constant is calibration + tripwire threshold,
+   NOT a per-frame gate.
+2. **Overruns never cause skips.** Sustained drift over the constant is corrected through
+   variance-free cost levers (harder cascade/probe-face amortisation, far clip), which
+   cheapen EVERY render slightly rather than making ONE frame different. The tripwire
+   surfaces it; quality — never cadence — absorbs it.
+3. **Fractional schedules (the opt-in fixed-envelope mode) must be strictly PERIODIC**
+   (1,2,1,2...), never opportunistic. Periodic load is smooth at identical averages;
+   irregular load is hitching.
+4. **Smoothness is an exit-gate metric.** Phase E's invariant now includes: the p95-p50
+   gap and the >50ms count at N=1,2,3 stay at the single-feed baseline values, not merely
+   "total cost flat".
