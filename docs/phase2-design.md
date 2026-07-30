@@ -246,3 +246,37 @@ user's VRAM/resource throttle, not a per-feed property. Consequences, mostly sim
   (resolution, cascade allocation) implies rebuilding EVERY feed. Stagger those rebuilds
   (one feed per settle window) rather than rebuilding N feeds in one frame, or a quality
   change becomes a hitch that scales with feed count.
+
+### THE BUDGET LOCK: what is actually held constant, and how (user question, 2026-07-29)
+
+"Lock 66 fps" names the wrong quantity. The feed renders once per engine frame, so feed
+fps EQUALS engine fps — 66 was the engine rate on the reference build (about 50 now, with
+everything enabled at higher world settings). Hard-locking an absolute renders/sec would
+make the feed skip engine frames on faster rigs, reintroducing exactly the cadence gaps
+proven pathological. **The constant is the PER-FRAME SLICE: one whole-scene render's cost
+out of every engine frame.** Feed fps stays the readout, never the setting.
+
+Three-level lock:
+
+1. **The constant.** `rttBudgetMsPerFrame` = the MEASURED warm cost of one
+   reference-quality render (~2.1-2.5 ms submit today), re-measured at each phase-exit
+   reference build, stored PER GLOBAL QUALITY PRESET (the quality knob changes what a
+   render costs; the budget stays honest about it). Capped at the reference value — users
+   may lower it, never raise it. That is the "never exceed" rule in one line.
+
+2. **The enforcement.** The credit scheduler meters ACTUAL cost, not assumptions: Perf.cs
+   already measures every render's submit time; the scheduler keeps a rolling average per
+   feed, grants renders each engine frame while that frame's budget lasts, and an overrun
+   (cold wake, heavy scene) REPAYS by delaying the next credit until the average is back
+   under. Hard cap in the long run, not statistical. With one feed this degenerates to
+   exactly today's behaviour — render every frame — so v1 costs nothing.
+
+3. **The regression guard.** A budget tripwire: persistent warning (log + stats-panel
+   flag) whenever rolling p50 submit exceeds the constant by ~20% for a minute. Any future
+   change that quietly makes renders more expensive surfaces as an on-screen budget
+   violation, not a mystery sessions later.
+
+Elegant consequence of defining the budget in MS rather than renders-per-frame: dropping
+the global quality preset makes renders cheaper, so MORE feeds fit inside the same
+per-frame envelope at full cadence each. The quality knob does not just throttle VRAM —
+it directly buys feed smoothness under an identical total cost. Falls out for free.
