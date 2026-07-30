@@ -104,6 +104,11 @@ internal static class BlitProbe
             // anything not carrying the feed tag, so a stats panel would never be seen.
             StatsPanel.OnLcdTick(component);
 
+            // Free anything a render-thread Reset retired but could not safely destroy
+            // there. This tick is the game thread and is outside any frame we record, which
+            // is exactly what freeing GPU resources requires.
+            WholeSceneRender.DisposePendingProbes();
+
             ResolveContracts(component);
             if (_contracts == null || _ui == null) return;
 

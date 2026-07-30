@@ -322,20 +322,26 @@ internal static class WholeSceneRender
                                   // applied to a NEW context would write another context's
                                   // objects into it, which is this same bug wearing a hat
 
-        // OUR PROBE MANAGER. Disposed rather than dropped: it owns eight cube textures once
-        // RecreateProbes has run, and leaking a set per hot reload is Rule 10's failure mode
-        // (~8 reloads once grew VRAM 13.2 -> 16.5 GB and the residency thrashing looked
-        // exactly like a rendering bug). DisposeTextures is non-public, hence Any.
-        if (_ourProbes != null)
-        {
-            try
-            {
-                var miDispose = _ourProbes.GetType().GetMethod("DisposeTextures", Any);
-                if (miDispose != null) miDispose.Invoke(_ourProbes, null);
-                else if (_ourProbes is IDisposable disp) disp.Dispose();
-            }
-            catch (Exception e) { RttLog.Error("dispose own probe textures", e); }
-        }
+        // OUR PROBE MANAGER — HANDED OFF, NOT DISPOSED HERE. See DisposePendingProbes.
+        //
+        // It owns eight cube textures once RecreateProbes has run, so dropping it silently
+        // would leak a set per hot reload (Rule 10: ~8 reloads once grew VRAM 13.2 -> 16.5
+        // GB, and the residency thrashing looked exactly like a rendering bug). But
+        // disposing it HERE is worse: Reset() runs from FeedConfig.Poll on the RENDER
+        // THREAD, inside the player's frame, and freeing GPU textures mid-frame is the
+        // fault family this project has recorded more than any other.
+        //
+        // CONFIRMED, expensively, 2026-07-30: flipping wholeSceneOwnProbes live removed the
+        // device. DRED breadcrumb EventStack [CullingProxies, MainViewCulling[FirstPass],
+        // ScenePreparation + Render] with PageFaultVA 0x0 and zero existing AND zero freed
+        // allocations — a NULL BIND, in the PLAYER'S culling pass, on the rebuild that this
+        // disposal rode along with. Steady-state own-probes had already soaked an hour
+        // clean, so it was the teardown, not the feature.
+        //
+        // So the manager is queued and freed from the LCD tick instead — the game thread,
+        // outside any frame we are recording. Same discipline as every other "do not create
+        // or destroy engine resources mid-frame" rule, applied to the teardown side.
+        if (_ourProbes != null) _probesPendingDispose = _ourProbes;
         _ourProbes = null; _probeField = null; _envProbesToUpdateField = null;
         _miPrepareProbes = null; _probeState = 0; _probeLogged = false;
         _dcBuilt = false;
@@ -2089,6 +2095,35 @@ internal static class WholeSceneRender
     // Buffer<Request> and EnvProbesToUpdate is a field of that type, so this is one
     // assignment — and calling it on OUR instance is not Rule 8, which is about globals.
     private static object _ourProbes;
+
+    // Set by Reset(), drained by DisposePendingProbes() from the LCD tick. Volatile because
+    // the writer is the render thread and the reader is the game thread.
+    private static volatile object _probesPendingDispose;
+
+    // Free a retired probe manager's cube textures from the GAME thread. Called from the
+    // LCD tick, which is where this mod already makes contracts calls, and which is never
+    // inside a frame we are recording.
+    //
+    // A single-shot swap so a second call cannot double-free, and it never throws upward:
+    // this runs on the tick that also drives panel discovery, and taking that down would
+    // cost far more than a leaked texture set.
+    internal static void DisposePendingProbes()
+    {
+        var probes = _probesPendingDispose;
+        if (probes == null) return;
+        _probesPendingDispose = null;
+        try
+        {
+            var mi = probes.GetType().GetMethod("DisposeTextures", Any);
+            if (mi != null) mi.Invoke(probes, null);
+            else if (probes is IDisposable d) d.Dispose();
+            RttLog.Line("Own probes: retired probe manager's textures released from the LCD tick " +
+                        "(game thread), not from Reset on the render thread — see the comment in " +
+                        "Reset for the device removal that bought this rule.");
+        }
+        catch (Exception e) { RttLog.Error("dispose retired probe textures", e); }
+    }
+
     private static FieldInfo _probeField, _envProbesToUpdateField;
     private static MethodInfo _miPrepareProbes;
     private static int _probeState;        // 0 = untried, 1 = ready, -1 = unavailable

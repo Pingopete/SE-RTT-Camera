@@ -367,3 +367,36 @@ Consequences:
   stakes on D1 — it is now the single most important experiment in the plan.**
 - It also re-confirms the every-frame default is not a tuning preference but a ~10x
   correctness issue for cost.
+
+### A3 RESULT: `wholeSceneOwnProbes` is NOT live-flippable — and why (2026-07-30)
+
+The phase-A3 live-flip test removed the device. The experiment worked: this is exactly the
+kind of claim A3 exists to check, and the classification table's suspicion that ownProbes
+"is likely class (a) as-is" was wrong.
+
+DRED: `EventStack [CullingProxies, MainViewCulling[FirstPass], ScenePreparation + Render]`,
+`PageFaultVA 0x0`, `ExistingAllocations 0`, `RecentFreedAllocations 0` — a NULL BIND in the
+PLAYER'S culling pass. Surfaced as DXGI_ERROR_DEVICE_REMOVED at
+`ShaderAssertsManager.CheckErrors`, which is only where the readback noticed it.
+
+**It was the teardown, not the feature.** Steady-state own-probes had already soaked an
+hour clean; the crash arrived on the flip, during the rebuild the signature change
+triggers. The disposal of our probe manager's eight cube textures rode along with that
+rebuild — and `Reset()` runs from `FeedConfig.Poll` **on the render thread, inside the
+player's frame**. Freeing GPU textures there is the same fault family as every other
+"do not create or destroy engine resources mid-frame" entry in this project's record; the
+teardown side had simply never been given the same discipline as the creation side.
+
+**Fix: deferred disposal.** `Reset()` now hands the retired manager to
+`_probesPendingDispose`, and `DisposePendingProbes()` frees it from the LCD tick — the game
+thread, outside any frame we record. Single-shot swap so it cannot double-free, and it
+never throws upward.
+
+**Generalises beyond probes:** every existing teardown in `Reset()` (ScreenBuffers,
+DrawContextManager) has the same exposure and has survived only because it has been
+exercised so heavily. Phase C's per-instance teardown should adopt the deferred-dispose
+pattern wholesale rather than inheriting the render-thread one.
+
+Classification correction: `wholeSceneOwnProbes` is class (c)/rebuild-bound in practice
+until the deferred disposal is proven, and the knob-class table's "(a) suspected" entries
+are now demonstrably worth testing individually rather than trusting.
