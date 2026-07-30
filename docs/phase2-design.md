@@ -521,3 +521,28 @@ about freeing it. Costs a bootstrap change and therefore a game restart.
 **Standing check this adds to phase C/E:** any resource whose lifetime is "process" but whose
 reference lives in the reloadable assembly is leaked once per reload. The probe manager is
 the one that bit; the audit for others is open.
+
+**CONFIRMED BY ELIMINATION, same evening.** The competing story — that our per-gate-cycle
+ScreenBuffers / DrawContextManager / cascade / LDR-ring rebuilds leak RTVs and probes merely
+hit the wall first — is DEAD. The session log shows a real teardown immediately before every
+reload, because the pause protocol was followed:
+
+```
+18:43:27.567  Feed gate: releasing resources now  ->  18:43:52  logic installed
+18:46:26.584  Feed gate: releasing resources now  ->  18:46:28  logic installed
+```
+
+Everything else we own IS disposed on that path. The probe manager is the single object
+exempted from it — deliberately, by yesterday's fix — which makes it the ONLY thing that can
+accumulate across reloads even when the protocol is followed perfectly.
+
+Note what this also means: the pause protocol is doing real work, not ceremony. Without it
+the bootstrap would orphan every one of those objects on each reload, since it loads the new
+assembly, calls Install() on it, and unloads the old one WITHOUT ever calling a teardown on
+it — and the new assembly's Reset() cannot reach the old assembly's statics. Rule 10's
+"~8 reloads grew VRAM 13.2 -> 16.5 GB" is that path, observed before the protocol existed.
+
+Follow-up worth doing regardless: have the bootstrap invoke a Shutdown() on the OLD assembly
+before old.Unload(), so correctness does not depend on a human remembering to pause. It must
+route the actual disposal through the render thread, exactly as gate shutdown does — "off the
+render thread" is still not "outside a frame".
