@@ -323,13 +323,23 @@ internal static class FeedHandover
     {
         if (args == null || args.Length == 0) return;
 
-        // TARGET-DRIVEN (phase C1b). The engine names the offscreen target it is drawing,
-        // so the feed is whoever owns that target. Keyed on the whole argument array for
-        // now: the component is found by scanning it below, and hoisting that scan above
-        // the scope would duplicate the logic C3 needs to replace anyway. ForTarget takes
-        // the identity it is given and, at Count == 1, ignores it.
-        using (Feeds.Enter(Feeds.ForTarget(args)))
+        // TARGET-DRIVEN (phase C1b, resolved for real in C3). The engine names the offscreen
+        // target it is drawing, so the feed is whoever parked a frame for it. The component
+        // is picked out of the args here rather than below, because the scope has to be open
+        // before ANY per-feed state is touched — including the _panelHandleText the
+        // ownership test itself reads.
+        using (Feeds.Enter(Feeds.ForTarget(TargetComponentOf(args))))
             OnOffscreenUiDrawScoped(args);
+    }
+
+    private static object TargetComponentOf(object[] args)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            var a = args[i];
+            if (a != null && a.GetType().Name.Contains("OffscreenRenderTargetComponent")) return a;
+        }
+        return null;
     }
 
     private static void OnOffscreenUiDrawScoped(object[] args)

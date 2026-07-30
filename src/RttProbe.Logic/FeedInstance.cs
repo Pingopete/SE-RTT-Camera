@@ -191,13 +191,49 @@ internal sealed class FeedInstance
 // the second instance, and the mechanism starts mattering.
 internal static class Feeds
 {
-    // The registry. C3 grows this; everything else is written not to care how long it is.
-    private static readonly FeedInstance[] All = { new FeedInstance(0) };
+    // THE REGISTRY (phase C3). Slots are ALLOCATED eagerly and ACTIVATED by config.
+    //
+    // Allocating is free — a FeedInstance is plain fields, it touches no engine type, and
+    // its ctor cannot run engine code. That matters more than it looks: reading a
+    // CoreSystems static forces that type's cctor, and doing so during plugin load once
+    // threw ConfigurationNotFoundException and permanently poisoned the type (see the
+    // comment in WholeSceneRender.Reset). So the array is built from nothing at load, and
+    // FeedConfig is never consulted at static-init time.
+    //
+    // Count is therefore a CONFIG READ, not an array length: feedCount clamps into the
+    // slots that exist. That keeps N=1 the shipped default and makes the second feed a
+    // live knob to switch off if it misbehaves, rather than a rebuild to revert.
+    private const int MaxFeeds = 4;
+
+    private static readonly FeedInstance[] All = CreateAll();
+
+    private static FeedInstance[] CreateAll()
+    {
+        var a = new FeedInstance[MaxFeeds];
+        for (int i = 0; i < MaxFeeds; i++) a[i] = new FeedInstance(i);
+        return a;
+    }
 
     // The feed that owns work not attributable to any specific one.
     internal static FeedInstance Primary => All[0];
 
-    internal static int Count => All.Length;
+    // ACTIVE feed count. Clamped hard: a typo in the config must not index past the slots
+    // or drop to zero, because zero feeds means NextForRender has nothing to return and
+    // every lookup would have to invent an answer.
+    internal static int Count
+    {
+        get
+        {
+            int n = FeedConfig.FeedCount;
+            return n < 1 ? 1 : n > MaxFeeds ? MaxFeeds : n;
+        }
+    }
+
+    // Enumerate the ACTIVE feeds. Anything sweeping the registry uses this, so shrinking
+    // feedCount stops touching the retired slots immediately — their resources are then
+    // released by the same gate-shutdown path a dormant panel uses, which is the only
+    // quiesced moment the renderer offers.
+    internal static FeedInstance At(int i) => All[i];
 
     // THE AMBIENT. ThreadStatic because the LCD tick can legitimately be on feed A while
     // the render thread is on feed B, at the same instant — which is exactly why C1a (where
@@ -304,10 +340,13 @@ internal static class Feeds
 
     internal static Scope Enter(FeedInstance f) => new Scope(f ?? All[0]);
 
-    // Run body once per feed, each under its own ambient. For whole-registry sweeps.
+    // Run body once per ACTIVE feed, each under its own ambient. For whole-registry sweeps
+    // — config rebuilds, teardowns. Snapshots Count first so a config edit landing mid-sweep
+    // cannot change the bound underneath the loop.
     internal static void ForEach(Action body)
     {
-        for (int i = 0; i < All.Length; i++)
+        int n = Count;
+        for (int i = 0; i < n; i++)
             using (Enter(All[i]))
                 body();
     }
@@ -320,16 +359,24 @@ internal static class Feeds
     // (dormant, settling, rate-gated) would hand its slot away permanently.
     private static int _slot;
 
-    internal static FeedInstance NextForRender() => All[_slot % All.Length];
+    internal static FeedInstance NextForRender() => All[_slot % Count];
 
-    internal static void AdvanceSlot() => _slot = (_slot + 1) % All.Length;
+    // Modulo the LIVE Count, so shrinking feedCount cannot strand the rotation on a slot
+    // that is no longer active.
+    internal static void AdvanceSlot() => _slot = (_slot + 1) % Count;
 
-    // LOOKUP for the panel- and target-driven hooks. With one feed every key resolves to it.
-    // The SIGNATURE is the point right now: every caller already threads the engine-supplied
-    // identity through, so C3 replaces these two bodies with a real identity map and touches
-    // nothing else. CameraFeed._targetSurfaces already holds the raw material — it becomes a
-    // map to the owning instance rather than a membership test.
-    internal static FeedInstance ForPanel(object panelKey) => All[0];
+    // LOOKUP for the panel- and target-driven hooks (phase C3). The C1b stubs returned
+    // All[0]; these now resolve real ownership. See FeedRouter for why claims are made on
+    // the FIRST tick rather than settling, and why they are keyed on the panel NAME rather
+    // than on a component reference the engine recreates.
+    internal static FeedInstance ForPanel(object renderComponent) =>
+        Count == 1 ? All[0] : FeedRouter.ForComponent(renderComponent);
 
-    internal static FeedInstance ForTarget(object targetKey) => All[0];
+    internal static FeedInstance ForTarget(object targetComponent) =>
+        Count == 1 ? All[0] : FeedRouter.ForTargetComponent(targetComponent);
+
+    // The panel-render hook is handed a surface context, which has no name to parse — it is
+    // claimed during discovery instead. See FeedRouter.ClaimSurface.
+    internal static FeedInstance ForSurface(object surfaceCtx) =>
+        Count == 1 ? All[0] : FeedRouter.ForSurface(surfaceCtx);
 }

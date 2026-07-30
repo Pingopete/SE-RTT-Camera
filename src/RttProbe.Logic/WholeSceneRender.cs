@@ -1096,7 +1096,16 @@ internal static class WholeSceneRender
                 {
                     _resetPending = false;
                     RttLog.Line("Whole-scene: running the deferred Reset now that the render has unwound.");
-                    Reset();
+
+                    // ACROSS EVERY FEED, not just the one that was rendering (phase C3
+                    // prerequisite). A deferred Reset comes from a config signature change,
+                    // and quality is GLOBAL by design — see docs/phase2-design.md: it is the
+                    // user's VRAM throttle, not a per-feed property. So a resolution change
+                    // has to rebuild ALL of them, or the feeds that did not happen to hold
+                    // the render slot when Poll() fired would keep ScreenBuffers at the old
+                    // size indefinitely, and nothing would ever tell us. At Count == 1 this
+                    // is the single Reset it always was.
+                    Feeds.ForEach(Reset);
                 }
             }
         }

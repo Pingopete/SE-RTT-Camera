@@ -468,6 +468,18 @@ internal static class FeedConfig
 
     public static int WholeSceneCascadeCount { get; private set; } = 3;
 
+    // HOW MANY INDEPENDENT FEEDS ARE ACTIVE (plan phase C3). 1 = the shipped behaviour.
+    //
+    // Deliberately a LIVE knob and deliberately NOT in WholeSceneSignature(): adding or
+    // removing a feed must not force every OTHER feed through a rebuild and a 30-frame
+    // settle. Feeds.Count clamps this into the slots that exist, so a typo degrades to a
+    // valid count instead of an index fault.
+    //
+    // A second feed needs a second tagged panel to point at. With feedCount=2 and only one
+    // tagged panel, feed 1 simply never finds a target and stays dormant — which is the
+    // graceful-cut contract (goal 7) doing its job, not a failure.
+    public static int FeedCount { get; private set; } = 1;
+
     // Render our OWN sun-shadow cascades, around OUR camera.
     //
     // 0 = off: our DrawContextManager borrows the ENGINE'S DirectionalLightShadowResources
@@ -662,6 +674,10 @@ internal static class FeedConfig
             Emissivity  = Dbl(kv, "emissivity", Emissivity);
             DimDistance = Dbl(kv, "dimDistance", DimDistance);
 
+            // Read BEFORE the signature block below, so the ForEach sweeps that follow use
+            // the new count. Not part of the signature itself — see the field comment.
+            FeedCount = Int(kv, "feedCount", FeedCount);
+
             // ---- the whole-scene route -------------------------------------------
             string before = WholeSceneSignature();
 
@@ -707,9 +723,16 @@ internal static class FeedConfig
             // string rather than thirty fields is what stops a newly-added knob silently
             // missing the comparison — the failure mode of the chain this replaced, where
             // editing the config appeared to do nothing at all.
+            // SWEPT ACROSS EVERY FEED (phase C3 prerequisite). Poll() runs under whichever
+            // feed holds the render slot at that instant, so a bare Reset() would rebuild
+            // exactly one of them and silently leave the rest at the old resolution. Quality
+            // is GLOBAL by design — the signature describes buffer identity, which every
+            // feed shares — so the rebuild is global too. At Count == 1 this is identical to
+            // what it replaced. (Reset defers itself when called from inside a render; the
+            // drain in RunSecondRender's finally sweeps all feeds the same way.)
             string after = WholeSceneSignature();
-            if (_firstPoll || before != after) RttProbe.WholeSceneRender.Reset();
-            else RttProbe.WholeSceneRender.Rearm();
+            if (_firstPoll || before != after) Feeds.ForEach(RttProbe.WholeSceneRender.Reset);
+            else Feeds.ForEach(RttProbe.WholeSceneRender.Rearm);
             _firstPoll = false;
 
             RttLog.Line($"Config: intervalMs={IntervalMs} (~{1000.0 / Math.Max(1, IntervalMs):F0} fps) " +

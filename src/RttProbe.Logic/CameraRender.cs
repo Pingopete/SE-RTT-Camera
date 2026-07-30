@@ -1736,6 +1736,21 @@ internal static class CameraRender
         if (_feedStartTicks == 0) _feedStartTicks = Clock.Ms;
         double t = (Clock.Ms - _feedStartTicks) / 1000.0;
 
+        // PER-FEED ORBIT PHASE (plan phase C3).
+        //
+        // Feeds are distinguished by their SUBJECT — each claims its own tagged panel and
+        // orbits that panel's grid — so two feeds on two ships already differ. But two feeds
+        // on panels of the SAME grid would otherwise sit at the same orbit angle at the same
+        // instant and produce pixel-identical pictures, which is the one arrangement that
+        // makes a multi-feed bug invisible: cross-contamination between feeds looks exactly
+        // like correct output when both feeds show the same thing.
+        //
+        // Offsetting each feed's phase around the orbit makes them visibly distinct, so
+        // "panel B is showing feed A's picture" is something you can SEE. It is a test
+        // affordance first and a nicety second — and it is also what the C3 exit gate
+        // ("both feeds live and correct") is actually checking.
+        t += Feeds.Cur.Id * (FeedConfig.OrbitPeriod / Math.Max(1, Feeds.Count));
+
         // Grid centre by default; the panel itself is the close-up shot.
         bool grid = FeedConfig.OrbitGrid && target.Extent > 0.0;
         var camWorld = CameraFeed.OrbitCameraWorld(

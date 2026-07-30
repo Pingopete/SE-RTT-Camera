@@ -66,6 +66,13 @@ internal static class CameraFeed
     private static void TrackSurface(object ctx)
     {
         if (ctx == null) return;
+
+        // Record which feed owns this surface (phase C3). This runs under the owning feed's
+        // ambient — discovery is scoped by FeedRouter.ForComponent — so ownership is simply
+        // written down here rather than re-derived later, which is what lets the panel-render
+        // hook route a context that carries no name of its own.
+        FeedRouter.ClaimSurface(ctx, Feeds.Cur);
+
         if (_targetSurfaces.Count >= MaxTrackedSurfaces)
         {
             _targetSurfaces.Clear();
@@ -144,9 +151,13 @@ internal static class CameraFeed
             // Log every distinct panel name once — makes "why isn't it finding my
             // panel" answerable without guessing at where the name lives.
             if (_seenNames.Add(name) && _seenNames.Count <= 20)
-                RttLog.Line($"LCD panel seen: \"{name}\"{(name.Contains(Tag, StringComparison.OrdinalIgnoreCase) ? "   <-- TAGGED" : "")}");
+                RttLog.Line($"LCD panel seen: \"{name}\"" +
+                            (FeedRouter.TryParseTag(name, out int tagged) ? $"   <-- TAGGED, feed {tagged}" : ""));
 
-            if (!name.Contains(Tag, StringComparison.OrdinalIgnoreCase)) return;
+            // ONE tag test for the whole mod (FeedRouter.IsFeedPanel), so [RTC2] cannot be
+            // recognised here and quietly ignored by the panel-render hook — which is exactly
+            // the kind of split that makes a panel "found" in the log and black on screen.
+            if (!FeedRouter.IsFeedPanel(name)) return;
 
             // THE LIVENESS SIGNAL for the whole mod.
             //
@@ -211,7 +222,7 @@ internal static class CameraFeed
         // The user tags the block's name, so prefer the entity's name; fall back
         // to the surface display name, which is where GS2 looks.
         var dbg = Prop(entity, "DebugName") as string;
-        if (!string.IsNullOrEmpty(dbg) && dbg.Contains(Tag, StringComparison.OrdinalIgnoreCase)) return dbg;
+        if (FeedRouter.IsFeedPanel(dbg)) return dbg;
 
         try
         {

@@ -29,6 +29,11 @@ public static class LogicEntry
             // each Reset into its global and per-feed halves before this becomes ForEach.
             // At Count == 1 the two are identical, which is exactly why this is safe now
             // and is a documented C3 prerequisite rather than a hidden one.
+            // Panel->feed claims belong to the previous assembly's instances. Cleared here
+            // so a reload re-derives ownership from what is actually in the world, rather
+            // than inheriting a map pointing at objects that no longer exist.
+            FeedRouter.Reset();
+
             using (Feeds.Enter(Feeds.Primary))
             {
                 FeedGate.Reset();

@@ -317,12 +317,13 @@ internal static class BlitProbe
     // render target, so this is a genuine RT-to-RT blit.
     public static void OnPanelRender(object rendererObj, object batchObj, object ctxObj)
     {
-        // PANEL-DRIVEN (phase C1b), keyed on the SURFACE CONTEXT — the identity
-        // CameraFeed._targetSurfaces already tracks, and therefore the one C3's real lookup
-        // will resolve. The scope opens before the gate check because FeedGate.Active is
-        // itself per-feed state now: "is this panel's feed live" is the question being
-        // asked, and it cannot be answered without first knowing which feed.
-        using (Feeds.Enter(Feeds.ForPanel(ctxObj)))
+        // PANEL-DRIVEN, keyed on the SURFACE CONTEXT (phase C3). A surface context carries no
+        // _lcdBlock and therefore no name, so it cannot be routed the way OnTick's component
+        // is — it is registered to its feed during discovery instead, which already runs
+        // under that feed's scope. The scope opens before the gate check because
+        // FeedGate.Active is per-feed state now: "is this panel's feed live" cannot be
+        // answered without first knowing which feed.
+        using (Feeds.Enter(Feeds.ForSurface(ctxObj)))
             OnPanelRenderScoped(rendererObj, batchObj, ctxObj);
     }
 
@@ -361,11 +362,14 @@ internal static class BlitProbe
             // generated RenderId handle. Confirmed by killing the game the instant a
             // tagged panel repainted. The feed reaches the panel by writing into the
             // panel's own render target instead — see CameraFeed.CapturePanelRenderTarget.
-            if (text != null && text.Contains(CameraFeed.Tag, StringComparison.OrdinalIgnoreCase))
+            // FeedRouter.IsFeedPanel, not a raw Contains, so [RTC2] is recognised here too.
+            // A tag the discovery side accepts and this side rejects would bind the panel's
+            // material and then let the panel paint straight over the feed.
+            if (FeedRouter.IsFeedPanel(text))
             {
                 PanelBinding.OnPanelRender(rendererObj, ctx);
             }
-            if (text != null && text.Contains(CameraFeed.Tag, StringComparison.OrdinalIgnoreCase))
+            if (FeedRouter.IsFeedPanel(text))
             {
                 // Draw nothing. The feed does not go through this batch at all — it is
                 // written straight into the panel's own render target from the UI stage
