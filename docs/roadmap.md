@@ -10,6 +10,25 @@ planet atmospheres, and no main-world bleed.
 
 ---
 
+> ## ⚠ THE BIGGEST OPEN QUESTION: is the feed truly remote?
+>
+> **See [open-question-remote-streaming.md](open-question-remote-streaming.md). Raised
+> 2026-07-30, untested, and it decides what goal 6 actually is.**
+>
+> The RENDER is settled: it is camera-relative, with culling, cascades, probes and planet
+> atmosphere all derived from OUR camera, not the player's. What is NOT settled is whether
+> the client has anything RESIDENT to draw at range — voxels and grids stream around the
+> player, and the feed cannot draw what was never loaded.
+>
+> Two different products hang on the answer: a **system-wide remote camera**, or a **local
+> security camera** that goes blank past the streaming radius. Both are worth building; they
+> are not the same mod.
+>
+> **Do not design goal 6's UI or scope around system-wide range until the radius test in
+> that document has been run.** It costs about a minute of config edits.
+
+---
+
 # PHASE 2: from POC to API (agreed 2026-07-29, from the user's notes)
 
 The destination, in the user's words distilled: **the current POC becomes an API** that
