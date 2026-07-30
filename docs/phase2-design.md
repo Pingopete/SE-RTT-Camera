@@ -189,3 +189,40 @@ Stack: E always -> C default order -> A override -> B when yielding means fewer 
 feeds -> D as the tier between full and standby. Gating unknown: the crossover where N
 warm feeds beat K cold ones — measurable only once two feeds exist (the stats-panel
 instancing work is the prerequisite).
+
+### THE ADOPTED BUDGET MODEL: fixed total, render credits (user decision, 2026-07-29)
+
+User clarification that supersedes the open-ended stack above: **the total cost of ALL
+feeds combined is FIXED at one warm feed's cost at current settings, per player.** Adding
+feeds divides the budget (2 feeds -> ~33 fps each, 3 -> ~22), ideally emerging naturally
+rather than by rule. The single-feed budget is never exceeded. This is the right shape for
+a shippable mod: worst-case frame cost is known at install time regardless of what players
+build.
+
+**Mechanism: the render credit.** Each engine frame carries one credit worth today's
+budget (one whole-scene render, ~2.1ms submit). Active feeds claim it in rotation. Feed
+fps = 66/N emergently; total load is invariant. Refinements:
+- Meter MILLISECONDS, not render counts: a render that runs over (cold wake, heavy scene)
+  delays the next credit until the average repays. Hard cap, not statistical.
+- Dormant feeds return their share (visibility dormancy): budget flows to watched panels.
+- Per-feed policy becomes share WEIGHTING inside the total (priority feed = 2 credits per
+  rotation); quality-first owners choose fewer live feeds (CCTV slots) over degraded ones.
+- Amortisation (D) and the submit diet (E) become fps MULTIPLIERS — cheaper renders mean
+  each feed's slice buys more frames.
+- Same-camera panels remain free (blits are off-budget).
+
+**The load-bearing hypothesis, and the first two-feed experiment.** Interleaving looks
+like the throttling we proved pathological, but the 6-7x cold-render figure was measured
+with the pipeline going GLOBALLY cold between renders (pools churning, nothing rendering
+our workload in the gaps). Under interleaving, some feed renders every frame: the global
+pipeline stays hot and only each feed's OWN temporal history ages N frames — mild, since
+per-feed PreviousCamera stamping keeps reprojection valid. Hypothesis: interleaved renders
+cost near-warm. Experiment the moment two feeds exist: two interleaved feeds vs one feed
+at every-2nd-frame — same per-feed cadence, different global heat. If the hypothesis
+fails, ms-metering absorbs it (feed fps drops a little further); the cap holds either way.
+
+**The time budget does not cap memory.** VRAM scales with INSTANTIATED feeds (ScreenBuffers,
+cascades, eight probe cubes each; the 2048 run showed the wall). Second constant required:
+max warm-feed count (resident resources); beyond it, extra feeds are fully torn down until
+rotated in. The whole system is two constants — submit-ms per frame, feeds resident — both
+fixed regardless of world content.
