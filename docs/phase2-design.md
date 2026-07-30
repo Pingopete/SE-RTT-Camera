@@ -470,3 +470,54 @@ before this lands rather than after.
   "reset" becomes per-instance, and the guard's question changes from "are we inside our render"
   to "are we inside THIS instance's render". The bug that guard fixes — nulling statics an
   in-flight `finally` still needs — gets strictly worse with more instances, not better.
+
+### CTD 2026-07-30 18:46 — "kept" does not survive a hot reload
+
+The probe manager decision recorded above ("simply KEPT", after three device removals) is
+**still correct about disposal and was wrong about the cost**. The game died on:
+
+```
+Assertion Failure: Out of the descriptor heap
+  at DescriptorHeapPool.BorrowRTV()
+  at RenderTargetCubeTexture.FaceMips.Initialize()
+  at EnvironmentProbeManager.RecreateProbes()
+  at EnvironmentProbeManager.PrepareProbes_Patch1()
+  at RttProbe.WholeSceneRender.InstallProbes()
+→ [Watchdog]: application froze with freeze type RenderThreadFreeze
+```
+
+First occurrence in ANY SpaceEngineers2 log, so it is new behaviour rather than an engine
+limit we finally noticed.
+
+**Mechanism.** The logic assembly is COLLECTIBLE. `_ourProbes` lives in it, so every hot
+reload starts null, `??=` builds a fresh `EnvironmentProbeManager` with 8 probes x 6 faces x
+mips of RTV descriptors, and the previous manager becomes unreachable from any code that
+could free it. Not disposing it was deliberate; **losing the reference to it was not.** Four
+reloads in one session ran the pool dry. (C1a moved that static onto `FeedInstance`, which
+changes nothing — it is replaced on reload either way. This predates C1a and C1b.)
+
+**Why every instrument missed it.** The cost was booked as VRAM ("eight cube textures
+resident until the game restarts"). It is RTV DESCRIPTORS — a small fixed pool that exhausts
+long before memory does. VRAM was flat at 12.2 GB for the entire session while this
+accumulated, and the stats panel, the PERF line and the watchdog all read healthy until the
+render thread froze. **We were watching the wrong resource, and being reassured by it.**
+
+**The reasoning error, which generalises.** Three device removals established "we must not
+dispose this". The very next sentence — "therefore it costs nothing to keep" — was never
+tested and rode in on the back of the well-evidenced conclusion beside it. A fix's proven
+part confers no confidence on the claims adjacent to it, and a cost assumption is exactly
+the kind of claim that needs its own evidence. Worth adding to the standing discipline: when
+a hard-won conclusion is written up, mark which sentences are MEASURED and which are
+ASSUMED.
+
+**The fix:** park the manager in the BOOTSTRAP assembly (not collectible, survives logic
+reloads) so the reference outlives the code that created it. One manager per process,
+created once, never orphaned. Disposal stays forbidden — this is about not losing it, not
+about freeing it. Costs a bootstrap change and therefore a game restart.
+
+**Interim:** `wholeSceneOwnProbes = 0`, which removes the only new allocator. Costs goal 4.4
+(camera-centred reflections) and nothing else.
+
+**Standing check this adds to phase C/E:** any resource whose lifetime is "process" but whose
+reference lives in the reloadable assembly is leaked once per reload. The probe manager is
+the one that bit; the audit for others is open.

@@ -421,14 +421,48 @@ internal static class WholeSceneRender
         // swapping it in. WholeSceneOwnProbes is out of the rebuild signature too, so
         // flipping it no longer reaches this path at all.
         //
-        // The cost is honest and bounded: eight cube textures stay resident until the game
-        // restarts. That is VRAM, not correctness, and it is the right trade against a
-        // device removal.
+        // ==================================================================
+        // ...AND "KEPT" WAS A LIE ACROSS HOT RELOADS. CTD 2026-07-30 18:46.
+        // ==================================================================
         //
-        // If the memory ever needs reclaiming, the only defensible place is a genuinely
+        // This comment used to end: "eight cube textures stay resident until the game
+        // restarts. That is VRAM, not correctness." BOTH HALVES WERE WRONG, and the game
+        // died proving it:
+        //
+        //     Assertion Failure: Out of the descriptor heap
+        //       at DescriptorHeapPool.BorrowRTV()
+        //       at RenderTargetCubeTexture.FaceMips.Initialize()
+        //       at EnvironmentProbeManager.RecreateProbes()
+        //       at WholeSceneRender.InstallProbes()
+        //     [Watchdog]: application froze, RenderThreadFreeze. Capturing dump.
+        //
+        // WRONG #1 — it is not VRAM, it is RTV DESCRIPTORS. Those live in a small fixed
+        // pool and exhaust long before memory does. VRAM sat flat at 12.2 GB for the whole
+        // session while this accumulated, which is precisely why every instrument we had
+        // looked healthy right up to the crash.
+        //
+        // WRONG #2 — it is not "until the game restarts", it is ONCE PER HOT RELOAD. The
+        // logic assembly is COLLECTIBLE. _ourProbes lives in it (on FeedInstance since
+        // C1a, which changes nothing here — that static is replaced either way), so every
+        // reload starts null, the ??= below builds a FRESH manager, and the previous one is
+        // unreachable from any code that could free it. Not disposing it was a deliberate
+        // choice; losing the reference to it was not. Four reloads in one session was
+        // enough to run the pool dry.
+        //
+        // The reasoning error is worth naming: "we must not dispose this" was established
+        // by three device removals and is still correct. "Therefore it costs nothing to
+        // keep" did not follow, and was never tested — it is an assumption that rode in on
+        // the back of a well-evidenced conclusion. A fix's PROVEN part does not confer
+        // confidence on the sentence next to it.
+        //
+        // THE FIX: park the manager in the BOOTSTRAP assembly, which is not collectible and
+        // survives logic reloads, so the reference outlives the code that made it and
+        // "kept" finally means kept — one manager per process, created once, never orphaned.
+        // Disposal stays forbidden; this is about not LOSING it, not about freeing it.
+        //
+        // If the memory ever genuinely needs reclaiming, the only defensible place remains a
         // QUIESCED renderer — gate shutdown with the feed already dormant — not "some other
-        // thread". Phase C1b inherits this rule verbatim: a destroyed feed's probe manager
-        // is retired to its FeedInstance and released at gate shutdown, never at teardown.
+        // thread".
         _probeState = 0; _probeLogged = false;
         _dcBuilt = false;
         _dcField = null;
