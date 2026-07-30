@@ -322,6 +322,18 @@ internal static class FeedHandover
     public static void OnOffscreenUiDraw(object[] args)
     {
         if (args == null || args.Length == 0) return;
+
+        // TARGET-DRIVEN (phase C1b). The engine names the offscreen target it is drawing,
+        // so the feed is whoever owns that target. Keyed on the whole argument array for
+        // now: the component is found by scanning it below, and hoisting that scan above
+        // the scope would duplicate the logic C3 needs to replace anyway. ForTarget takes
+        // the identity it is given and, at Count == 1, ignores it.
+        using (Feeds.Enter(Feeds.ForTarget(args)))
+            OnOffscreenUiDrawScoped(args);
+    }
+
+    private static void OnOffscreenUiDrawScoped(object[] args)
+    {
         if (!FeedGate.Active) return;           // nothing parked, nothing to deliver
         try
         {

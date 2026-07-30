@@ -97,6 +97,17 @@ internal static class BlitProbe
     public static void OnTick(object component)
     {
         _tickCount++;
+
+        // PANEL-DRIVEN (phase C1b). The engine hands us ONE LCD component per call, on its
+        // own schedule — so the feed is whoever owns that panel, a lookup, NOT a rotation.
+        // Rotating here would hand panel A's tick to feed B, which is the single easiest way
+        // to make two feeds silently corrupt each other.
+        using (Feeds.Enter(Feeds.ForPanel(component)))
+            OnTickScoped(component);
+    }
+
+    private static void OnTickScoped(object component)
+    {
         try
         {
             // Polled here as well as in the whole-scene hook: this is the tick that keeps
@@ -305,6 +316,17 @@ internal static class BlitProbe
     // Stage 4. The batch handed to us here targets the panel's own offscreen
     // render target, so this is a genuine RT-to-RT blit.
     public static void OnPanelRender(object rendererObj, object batchObj, object ctxObj)
+    {
+        // PANEL-DRIVEN (phase C1b), keyed on the SURFACE CONTEXT — the identity
+        // CameraFeed._targetSurfaces already tracks, and therefore the one C3's real lookup
+        // will resolve. The scope opens before the gate check because FeedGate.Active is
+        // itself per-feed state now: "is this panel's feed live" is the question being
+        // asked, and it cannot be answered without first knowing which feed.
+        using (Feeds.Enter(Feeds.ForPanel(ctxObj)))
+            OnPanelRenderScoped(rendererObj, batchObj, ctxObj);
+    }
+
+    private static void OnPanelRenderScoped(object rendererObj, object batchObj, object ctxObj)
     {
         // Dormant means the panel draws its own content, exactly as it would without
         // this mod installed.

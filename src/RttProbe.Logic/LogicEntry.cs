@@ -10,16 +10,38 @@ public static class LogicEntry
         RttLog.Line("=== logic installed ===");
         try
         {
-            FeedGate.Reset();
-            BlitProbe.Reset();
-            ScenePassHook.Reset();
-            CameraRender.Reset();
-            CameraFeed.Reset();
-            StatsPanel.Reset();
-            WholeSceneRender.Reset();
-            CameraCbSwap.Reset();
-            FeedHandover.Reset();
-            PanelBinding.Reset();
+            // Prove the unscoped-access detector can actually fire, BEFORE the scope below
+            // makes every later access legitimate. This runs on the load thread with no pump
+            // having claimed it, so it is genuinely unscoped — see Feeds.SelfTest for why a
+            // silent detector is worthless evidence at Count == 1.
+            Feeds.SelfTest();
+
+            // SCOPED (phase C1b). Every Reset below writes per-feed state, and on plugin
+            // load no pump has claimed this thread — so without a scope the very first
+            // thing a reload does is trip the unscoped-access diagnostic, dozens of times,
+            // before anything has gone wrong.
+            //
+            // Scoped to Primary rather than swept across the registry with ForEach, because
+            // these methods are a MIX: FeedGate.Reset is purely per-feed, while
+            // BlitProbe.Reset also clears the arm markers and CameraRender.Reset drops
+            // reflection caches — process-global work that running once per feed would
+            // repeat pointlessly and, for the marker files, incorrectly. C3 has to split
+            // each Reset into its global and per-feed halves before this becomes ForEach.
+            // At Count == 1 the two are identical, which is exactly why this is safe now
+            // and is a documented C3 prerequisite rather than a hidden one.
+            using (Feeds.Enter(Feeds.Primary))
+            {
+                FeedGate.Reset();
+                BlitProbe.Reset();
+                ScenePassHook.Reset();
+                CameraRender.Reset();
+                CameraFeed.Reset();
+                StatsPanel.Reset();
+                WholeSceneRender.Reset();
+                CameraCbSwap.Reset();
+                FeedHandover.Reset();
+                PanelBinding.Reset();
+            }
 
             var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
             if (bridge == null)

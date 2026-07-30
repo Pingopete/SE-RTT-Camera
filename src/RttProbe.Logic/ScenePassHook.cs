@@ -36,8 +36,22 @@ internal static class ScenePassHook
         //
         // The camera pass is self-contained — it borrows every resource it uses — so this
         // is a dispatch change rather than a restructure.
+        //
+        // SCHEDULER-DRIVEN, and scoped (phase C1b). The camera pass is per-feed work — it
+        // advances the orbit, builds the view and delivers the frame — but it rides a hook
+        // that fires during the PLAYER'S frame, where no pump has set an ambient. So it
+        // gets one here, from the same slot holder the whole-scene render will use.
+        //
+        // Consistent by construction: NextForRender only PEEKS, and the slot advances only
+        // after a render completes, so the camera pass and the render it feeds always agree
+        // on whose frame this is. When this fires INSIDE our nested render (stage 2 is
+        // force-run when ownProbes is on) the ambient is already set to that same instance,
+        // and Scope restores the previous value rather than nulling — so nesting is a no-op
+        // rather than a hazard.
         int want = FeedConfig.PassOnFrameHook ? 1 : 0;
-        if (which == want) CameraRender.OnProbePass(sceneDrawSystem, commandList);
+        if (which == want)
+            using (Feeds.Enter(Feeds.NextForRender()))
+                CameraRender.OnProbePass(sceneDrawSystem, commandList);
 
         var now = Environment.TickCount64;
         if (now - _lastRateLog >= 10000)

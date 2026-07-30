@@ -171,22 +171,165 @@ internal sealed class FeedInstance
     public WeakReference BoundCtx;
 }
 
-// The registry.
+// The registry, and the ambient that decides WHOSE state `Feeds.Cur` means.
 //
-// C1a: exactly one instance, so Cur is a constant and BOTH THREADS SEE THE SAME OBJECT
-// — which is precisely what a static field did. That is the whole reason this stage is
-// separated from C1b: the transform introduces no threading change of any kind, so a
-// parity failure at C2 can only be the field mapping.
+// PHASE C1b. C1a moved the state onto instances; this decides which instance a given hook
+// call refers to. That mapping is NOT uniform across our ten entry points, and assuming it
+// was is the mistake this design exists to avoid — see docs/phase2-design.md:
 //
-// C1b replaces Cur with a per-thread ambient the pump sets around each feed's work.
-// The render thread and the LCD tick will then legitimately be on different feeds at
-// the same instant, and that is the moment ThreadStatic becomes load-bearing rather
-// than decorative.
+//   - PANEL-driven (BlitProbe.OnTick, CameraFeed/StatsPanel.OnLcdTick, the two
+//     OnPanelRender hooks): the ENGINE hands us a specific LCD component, renderer or
+//     surface context, on its own schedule. The feed is whoever OWNS that panel — a
+//     LOOKUP. A rotation here would hand panel A's tick to feed B.
+//   - TARGET-driven (FeedHandover.OnOffscreenUiDraw): the engine hands us the offscreen
+//     target being drawn. Also a lookup.
+//   - SCHEDULER-driven (the whole-scene hooks, and the probe pass nested inside them):
+//     nothing external names a feed, so WE choose. Phase E1's render slot, in embryo.
+//
+// STILL EXACTLY ONE INSTANCE. Every lookup and every pick resolves to it, so this stage
+// builds the mechanism and leaves the answer alone — it cannot change behaviour. C3 adds
+// the second instance, and the mechanism starts mattering.
 internal static class Feeds
 {
-    private static readonly FeedInstance Solo = new FeedInstance(0);
+    // The registry. C3 grows this; everything else is written not to care how long it is.
+    private static readonly FeedInstance[] All = { new FeedInstance(0) };
 
-    internal static FeedInstance Cur => Solo;
+    // The feed that owns work not attributable to any specific one.
+    internal static FeedInstance Primary => All[0];
 
-    internal static int Count => 1;
+    internal static int Count => All.Length;
+
+    // THE AMBIENT. ThreadStatic because the LCD tick can legitimately be on feed A while
+    // the render thread is on feed B, at the same instant — which is exactly why C1a (where
+    // Cur was a constant and both threads saw one object) was graded at parity BEFORE this
+    // landed. Null means "no pump has claimed this thread": a bug to be found, not a state
+    // to rely on. See Unscoped().
+    [ThreadStatic] private static FeedInstance _ambient;
+
+    // AGGRESSIVELY INLINED, and not cargo-culted. This sits in front of state that hot paths
+    // touch — ShouldSkipStage runs per stage per render, the LDR ring is indexed through it,
+    // and the render path reads a dozen of these per frame. A ThreadStatic read plus a null
+    // test is a few nanoseconds and the JIT folds the accessor away, but the attribute makes
+    // that a guarantee rather than a hope. Measured context: on the C1a build ourDraw held
+    // 2.4-2.7 ms across a 3x swing in engine frame time, so the seam was already free — this
+    // keeps it free now that a real indirection has replaced the constant.
+    internal static FeedInstance Cur
+    {
+        [System.Runtime.CompilerServices.MethodImpl(
+            System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        get => _ambient ?? Unscoped();
+    }
+
+    // ---- the unscoped-access diagnostic ------------------------------------------
+    //
+    // Falling back to Primary is SAFE while Count == 1 (it is the same object every lookup
+    // would return) and WRONG the moment C3 adds a feed, because an unscoped path would
+    // silently operate on feed 0's state whichever feed it actually belongs to.
+    //
+    // So the fallback is deliberately both things at once. It keeps the mod running — a null
+    // here would NRE on the render thread every frame, and "never device-remove" outranks
+    // "fail loudly" — and it reports itself. The FIRST occurrence captures a stack trace,
+    // which turns "some path is unscoped" into the exact file and line needing a scope.
+    // That log line IS the C3 to-do list, written by the code instead of by me guessing
+    // which of the ten entry points I missed.
+    private static bool _unscopedLogged;
+    private static int _unscopedCount;
+    private static bool _selfTesting;
+    internal static int UnscopedCount => _unscopedCount;
+
+    private static FeedInstance Unscoped()
+    {
+        _unscopedCount++;
+        if (!_unscopedLogged)
+        {
+            _unscopedLogged = true;
+            string where;
+            try { where = new System.Diagnostics.StackTrace(1, true).ToString(); }
+            catch { where = "(stack unavailable)"; }
+            RttLog.Line(_selfTesting
+                ? "Feeds: (SELF-TEST) deliberate unscoped access — this is the diagnostic proving " +
+                  "it can fire, NOT a real finding. The stack below is the self-test's own.\n" + where
+                : "Feeds: per-feed state touched with NO ambient instance set — falling " +
+                  "back to feed 0. HARMLESS while there is one feed, since every lookup " +
+                  "returns that same object; WRONG as soon as there are two, because this " +
+                  "path would operate on feed 0 whichever feed it belongs to. Scope it " +
+                  "before C3. Logged once; running total in Feeds.UnscopedCount.\n" + where);
+        }
+        return All[0];
+    }
+
+    // PROVE THE DIAGNOSTIC WORKS, every load, before trusting its silence.
+    //
+    // At Count == 1 a scoped access and an unscoped one are behaviourally IDENTICAL — both
+    // resolve to feed 0 — so "the log is clean" is equally consistent with "every path is
+    // scoped" and with "the detector is broken". Trusting the second reading is how C3 would
+    // start with false confidence, and this project has already paid for the general version
+    // of that mistake: a mechanism is only real once it has been observed FIRING (Rule 26,
+    // which is also what condemned the dead probe-dispose queue).
+    //
+    // So: call this from Install, which runs BEFORE any pump has claimed the thread and is
+    // therefore genuinely unscoped. It exercises the whole path — the null test, the counter,
+    // the StackTrace capture and RttLog — then re-arms so a real unscoped access still gets
+    // reported with its own stack.
+    internal static void SelfTest()
+    {
+        _selfTesting = true;
+        int before = _unscopedCount;
+        _ = Cur;
+        bool fired = _unscopedCount > before;
+        _selfTesting = false;
+
+        _unscopedLogged = false;
+        _unscopedCount = 0;
+
+        RttLog.Line(fired
+            ? "Feeds: unscoped-access diagnostic SELF-TEST PASSED — an unscoped read was " +
+              "detected and reported, so a SILENT log from here on is real evidence that every " +
+              "per-feed access is properly scoped. Counter re-armed."
+            : "Feeds: unscoped-access diagnostic SELF-TEST FAILED — an access with no ambient " +
+              "set was NOT detected. The detector is broken, so its silence means nothing and " +
+              "C3 must not rely on it. Fix this before adding a second feed.");
+    }
+
+    // ---- scoping -----------------------------------------------------------------
+
+    // Restores the PREVIOUS ambient rather than null, so nesting is safe — the probe pass
+    // fires inside the whole-scene render, which is already scoped.
+    internal readonly struct Scope : IDisposable
+    {
+        private readonly FeedInstance _prev;
+        internal Scope(FeedInstance f) { _prev = _ambient; _ambient = f; }
+        public void Dispose() => _ambient = _prev;
+    }
+
+    internal static Scope Enter(FeedInstance f) => new Scope(f ?? All[0]);
+
+    // Run body once per feed, each under its own ambient. For whole-registry sweeps.
+    internal static void ForEach(Action body)
+    {
+        for (int i = 0; i < All.Length; i++)
+            using (Enter(All[i]))
+                body();
+    }
+
+    // ---- the two selectors --------------------------------------------------------
+
+    // THE RENDER SLOT (phase E1, in embryo): at most one render per engine frame, strict
+    // cyclic rotation. Peek and advance are SEPARATE on purpose — the rotation must move
+    // when a render actually happens, not on every frame, or a feed that declines its turn
+    // (dormant, settling, rate-gated) would hand its slot away permanently.
+    private static int _slot;
+
+    internal static FeedInstance NextForRender() => All[_slot % All.Length];
+
+    internal static void AdvanceSlot() => _slot = (_slot + 1) % All.Length;
+
+    // LOOKUP for the panel- and target-driven hooks. With one feed every key resolves to it.
+    // The SIGNATURE is the point right now: every caller already threads the engine-supplied
+    // identity through, so C3 replaces these two bodies with a real identity map and touches
+    // nothing else. CameraFeed._targetSurfaces already holds the raw material — it becomes a
+    // map to the owning instance rather than a membership test.
+    internal static FeedInstance ForPanel(object panelKey) => All[0];
+
+    internal static FeedInstance ForTarget(object targetKey) => All[0];
 }

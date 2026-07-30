@@ -651,10 +651,22 @@ internal static class WholeSceneRender
     };
 
     // Fires after the engine has finished the player's frame.
+    //
+    // THE RENDER-THREAD PUMP (phase C1b). This hook and the prefix below are
+    // SCHEDULER-driven: nothing in the engine's call names a feed, so we pick one and scope
+    // every piece of per-feed state the frame touches to it. The scope must wrap the WHOLE
+    // body, not just the render — ShouldSkipStage is called from deep inside the nested
+    // Draw with no arguments identifying a feed, so it can only read the ambient, and the
+    // ambient has to still be set when it does.
     public static void OnWholeScene(object sceneDrawSystem, object finalLdrBuffer)
     {
         if (_inOurRender) return;               // our own nested Draw — do nothing
+        using (Feeds.Enter(Feeds.NextForRender()))
+            OnWholeSceneScoped(sceneDrawSystem, finalLdrBuffer);
+    }
 
+    private static void OnWholeSceneScoped(object sceneDrawSystem, object finalLdrBuffer)
+    {
         // The gate is polled HERE because this hook is the one that fires every engine
         // frame regardless of what else is switched on. Polled before the disabled-state
         // check so a dormant mod still notices the panel coming back.
@@ -740,7 +752,16 @@ internal static class WholeSceneRender
     public static void OnWholeSceneEarly(object sceneDrawSystem, object finalLdrBuffer)
     {
         if (_inOurRender) return;               // our own nested Draw
+        using (Feeds.Enter(Feeds.NextForRender()))
+            OnWholeSceneEarlyScoped(sceneDrawSystem);
+    }
 
+    // Scoped to the SAME feed the postfix will pick, because NextForRender only advances
+    // when a render completes — so the prefix and postfix of one engine frame always agree
+    // on whose frame it is. That invariant is what lets _earlyRan / _earlyOwnsThisFrame stay
+    // plain per-frame statics rather than becoming per-feed state.
+    private static void OnWholeSceneEarlyScoped(object sceneDrawSystem)
+    {
         // Cleared HERE, at frame start, not just after the postfix reads it. If the postfix
         // bails early — gate went dormant mid-frame, _state faulted — a stale true would
         // survive into the next frame and mis-bucket a Perf sample. That histogram is the
@@ -807,6 +828,13 @@ internal static class WholeSceneRender
 
         _lastRenderMs = Clock.Ms;
         RunSecondRender(sceneDrawSystem);
+
+        // THE SLOT ADVANCES HERE, and only here: after a render actually happened. Every
+        // early return above this line — dormant gate, settling after a rebuild, rate gate,
+        // route disabled — leaves the rotation where it is, so a feed that declines its turn
+        // keeps it rather than forfeiting it to the next feed forever. With one feed this is
+        // a no-op; with N it is the difference between fair rotation and starvation.
+        Feeds.AdvanceSlot();
         return true;
     }
 
