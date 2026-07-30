@@ -221,8 +221,58 @@ internal static class WholeSceneRender
         }
     }
 
+    // Set when Reset() is asked to run while our render is on the stack. Drained in
+    // RunSecondRender's finally, once the swaps have been unwound.
+    private static bool _resetPending;
+    private static bool _deferLogged;
+
     public static void Reset()
     {
+        // ==================================================================
+        // NEVER TEAR DOWN WHILE OUR RENDER IS ON THE STACK.
+        // ==================================================================
+        //
+        // FeedConfig.Poll() runs from the camera pass, which is INSIDE the player's Draw
+        // and therefore inside our nested render. A config change that alters the rebuild
+        // signature calls Reset() from there — and Reset() nulls the very statics the
+        // in-flight render's `finally` blocks need to unwind their swaps.
+        //
+        // CONFIRMED, and it cost two device removals on 2026-07-30 (flipping
+        // wholeSceneOwnProbes live). The mod's own log caught the real cause the second
+        // time, after the first diagnosis — "disposing GPU textures mid-frame" — turned out
+        // to be a plausible story about the wrong line:
+        //
+        //     ERROR restore probe manager: NullReferenceException at RunSecondRender:928
+        //     ERROR ... at WholeSceneRender.RestoreScoped() line 1118
+        //
+        // Reset() nulled _probeField, so the finally's `_probeField.SetValue(null, saved)`
+        // threw — and the ENGINE'S EnvironmentProbeManager was never put back. OUR manager
+        // stayed installed in CoreSystems, its textures were then released, and the
+        // player's next culling pass bound null: DRED EventStack [CullingProxies,
+        // MainViewCulling[FirstPass]], PageFaultVA 0x0, zero existing and zero freed.
+        // RestoreScoped() failed identically on _settingsObj, which would have left the
+        // player's settings scoped to OUR values as well.
+        //
+        // This was never a probe bug. It is EVERY finally block in the render, and it has
+        // been latent for as long as Poll() has been called from inside the render — the
+        // probe flip is simply the first change big enough to make it fatal rather than
+        // cosmetic. Deferring is the correct fix precisely because it protects all of them
+        // at once, rather than hardening one restore path and leaving the rest.
+        if (_inOurRender)
+        {
+            _resetPending = true;
+            if (!_deferLogged)
+            {
+                _deferLogged = true;
+                RttLog.Line("Whole-scene: Reset requested from INSIDE our render — deferred to the " +
+                            "end of this render. Tearing down here would null the statics the " +
+                            "in-flight finally blocks use to restore the engine's ScreenBuffers, " +
+                            "DrawContextManager, probe manager and scoped settings, leaving OUR " +
+                            "objects installed in the player's frame.");
+            }
+            return;
+        }
+
         // Do NOT dispose the engine's. Ours is disposable and holds real GPU memory, so
         // dropping it on a hot reload would leak — the pool asserts about exactly that
         // at shutdown, which is what turned every quit into a crash report earlier in
@@ -925,10 +975,31 @@ internal static class WholeSceneRender
                 if (planetEnvSwapped) RestorePlanetEnv();
                 RestoreScoped();
                 // Before the DrawContextManager goes back, so the ordering mirrors install.
-                if (savedProbes != null) { try { _probeField.SetValue(null, savedProbes); } catch (Exception e) { RttLog.Error("restore probe manager", e); } }
+                // The FieldInfo is re-read rather than trusted: a deferred Reset cannot null
+                // it any more, but this restore is the one whose failure leaves OUR probe
+                // manager installed in the player's frame, so it carries its own guard.
+                if (savedProbes != null)
+                {
+                    try
+                    {
+                        var pf = _probeField ?? Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12")
+                            ?.GetField("EnvironmentProbeManager", BindingFlags.Public | BindingFlags.Static);
+                        pf?.SetValue(null, savedProbes);
+                    }
+                    catch (Exception e) { RttLog.Error("restore probe manager", e); }
+                }
                 if (savedDc != null) _dcField.SetValue(null, savedDc);
                 _sbField.SetValue(null, savedSb);
                 _inOurRender = false;
+
+                // Now that every swap is unwound and _inOurRender is clear, a Reset that
+                // arrived mid-render can safely run.
+                if (_resetPending)
+                {
+                    _resetPending = false;
+                    RttLog.Line("Whole-scene: running the deferred Reset now that the render has unwound.");
+                    Reset();
+                }
             }
         }
         catch (Exception e)
