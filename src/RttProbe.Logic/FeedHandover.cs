@@ -38,10 +38,20 @@ internal static class FeedHandover
     private static string _panelHandleText
     { get => Feeds.Cur.PanelHandleText; set => Feeds.Cur.PanelHandleText = value; }
 
-    private static bool _argsLogged, _disarmed, _armed;
+    // PER-FEED: whether THIS feed's frames have reached THIS feed's panel. See the
+    // FeedInstance comment — as global latches these made a dead feed and a live feed
+    // produce identical logs.
+    private static bool _argsLogged
+    { get => Feeds.Cur.HandoverArgsLogged; set => Feeds.Cur.HandoverArgsLogged = value; }
+    private static int _handovers
+    { get => Feeds.Cur.Handovers; set => Feeds.Cur.Handovers = value; }
+    private static bool _survivedLogged
+    { get => Feeds.Cur.HandoverSurvivedLogged; set => Feeds.Cur.HandoverSurvivedLogged = value; }
+
+    // Process-global: the arm/disarm markers are files that gate the whole route.
+    private static bool _disarmed, _armed;
     private static long _lastArmCheck;
-    private static int _handovers, _errLogs;
-    private static bool _survivedLogged;
+    private static int _errLogs;
 
     public static void Reset()
     {

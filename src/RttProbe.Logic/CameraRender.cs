@@ -394,7 +394,10 @@ internal static class CameraRender
     { get => Feeds.Cur.FeedComponent; set => Feeds.Cur.FeedComponent = value; }
     private static int _feedState       // 0 untried, 1 ready, -1 unavailable
     { get => Feeds.Cur.FeedState; set => Feeds.Cur.FeedState = value; }
-    private static int _copyLogs;
+    // PER-FEED: a copy failure on feed 1 must not be silenced by feed 0's healthy budget,
+    // and the third failure disables THAT feed (_feedState = -1), not the route.
+    private static int _copyLogs
+    { get => Feeds.Cur.CopyLogs; set => Feeds.Cur.CopyLogs = value; }
 
     // Separately gated from the render. The camera pass alone has run for 17
     // minutes without incident; the copy is the part that killed the game, so it

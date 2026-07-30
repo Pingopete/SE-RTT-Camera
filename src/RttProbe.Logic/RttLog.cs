@@ -19,9 +19,30 @@ internal static class RttLog
     {
         try
         {
-            lock (Gate) File.AppendAllText(LogFile, $"[{DateTime.Now:HH:mm:ss.fff}] {msg}{Environment.NewLine}");
+            lock (Gate) File.AppendAllText(LogFile,
+                $"[{DateTime.Now:HH:mm:ss.fff}]{FeedTag()} {msg}{Environment.NewLine}");
         }
         catch { }
+    }
+
+    // WHICH FEED IS TALKING (phase C3).
+    //
+    // Silent with one feed, so every existing line and every log-reading habit is unchanged.
+    // With two, it is the difference between reading the log and guessing at it: the gate,
+    // rebuild and handover lines all describe per-feed work and none of them said whose. The
+    // first two-feed run produced two "FEED GATE: ACTIVE" lines 22 ms apart and there was no
+    // way to tell whether that was both feeds starting or one feed cycling twice.
+    //
+    // Never throws and never recurses: a logger that can fail is a logger that loses the
+    // evidence of the thing that made it fail, and this runs on the render thread.
+    private static string FeedTag()
+    {
+        try
+        {
+            if (Feeds.Count <= 1) return "";
+            return $" [feed {Feeds.Cur.Id}]";
+        }
+        catch { return ""; }
     }
 
     // Reflection wraps everything in TargetInvocationException, whose own message

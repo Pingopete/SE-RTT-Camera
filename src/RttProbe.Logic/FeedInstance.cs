@@ -148,6 +148,19 @@ internal sealed class FeedInstance
     public int ParkGeneration;
     public string PanelHandleText;
 
+    // DELIVERY PROOF, per feed (phase C3). These were process-global "log once" latches,
+    // classified during the C1a inventory as statements about the ENGINE. They are not —
+    // "this feed's frames reached its panel" is the most feed-specific fact in the mod, and
+    // as a global latch feed 0 fires it first and feed 1's copy is swallowed forever.
+    //
+    // That is not merely untidy: it is what made the first black-panel diagnosis a guessing
+    // game. A silent feed and a working feed produced identical logs.
+    public bool HandoverSurvivedLogged;
+    public int Handovers;
+    public bool HandoverArgsLogged;
+    public bool PanelRtDiag;
+    public int CopyLogs;
+
     // ---- BlitProbe: the target and its batch -------------------------------------
     public OffscreenRenderTarget? Rt;
     public bool RtTried;

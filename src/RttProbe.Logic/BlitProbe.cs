@@ -226,10 +226,18 @@ internal static class BlitProbe
     {
         if (_rtTried) return;
         _rtTried = true;
-        RttLog.Line($"Stage 2: CreateOffscreenTarget(\"RttProbe\", {RtSize}x{RtSize})...");
+
+        // NAMED PER FEED (phase C3). This was the literal "RttProbe" for every caller, which
+        // was fine when there was exactly one, and is a collision the moment there are two:
+        // both feeds would ask the engine's contracts for a target under one name, and the
+        // feed that asked second would either be handed the first feed's target — two panels
+        // showing one camera — or fight it for ownership. Neither failure announces itself.
+        string name = Feeds.Count <= 1 ? "RttProbe" : $"RttProbe{Feeds.Cur.Id}";
+
+        RttLog.Line($"Stage 2: CreateOffscreenTarget(\"{name}\", {RtSize}x{RtSize})...");
         try
         {
-            var rt = _contracts.CreateOffscreenTarget("RttProbe", new Vector2I(RtSize, RtSize));
+            var rt = _contracts.CreateOffscreenTarget(name, new Vector2I(RtSize, RtSize));
             RttLog.Line($"Stage 2: returned Id={rt.Id} IsValid={rt.IsValid}");
             if (!rt.IsValid) { RttLog.Line("Stage 2 FAILED — target is not valid."); return; }
             _rt = rt;

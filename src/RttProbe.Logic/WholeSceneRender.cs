@@ -719,10 +719,32 @@ internal static class WholeSceneRender
             // STAGE 1: observe. The engine's own final target tells us exactly what a
             // second one has to match — format and resolution are the two things the
             // earlier attempt got wrong.
+            //
+            // THE STATE TRANSITION AND THE LOG LATCH ARE SEPARATE, and conflating them cost
+            // the whole first two-feed evening.
+            //
+            // This used to be one block: `if (!_describedTarget) { _describedTarget = true;
+            // _state = 1; ...log... }`. _describedTarget is process-global — correctly, it
+            // describes the ENGINE'S final target, which is the same for everyone — but
+            // _state is PER-FEED. So feed 0 ran first, claimed the latch, and set ITS OWN
+            // _state to 1. Feed 1 never entered the block, its _state stayed 0 forever, and
+            // PanelSource requires _state == 1 — so feed 1's source view was permanently
+            // null, its copy failed with wholeSceneSrv=False, it never parked a frame, and
+            // its panel was black. Everything else about feed 1 was healthy: own target, own
+            // 1024x1024 buffers, own LDR ring, rendering and settling normally.
+            //
+            // This is EXACTLY the hazard the C1a inventory called out — "a log latch that
+            // also gates behaviour" — written down, and then walked into anyway, because the
+            // gating was one line inside something that reads as pure diagnostics.
+            //
+            // The rule this earns: when splitting state into per-feed and global, the
+            // question is not "is this field per-feed" but "is every ASSIGNMENT to it
+            // reachable by every feed".
+            if (finalLdrBuffer != null) _state = 1;
+
             if (!_describedTarget && finalLdrBuffer != null)
             {
                 _describedTarget = true;
-                _state = 1;
                 RttLog.Line($"Whole-scene hook: LIVE. SceneDrawSystem.Draw postfix fired with " +
                             $"{Describe(finalLdrBuffer)}. This is the top of the pipeline — the only " +
                             "site where a second whole-scene render can be driven without re-entering " +

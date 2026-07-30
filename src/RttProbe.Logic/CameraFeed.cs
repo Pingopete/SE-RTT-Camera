@@ -635,7 +635,10 @@ internal static class CameraFeed
     // The render component for the tagged panel, needed to refresh its material
     // replacements after a rebind.
     public static object LastRenderComponent { get; private set; }
-    private static bool _panelRtDiag;
+    // PER-FEED: "did THIS feed capture its panel's render target" is the first thing that
+    // has to be true for a panel to show anything, so it must be answerable per feed.
+    private static bool _panelRtDiag
+    { get => Feeds.Cur.PanelRtDiag; set => Feeds.Cur.PanelRtDiag = value; }
 
     private static void CapturePanelRenderTarget(object renderComponent)
     {
