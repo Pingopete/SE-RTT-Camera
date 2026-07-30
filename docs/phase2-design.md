@@ -157,3 +157,35 @@ feed at full cadence, never ACROSS feeds by skipping frames.** Scheduler design:
 Honest limit: at some N, N x 2.1ms of submit is real (3 feeds ~ 6ms). Whether
 warm-at-low-preset beats cold-at-high-preset there is a MEASUREMENT, scheduled for when
 two feeds exist.
+
+### Budget hypotheses v2 (2026-07-29 late) — after the user's quality-first objection
+
+User objection to "budget trims layers": quality-vs-framerate is a USER preference; some
+owners rightfully want quality held. Accepted — and it exposed a framing error worth
+keeping: **the scarce resource is render-thread SUBMIT time (passes x draws), not pixels.**
+Quality/resolution knobs mostly spend GPU, which has headroom; submit is what limits feed
+count (~2.1ms per warm feed per frame). Budget in submit-ms. The revised option stack:
+
+- **A. Per-feed degradation POLICY.** The budget enforces only the TOTAL; each feed
+  carries an owner-set policy for how it yields: quality | cadence | resolution | standby
+  | never (= priority; others yield first). The system never chooses the axis.
+- **B. Coarse-quantum rotation — the user's round-robin at the RIGHT timescale.** The
+  cold-start tax is per WAKE: per-frame rotation pays it every render (pathological);
+  multi-second slots pay ~0.2-1s of re-warm once, then render warm for the rest. 10s slots
+  ~= 90% warm efficiency,每 live feed at FULL quality and cadence during its slot; standby
+  feeds hold their last frame. CCTV-multiplexer shape. Budget decides HOW MANY are live,
+  never how good a live feed looks.
+- **C. Perceptual budgeting.** Off-screen panels dormant (absence-of-ticking, test
+  pending); small/distant panels absorb cadence/quality trims BECAUSE imperceptible there;
+  the up-close watched panel gets full everything. Default yield order.
+- **D. Staggered intra-feed amortisation at full cadence.** Base pass every frame per feed
+  (warm history, current image); expensive sub-passes rotate offset across feeds (cascades
+  even/odd, probe faces, RT diffuse/specular alternation). Cuts real submit without
+  disabling anything; costs update latency only.
+- **E. Per-feed submit diet, always on.** Far clip / LOD bias / pass masks for content a
+  camera never needs. Raises the N where budgeting activates at all.
+
+Stack: E always -> C default order -> A override -> B when yielding means fewer live
+feeds -> D as the tier between full and standby. Gating unknown: the crossover where N
+warm feeds beat K cold ones — measurable only once two feeds exist (the stats-panel
+instancing work is the prerequisite).
