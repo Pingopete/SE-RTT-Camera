@@ -28,7 +28,7 @@ The measuring tools everything later depends on, plus experiments that cost seco
 
 | # | item | test / exit evidence |
 |---|---|---|
-| A1 | **Stats panel v1** — `[RTS]` tag scan, font survey (3 routes, one-shot log), persistent batch with ~6 DrawString lines re-recorded every 500ms | stats visible in game; feed panel untouched; 3 teardown cycles clean. THIS IS THE INSTANCING PATHFINDER — it forces target/binding/batch out of single-panel statics on a surface where failure = broken numbers, not broken feed |
+| A1 | **Stats panel v1** — `[RTS]` tag scan, font survey (3 routes, one-shot log), persistent batch with ~6 DrawString lines re-recorded every 500ms. Include the **budget tripwire** from day one: a line showing rolling p50 submit vs `rttBudgetMsPerFrame` (the measured reference constant), flagged when >20% over for a minute | stats visible in game; feed panel untouched; 3 teardown cycles clean. THIS IS THE INSTANCING PATHFINDER — it forces target/binding/batch out of single-panel statics on a surface where failure = broken numbers, not broken feed |
 | A2 | **`intervalMs` out of the rebuild signature** (trivially class (a)) | live change 0->33->0 with NO gate cycle in the log; rate follows within one poll |
 | A3 | **Ten-second experiments**: (i) FSR smear discriminator — player AA off FSR, look at distant panel; (ii) visibility dormancy — walk the panel out of view, watch for DORMANT; (iii) `ownProbes` live flip both directions | each answered with one log line + user observation; findings recorded |
 | A4 | **Class (a) knob A/B sweep** — one knob at a time under pause protocol, per the classification table | verified live-switch list; any knob that misbehaves demoted with evidence |
