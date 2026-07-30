@@ -631,3 +631,105 @@ Two log strings now hardcode 512 and print it regardless of the real value:
 correct; only the prose is stale. The trustworthy lines are `Feed blit identity` and
 `Camera CB: Screen.Resolution`. Worth fixing — misleading log text is how the ghost hunt
 lost a day.
+
+## Goal 4.4 groundwork: the stage-27 contradiction, RESOLVED (2026-07-29)
+
+Design work could not start until our own records stopped disagreeing. They now agree, and
+the answer removes the main perceived risk.
+
+### The contradiction
+
+`RttPlugin.cs`'s stage-27 dossier called `EnvironmentProbeManager.PrepareProbes` a CONFIRMED
+device removal at `wholeSceneIntervalMs=33`, complete with a DRED breadcrumb. A later entry
+proved stage 27 never executes at all, because `DrawContextManager.OnBeginDraw` is reached
+from `DrawInternal`, not from `Draw`. Both cannot be true.
+
+### The resolution
+
+`PrepareProbes` has **exactly one caller**: `DrawContextManager.OnBeginDraw`. Our nested
+`Draw` does not reach it. **Stage 27 is provably inert, and the skip never fired once** — so
+it cannot have fixed anything.
+
+The crash was real; the attribution was wrong. Its signature — `PageFaultVA 0x0`,
+`ExistingAllocations 0`, `RecentFreedAllocations 0`, EventStack
+`[EnvironmentProbes, ScenePreparation + Render]`, a queue of `EnvProbe_Blending` still in
+`OutstandingOps` — is the SAME crash Rule 19 describes: a rebuild trips
+`EnvironmentProbeManager._forceReprocess`, the engine reprocesses every probe, and a second
+whole-scene render inside that batch removes the device. **The fix that actually worked was
+the 30-frame settle window.**
+
+Consequence, and it is the useful part: **there is no crash attached to probe work per se.**
+The hazard is rendering during a reprocess, and that is already handled. 4.4 is expensive,
+not cursed.
+
+Generalises: a "confirmed fix" is only confirmed if the mechanism was observed FIRING. Stage
+27 was credited for a recovery it took no part in, and that false credit then made the whole
+probe area look more dangerous than it is — which is its own cost.
+
+### What owning probes actually requires
+
+`EnvironmentProbeManager` holds the atlas as EIGHT instance cube textures:
+
+    _closeFinalTexture  _closeBlendTexture  _closeWorkTextureA  _closeWorkTextureB
+    _farFinalTexture    _farBlendTexture    _farWorkTextureA    _farWorkTextureB
+
+plus the state machine (`_lastSettings`, `_forceReprocess`, `_state`, `_startedUpdateTime`)
+and `LastLocalLightAmbient`. It lives on `CoreSystems.EnvironmentProbeManager` — a global.
+
+Two facts decide the design:
+
+1. **The atlas is per-manager, not per-context.** Rendering probes without our own manager
+   writes the PLAYER'S atlas from the orbit camera. That is the reported "reflections and
+   ambient from light sources but not the lights themselves", and it is why
+   `wholeSceneDisableProbeUpdates` exists.
+2. **`DrawContexts.EnvProbesToUpdate` is written ONLY by `OnBeginDraw`**, which our nested
+   Draw never reaches. So our context's queue is permanently empty and unskipping stage 2
+   today iterates nothing while still running `EnvironmentProbeExposureJob` against the
+   shared `CloseIBL`. That is the whole reason stage 2 is "free" to skip right now.
+
+So the shape is the one already proven twice in this project — own the object, swap it for the
+duration of our render:
+
+    build (gate time, inside the 30-frame settle window):
+      ourProbes = new EnvironmentProbeManager(...)        // 8 cube textures
+    per render:
+      swap CoreSystems.EnvironmentProbeManager -> ourProbes
+      ourDc.EnvProbesToUpdate = ourProbes.PrepareProbes() // OUR manager, so Rule 8 holds
+      run stage 2 (RenderEnvironmentProbe)
+      restore
+
+`PrepareProbes` on OUR instance is not a Rule 8 violation: Rule 8 forbids advancing a GLOBAL
+manager's state a second time per frame, and ours is not shared with anyone.
+
+### Risk assessment, honestly
+
+- **The allocation is the biggest this mod would do.** Not unprecedented: we already
+  construct our own `ScreenBuffers` and `DrawContextManager`, both of which allocate
+  heavily, and both work — because they are built at gate time inside the settle window.
+  Rule 11's real content is "do not allocate mid-frame", not "never allocate". The
+  EyeAdaptationJob failure was a ctor compiling PSOs on another thread WHILE the recorder
+  ran; gate-time construction is a different situation.
+- **`_forceReprocess` is guaranteed to trip** on a fresh manager, so construction MUST sit
+  inside the settle window. Rule 19 exists for exactly this and is already implemented.
+- **Cost is the real problem, not stability.** A probe update is scene geometry from six
+  viewpoints. The engine amortises it round-robin through the queue, and honouring the queue
+  gives us the same amortisation for free — but the feed's share is still six cube faces of
+  culling and command building, and CPU submit is this route's bottleneck. Expect this to be
+  the first feature that actually costs measurable frame time. Measure before tuning.
+- **Fallback is graceful.** `EnvironmentProbeManager.CloseIBL`/`FarIBL` fall back to
+  `CommonResources.SkyboxIBL`, so a probe that is not ready yet degrades to the skybox term
+  rather than binding null.
+
+### Order of work
+
+1. Construct our own manager at gate time behind a default-OFF flag, swap it per render,
+   and log its texture identities — but do NOT unskip stage 2 yet. This proves the
+   allocation and the swap are survivable while the feed's appearance is unchanged, because
+   an empty queue still renders nothing.
+2. Only then populate the queue from our own `PrepareProbes()` and drop 2 from the skip list.
+3. Measure. If six faces per update is too expensive, cap the queue per render rather than
+   rate-limiting the feed — the rate limit is what made everything else slow.
+
+Step 1 is deliberately a no-op visually. After three CTDs in one session, the allocation
+deserves its own verified step rather than being bundled with the thing that starts consuming
+it.
