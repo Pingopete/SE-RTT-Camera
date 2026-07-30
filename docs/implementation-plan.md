@@ -73,7 +73,7 @@ Exit gate: the two budget constants are numbers with measurements behind them.
 
 | # | item | test / exit evidence |
 |---|---|---|
-| E1 | **ms-metered render credit**: one credit per engine frame worth the budget; rotation among ACTIVE feeds; overrun repays by delaying the next credit; dormant feeds return their share; priority = extra credits | total submit flat as N goes 1->2->3 (THE invariant); feed fps ~66/N; kill a feed -> others speed up within a second |
+| E1 | **The render SLOT** (see the smoothness constraint in phase2-design.md): at most one render per engine frame, strict cyclic rotation among ACTIVE feeds; the ms constant is calibration + tripwire, NOT a per-frame gate; overruns NEVER cause skips — sustained drift is absorbed by variance-free cost levers (amortisation, far clip), surfaced on the tripwire; dormant feeds return their share; priority = extra slots on a strictly PERIODIC schedule | total submit flat as N goes 1->2->3 AND the p95-p50 gap + >50ms count hold the single-feed baseline (smoothness IS the invariant); feed fps ~engine/N; kill a feed -> others speed up within a second |
 | E2 | **Shared source + per-panel aspect crop** — same camera onto 2+ panels of different aspects via per-panel source rects | crops centred and correct; N same-camera panels cost no extra credits (blits off-budget, verified on stats panel) |
 | E3 | Global quality preset changes under N feeds: staggered rebuilds, one feed per settle window | quality switch with 3 feeds live -> no >50ms frame |
 
