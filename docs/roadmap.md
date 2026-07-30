@@ -827,3 +827,23 @@ that the player's atlas is untouched, so anything odd on the player's side is a 
 
 Also worth recording: the drift criterion holds with probes on. 15+ minutes, stable fps,
 flat VRAM, on the every-frame config.
+
+## Goal 4.3 DONE AND VERIFIED (2026-07-29, 21:58-22:00)
+
+The lifetime fix held against its exact reproducer. Deploy under pause protocol, flares
+re-enabled, then THREE full gate cycles with a 10-second dwell in the dormant state each
+time — the dwell matters, because both CTDs landed ~1 second after teardown, when the
+player's own flare pass ran against what our teardown had freed.
+
+    CYCLE 1: survived. scrubLine=1 remirrored=1 errors=0
+    CYCLE 2: survived. scrubLine=1 remirrored=1 errors=0
+    CYCLE 3: survived. scrubLine=1 remirrored=1 errors=0
+
+Every teardown scrubbed the mirrored engine references back to ctor originals; every rebuild
+re-mirrored 4/4 definition members and force-ran stage 21. The feed has lens flares at
+intensity 0.2, and the player's flare state is untouchable by our teardown.
+
+**All four fidelity goals are now landed:** 4.1 atmosphere LUTs (free), 4.2 AA via 1024
+supersampling (free), 4.3 lens flares (near-free, one lifetime bug found and fixed), 4.4 own
+environment probes (~0.1-0.2ms, 15-min soak clean). Feed state: both features on together,
+~50 fps, submit 2.2-2.5ms, zero errors.
