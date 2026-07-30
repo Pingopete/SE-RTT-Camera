@@ -89,9 +89,33 @@ internal static class FeedGate
     public static void Poll()
     {
         long now = Clock.Ms;
-        if (now - _lastPollMs < 250) return;
-        _lastPollMs = now;
 
+        // THE THROTTLE COVERS THE FILE STAT ONLY — not the per-feed decision below.
+        //
+        // This used to be `if (now - _lastPollMs < 250) return;` at the top, throttling the
+        // whole method. That was correct with one feed and BROKE THE SECOND ONE the instant
+        // feedCount went to 2: _lastPollMs is process-global, so whichever feed polled first
+        // consumed the window and every other feed returned here without ever computing its
+        // own `alive`. Feed 1's gate therefore never went ACTIVE, the whole-scene hook's
+        // `if (!FeedGate.Active) return` fired on its every slot, and it never built or
+        // rendered anything — while feed 0 carried on looking perfectly healthy.
+        //
+        // Observed 2026-07-30 on the first two-feed run. The split is the fix: the expensive
+        // part is the filesystem stat, which genuinely is shared and stays throttled; the
+        // per-feed part is two timestamp comparisons and must run on every call, for every
+        // feed. Cost is nil and it removes a whole class of "feed N is silently dormant".
+        if (now - _lastPollMs >= 250)
+        {
+            _lastPollMs = now;
+            PollPauseMarker();
+        }
+
+        PollFeed(now);
+    }
+
+    // Process-global: the pause marker is one file that stops the WHOLE mod.
+    private static void PollPauseMarker()
+    {
         // THE PAUSE MARKER. A file is the right mechanism here precisely because it is
         // outside the game: it can be created before a rebuild, by a script, or by a
         // human, and it takes effect without the config parser, the panel, or anything
@@ -112,7 +136,14 @@ internal static class FeedGate
                 : "=== FEED UNPAUSED (marker removed). Resuming. ===");
         }
 
-        bool alive = !paused && _lastPanelMs != 0 && (now - _lastPanelMs) < FeedConfig.PanelIdleMs;
+    }
+
+    // PER-FEED, every call. Two timestamp comparisons — cheap enough that throttling it was
+    // never buying anything, and expensive in a way nothing measured: a feed whose gate is
+    // never evaluated is a feed that never runs.
+    private static void PollFeed(long now)
+    {
+        bool alive = !_paused && _lastPanelMs != 0 && (now - _lastPanelMs) < FeedConfig.PanelIdleMs;
         if (alive == _active) return;
 
         _active = alive;

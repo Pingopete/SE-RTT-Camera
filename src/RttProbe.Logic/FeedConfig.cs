@@ -470,10 +470,24 @@ internal static class FeedConfig
 
     // HOW MANY INDEPENDENT FEEDS ARE ACTIVE (plan phase C3). 1 = the shipped behaviour.
     //
-    // Deliberately a LIVE knob and deliberately NOT in WholeSceneSignature(): adding or
-    // removing a feed must not force every OTHER feed through a rebuild and a 30-frame
-    // settle. Feeds.Count clamps this into the slots that exist, so a typo degrades to a
-    // valid count instead of an index fault.
+    // IN the rebuild signature, and the first attempt had this exactly backwards.
+    //
+    // The original reasoning was "adding a feed must not drag the OTHERS through a rebuild
+    // and a 30-frame settle". That sounds right and is wrong, because changing this value
+    // changes WHICH PANEL EACH FEED OWNS. Every feed caches its panel resolution — the
+    // resolved panel id, the offscreen target, the handle text the handover matches on, the
+    // render target itself — and re-routing underneath those caches leaves each feed holding
+    // another panel's identity. Observed 2026-07-30 on the first two-feed run: routing was
+    // correct in the log, both panels claimed the right feeds, and the picture froze, because
+    // feed 0 was still matching the handle of the panel that had just been reassigned to
+    // feed 1. drawOne(ours) went to 0.0 and copies stopped, with no error anywhere.
+    //
+    // A rebuild is exactly the thing that clears those caches, so this belongs in the
+    // signature. The cost is one gate cycle when you change the feed COUNT, which is a rare,
+    // deliberate act — not the per-frame cadence tuning A2 freed from the signature.
+    //
+    // Feeds.Count clamps this into the slots that exist, so a typo degrades to a valid count
+    // instead of an index fault.
     //
     // A second feed needs a second tagged panel to point at. With feedCount=2 and only one
     // tagged panel, feed 1 simply never finds a target and stays dormant — which is the
@@ -674,13 +688,14 @@ internal static class FeedConfig
             Emissivity  = Dbl(kv, "emissivity", Emissivity);
             DimDistance = Dbl(kv, "dimDistance", DimDistance);
 
-            // Read BEFORE the signature block below, so the ForEach sweeps that follow use
-            // the new count. Not part of the signature itself — see the field comment.
-            FeedCount = Int(kv, "feedCount", FeedCount);
+            // NOT read here. FeedCount is part of the whole-scene signature (see the field
+            // comment: re-routing panels invalidates every feed's cached panel identity), so
+            // it is read inside the signature block below, between the two snapshots.
 
             // ---- the whole-scene route -------------------------------------------
             string before = WholeSceneSignature();
 
+            FeedCount               = Int(kv, "feedCount", FeedCount);
             WholeSceneEnabled       = Bool(kv, "wholeSceneRender", WholeSceneEnabled);
             WholeSceneBuildBuffers  = Bool(kv, "wholeSceneBuildBuffers", WholeSceneBuildBuffers);
             WholeSceneWidth         = Int(kv, "wholeSceneWidth", WholeSceneWidth);
@@ -752,6 +767,13 @@ internal static class FeedConfig
     // Everything the second ScreenBuffers / DrawContexts build depends on.
     private static string WholeSceneSignature() =>
         string.Join("|", WholeSceneBuildBuffers, WholeSceneWidth, WholeSceneHeight,
+                         // FeedCount IS here. Changing it re-routes which panel each feed
+                         // owns, and every feed caches its panel's identity (resolved id,
+                         // offscreen target, handle text, render target). Without a rebuild
+                         // those caches survive the re-route and each feed keeps matching
+                         // another panel's handle — which is a silent frozen picture, not an
+                         // error. See the FeedCount field comment for the observed failure.
+                         FeedCount,
                          // WholeSceneIntervalMs is deliberately ABSENT (plan phase A2).
                          // Its only consumer is TryRender's rate gate, which reads
                          // FeedConfig fresh every frame, so a change needs no rebuild:
