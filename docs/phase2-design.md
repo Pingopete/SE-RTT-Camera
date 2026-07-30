@@ -280,3 +280,31 @@ Elegant consequence of defining the budget in MS rather than renders-per-frame: 
 the global quality preset makes renders cheaper, so MORE feeds fit inside the same
 per-frame envelope at full cadence each. The quality knob does not just throttle VRAM —
 it directly buys feed smoothness under an identical total cost. Falls out for free.
+
+### BUDGET LOCK v2: quality-coupled budget — savings flow to the GAME (user correction, 2026-07-30)
+
+The v1 lock had an inversion the user caught before it was built. Defining the budget as a
+FIXED ms envelope and letting cheaper renders fit more feed frames means the envelope is
+always fully spent — so a user on a weaker PC who lowers feed quality to reclaim game
+frame rate gains NOTHING: the RTT system keeps consuming the same slice, just on more feed
+renders. A fixed penalty the quality knob cannot reduce. Wrong default.
+
+**Corrected model:**
+
+- `rttBudgetMsPerFrame` DEFAULTS to the measured warm cost of ONE render at the CURRENT
+  global quality preset (per-preset constants come from the phase-B cost table). Lowering
+  quality shrinks the envelope; the saved milliseconds return to the game.
+- Feed cadence is unchanged by preset: one render per frame at every quality, so feed fps
+  = engine fps / N regardless. And the cheaper render raises engine fps itself — lowering
+  quality helps the game TWICE (smaller slice, faster frames) while feeds keep cadence.
+- The absolute ceiling is unchanged: never above one feed's cost at reference (high)
+  quality.
+- The v1 behaviour — fixed envelope, savings reinvested as extra feed renders — survives
+  ONLY as an explicit opt-in override: the budget may be pinned anywhere below the
+  ceiling, including above the current preset's one-render cost, for users who want many
+  cheap smooth feeds. The DEFAULT routes savings to the game.
+
+Net: the global quality knob now serves all three stated intents at once — VRAM throttle,
+uniform quality across feeds, and the whole-game frame-rate lever. The tripwire (A1)
+compares rolling p50 submit against the CURRENT preset's constant, so preset changes move
+the guard automatically.
