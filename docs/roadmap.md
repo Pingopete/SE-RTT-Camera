@@ -4,7 +4,81 @@ Agreed goals beyond the POC, recorded 2026-07-28. The POC itself is achieved: a 
 30fps whole-scene render on an `[RTC]` panel with RT ambient, own shadow cascades,
 planet atmospheres, and no main-world bleed.
 
-## 1. In-game control panel (LCD UI menu)
+> **2026-07-29 update:** the POC has moved well past that description — every-frame
+> rendering at ~50-66 fps, 1024 supersampling, own probes, own flares, atmosphere LUTs,
+> and the GPU-starvation drift gone. Phase 2 below is the direction from here.
+
+---
+
+# PHASE 2: from POC to API (agreed 2026-07-29, from the user's notes)
+
+The destination, in the user's words distilled: **the current POC becomes an API** that
+handles creating and running RTT feeds from remote cameras, with handles other mods can
+call. A separate **camera-block mod** consumes that API — plugin access now, Keen-shipped
+APIs when they exist. The work to date (stability, performance, drift) was about making
+that baseline trustworthy.
+
+## 5. The RTT Feed API (the plugin's public surface)
+
+Turn the feed machinery into a service other mods drive through handles:
+
+- **CreateFeed / DestroyFeed** — a feed is (camera source, target surface, options).
+  Multiple instances, different screens.
+- **Caller-driven camera** — the API takes a transform (e.g. a block's world matrix) each
+  frame instead of running its own orbit. The orbit becomes a demo client of the API.
+- **Liveness contract** — the caller registers an entity ID; the API monitors existence
+  and damage. Block destroyed or damaged past threshold -> the feed closes ITSELF,
+  gracefully. This generalises the pattern the gate already proves: the panel-off path
+  works because "absence of ticking IS the signal". Same principle, per feed.
+- **Graceful cut, always.** A feed cut for ANY reason — block destroyed, panel gone,
+  world unload, alt-tab, caller crash — must never device-remove. Today's teardown work
+  (the flares scrub, probe DisposeTextures, PanelBinding.Unbind) is exactly this
+  discipline; the API hardens it into a contract.
+
+What exists already maps cleanly: FeedGate is the lifecycle, WholeSceneRender the
+renderer, CameraRender the camera/delivery, PanelBinding the output binding. What is
+missing is per-feed instancing (goal 2's static->instance work) and the public surface.
+
+## 6. The camera-block mod (separate add-on)
+
+A basic camera block part whose handle calls the API: sends its ID for the liveness
+contract, positions the feed camera from its own transform, picks a target LCD. Ships
+with an interactable UI including a low / medium / high graphics setting. Plugin access
+now; migrate to Keen APIs when shipped.
+
+## 7. Reliability engineering (the contract behind goal 5)
+
+- Feed quickly startable, easily restartable, multiple instances.
+- Every failure path exercised deliberately: block destroyed mid-frame, panel destroyed,
+  world exit with feeds live, alt-tab/device events, hot reload with N feeds.
+- Known open items that belong here: the panel-freeze-after-config-change bug
+  (workaround: gate cycle; still undiagnosed) and the far-distance smear (FSR suspect;
+  the AA-mode discriminator test is still unrun).
+
+## 8. Fidelity presets (low / medium / high)
+
+The layer inventory in `docs/feed-render-layers.md` is the menu these presets choose
+from. Defining them needs:
+
+- **Discrete per-layer control** — largely exists (skip list, own-shadows, own-probes,
+  own-flares, RT flags, bloom, resolution, far clip).
+- **Rapid toggling WITHOUT stopping the feed** — the real gap. Most layer knobs sit in
+  the rebuild signature, so every change is a gate cycle plus a 30-frame settle. Design
+  work: classify each knob as (a) safe to flip per-render (skip-list ids are already
+  read per render), (b) needs only a scope change, (c) genuinely needs a rebuild
+  (resolution, buffer counts). Move (a) and (b) out of the signature. Rule 17 still
+  applies — reclassification needs evidence per knob, not optimism.
+- **Per-layer cost measurement** — flip one layer, read PERF deltas; the presets are
+  then chosen from measured costs, not guesses.
+
+## 9. On-screen perf UI (testing aid, current build)
+
+Frame time and fps visible in game while testing modes, instead of tailing rtt.log.
+Options, cheapest first: (a) stamp the numbers into the FEED image itself — we own the
+render and the blit; (b) a second small [RTT]-style surface dedicated to stats; (c) hook
+the game's own debug HUD. Start with (a).
+
+---
 
 Many of the render-layer options and the frame-rate cap should be controllable from an
 on-LCD UI menu in game, not from feed-config.txt. Candidate controls, all already
