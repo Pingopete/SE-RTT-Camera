@@ -299,7 +299,106 @@ internal static class FeedConfig
     //
     // Forces stage 21 to run, the same way WholeSceneOwnShadows forces stage 3: owning the
     // context is pointless if the pass that reads it never executes.
+    //
+    // ==========================================================================
+    // BROKEN. DO NOT ENABLE. Two CTDs, and the SECOND one found the real flaw.
+    // ==========================================================================
+    //
+    // Both crashes were the same NullReferenceException in FlaresContext.GetFlareConstants,
+    // which does `_flaresBuffer.GPUBufferId` unguarded. The first was diagnosed as stage 21
+    // being force-run before the mirror had happened, and fixed with the _flaresReady guard.
+    // That fix is correct and is still in place — but it addressed the wrong half, because
+    // the second CTD happened WITH the guard active.
+    //
+    // THE ACTUAL BUG IS LIFETIME, NOT READINESS. MirrorFlareDefinitions copies REFERENCES
+    // out of the engine's context into ours, and one of them, _flaresBuffer, is a GPU
+    // resource. Our FlaresContext hangs off OUR DrawContextManager. When the gate tears down
+    // — a pause, a config change, a hot reload — Reset() disposes that DrawContextManager,
+    // which disposes our FlaresContext, which disposes _flaresBuffer. That reference IS the
+    // ENGINE'S buffer. We free the player's flare definitions, the engine's context keeps
+    // pointing at the freed object, and its very next flare pass dereferences it.
+    //
+    // The timing is the proof. Both crashes landed immediately after a gate teardown:
+    //   CTD 1  20:20:20  right after a pause/resume cycle
+    //   CTD 2  20:59:52  one second after "FEED GATE: DORMANT" from a pause
+    // Neither happened during steady-state rendering, which is why flares looked fine for
+    // twelve minutes the first time.
+    //
+    // _flaresReady cannot help: it protects OUR pass from reading a null buffer. It says
+    // nothing about us having freed the ENGINE'S.
+    //
+    // THE FIX, unbuilt: null the four mirrored fields on our context BEFORE our
+    // DrawContextManager is disposed, so its dispose chain cannot reach objects we do not
+    // own. That needs a teardown hook ordered strictly before the DC dispose, and getting
+    // that order wrong is another crash — hence not attempted at the end of a session with
+    // four CTDs in it.
+    //
+    // GENERAL LESSON, worth more than the feature: sharing a reference INTO an object you
+    // will later dispose makes you the owner of something you did not allocate. Borrowing
+    // read-only state is only safe if the borrower's lifetime is strictly shorter AND its
+    // teardown cannot touch what it borrowed. Ours failed the second condition. Every other
+    // shared object in this route is shared the other way round — we hand OUR resources to
+    // nobody, and we read the engine's without holding them past a frame.
     public static bool WholeSceneOwnFlares { get; private set; }
+
+    // OWN ENVIRONMENT PROBES (roadmap goal 4.4). Default OFF — this is the most expensive
+    // feature on the roadmap and the first one expected to cost measurable frame time.
+    //
+    // WHY IT MATTERS. This is a REMOTE camera, and the feed currently samples the PLAYER'S
+    // probe atlas, which is centred on the player. So the feed's reflections and ambient
+    // bounce are correct for where the player is standing rather than where the camera is.
+    // Subtle at a 100 m orbit, visibly wrong at real remote-camera distances, and worse the
+    // further the camera goes. A correctness problem dressed as a fidelity one.
+    //
+    // WHY IT COULD NOT SIMPLY BE UNSKIPPED. Two facts, both verified offline:
+    //   * the atlas is EIGHT cube textures held per-MANAGER on the global
+    //     CoreSystems.EnvironmentProbeManager, so rendering probes without our own manager
+    //     writes the PLAYER'S atlas from the orbit camera — the old "ambient and reflections
+    //     from light sources but not the lights themselves" bug;
+    //   * DrawContexts.EnvProbesToUpdate is written ONLY by DrawContextManager.OnBeginDraw,
+    //     which runs in DrawInternal and never in our nested Draw. Our context's queue is
+    //     therefore permanently empty, which is exactly why skipping stage 2 costs nothing
+    //     today: we were never consuming it.
+    //
+    // WHAT THIS DOES. Owns the object, the pattern already proven for ScreenBuffers and
+    // DrawContextManager: construct our own manager, swap the global for the duration of our
+    // render, fill our own queue from our own PrepareProbes(), and let stage 2 run.
+    // PrepareProbes on OUR instance is not a Rule 8 violation — Rule 8 forbids advancing a
+    // GLOBAL manager's state twice per frame, and ours is shared with nobody.
+    //
+    // RISK, honestly. The ctor allocates NOTHING (it calls only Object..ctor), so
+    // construction is free — the textures are created later in RecreateProbes, reached from
+    // PrepareProbes. That is the allocation to respect, and it is also guaranteed to trip
+    // _forceReprocess, so it must land inside the 30-frame settle window (Rule 19). Failure
+    // is graceful rather than fatal: CloseIBL/FarIBL fall back to CommonResources.SkyboxIBL,
+    // so a probe that is not ready degrades to the skybox term instead of binding null.
+    //
+    // Forces wholeSceneDisableProbeUpdates OFF in effect — see WholeSceneRender. Scoping
+    // ProbeSettings.Enable off existed purely to stop us updating the SHARED atlas, and with
+    // our own manager installed that reason is gone. Leaving it on would make PrepareProbes
+    // do nothing and this feature would silently be a no-op.
+    public static bool WholeSceneOwnProbes { get; private set; }
+
+    // Flare intensity for the FEED ONLY, scoped like exposure and bloom. Negative = leave
+    // the engine's value alone (default).
+    //
+    // Reported once flares went live: the sun flare is "extremely bright" and shows "a faint
+    // square box around the edges of the square flare texture". Both are the same symptom.
+    // The feed runs a FIXED exposure — eye adaptation is scoped off because its history is
+    // shared, and stage 25 makes exposure read-only — so it has no auto-adaptation to pull a
+    // blown highlight back, and on top of that the panel material multiplies by
+    // EmissivityMultiplier (10 by default). A flare quad that saturates then shows its
+    // texture's near-zero alpha border as a visible rectangle.
+    //
+    // FlaresIntensity is the right lever rather than emissivity: GetFlareConstants reads it
+    // straight into FlaresConstantData.IntensityMultiplier, so scoping it touches ONLY the
+    // flare pass, and only during our render. Lowering emissivity instead would dim the
+    // whole feed, and it lives on a material shared with every other LCD in the world.
+    //
+    // Deliberately NOT in the rebuild signature: it is a pure per-render scope, so retuning
+    // it takes effect on the next render with no rebuild and no settle window. That makes
+    // finding the right value a live sweep instead of a series of gate cycles.
+    public static double WholeSceneFlareIntensity { get; private set; } = -1;
 
     // Hold the tagged panel in FSR's REACTIVE mask. Default ON — it fixes a real, long-lived
     // visual bug and the whole change is one float property plus one int field per tick.
@@ -568,6 +667,8 @@ internal static class FeedConfig
             WholeSceneOwnFlares         = Bool(kv, "wholeSceneOwnFlares", WholeSceneOwnFlares);
             PanelFsrMask                = Bool(kv, "panelFsrMask", PanelFsrMask);
             PanelMipRegen               = Bool(kv, "panelMipRegen", PanelMipRegen);
+            WholeSceneFlareIntensity    = Dbl(kv, "wholeSceneFlareIntensity", WholeSceneFlareIntensity);
+            WholeSceneOwnProbes         = Bool(kv, "wholeSceneOwnProbes", WholeSceneOwnProbes);
             WholeSceneDisableRaytracing    = Int(kv, "wholeSceneDisableRaytracing", WholeSceneDisableRaytracing);
             WholeSceneDisableEyeAdaptation = Bool(kv, "wholeSceneDisableEyeAdaptation", WholeSceneDisableEyeAdaptation);
             WholeSceneDisableProbeUpdates  = Bool(kv, "wholeSceneDisableProbeUpdates", WholeSceneDisableProbeUpdates);
@@ -610,7 +711,7 @@ internal static class FeedConfig
                          WholeSceneDisableEyeAdaptation, WholeSceneDisableProbeUpdates,
                          WholeSceneOwnDrawContexts, WholeSceneOwnShadows,
                          WholeSceneCascadeResolution, WholeSceneCascadeCount,
-                         WholeScenePlanetEnv, WholeSceneOwnFlares,
+                         WholeScenePlanetEnv, WholeSceneOwnFlares, WholeSceneOwnProbes,
                          string.Join(",", WholeSceneSkipStages),
                          string.Join(",", WholeSceneRtFlags));
 

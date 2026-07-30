@@ -302,6 +302,23 @@ internal static class WholeSceneRender
         // would point at a disposed context after a rebuild, and a surviving
         // _flareMirrorLogged would swallow the log line that proves the mirror took.
         _engineFlares = null; _flareMirrorLogged = false; _flaresReady = false;
+
+        // OUR PROBE MANAGER. Disposed rather than dropped: it owns eight cube textures once
+        // RecreateProbes has run, and leaking a set per hot reload is Rule 10's failure mode
+        // (~8 reloads once grew VRAM 13.2 -> 16.5 GB and the residency thrashing looked
+        // exactly like a rendering bug). DisposeTextures is non-public, hence Any.
+        if (_ourProbes != null)
+        {
+            try
+            {
+                var miDispose = _ourProbes.GetType().GetMethod("DisposeTextures", Any);
+                if (miDispose != null) miDispose.Invoke(_ourProbes, null);
+                else if (_ourProbes is IDisposable disp) disp.Dispose();
+            }
+            catch (Exception e) { RttLog.Error("dispose own probe textures", e); }
+        }
+        _ourProbes = null; _probeField = null; _envProbesToUpdateField = null;
+        _miPrepareProbes = null; _probeState = 0; _probeLogged = false;
         _dcBuilt = false;
         _dcField = null;
         _cascFld = _charCascFld = null;
@@ -428,6 +445,21 @@ internal static class WholeSceneRender
         // running the pass would have advanced the player's occlusion readback twice a
         // frame. With our own context installed that hazard is gone, so refuse the skip
         // rather than let a stale skip list silently produce "own flares, no flares".
+        // Stage 2 and wholeSceneOwnProbes, same pair as 3/ownShadows and 21/ownFlares. Owning
+        // a probe manager and filling its queue is pointless if RenderEnvironmentProbe never
+        // runs — the queue would just be discarded, and we would pay PrepareProbes and the
+        // eight cube textures for nothing. Gated on _probeState, not on the config flag,
+        // because that is the lesson stage 21 taught: intent is not readiness.
+        if (id == 2 && FeedConfig.WholeSceneOwnProbes && _probeState > 0)
+        {
+            if (Array.IndexOf(stages, 2) >= 0 && _skippedLogged.Add(-2))
+                RttLog.Line("Whole-scene: stage 2 (RenderEnvironmentProbe) is in the skip list but " +
+                            "wholeSceneOwnProbes is on and our probe manager is installed — running it " +
+                            "anyway. The skip existed because our queue was always empty and the atlas " +
+                            "was the player's; both are now ours. Drop 2 from wholeSceneSkipStages.");
+            return false;
+        }
+
         // _flaresReady, NOT the config flag. See the comment on _flaresReady: force-running
         // this on intent alone dereferenced a null _flaresBuffer and took the game down.
         if (id == 21 && FeedConfig.WholeSceneOwnFlares && _flaresReady)
@@ -719,7 +751,7 @@ internal static class WholeSceneRender
             }
 
             var savedSb = _sbField.GetValue(null);
-            object savedCam = null, savedDc = null;
+            object savedCam = null, savedDc = null, savedProbes = null;
             object[] savedCb = null;
             bool camSwapped = false, ownShadows = false, planetEnvSwapped = false;
 
@@ -751,6 +783,11 @@ internal static class WholeSceneRender
                 // reference assignments — and it is what keeps a replaced _flaresBuffer from
                 // leaving the feed permanently stale. No-op unless wholeSceneOwnFlares is on.
                 if (FeedConfig.WholeSceneOwnFlares) MirrorFlareDefinitions();
+
+                // AFTER the DrawContextManager swap, because it writes our context's
+                // EnvProbesToUpdate and reads _ourDrawContexts to find the field. No-op
+                // unless wholeSceneOwnProbes is on.
+                savedProbes = InstallProbes();
 
                 ScopeSharedState();
                 if (FeedConfig.WholeSceneCamera) camSwapped = InstallCamera(out savedCam);
@@ -861,6 +898,8 @@ internal static class WholeSceneRender
                 // weather-modifier culling and all the setup CBs from the PLAYER'S view.
                 if (planetEnvSwapped) RestorePlanetEnv();
                 RestoreScoped();
+                // Before the DrawContextManager goes back, so the ordering mirrors install.
+                if (savedProbes != null) { try { _probeField.SetValue(null, savedProbes); } catch (Exception e) { RttLog.Error("restore probe manager", e); } }
                 if (savedDc != null) _dcField.SetValue(null, savedDc);
                 _sbField.SetValue(null, savedSb);
                 _inOurRender = false;
@@ -1133,7 +1172,12 @@ internal static class WholeSceneRender
         // hence the dotted path. ApplyEnvProbe is deliberately NOT cleared: we want our
         // render to keep USING the probes for ambient, just not to update them. If the
         // feed loses its ambient term anyway, Enable gates both and this needs splitting.
-        if (FeedConfig.WholeSceneDisableProbeUpdates)
+        // NOT when we own the probes. Scoping Enable off exists solely to stop our render
+        // updating the SHARED atlas; with our own manager installed there is no shared atlas
+        // to protect, and leaving it off would make our own PrepareProbes do nothing — the
+        // feature would silently be a no-op with no error to explain it. The two settings are
+        // coupled, so the coupling is enforced here rather than left to the config file.
+        if (FeedConfig.WholeSceneDisableProbeUpdates && !FeedConfig.WholeSceneOwnProbes)
             ScopeOff("EnvironmentSettings", "environment probe updates", "ProbeSettings.Enable");
 
         // TEMPORAL AA / UPSCALING. FSR consumes motion vectors, and ours are garbage:
@@ -1228,6 +1272,17 @@ internal static class WholeSceneRender
             ScopeSetValues("PostProcessSettings",
                 "feed bloom OFF (shared BloomJob retains its cascade borrows across renders)",
                 ("Bloom", false));
+
+        // FLARE INTENSITY, feed only. GetFlareConstants reads FlaresIntensity straight into
+        // FlaresConstantData.IntensityMultiplier, so this reaches the flare pass and nothing
+        // else. Only meaningful while wholeSceneOwnFlares is on — with flares off the pass
+        // never runs and the scope is a no-op, which is harmless and not worth a gate on.
+        // See FeedConfig.WholeSceneFlareIntensity for why this and not emissivity.
+        if (FeedConfig.WholeSceneFlareIntensity >= 0)
+            ScopeSetValues("LightSettings",
+                $"feed flare intensity {FeedConfig.WholeSceneFlareIntensity:0.###} " +
+                "(fixed feed exposure cannot pull a blown flare back, and the panel multiplies by emissivity)",
+                ("FlaresIntensity", (float)FeedConfig.WholeSceneFlareIntensity));
     }
 
 
@@ -1955,6 +2010,111 @@ internal static class WholeSceneRender
                         "incomplete. Field names likely changed; re-check with tools/EngineQuery.");
         }
         return copied;
+    }
+
+    // ---- OWN ENVIRONMENT PROBES (goal 4.4) ---------------------------------------------
+    //
+    // The atlas is eight cube textures held per-MANAGER, and the manager is the global
+    // CoreSystems.EnvironmentProbeManager. So probes cannot be rendered from the orbit camera
+    // without either corrupting the player's atlas or owning a manager. This owns one.
+    //
+    // Construction is genuinely free: EnvironmentProbeManager..ctor() is parameterless and
+    // calls only Object..ctor(). The textures appear later, in RecreateProbes, reached from
+    // PrepareProbes — which is also what trips _forceReprocess, so the first PrepareProbes
+    // must land inside the 30-frame settle window. It does: our first render after a rebuild
+    // is gated by _settleFrames.
+    //
+    // Filling the queue ourselves is the other half. DrawContexts.EnvProbesToUpdate is
+    // written only by DrawContextManager.OnBeginDraw, which our nested Draw never reaches, so
+    // our queue is permanently empty unless we assign it. PrepareProbes() returns
+    // Buffer<Request> and EnvProbesToUpdate is a field of that type, so this is one
+    // assignment — and calling it on OUR instance is not Rule 8, which is about globals.
+    private static object _ourProbes;
+    private static FieldInfo _probeField, _envProbesToUpdateField;
+    private static MethodInfo _miPrepareProbes;
+    private static int _probeState;        // 0 = untried, 1 = ready, -1 = unavailable
+    private static bool _probeLogged;
+
+    // Install our manager and fill our queue. Returns the manager that was there before, or
+    // null if nothing was swapped — the caller restores it in the finally either way.
+    //
+    // Fails SOFT and permanently on the first problem: a half-installed probe manager is
+    // worse than none, and this runs on the render thread with the player's frame in flight.
+    private static object InstallProbes()
+    {
+        if (_probeState < 0 || !FeedConfig.WholeSceneOwnProbes) return null;
+        try
+        {
+            if (_probeState == 0)
+            {
+                var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+                _probeField = core?.GetField("EnvironmentProbeManager", BindingFlags.Public | BindingFlags.Static);
+                if (_probeField == null)
+                {
+                    _probeState = -1;
+                    RttLog.Line("Own probes: CoreSystems.EnvironmentProbeManager not found — feature unavailable.");
+                    return null;
+                }
+
+                var mgrType = _probeField.FieldType;
+                _miPrepareProbes = mgrType.GetMethod("PrepareProbes", Any);
+                if (_miPrepareProbes == null)
+                {
+                    _probeState = -1;
+                    RttLog.Line("Own probes: EnvironmentProbeManager.PrepareProbes not found — feature unavailable.");
+                    return null;
+                }
+
+                _envProbesToUpdateField = _ourDrawContexts?.GetType().GetField("EnvProbesToUpdate", Any);
+                if (_envProbesToUpdateField == null)
+                {
+                    _probeState = -1;
+                    RttLog.Line("Own probes: DrawContextManager.EnvProbesToUpdate not found — cannot hand our " +
+                                "own queue to RenderEnvironmentProbe, so stage 2 would iterate nothing.");
+                    return null;
+                }
+
+                // Parameterless ctor that allocates nothing. Deliberately created HERE rather
+                // than in the DrawContextManager build: it costs nothing, so there is no
+                // reason to widen that function's failure surface for it.
+                _ourProbes = Activator.CreateInstance(mgrType, nonPublic: true);
+                if (_ourProbes == null)
+                {
+                    _probeState = -1;
+                    RttLog.Line("Own probes: could not construct an EnvironmentProbeManager — feature unavailable.");
+                    return null;
+                }
+                _probeState = 1;
+            }
+
+            var saved = _probeField.GetValue(null);
+            _probeField.SetValue(null, _ourProbes);
+
+            // PrepareProbes advances OUR state machine and, on the first call, runs
+            // RecreateProbes — the eight cube textures. Inside the settle window by
+            // construction, because TryRender will not call us until it expires.
+            var queue = _miPrepareProbes.Invoke(_ourProbes, null);
+            _envProbesToUpdateField.SetValue(_ourDrawContexts, queue);
+
+            if (!_probeLogged)
+            {
+                _probeLogged = true;
+                RttLog.Line("Own probes: OUR EnvironmentProbeManager installed for our render and our " +
+                            "EnvProbesToUpdate filled from its own PrepareProbes(). The feed's reflections " +
+                            "and ambient bounce now come from probes rendered at the ORBIT camera instead " +
+                            "of the player's atlas. CloseIBL/FarIBL fall back to CommonResources.SkyboxIBL " +
+                            "until the first faces land, so early frames lose local bounce rather than " +
+                            "binding null. Stage 2 (RenderEnvironmentProbe) must be OUT of " +
+                            "wholeSceneSkipStages for any of this to reach the screen.");
+            }
+            return saved;
+        }
+        catch (Exception e)
+        {
+            _probeState = -1;
+            RttLog.Error("install own probes (feature DISABLED for this session)", e);
+            return null;
+        }
     }
 
     private static FieldInfo _dcField;

@@ -733,3 +733,71 @@ manager's state a second time per frame, and ours is not shared with anyone.
 Step 1 is deliberately a no-op visually. After three CTDs in one session, the allocation
 deserves its own verified step rather than being bundled with the thing that starts consuming
 it.
+
+## Goal 4.3 BLOCKED: own-flares is a LIFETIME bug, not a readiness bug (2026-07-29)
+
+Two CTDs, same NullReferenceException in `FlaresContext.GetFlareConstants` (which does
+`_flaresBuffer.GPUBufferId` unguarded). `wholeSceneOwnFlares = 0`. **Do not enable.**
+
+The first CTD was diagnosed as stage 21 being force-run before the definition mirror had
+run, and fixed with a `_flaresReady` readiness guard. That fix is correct and is still in
+place. It addressed the wrong half: **the second CTD happened with the guard active.**
+
+### The actual bug
+
+`MirrorFlareDefinitions` copies REFERENCES out of the engine's context into ours, and one of
+them — `_flaresBuffer` — is a GPU resource. Our `FlaresContext` hangs off OUR
+`DrawContextManager`. On any gate teardown (pause, config change, hot reload) `Reset()`
+disposes that DrawContextManager, which disposes our FlaresContext, which disposes
+`_flaresBuffer`. **That reference is the ENGINE'S buffer.** We free the player's flare
+definitions; the engine's context keeps pointing at the freed object; its next flare pass
+dereferences it.
+
+The timing is the proof — both crashes landed immediately after a teardown, never during
+steady-state rendering:
+
+    CTD 1   20:20:20   right after a pause/resume gate cycle
+    CTD 2   20:59:52   one second after "FEED GATE: DORMANT" from a pause
+
+Which is also why flares rendered correctly for twelve minutes on the first attempt.
+
+`_flaresReady` cannot help. It protects OUR pass from reading a null buffer; it says nothing
+about us having freed the ENGINE'S.
+
+### The fix, unbuilt
+
+Null the four mirrored fields on our context BEFORE our DrawContextManager is disposed, so
+its dispose chain cannot reach objects we do not own. That needs a teardown hook ordered
+strictly before the DC dispose. Getting that order wrong is another crash, so it is not
+something to attempt at the end of a session with four CTDs in it.
+
+### The lesson, which outlives the feature
+
+**Sharing a reference INTO an object you will later dispose makes you the owner of something
+you did not allocate.** Borrowing read-only state is safe only if the borrower's lifetime is
+strictly shorter AND its teardown cannot touch what it borrowed. Ours satisfied the first
+and violated the second.
+
+Every other shared object on this route is shared the other way round: we hand our resources
+to nobody, and we read the engine's without holding them past a frame. `DirectionalLightShadow-
+Resources` is shared read-only and never disposed by us; the flare definitions were the first
+time we stored an engine-owned GPU resource in a field of an object we destroy. That is the
+pattern to look for before sharing anything else.
+
+## Goal 4.4 own probes: IMPLEMENTED, NEVER EXERCISED
+
+The code is in and builds — own `EnvironmentProbeManager` (ctor allocates nothing, verified),
+swapped per render, our own `EnvProbesToUpdate` filled from our own `PrepareProbes()`, stage 2
+force-run on `_probeState > 0` rather than on the config flag, and `DisposeTextures` on Reset
+so a hot reload cannot leak eight cube textures (Rule 10).
+
+It was enabled once and **never got to run**: the flares CTD above killed the game during the
+pause that preceded it, so the config carrying `wholeSceneOwnProbes = 1` was never loaded.
+Left at 0. It also inherits a suspicion from the flares bug and should be re-read against it
+before enabling — but note the difference: our probe manager's textures are ones IT allocates
+in `RecreateProbes`, so disposing them is correct ownership, not a borrowed-resource free.
+The `ProbeSettings.Enable` coupling is enforced in code rather than left to the config, since
+scoping it off would silently make the whole feature a no-op.
+
+Next session, in order: fix the flares lifetime bug (it is the smaller, better-understood of
+the two), then exercise probes on a clean launch with nothing else changing.
