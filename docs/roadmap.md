@@ -517,3 +517,117 @@ long enough for scene load to build.
   before multiple feeds run, because N feeds multiply resident footprint.
 
 Grade the TAIL (p95, >50 ms) and total fps, not p50 — p50 hid this the first time.
+
+## Goal 4.2 DONE via supersampling — and THE STALE-RESOLUTION BUG (2026-07-29)
+
+AA is solved, by none of the three routes originally planned. FXAA crashed the game, FSR was
+argued down, and supersampling won on cost, quality and risk at once. Settled at
+`wholeSceneWidth/Height = 1024` — 4x supersampling into the 512x512 panel.
+
+The supersampling path needed NO new code. `CameraRender.cs:549` already names the full
+SOURCE rect so the CopyJob blit SCALES to the panel instead of cropping (leaving it null
+copies the top-left quadrant 1:1 — the "feed zoomed into the top left" symptom someone had
+already hit and fixed). And the LDR ring is sized from `_feedTexture.Resolution` — the
+PANEL's 512 — not from our render, so the chain already supported a larger source:
+
+    our render 1024 -> FinalLDR 1024 -> [CopyJob, filtered scale] -> ring 512 -> [raw copy] -> panel 512
+
+### THE BUG THAT ALMOST BECAME A WRONG CONCLUSION
+
+`CameraRender._wsResolution` was built ONCE behind `if (_wsResolution == null)` and was NOT
+cleared in `Reset()`, so it survived every config change, gate cycle and hot reload. It is
+stamped into the camera CB's `Screen.Resolution` / `PrevResolution`, and every shader turns
+that into `ScreenToUV() = rcp(Screen_.Resolution)` — so the entire render came out scaled by
+the ratio between the stale value and the real one.
+
+Symptoms at a 1024 render with 768 still cached (1.33x out per axis), all user-confirmed:
+planet atmospheres misaligned with their planets, and "objects rotating in non-recurring
+patterns". `StampScreenResolution`'s own comment had predicted them verbatim years of
+debugging earlier: "the sky being far too zoomed and rotating far too fast", plus mis-scaled
+view vectors, specular response and depth-based dimming.
+
+**The proof, and it is worth keeping because it is unusually clean:**
+
+    19:54:37  Camera CB: Screen.Resolution {X:1024 Y:1024} -> {X:768 Y:768}     <- WE corrupted it
+    19:58:15  Camera CB: Screen.Resolution {X:1024 Y:1024} -> {X:1024 Y:1024}   <- after the fix
+
+The engine's incoming value was ALREADY 1024. Our stale cache was overwriting a correct
+value with a wrong one. (Note this also dates the original comment: it says "the engine's
+value is the player's screen", which was true on the probe route but is no longer true here
+— our own ScreenBuffers reports our resolution. The stamp is now near-redundant except for
+PrevResolution and JitterUVDelta.)
+
+Fix: `_wsResolution = null; _wsRenderView = null;` in `CameraRender.Reset()`.
+
+### THE METHODOLOGICAL LESSON, which is the real value here
+
+I concluded and stated confidently that "1024 is genuinely broken" and "768 is the sweet
+spot". **Both were false.** The reasoning failed like this:
+
+- 512 looked clean. 768 looked clean. 1024 looked broken. Resolution appeared to be the
+  variable.
+- But 512 and 768 had each been the value at GAME LAUNCH, while 1024 was only ever set
+  LIVE. The real variable was "does the cache agree with the config", not the resolution.
+- Reverting to 768 "fixed" it — which felt like confirmation, and was pure coincidence:
+  768 was simply what the static already held.
+
+**A stale cache that happens to agree with the config is indistinguishable from a correct
+one.** It only reveals itself when the config moves. And a revert that appears to confirm a
+hypothesis is worthless if the revert also restores the confounder.
+
+Two corollaries that outlive this bug:
+
+1. **Live config changes had been silently broken for as long as that cache existed.** Every
+   "no issues" verdict from a live resolution change was unreliable.
+2. **Counters do not validate images.** Throughout the broken period, PERF, secondRenders,
+   copies, the park counter, VRAM and the error count all read perfectly healthy while the
+   render was geometrically wrong. Only the user's eyes and one log line caught it.
+
+### THE MEASUREMENT: pixels are free, up to a VRAM wall
+
+| render res | fps | ours p50 | p95 | CPU submit | >50ms | VRAM on rebuild |
+|---|---|---|---|---|---|---|
+| 512 | 51.6 | 19.1 | 19.5 | 2.0 | 0 | — |
+| 768 (2.25x px) | 51.9-58.5 | 17.3-19.2 | 19.2-21.4 | 1.9-2.0 | 0 | — |
+| **1024 (4x px)** | **53.6-55.7** | **18.0** | **19.6** | **1.9** | **0** | **+139MB** |
+| 2048 (16x px) | 46.0-50.8 | 19.9-21.1 | 21.9-23.7 | 1.9 | **1 per window** | **+610MB** |
+
+512 -> 1024 is FREE: four times the pixels, nothing moved, CPU submit if anything down.
+Rule 9 confirmed at 4x — the route's cost is the second whole-scene CULL AND COMMAND BUILD,
+not pixel shading.
+
+2048 is the first resolution that costs: ~5-8 fps, and `>50ms` stopped being zero. CPU submit
+stayed flat at 1.9ms, so it is NOT a shading wall — it is VRAM. The tell is VRAM continuing
+to FALL after the +610MB spike (-280, -44, -33MB) while it settled: eviction churn, the
+allocator pushing things out to fit our buffers. That is the same mechanism as the
+GPU-starvation drift, and a persistent `>50ms=1` is what its early stage looks like. Also a
+373ms frame and a 294ms CPU submit spike during the rebuild itself.
+
+Settled on 1024: free, zero frames over 50ms, and user-confirmed visually
+indistinguishable from 2048. Expected, since 2048 into a 512 panel discards fifteen
+sixteenths of its samples.
+
+Hard ceiling worth knowing: the pool key `MaxResolution` is 3840x2160, so 2048x2048 fits but
+4096 would exceed it on Y and fail rather than merely cost.
+
+### Consequences beyond AA
+
+- **Resolution is a free quality knob** up to ~4x the panel, bounded by VRAM not shading.
+- **FSR was never worth the risk.** Its entire optimisation targets pixel cost — the one
+  thing we do not pay. Own-FSR would have been a large pile of GPU-resource creation (async
+  PSO init, `CreateRWRenderTargetTexture`, `TryCreateContext`) aimed at a bottleneck we do
+  not have. It is what the user originally asked for; declining it was correct.
+- **Multi-feed budgeting (goal 3) gets its real input.** N feeds multiply CULL AND SUBMIT,
+  not pixels. But N feeds at 4x supersampling each DO multiply VRAM, and 2048 showed where
+  that wall is. Budget VRAM, schedule submit.
+- **The perf lever remains draw count**: LOD bias for our view, tighter culling, far clip
+  below 2500.
+
+### Known cosmetic debt introduced by all this
+
+Two log strings now hardcode 512 and print it regardless of the real value:
+`WholeSceneRender`'s "FinalLDR resized ... now upscales 512->512", and CameraRender's
+"shaders now read ... 512x512 Screen.Resolution". The NUMBERS in the FinalLDR line are
+correct; only the prose is stale. The trustworthy lines are `Feed blit identity` and
+`Camera CB: Screen.Resolution`. Worth fixing — misleading log text is how the ghost hunt
+lost a day.

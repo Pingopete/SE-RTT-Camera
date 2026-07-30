@@ -83,6 +83,34 @@ internal static class CameraRender
         // the failure mode that has wasted the most time on this project.
         _screenResLog = null;
         _cbRenderView = null; _miCreateNonjittered = _miRvSetCamera = _miRvSetResolution = null;
+
+        // THE CACHED RENDER RESOLUTION, and it must die here. Built once from
+        // FeedConfig.WholeSceneWidth/Height behind an `if (_wsResolution == null)`, it used
+        // to survive every config change, gate cycle and hot reload — so a LIVE resolution
+        // change resized ScreenBuffers and FinalLDR while the camera CB kept stamping the
+        // OLD value into Screen.Resolution / PrevResolution.
+        //
+        // Every shader turns that into ScreenToUV() = rcp(Screen_.Resolution), so the whole
+        // render came out scaled by the ratio between the two: 768 stamped into a 1024
+        // render is 1.33x out in each axis. Symptoms, all user-confirmed 2026-07-29 and all
+        // predicted verbatim by StampScreenResolution's own comment: planet atmospheres
+        // misaligned with their planets, and "objects rotating in non-recurring patterns"
+        // (that comment says "the sky being far too zoomed and rotating far too fast", plus
+        // mis-scaled view vectors, specular response and depth-based dimming).
+        //
+        // It cost a wrong conclusion, which is the real lesson. 512 and 768 both looked
+        // CLEAN and 1024 looked BROKEN, so resolution appeared to be the variable — but 512
+        // and 768 had each been the value at GAME LAUNCH, and 1024 was only ever set live.
+        // Reverting to 768 "fixed" it purely because 768 was what this static already held.
+        // A stale cache that happens to agree with the config is indistinguishable from a
+        // correct one; it only shows up when the config moves.
+        //
+        // _wsRenderView goes too. Its resolution is re-set from _wsResolution on every
+        // build, so it is not independently stale today — but it is the same
+        // built-once-and-kept object, and _miRvSetResolution (the setter used on it) IS
+        // cleared on the line above, which is exactly the kind of half-cleared pair that
+        // produced this bug.
+        _wsResolution = null; _wsRenderView = null;
         _fullCbBlocked = _fullCbLogged = false;
         // Previous-camera history must not survive a reload: the orbit may have been
         // rebuilt, and a stale "previous" is worse than none — it reprojects into a view
