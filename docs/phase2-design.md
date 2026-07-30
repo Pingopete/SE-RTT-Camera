@@ -400,3 +400,73 @@ pattern wholesale rather than inheriting the render-thread one.
 Classification correction: `wholeSceneOwnProbes` is class (c)/rebuild-bound in practice
 until the deferred disposal is proven, and the knob-class table's "(a) suspected" entries
 are now demonstrably worth testing individually rather than trusting.
+
+### CORRECTION, 2026-07-30 evening — the deferred disposal did NOT hold
+
+The section above ends by proposing deferred disposal as the fix and recommending phase C
+adopt it "wholesale". **Both of those are superseded.** Leaving them as the last word would
+send phase C down a route that has already been disproven twice, so:
+
+Attempt 2 (defer the dispose to the LCD tick) **crashed identically** — same DRED, same null
+bind in the player's culling pass. So did attempt 3. The conclusion that survived:
+
+> **Off the render thread is NOT the same as outside a frame.** The LCD tick runs while the
+> render thread is rendering. There is no safe moment to free these while the renderer is live.
+
+The probe manager is therefore **KEPT**, permanently, and both `_probesPendingDispose` and
+`DisposePendingProbes()` were deleted during the C1 static inventory — the slot had had no
+writer since attempt 3, so the drain ran every tick and found null every time. Dead code that
+documents a live safety mechanism is worse than no code: it claimed the cube textures were
+being reclaimed off the render thread, which is the opposite of the rule that actually holds.
+
+Attempt 2 was not worthless — it found and fixed a real, separate, and long-latent bug: `Reset()`
+running INSIDE our render (via `FeedConfig.Poll`) and nulling the very statics every `finally`
+block needs to restore the engine's objects. That fix is kept. It is also why attempt 3 arrived
+with a clean mod log and nothing left to blame, which is what forced the right conclusion.
+
+**What phase C should actually inherit:** not deferred disposal, but the rule that a live
+renderer has no safe teardown window at all. Per-instance teardown frees only at gate shutdown,
+with the feed already dormant.
+
+## Phase C1b — where the pump sets the ambient instance
+
+Written 2026-07-30 while C2 soaked. C1a moved the state; C1b decides *whose* state a given hook
+call refers to. Mapping the ten entry points first, because the answer is not uniform and
+assuming it was would have produced a rotation-driven design that cannot work.
+
+**The hooks split three ways, by what determines the feed — and only one of them is the
+scheduler's choice:**
+
+| driver | hooks | how the feed is chosen |
+|---|---|---|
+| **panel-driven** (game thread) | `BlitProbe.OnTick`, `CameraFeed.OnLcdTick`, `StatsPanel.OnLcdTick`, `BlitProbe.OnPanelRender`, `PanelBinding.OnPanelRender` | the ENGINE hands us a specific LCD component / renderer / surface context. The feed is whichever one owns that panel: a **lookup**, not a rotation |
+| **target-driven** (render thread) | `FeedHandover.OnOffscreenUiDraw` | the engine hands us the offscreen target being drawn. Feed = whoever owns that target: also a **lookup** |
+| **scheduler-driven** (render thread) | `WholeSceneRender.OnWholeScene` / `OnWholeSceneEarly` / `ShouldSkipStage`, `ScenePassHook.OnSceneDraw` -> `CameraRender.OnProbePass` / `CaptureBaseView` | nothing external names a feed. WE choose which one renders this engine frame — this is the render **slot** of phase E1 |
+
+**This is the structural finding, and it changes C1b's shape.** The obvious reading of "one
+global render-thread pump" is a loop that rotates over feeds and does each one's work. That is
+right for the third row and WRONG for the first two: the engine drives those, per panel, on its
+own schedule, and a rotation would hand panel A's tick to feed B. So C1b needs both:
+
+1. **A registry lookup** — panel/surface/target identity -> `FeedInstance`. `CameraFeed`
+   already has the raw material (`_targetSurfaces`, a reference-identity `HashSet`); it becomes
+   a map to the owning instance instead of a membership test. Same for `FeedHandover`'s
+   parked-target matching.
+2. **A scheduler pick** — one feed per engine frame, strict rotation. This is E1's slot arriving
+   early, which is fine: C3's "simple alternator" IS this with N=2.
+
+Both then set `Feeds.Cur` and restore it in a `finally`. `Cur` becomes `[ThreadStatic]`, which is
+where that attribute stops being decorative: the LCD tick can legitimately be on feed A while
+the render thread is on feed B, at the same instant. C1a deliberately has no such window —
+`Cur` is a constant and both threads see one object — which is exactly why parity is graded
+before this lands rather than after.
+
+**Two hazards to carry in, both already paid for once:**
+
+- `ShouldSkipStage` is called from deep inside the nested `Draw`, on the render thread, with no
+  arguments identifying a feed. It MUST read the ambient rather than take a parameter, and the
+  ambient must still be set — so the scheduler's `finally` has to outlive the whole nested Draw.
+- `Reset()` and the deferred-reset guard (`_resetPending`) are currently global. With N feeds,
+  "reset" becomes per-instance, and the guard's question changes from "are we inside our render"
+  to "are we inside THIS instance's render". The bug that guard fixes — nulling statics an
+  in-flight `finally` still needs — gets strictly worse with more instances, not better.
