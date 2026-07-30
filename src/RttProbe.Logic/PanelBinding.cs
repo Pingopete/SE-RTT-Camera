@@ -76,6 +76,7 @@ internal static class PanelBinding
             // nothing. "Disarmed" has to mean disarmed, or the safety model is worthless
             // the one time it matters.
             ApplyEmissivity(ctx);
+            ApplyFsrMask(ctx);
 
             if (_bound) return;
 
@@ -116,6 +117,27 @@ internal static class PanelBinding
     // feed gate goes dormant, so a mod-free comparison really is mod-free.
     public static void RestoreEngineState()
     {
+        // The FSR mask goes back first, and on its own terms: it is a SEPARATE property on
+        // the same shared material, so an early-out on the emissivity trio would have left
+        // every LCD in the world permanently marked FSR-reactive after the gate went
+        // dormant — which would silently invalidate exactly the mod-free comparison this
+        // method exists to make honest.
+        if (_stockFsrMask != null && _fsrMaskMaterial != null && _fsrMaskProp != null)
+        {
+            try
+            {
+                _fsrMaskProp.SetValue(_fsrMaskMaterial, _stockFsrMask);
+                RttLog.Line($"Panel material: FSRMaskAmount restored to the stock {_stockFsrMask}.");
+            }
+            catch (Exception e) { RttLog.Error("restore panel FSR mask", e); }
+            finally
+            {
+                _stockFsrMask = _fsrMaskMaterial = null;
+                _fsrMaskProp = null; _fsrFramesField = null;
+                _fsrMaskBlocked = _fsrMaskLogged = false;
+            }
+        }
+
         if (_stockEmissivity == null || _emissiveMaterial == null || _emissiveProp == null) return;
         try
         {
@@ -129,6 +151,104 @@ internal static class PanelBinding
             _emissiveProp = null;
             _emissivityApplied = double.NaN;   // so it re-applies cleanly on restart
         }
+    }
+
+    // THE FSR REACTIVE MASK — the fix for the accumulating star-smear on the panel.
+    //
+    // Symptom, reported after months of living with it: at close range the feed looks
+    // sharp, but the further the player stands back the more the stars smear ALONG their
+    // apparent path; moving the player briefly cleans it up, and standing still lets it
+    // build again. Everything on the panel gets it — stars just show it most.
+    //
+    // It is the player's FSR accumulating temporal history over a surface it believes is
+    // static. The engine already has the answer and we were bypassing it:
+    //
+    //   RebuildSurfaceContent (content changed):  ScreenMaterial.FSRMaskAmount = 1f
+    //                                             ctx.FsrMaskFramesRemaining  = 5
+    //   TickFsrMask (once per frame, per surface): if (remaining > 0) { remaining--;
+    //                                                if (remaining == 0) FSRMaskAmount = 0f; }
+    //
+    // FSRMaskAmount writes the panel into FSR's REACTIVE mask, which tells FSR "these
+    // pixels change independently of their motion vectors — do not trust history here".
+    // Our feed replaces the panel's content EVERY frame but never goes through
+    // RebuildSurfaceContent, so nothing ever arms it: the amount sits at 0 forever and FSR
+    // blends our changing image with reprojected old frames. Distance-dependent because
+    // FSR leans harder on history the fewer screen pixels the panel covers, and player
+    // motion perturbs the history, which is exactly the reported behaviour.
+    //
+    // Re-armed on EVERY panel tick rather than once. Our postfix runs after TickFsrMask has
+    // already decremented and possibly zeroed, so a one-shot write would be undone; setting
+    // it every tick means we always win that race.
+    //
+    // SHARED-MATERIAL CAVEAT, stated because it is a real cost and not hypothetical:
+    // LCDMaterialDefinition is shared by every panel in the world (see ApplyEmissivity), so
+    // FSRMaskAmount = 1 marks ALL LCD panels reactive, not only ours. For the others that
+    // means FSR stops accumulating history on their surfaces — slightly noisier text, no
+    // correctness problem. The stock value is captured and restored on shutdown exactly as
+    // emissivity is, so vanilla behaviour returns when the mod goes dormant.
+    private static object _stockFsrMask;
+    private static object _fsrMaskMaterial;
+    private static PropertyInfo _fsrMaskProp;
+    private static FieldInfo _fsrFramesField;
+    private static bool _fsrMaskBlocked, _fsrMaskLogged;
+
+    private static void ApplyFsrMask(object ctx)
+    {
+        if (_fsrMaskBlocked || !FeedConfig.PanelFsrMask) return;
+        try
+        {
+            var material = Prop(ctx, "ScreenMaterial");
+            if (_fsrMaskProp == null)
+            {
+                _fsrMaskProp = material?.GetType().GetProperty("FSRMaskAmount", Any);
+                if (_fsrMaskProp == null || !_fsrMaskProp.CanWrite)
+                {
+                    _fsrMaskBlocked = true;
+                    RttLog.Line("FSR mask: FSRMaskAmount not settable on " +
+                                (material?.GetType().Name ?? "<no ScreenMaterial>") +
+                                " — the panel cannot be marked FSR-reactive, so expect temporal " +
+                                "smearing on the feed at distance when the player's AA is FSR.");
+                    return;
+                }
+                _stockFsrMask = _fsrMaskProp.GetValue(material);
+                _fsrMaskMaterial = material;
+            }
+
+            _fsrFramesField ??= ctx.GetType().GetField("FsrMaskFramesRemaining", Any);
+
+            // Write the MATERIAL property only when it is not already 1, and re-arm the
+            // plain int field every tick.
+            //
+            // The first version set both every tick. That is ~30 writes/sec to a property on
+            // a shared material DEFINITION, where the engine writes it about twice per
+            // content change — and this project has already lost a build to exactly that
+            // shape (the planet-env rebuild's attempt 2 died of descriptor churn from
+            // re-registering tables 20x/sec). It was not the cause of the 2026-07-29 CTD —
+            // that was the flares pass — but it is unnecessary risk for no benefit.
+            //
+            // Re-arming the counter is what actually keeps the mask alive: TickFsrMask only
+            // zeroes FSRMaskAmount when the countdown REACHES zero, so a counter that never
+            // reaches zero means the amount never needs rewriting. The field is a plain int
+            // on a per-surface context object — no setter logic, no material involvement.
+            var current = _fsrMaskProp.GetValue(material);
+            if (!(current is float f && f == 1f)) _fsrMaskProp.SetValue(material, 1f);
+            _fsrFramesField?.SetValue(ctx, 5);   // the engine's own re-arm value
+
+            if (!_fsrMaskLogged)
+            {
+                _fsrMaskLogged = true;
+                RttLog.Line($"FSR mask: {material.GetType().Name}.FSRMaskAmount held at 1 and " +
+                            $"FsrMaskFramesRemaining re-armed to 5 every panel tick (stock was " +
+                            $"{_stockFsrMask}). The panel is now in FSR's reactive mask, so the " +
+                            "player's upscaler stops accumulating history over our per-frame " +
+                            "content — this is the accumulating star-smear fix." +
+                            (_fsrFramesField == null
+                                ? " WARNING: FsrMaskFramesRemaining not found, so TickFsrMask will " +
+                                  "zero the amount and the fix will only half work."
+                                : ""));
+            }
+        }
+        catch (Exception e) { _fsrMaskBlocked = true; RttLog.Error("apply FSR mask", e); }
     }
 
     private static void ApplyEmissivity(object ctx)

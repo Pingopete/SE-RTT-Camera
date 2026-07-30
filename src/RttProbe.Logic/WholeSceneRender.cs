@@ -298,6 +298,10 @@ internal static class WholeSceneRender
         _ourDrawContexts = null;
         _ourFreshShadowResources = null;
         _ourFreshFlares = null;
+        // Same class of latch as everything else cleared here: a surviving _engineFlares
+        // would point at a disposed context after a rebuild, and a surviving
+        // _flareMirrorLogged would swallow the log line that proves the mirror took.
+        _engineFlares = null; _flareMirrorLogged = false; _flaresReady = false;
         _dcBuilt = false;
         _dcField = null;
         _cascFld = _charCascFld = null;
@@ -417,6 +421,35 @@ internal static class WholeSceneRender
                             "means rendering into them; drop 3 from wholeSceneSkipStages.");
             return false;
         }
+
+        // Stage 21 and wholeSceneOwnFlares are the same kind of pair. Owning the
+        // FlaresContext is pointless if RenderFlares never runs, and the ONLY reason 21 is
+        // in the default skip list is that we used to install the ENGINE'S context — where
+        // running the pass would have advanced the player's occlusion readback twice a
+        // frame. With our own context installed that hazard is gone, so refuse the skip
+        // rather than let a stale skip list silently produce "own flares, no flares".
+        // _flaresReady, NOT the config flag. See the comment on _flaresReady: force-running
+        // this on intent alone dereferenced a null _flaresBuffer and took the game down.
+        if (id == 21 && FeedConfig.WholeSceneOwnFlares && _flaresReady)
+        {
+            if (Array.IndexOf(stages, 21) >= 0 && _skippedLogged.Add(-21))
+                RttLog.Line("Whole-scene: stage 21 (RenderFlares) is in the skip list but " +
+                            "wholeSceneOwnFlares is on and our FlaresContext has a definition " +
+                            "buffer — running it anyway. The skip existed only because we shared " +
+                            "the engine's context; we now own ours, so the readback we advance is " +
+                            "our own. Drop 21 from wholeSceneSkipStages.");
+            return false;
+        }
+
+        // Own-flares requested but our context is not ready. Say so ONCE and fall through to
+        // the skip list, which keeps 21 skipped. Silence here is what turned a missing buffer
+        // into a crash.
+        if (id == 21 && FeedConfig.WholeSceneOwnFlares && !_flaresReady && _skippedLogged.Add(-121))
+            RttLog.Line("Whole-scene: wholeSceneOwnFlares is on but our FlaresContext has no " +
+                        "_flaresBuffer yet — stage 21 stays SKIPPED this render rather than " +
+                        "dereferencing null in GetFlareConstants. Normal for the first renders " +
+                        "after a reload or rebuild; if it never clears, the definition mirror is " +
+                        "failing and the feed will simply have no flares.");
 
         for (int i = 0; i < stages.Length; i++)
             if (stages[i] == id)
@@ -713,6 +746,11 @@ internal static class WholeSceneRender
                         }
                     }
                 }
+
+                // Re-share the flare DEFINITIONS every render (goal 4.3). Cheap — four
+                // reference assignments — and it is what keeps a replaced _flaresBuffer from
+                // leaving the feed permanently stale. No-op unless wholeSceneOwnFlares is on.
+                if (FeedConfig.WholeSceneOwnFlares) MirrorFlareDefinitions();
 
                 ScopeSharedState();
                 if (FeedConfig.WholeSceneCamera) camSwapped = InstallCamera(out savedCam);
@@ -1784,6 +1822,10 @@ internal static class WholeSceneRender
             // by CreateInitialContexts and never given a single definition, because
             // registration goes through the global and the global belongs to the engine
             // whenever a light is actually created. So the feed loses nothing it had.
+            // With wholeSceneOwnFlares ON we take the other route: keep OUR context and
+            // share only its DEFINITION members, so the feed gets real flares while the
+            // player's occlusion readback stays ours-proof. See FeedConfig.WholeSceneOwnFlares
+            // for the full offline verification and the one bounded risk.
             var flareProp = t.GetProperty("LensFlares", Any);
             string flareState = "NOT shared — LensFlares unreachable, flare registration during our " +
                                 "render window still lands in our empty context";
@@ -1791,11 +1833,28 @@ internal static class WholeSceneRender
             {
                 _ourFreshFlares = flareProp.GetValue(_ourDrawContexts);
                 var engineFlares = flareProp.GetValue(engineDc);
-                flareProp.SetValue(_ourDrawContexts, engineFlares);
-                flareState = ReferenceEquals(flareProp.GetValue(_ourDrawContexts), engineFlares)
-                    ? "SHARED from the engine (registration cannot land in the wrong context; " +
-                      "stage 21 keeps us from advancing its occlusion readback)"
-                    : "SHARE FAILED — the property did not take the engine's context";
+
+                if (FeedConfig.WholeSceneOwnFlares)
+                {
+                    // Ours stays installed. Remember the engine's so MirrorFlareDefinitions
+                    // can re-read the definition members before every render.
+                    _engineFlares = engineFlares;
+                    int copied = MirrorFlareDefinitions();
+                    flareState = _ourFreshFlares == null
+                        ? "OWN FLARES REQUESTED but our context is null — falling back to none"
+                        : $"OURS, with {copied}/{FlareDefFields.Length} definition members shared from the " +
+                          "engine (stage 21 now RUNS: the feed renders flares against our own " +
+                          "occlusion buffers, so the player's readback is never advanced by us)";
+                }
+                else
+                {
+                    flareProp.SetValue(_ourDrawContexts, engineFlares);
+                    _engineFlares = null;
+                    flareState = ReferenceEquals(flareProp.GetValue(_ourDrawContexts), engineFlares)
+                        ? "SHARED from the engine (registration cannot land in the wrong context; " +
+                          "stage 21 keeps us from advancing its occlusion readback)"
+                        : "SHARE FAILED — the property did not take the engine's context";
+                }
             }
 
             RttLog.Line("Whole-scene: SECOND DrawContextManager built — its ctor runs " +
@@ -1811,6 +1870,91 @@ internal static class WholeSceneRender
                         " LensFlares " + flareState + ".");
         }
         catch (Exception e) { RttLog.Error("build second DrawContextManager", e); }
+    }
+
+    // ---- OWN FLARES CONTEXT, SHARED DEFINITIONS (goal 4.3) ----------------------------
+    //
+    // The four members that carry WHAT the flares are, as opposed to the per-frame state of
+    // drawing them. Verified with EngineQuery to be written only by FlaresContext..ctor and
+    // UpdateFlaresBuffer, neither of which is in the render path — so pointing ours at the
+    // engine's cannot be mutated by our own render.
+    private static readonly string[] FlareDefFields =
+    {
+        "_flaresByGuid",               // Dictionary<Guid, FlareHandle> — the registry
+        "_texturePinsByGuid",          // Dictionary<Guid, (ManagedTexturePin, int)>
+        "_flaresBuffer",               // IManagedROBuffer — the GPU definition buffer (RO)
+        "_flareDefinitionsAllocator",  // SimpleIndexAllocator — index -> buffer slot
+    };
+
+    private static object _engineFlares;
+    private static bool _flareMirrorLogged;
+
+    // THE INVARIANT THAT WAS MISSING, and it cost a CTD on 2026-07-29.
+    //
+    // Stage 21 was force-run on FeedConfig.WholeSceneOwnFlares alone, while
+    // MirrorFlareDefinitions returns 0 SILENTLY whenever either context is null. A hot
+    // reload nulls both statics in Reset(), the next render force-ran RenderFlares before
+    // the DrawContextManager rebuild had re-established them, and FlaresContext.
+    // GetFlareConstants dereferenced a null _flaresBuffer:
+    //
+    //     NullReferenceException at FlaresContext.GetFlareConstants()
+    //       at FlaresOcclusionJob.DoWork -> RenderFlares_Patch1 -> Draw_Patch1
+    //
+    // "Own the context" and "run the pass" are one decision, not two, and the config flag
+    // only expresses the INTENT. This flag expresses the FACT: our context really does have
+    // a flare definition buffer right now. Stage 21 consults this, so a mirror that fails
+    // for any reason degrades to the old behaviour — no flares in the feed — instead of
+    // taking the process down.
+    private static bool _flaresReady;
+
+    // Re-read the definition members from the engine's context into ours. Called before
+    // EVERY render, not once at build time, deliberately: UpdateFlaresBuffer REPLACES
+    // _flaresBuffer on whichever context is installed, so a one-shot copy could go stale
+    // and stay stale. Re-reading makes the worst case "one frame behind", not "wrong
+    // forever". Returns how many members were successfully shared.
+    private static int MirrorFlareDefinitions()
+    {
+        _flaresReady = false;
+        if (_engineFlares == null || _ourFreshFlares == null) return 0;
+        int copied = 0;
+        var missing = new List<string>();
+        try
+        {
+            var ft = _ourFreshFlares.GetType();
+            foreach (var name in FlareDefFields)
+            {
+                var f = ft.GetField(name, Any);
+                if (f == null) { missing.Add(name); continue; }
+                f.SetValue(_ourFreshFlares, f.GetValue(_engineFlares));
+                copied++;
+            }
+
+            // The one field the flare pass CANNOT tolerate as null: GetFlareConstants does
+            // `_flaresBuffer.GPUBufferId` unguarded. Note it is legitimately null on the
+            // ENGINE'S context too until the first AddFlare/UpdateFlare, so this is a real
+            // runtime state and not only a mirror failure — which is exactly why the check
+            // belongs here, on every render, rather than once at build time.
+            var bufField = ft.GetField("_flaresBuffer", Any);
+            _flaresReady = bufField != null && bufField.GetValue(_ourFreshFlares) != null;
+        }
+        catch (Exception e)
+        {
+            _flaresReady = false;
+            if (!_flareMirrorLogged) { _flareMirrorLogged = true; RttLog.Error("mirror flare definitions", e); }
+            return copied;
+        }
+
+        // Name the missing member rather than failing silently — a renamed private field is
+        // the likeliest way this breaks on a game update, and "no flares in the feed" with
+        // no explanation is the worst possible symptom.
+        if (missing.Count > 0 && !_flareMirrorLogged)
+        {
+            _flareMirrorLogged = true;
+            RttLog.Line("Whole-scene flares: could not find FlaresContext member(s) [" +
+                        string.Join(", ", missing) + "] — the feed's flare definitions will be " +
+                        "incomplete. Field names likely changed; re-check with tools/EngineQuery.");
+        }
+        return copied;
     }
 
     private static FieldInfo _dcField;

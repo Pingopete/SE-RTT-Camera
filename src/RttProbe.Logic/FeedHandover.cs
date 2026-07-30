@@ -414,7 +414,25 @@ internal static class FeedHandover
             if (FeedConfig.SrcTransition) TransitionForCopy(commandList, frame, forSource: true);
             if (FeedConfig.DestTransition) TransitionForCopy(commandList, dest, forSource: false);
 
-            mi.Invoke(commandList, _copyArgs(dest, frame));
+            // Build the SOURCE's mip chain before copying, then copy every level.
+            //
+            // The panel's own texture is an ROTexture, so mips cannot be generated on it
+            // directly — which is why DrawOne generates them on a borrowed RW texture and
+            // copies the whole resource in. Our LDR ring targets ARE pool
+            // RWRenderTargetTextures, so the same trick works on them, using the very
+            // MipMapJob instance DrawOne just used for this target.
+            int levels = (FeedConfig.PanelMipRegen && RegenerateMips(args, frame, commandList))
+                ? CameraRender.LdrMips
+                : 1;
+
+            // Level-by-level with the SAME call that has been copying mip 0 all along.
+            // CopyResource would move the whole chain in one go — it is what DrawOne uses —
+            // but this path has a device removal on its record from a mip-count mismatch,
+            // and there is nothing to gain: ten subresource copies of a 512x512 chain is
+            // noise next to the render that produced the image.
+            for (int level = 0; level < levels; level++)
+                mi.Invoke(commandList, _copyArgs(dest, frame, level));
+
             _handovers++;
             _copiesInterval++;
 
@@ -561,7 +579,136 @@ internal static class FeedHandover
     // Mip 0 is what the panel samples at the range this is tested from; mips 1..9
     // keep whatever DrawOne's own mip generation left there.
     private static MethodInfo _miCopy;
-    private static Func<object, object, object[]> _copyArgs;
+    // (dest, source, mipLevel) -> the resolved copy call's argument array.
+    private static Func<object, object, int, object[]> _copyArgs;
+
+    // True only when the resolved copy addresses source and destination subresources
+    // independently. Without it, filling anything but mip 0 is not expressible.
+    private static bool CopyPerLevel;
+
+    // ---- MIP REGENERATION ---------------------------------------------------------------
+    //
+    // THE PROBLEM. CopyTextureSubresource writes ONE subresource, so our handover fills mip
+    // 0 and nothing else. The panel target has a full chain (10 levels at 512x512), and what
+    // sits in levels 1..N is whatever DrawOne left there — which is NOT a stale frame of our
+    // feed. DrawOne borrows an RWRenderTargetTexture from the POOL, clears it, draws the
+    // panel's UI batch, generates mips on that borrowed texture, and copies it to the panel.
+    // So levels 1..N carry the UI batch's content on a RECYCLED pool texture, and which
+    // recycled slot it is changes from frame to frame.
+    //
+    // Result: correct up close (mip 0), progressively wrong as the player backs away and
+    // trilinear filtering weights the higher levels — foreign, non-deterministic content,
+    // which the player's FSR then happily accumulates. That is the reported "stars smear
+    // along their motion path, worse the further back you stand, clears briefly when you
+    // move". The old comment on ResolveCopy conceded exactly this and scoped it away with
+    // "mip 0 is what the panel samples at the range this is tested from".
+    //
+    // THE FIX. Run the engine's own mip generator on the panel's texture immediately after
+    // our copy, so every level is a downsample of the frame we just delivered.
+    // OffscreenUIRenderer._mipMapJob is the very instance DrawOne used one call earlier for
+    // this same target, which is why the bootstrap appends __instance to the args: reusing
+    // it creates nothing (Rule 11), and it cannot collide with another system over its
+    // descriptor table the way borrowing CloudShadowJob's MipMapJob could have.
+    //
+    // Everything here fails SOFT. A missing renderer, job, texture, mip count or overload
+    // logs once and leaves the feed exactly as it was — correct up close, wrong at distance.
+    // That is the pre-existing behaviour, so a failure here can only decline to improve
+    // things, never break them. Written that way on purpose: this runs inside the UI stage's
+    // command recording, and a throw there is a dead game.
+    private static object _mipJob;
+    private static MethodInfo _miMipDoWork;
+    private static int _mipState;          // 0 = untried, 1 = ready, -1 = unavailable
+    private static bool _mipLogged;
+
+    private static bool RegenerateMips(object[] args, object source, object commandList)
+    {
+        if (_mipState < 0 || !CopyPerLevel || CameraRender.LdrMips <= 1 || source == null) return false;
+        try
+        {
+            // Pool borrows arrive as Borrowed<T>, and the copy path is happy with that
+            // because it converts implicitly to a view. MipMapJobExtensions wants the
+            // RESOURCE, so unwrap .Resource when it is there — the same unwrap CameraRender
+            // does for its blit source. Harmless when the object is already the resource.
+            source = Prop(source, "Resource") ?? source;
+            if (_mipState == 0)
+            {
+                // The renderer is appended to the args by the bootstrap. Absent on an older
+                // one, which is a normal state and not an error.
+                object renderer = null;
+                foreach (var a in args)
+                    if (a != null && a.GetType().Name.Contains("OffscreenUIRenderer")) { renderer = a; break; }
+
+                if (renderer == null)
+                {
+                    _mipState = -1;
+                    RttLog.Line("Panel mips: no OffscreenUIRenderer in the hook args — this bootstrap " +
+                                "does not pass __instance yet. RESTART THE GAME to adopt it. Until then " +
+                                "the panel's mips 1..N keep DrawOne's recycled pool content and the feed " +
+                                "will look wrong from a distance.");
+                    return false;
+                }
+
+                _mipJob = renderer.GetType()
+                    .GetField("_mipMapJob", BindingFlags.Instance | BindingFlags.NonPublic)
+                    ?.GetValue(renderer);
+                if (_mipJob == null)
+                {
+                    _mipState = -1;
+                    RttLog.Line("Panel mips: OffscreenUIRenderer._mipMapJob not found — field renamed? " +
+                                "Re-check with tools/EngineQuery. Distance appearance unchanged.");
+                    return false;
+                }
+
+                // MipMapJobExtensions.DoWork(MipMapJob, ComputeCommandList, <target>, int).
+                // Two overloads differing only in the target type; pick the one our SOURCE
+                // satisfies rather than guessing. The source is one of CameraRender's LDR
+                // ring targets — a pool RWRenderTargetTexture, which is exactly what these
+                // overloads want, and the reason the generation happens here rather than on
+                // the panel (whose own texture is read-only).
+                var ext = Type.GetType("Keen.VRage.Render12.PostProcessStage.MipMapJobExtensions, VRage.Render12");
+                _miMipDoWork = ext?.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                    .FirstOrDefault(m =>
+                    {
+                        if (m.Name != "DoWork") return false;
+                        var p = m.GetParameters();
+                        return p.Length == 4
+                            && p[1].ParameterType.IsInstanceOfType(commandList)
+                            && p[2].ParameterType.IsInstanceOfType(source)
+                            && p[3].ParameterType == typeof(int);
+                    });
+
+                if (_miMipDoWork == null)
+                {
+                    _mipState = -1;
+                    RttLog.Line($"Panel mips: no MipMapJobExtensions.DoWork overload accepts " +
+                                $"({commandList.GetType().Name}, {source.GetType().Name}, int). " +
+                                "Distance appearance unchanged.");
+                    return false;
+                }
+                _mipState = 1;
+            }
+
+            int levels = CameraRender.LdrMips;
+            _miMipDoWork.Invoke(null, new[] { _mipJob, commandList, source, (object)levels });
+
+            if (!_mipLogged)
+            {
+                _mipLogged = true;
+                RttLog.Line($"Panel mips: generating {levels - 1} level(s) below mip 0 on our LDR ring " +
+                            "target with the engine's own OffscreenUIRenderer._mipMapJob, then copying " +
+                            "every level to the panel. Before this, only mip 0 was ours and levels 1..N " +
+                            "held DrawOne's recycled pool content, so the panel was correct only at " +
+                            "close range.");
+            }
+            return true;
+        }
+        catch (Exception e)
+        {
+            _mipState = -1;   // one strike: never throw twice inside UI command recording
+            if (!_mipLogged) { _mipLogged = true; RttLog.Error("generate feed mips", e); }
+            return false;
+        }
+    }
 
     private static MethodInfo ResolveCopy(object commandList)
     {
@@ -569,28 +716,39 @@ internal static class FeedHandover
         var t = commandList.GetType();
 
         // CopyTextureSubresource(ICopyDestinationView dst, int dstSub, ICopySourceView src, int srcSub)
+        // The ONLY overload that addresses source and destination subresources
+        // independently, and therefore the only one that can fill a mip chain level by
+        // level. CopyPerLevel is what tells the caller that.
         var m = t.GetMethods(Any).FirstOrDefault(x => x.Name == "CopyTextureSubresource" && x.GetParameters().Length == 4);
         if (m != null)
         {
-            _copyArgs = (d, s) => new object[] { d, 0, s, 0 };
-            RttLog.Line("Handover: using CopyTextureSubresource(dst,0,src,0) — mip counts differ (dest 10, source 1).");
+            _copyArgs = (d, s, lv) => new object[] { d, lv, s, lv };
+            CopyPerLevel = true;
+            RttLog.Line("Handover: using CopyTextureSubresource(dst,N,src,N) — per-level, so the " +
+                        "panel's whole mip chain can be filled from ours.");
             return _miCopy = m;
         }
 
         // CopySubresource(ICopyDestinationView dst, ICopySourceView src, int srcSubOffset)
+        // One index only, so mip 0 is all this can safely address.
         m = t.GetMethods(Any).FirstOrDefault(x => x.Name == "CopySubresource" && x.GetParameters().Length == 3);
         if (m != null)
         {
-            _copyArgs = (d, s) => new object[] { d, s, 0 };
-            RttLog.Line("Handover: using CopySubresource(dst,src,0).");
+            _copyArgs = (d, s, lv) => new object[] { d, s, 0 };
+            CopyPerLevel = false;
+            RttLog.Line("Handover: using CopySubresource(dst,src,0) — mip 0 only, so the feed will " +
+                        "still look wrong at a distance.");
             return _miCopy = m;
         }
 
-        // Last resort, and known to be invalid across a mip-count mismatch.
+        // Last resort. Moves the whole resource in one call, which is what DrawOne uses —
+        // but a mip-count mismatch here is a device removal on this project's record, and
+        // per-level copying is available above, so this stays the fallback it always was.
         m = t.GetMethods(Any).FirstOrDefault(x => x.Name == "CopyResource" && x.GetParameters().Length == 2);
         if (m != null)
         {
-            _copyArgs = (d, s) => new object[] { d, s };
+            _copyArgs = (d, s, lv) => new object[] { d, s };
+            CopyPerLevel = false;
             RttLog.Line("Handover: falling back to CopyResource — INVALID if mip counts differ. Expect device removal.");
             return _miCopy = m;
         }

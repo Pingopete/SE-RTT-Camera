@@ -262,6 +262,70 @@ internal static class FeedConfig
     // aim. Twenty-six jobs read them, atmosphere and volumetrics included.
     public static bool WholeScenePlanetEnv { get; private set; }
 
+    // LENS FLARES IN THE FEED (roadmap goal 4.3). Default OFF — it changes which context
+    // receives flare REGISTRATION, and the conservative arrangement it replaces was put
+    // there deliberately.
+    //
+    // Today our render installs the ENGINE'S FlaresContext and skips stage 21. That is
+    // correct but gives the feed no flares at all: registration goes through the global
+    // (PointLightEntityComponent.Init / SetParameters / OnRemovedFromScene, the spot and
+    // particle equivalents, SceneManager.UpdateFlareDefinitions), so whichever context is
+    // installed receives it — and running RenderFlares against the shared context would
+    // advance ProcessFinishedFrame / PrepareReadback twice per frame and corrupt the
+    // player's flare occlusion.
+    //
+    // With this ON we keep OUR OWN FlaresContext installed and share only the four
+    // DEFINITION members from the engine's: _flaresByGuid, _texturePinsByGuid,
+    // _flaresBuffer and _flareDefinitionsAllocator. Verified offline with EngineQuery:
+    //
+    //   * those four are written ONLY by FlaresContext..ctor and UpdateFlaresBuffer —
+    //     neither is in the render path, so our render cannot mutate them;
+    //   * ProcessFinishedFrame and PrepareReadback touch ONLY _occlusionCounterBuffers,
+    //     _drawCommandsCounterBuffers, _occlusionCount, _instancesCount and
+    //     _flareDrawBuffersCapacity — all of which are then OURS, so the player's readback
+    //     is untouchable;
+    //   * the ctor allocates every RW buffer up front (CreateResizableRWBuffer x5 plus both
+    //     counter arrays sized from FrameSpanManager.ResourceSpanCount), so our context is
+    //     fully formed with no lazy path to trip over.
+    //
+    // KNOWN BOUNDED RISK. AddFlare / UpdateFlare / RemoveFlare call UpdateFlaresBuffer,
+    // which REPLACES _flaresBuffer on whichever context is installed. Those run from
+    // render-command-buffer replay, which happens before Draw and therefore outside our
+    // window — but that is inference, not proof. If one ever did land inside our window it
+    // would set OUR buffer and leave the engine's holding the previous one, so the player
+    // would be stale by one flare until the next registration. Degraded and self-healing,
+    // not broken. The definition members are re-read from the engine on EVERY render rather
+    // than copied once, so nothing accumulates.
+    //
+    // Forces stage 21 to run, the same way WholeSceneOwnShadows forces stage 3: owning the
+    // context is pointless if the pass that reads it never executes.
+    public static bool WholeSceneOwnFlares { get; private set; }
+
+    // Hold the tagged panel in FSR's REACTIVE mask. Default ON — it fixes a real, long-lived
+    // visual bug and the whole change is one float property plus one int field per tick.
+    //
+    // Without it the player's FSR accumulates temporal history over a surface whose content
+    // we replace every frame, because the engine only marks a panel reactive for 5 frames
+    // after RebuildSurfaceContent and our feed bypasses that path entirely. The result is
+    // the accumulating smear along the stars' apparent motion, worse the further the player
+    // stands back and briefly cleared by player movement. See PanelBinding.ApplyFsrMask.
+    //
+    // Set to 0 to get the old behaviour back — worth having as an A/B, and worth turning off
+    // if the player's AA is not FSR, since the reactive mask then buys nothing while still
+    // touching the shared LCD material.
+    public static bool PanelFsrMask { get; private set; } = true;
+
+    // Rebuild the panel target's mips 1..N from our frame after the handover copy.
+    //
+    // CopyTextureSubresource writes one subresource, so without this only mip 0 is ours and
+    // the lower levels keep whatever DrawOne left on a recycled pool texture — making the
+    // feed correct up close and progressively wrong as the player backs away. Default ON:
+    // it uses the engine's own MipMapJob instance, creates nothing, and fails soft to the
+    // previous behaviour if any member is missing. Needs the bootstrap that appends
+    // __instance to the offscreen-UI hook args, so it is inert until the game is restarted.
+    // See FeedHandover.RegenerateMips.
+    public static bool PanelMipRegen { get; private set; } = true;
+
     // How long a tagged panel may go without ticking before the mod shuts itself down.
     //
     // The LCD render component ticks every panel it draws, so a panel switched off,
@@ -501,6 +565,9 @@ internal static class FeedConfig
             WholeSceneCascadeResolution = Int(kv, "wholeSceneCascadeResolution", WholeSceneCascadeResolution);
             WholeSceneCascadeCount      = Int(kv, "wholeSceneCascadeCount", WholeSceneCascadeCount);
             WholeScenePlanetEnv         = Bool(kv, "wholeScenePlanetEnv", WholeScenePlanetEnv);
+            WholeSceneOwnFlares         = Bool(kv, "wholeSceneOwnFlares", WholeSceneOwnFlares);
+            PanelFsrMask                = Bool(kv, "panelFsrMask", PanelFsrMask);
+            PanelMipRegen               = Bool(kv, "panelMipRegen", PanelMipRegen);
             WholeSceneDisableRaytracing    = Int(kv, "wholeSceneDisableRaytracing", WholeSceneDisableRaytracing);
             WholeSceneDisableEyeAdaptation = Bool(kv, "wholeSceneDisableEyeAdaptation", WholeSceneDisableEyeAdaptation);
             WholeSceneDisableProbeUpdates  = Bool(kv, "wholeSceneDisableProbeUpdates", WholeSceneDisableProbeUpdates);
@@ -543,7 +610,7 @@ internal static class FeedConfig
                          WholeSceneDisableEyeAdaptation, WholeSceneDisableProbeUpdates,
                          WholeSceneOwnDrawContexts, WholeSceneOwnShadows,
                          WholeSceneCascadeResolution, WholeSceneCascadeCount,
-                         WholeScenePlanetEnv,
+                         WholeScenePlanetEnv, WholeSceneOwnFlares,
                          string.Join(",", WholeSceneSkipStages),
                          string.Join(",", WholeSceneRtFlags));
 

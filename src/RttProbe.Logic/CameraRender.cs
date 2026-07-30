@@ -72,7 +72,7 @@ internal static class CameraRender
     {
         _armed = _disarmed = false;
         _lastRender = _lastArmCheck = _lastDisarmCheck = 0; _errors = 0;
-        Array.Clear(_ldrRing, 0, _ldrRing.Length); _ldrReady = null; _ringIndex = -1;
+        Array.Clear(_ldrRing, 0, _ldrRing.Length); _ldrReady = null; _ringIndex = -1; _ldrMips = 1;
         _resolvedPanelId = null; _blitLogged = _blitResLogged = false; _farClipLogged = double.NaN;
         _baseViewSnapshot = null; _baseViewMismatches = 0; _mismatchLogged = false;
         _viewSkips = _viewSkipLogs = 0;
@@ -425,7 +425,7 @@ internal static class CameraRender
                 // be reading it this frame, and returning it there is the use-after-free
                 // that cost us two crashes. Leaking one pooled texture per panel-target
                 // churn is the cheaper mistake.
-                Array.Clear(_ldrRing, 0, _ldrRing.Length); _ldrReady = null; _ringIndex = -1;
+                Array.Clear(_ldrRing, 0, _ldrRing.Length); _ldrReady = null; _ringIndex = -1; _ldrMips = 1;
             }
 
             // Throttled: the resolve now retries rather than latching, so without a gate
@@ -497,11 +497,47 @@ internal static class CameraRender
                     if (_ldrRing[0] == null)
                     {
                         var res = Prop2(_feedTexture, "Resolution") ?? _feedRes;
+
+                        // MIP COUNT MATCHED TO THE PANEL, not 1.
+                        //
+                        // These used to be single-mip, which meant the handover could only
+                        // ever fill the panel's mip 0 — leaving levels 1..N holding
+                        // DrawOne's own mip chain, built from the UI batch on a RECYCLED
+                        // pool texture. Correct up close, progressively wrong as the player
+                        // backs away and trilinear filtering weights the higher levels.
+                        //
+                        // With a matching chain the ring becomes a valid source for EVERY
+                        // level: FeedHandover generates mips on it with the engine's own
+                        // MipMapJob and then copies each subresource. Costs a third more
+                        // memory per target (a full chain is 4/3 of mip 0) on three 512x512
+                        // targets — a few hundred KB.
+                        // The count comes from the D3D RESOURCE DESCRIPTION, not from the
+                        // texture wrapper. ROTexture exposes Resolution and Format but no mip
+                        // count of its own — MipLevels lives on OffscreenRenderTargetComponent,
+                        // which we do not have here, and on the underlying
+                        // D3DResourceDescription, which we do. That is also the authoritative
+                        // answer: it is what the resource was actually created with, rather
+                        // than what a full chain for this resolution would be.
+                        int mips = 1;
+                        try
+                        {
+                            var desc = Prop2(_feedTexture, "D3DResourceDescription");
+                            var lv = Prop2(desc, "MipLevels");   // Prop2 falls back to fields
+                            if (lv != null) mips = Math.Max(1, System.Convert.ToInt32(lv));
+                        }
+                        catch { mips = 1; }
+                        _ldrMips = mips;
+
                         for (int i = 0; i < _ldrRing.Length; i++)
                             _ldrRing[i] = _miBorrowRt.Invoke(_texPool, new object[]
-                                { "RttCameraLdr" + (char)('A' + i), _feedFormat, _feedFormat, res ?? _feedRes, 1, null, 128 });
+                                { "RttCameraLdr" + (char)('A' + i), _feedFormat, _feedFormat, res ?? _feedRes, mips, null, 128 });
                         _ringIndex = -1;
-                        RttLog.Line($"Feed: allocated {_ldrRing.Length} persistent LDR targets (ring; write N, hand over N-1).");
+                        RttLog.Line($"Feed: allocated {_ldrRing.Length} persistent LDR targets " +
+                                    $"(ring; write N, hand over N-1) with {mips} mip level(s) to match the " +
+                                    (mips > 1
+                                        ? "panel — the handover can now fill every level, not just mip 0."
+                                        : "panel. Only ONE level: either the panel has no mip chain or its " +
+                                          "level count was unreadable, so distance appearance is unchanged."));
                     }
 
                     // Advance only on a pass that actually writes, so the ring never
@@ -643,6 +679,11 @@ internal static class CameraRender
     private static MethodInfo _miCopyDoWork;
     private static object _channelAll, _channelRgb;
     private static readonly object[] _ldrRing = new object[3];   // session-owned; see CopyToFeed
+
+    // Mip levels the ring was allocated with, matched to the panel. Read by FeedHandover to
+    // decide how many subresources to generate and copy. 1 = no chain, old behaviour.
+    internal static int LdrMips => _ldrMips;
+    private static int _ldrMips = 1;
     private static object _ldrReady;                             // the slot handed to the UI stage
     private static int _ringIndex = -1;
     private static bool _blitLogged;

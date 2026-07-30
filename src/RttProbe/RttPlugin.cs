@@ -170,9 +170,27 @@ public sealed class RttPlugin : IPlugin
         catch (Exception e) { Log("Patching OffscreenUIRenderer FAILED: " + e.Message); }
     }
 
-    private static void OffscreenUiPostfix(object[] __args)
+    // __instance is APPENDED to the argument array rather than passed through a new bridge
+    // field, deliberately. The logic side already locates what it needs by type name, so a
+    // longer array costs it nothing — and a logic assembly running against an OLDER
+    // bootstrap simply does not find an OffscreenUIRenderer in the args and degrades to "no
+    // mip regeneration" with one log line, instead of a missing-field failure that would
+    // take the whole handover down with it.
+    //
+    // Why the instance is wanted at all: OffscreenUIRenderer._mipMapJob is the engine's own
+    // mip generator for this exact target, invoked one call earlier in DrawOne. Reusing it
+    // creates nothing (Rule 11) and cannot fight another system for its descriptor table,
+    // which borrowing CloudShadowJob's MipMapJob would have risked.
+    private static void OffscreenUiPostfix(object __instance, object[] __args)
     {
-        try { RttBridge.OffscreenUiDrawHook?.Invoke(__args); } catch { }
+        try
+        {
+            var withInstance = new object[__args.Length + 1];
+            Array.Copy(__args, withInstance, __args.Length);
+            withInstance[__args.Length] = __instance;
+            RttBridge.OffscreenUiDrawHook?.Invoke(withInstance);
+        }
+        catch { }
     }
 
     // SceneDrawSystem lives in VRage.Render12 and is internal, so everything here
