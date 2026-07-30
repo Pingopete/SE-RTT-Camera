@@ -546,3 +546,42 @@ Follow-up worth doing regardless: have the bootstrap invoke a Shutdown() on the 
 before old.Unload(), so correctness does not depend on a human remembering to pause. It must
 route the actual disposal through the render thread, exactly as gate shutdown does — "off the
 render thread" is still not "outside a frame".
+
+### CTD 2026-07-30 19:21 — two feeds at full quality exceed the VRAM budget
+
+```
+19:21:38    feedCount 2 -> 1 (revert)
+19:21:41.306  FEED GATE: DORMANT  (both feeds tearing down; feedCount is in the signature)
+19:21:41.316  DXGI_ERROR_DEVICE_REMOVED — "The GPU device instance has been suspended"
+```
+
+The teardown was the trigger, not the cause. For the ~40 s before it, two feeds at
+1024x1024 every engine frame ran with **VRAM over budget** — 13.70 GB used against 13.61 GB
+available — at ~15 fps with `>50ms` on every single frame. CPU submit stayed at 2.3 ms
+throughout, so none of that was ours: it is GPU cost and GPU memory, pure and simple.
+
+**THIS PROMOTES PHASE E FROM "NEXT" TO "PREREQUISITE".** The plan had C3 (two feeds) before
+E (the budget), on the reasoning that you need two feeds to measure what the budget should
+be. That ordering is wrong in one specific way: it assumes two feeds can COEXIST unbudgeted
+for long enough to measure them. They cannot. Two full-quality feeds do not merely run
+slowly — they exceed the card's VRAM and take the device with them.
+
+**It also validates the settled design, expensively.** "Quality is GLOBAL across feeds — it
+is the user's VRAM throttle" was chosen on taste, as the simplest thing that could work.
+It is not a preference; it is the constraint. A second feed at the same quality as the first
+is not affordable on this hardware at 1024x1024, so the quality knob IS the multi-feed knob.
+
+**What C3 needs before it is retried:**
+
+1. A resolution the pair actually fits in. 1024 was chosen for ONE feed (goal 4.2's SSAA)
+   with VRAM at ~12.2 GB of 13.6. Two of those does not fit and no amount of scheduling
+   fixes a memory ceiling. Drop to 512 per feed for the two-feed bring-up and raise it only
+   with a measured VRAM figure per feed (which is experiment D3, and should now run FIRST).
+2. The render slot doing real work. Both feeds currently render EVERY engine frame — the
+   rotation exists (Feeds.NextForRender/AdvanceSlot) but nothing rate-limits the pair, so N
+   feeds cost N full scene renders per frame instead of dividing one budget.
+3. Feed 1's parking bug, still open: it copies now but parks nothing.
+
+Revised order: **D3 (VRAM per feed) -> E1 (the slot) -> finish C3.** Measure the ceiling,
+build the throttle, then add the feed — rather than adding the feed and discovering the
+ceiling by hitting it.
