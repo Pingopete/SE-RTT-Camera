@@ -787,19 +787,43 @@ internal static class CameraRender
     // are per-session latches cleared by Reset().
     private static double _farClipLogged = double.NaN;
 
+    // MIN-ONLY BY DEFAULT, and that is deliberate rather than incidental.
+    //
+    // This knob was built as a PERF lever: the far plane is what culling reads, so pulling
+    // it in cuts draw count. Taking the min meant "never accidentally make the feed more
+    // expensive than the player's own view", which is the right default for a perf lever
+    // and has been correct for every use it has had.
+    //
+    // It also silently caps the feed at the engine's FarClipping (~15 km here). That went
+    // unnoticed until the remoteness test asked for 50000 and the log answered 15000 — see
+    // docs/open-question-remote-streaming.md. For a REMOTE camera the cap is not a safety
+    // rail, it is the thing under investigation: past it, "nothing is drawn" is our own far
+    // plane rather than the engine's streaming, and the two cannot be told apart.
+    //
+    // wholeSceneFarClipExtend lifts the min, so the configured value wins in BOTH
+    // directions. Off by default: widening the plane widens the cull, and that cost belongs
+    // to whoever asked for it.
     private static float FarClip(float engineFar)
     {
         double clip = FeedConfig.WholeSceneFarClip;
-        return clip > 0 && engineFar > clip ? (float)clip : engineFar;
+        if (clip <= 0) return engineFar;
+        if (FeedConfig.WholeSceneFarClipExtend) return (float)clip;
+        return engineFar > clip ? (float)clip : engineFar;
     }
 
     private static void LogFarClipOnce(float far, float veryFar)
     {
         if (_farClipLogged.Equals((double)far)) return;
         _farClipLogged = far;
+        // Says which DIRECTION the knob is allowed to act in, because the silent min-only
+        // cap is exactly what made a 50000 request read as 15000 with nothing to explain it.
         RttLog.Line(FeedConfig.WholeSceneFarClip > 0
-            ? $"Feed far clip: {far:F0} m (veryFar {veryFar:F0} m untouched — planets/sky still render). " +
-              "Watch ourDraw(cpu submit) in PERF for the draw-count saving."
+            ? $"Feed far clip: {far:F0} m (requested {FeedConfig.WholeSceneFarClip:F0} m, " +
+              (FeedConfig.WholeSceneFarClipExtend
+                  ? "EXTEND on — the requested value wins in both directions"
+                  : "extend OFF — capped at the engine's plane, this knob can only pull IN") +
+              $"; veryFar {veryFar:F0} m untouched — planets/sky still render). " +
+              "Watch ourDraw(cpu submit) in PERF for the draw-count change."
             : $"Feed far clip: engine value {far:F0} m (wholeSceneFarClip=0, no override).");
     }
     private static long _firstPassAt;

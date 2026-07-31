@@ -199,6 +199,18 @@ internal static class FeedConfig
     // Live-tunable; not part of the rebuild signature.
     public static double WholeSceneFarClip { get; private set; }
 
+    // Let WholeSceneFarClip EXTEND the far plane, not just pull it in.
+    //
+    // Off by default because the min-only behaviour is correct for the perf lever this knob
+    // was built as. On, the configured value wins in both directions — which is what the
+    // remoteness investigation needs, because the engine's own FarClipping (~15 km) was
+    // silently capping the feed and making "nothing is drawn out there" ambiguous between
+    // our far plane and the engine's streaming. See docs/open-question-remote-streaming.md.
+    //
+    // Costs draw count: the far plane is what culling reads, so widening it widens the cull.
+    // Live-tunable; not part of the rebuild signature.
+    public static bool WholeSceneFarClipExtend { get; private set; }
+
     // A/B gate on the FinalLDR resize (the phantom-bleed fix). In the rebuild signature
     // so flipping it forces the rebuild that re-runs (or skips) the one-shot resize.
     public static bool WholeSceneLdrResize { get; private set; } = true;
@@ -759,6 +771,7 @@ internal static class FeedConfig
             WholeSceneLdrResize     = Bool(kv, "wholeSceneLdrResize", WholeSceneLdrResize);
             WholeSceneSubmitEarly   = Bool(kv, "wholeSceneSubmitEarly", WholeSceneSubmitEarly);
             WholeSceneFarClip       = Dbl(kv, "wholeSceneFarClip", WholeSceneFarClip);
+            WholeSceneFarClipExtend = Bool(kv, "wholeSceneFarClipExtend", WholeSceneFarClipExtend);
             WholeSceneOwnDrawContexts   = Bool(kv, "wholeSceneOwnDrawContexts", WholeSceneOwnDrawContexts);
             WholeSceneOwnShadows        = Int(kv, "wholeSceneOwnShadows", WholeSceneOwnShadows);
             WholeSceneCascadeResolution = Int(kv, "wholeSceneCascadeResolution", WholeSceneCascadeResolution);
