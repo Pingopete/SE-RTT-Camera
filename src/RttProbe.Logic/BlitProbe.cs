@@ -130,6 +130,13 @@ internal static class BlitProbe
             // half of that premise is FALSE — the render thread renders concurrently with
             // this tick — and it cost a third device removal to establish. Both the drain
             // and its queue are gone; see the probe-manager comment in WholeSceneRender.Reset.
+
+            // On-demand resource report (drop output/resource-report.marker). Read-only
+            // reflection, one File.Exists every 2 s until asked. Deliberately NOT a config
+            // knob: a config change can cost a gate cycle, and gate-cycle churn is what
+            // took the device three times on 2026-07-30.
+            FeedResourceReport.MaybeRun();
+
             ResolveContracts(component);
             if (_contracts == null || _ui == null) return;
 
