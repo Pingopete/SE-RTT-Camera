@@ -662,3 +662,63 @@ Both flips ran through the quiesced path (v2, with ForceDormant) — dormant-to-
 Also answered for the user: the stats panel's fps is the TOTAL game frame rate (our hook
 fires once per engine frame); it does not yet show per-feed refresh, which at N=2 is
 engine/2. Worth adding to the panel when it next gets touched.
+
+---
+
+## SESSION DIGEST 2026-07-30 (evening) — multi-feed lands, and what it taught
+
+Written at the user's request as the consolidated record; detail lives in the dated
+sections above and the commit messages on `start-of-frame-submit` / `multi-render`.
+
+### What now works, all user-verified
+- **Two independent camera feeds** ([RTC] / [RTC2]), half an orbit apart, both delivering
+  simultaneously — C3's gate met by sustained observation, not just counters.
+- **Panel fan-out (E2)**: at `feedCount=1` both panels mirror ONE camera for the cost of a
+  material bind. Aspect crop in the blit for non-square panels.
+- **Live feed-count changes** through the quiesced rebuild (both directions, ~4 s).
+- **The E1 VRAM admission cap**, observed clamping and releasing.
+- **Own-probes restored** (goal 4.4) on the bootstrap-parked manager.
+- **The definitive A/B**: the second feed's frame-level cost is ZERO (52 fps / p95 ~21 /
+  submit 2.3 ms in both configs); each camera refreshes at engine/N. Fixed total cost,
+  fps divides by N — measured, not designed.
+
+### The recurring defect, now a design rule
+Five bugs tonight were the SAME shape: process-global state starving one feed (gate poll
+throttle, startup flag, DC failure counter, resumed-intact flag, delivery request
+throttle — the last one user-caught as "one feed paused, then they swap"). **On this route,
+state is per-feed unless it is demonstrably about the engine.** The unscoped-access
+detector and the compiler-verified FeedInstance seam are what kept these findable.
+
+### The GC-spike finding (user-caught: stationary, panels in view, periodic 100-270 ms hitches)
+Attribution chain, each step killing a hypothesis: engine CLRStalls 0.009→12 with sim-thread
+maxima ~200 ms (GC, not render/VRAM) → heap climbing ~32 MB/s to 4.5 GB (gen2 over that IS
+the hitch) → dormant-minute test: churn stops with the feed (ours-correlated) → per-thread
+allocation counters on all three entry points: OUR code only ~6 MB/s → request-rate A/B:
+delivery servicing acquitted → **remainder ≈24 MB/s is the engine's WORKER-POOL allocation
+from our nested Draw's parallel cull/visibility jobs** — per-thread counters cannot see it,
+and it is the managed cost of a second full-scene cull at 52 Hz. A teardown lets the heap
+collapse and the spikes vanish (user-confirmed), which is workaround, not fix. Permanent
+instrumentation: `alloc render= ui=` in every PERF line. Continuation is task #18
+(feedCount 0/1/2 sweep against the engine's GCMemoryDelta, then measured mitigations).
+
+### The VRAM-ceiling state (live at 23:58, protectively paused at 23:59)
+Used VRAM ratcheted across the evening's ~15 hot-reload/rebuild cycles (allocator pool
+growth — the pause-protocol fix stopped the ~570 MB orphans, but pooled blocks are never
+returned) plus scene growth, reaching **13.64 GB against a 13.67-13.70 budget** with frames
+pinned at 66 ms under focus=GAME — the pre-device-removal signature. Feed paused
+protectively; both feeds released −126 MB each. **Allocator pool state is process-lifetime:
+only a game restart truly resets it.** Long dev sessions with many deploys will always walk
+toward this wall; play sessions without deploys should not.
+
+### Instrumentation added tonight, all permanent
+- `alloc render= / ui=` per PERF window (managed churn attribution).
+- `focus=GAME/AWAY` on every watchdog line (the game frame-caps when alt-tabbed —
+  user-reported; graded windows must be focus=GAME).
+- `Rates/s all: ... | this: ...` (aggregate vs per-feed telemetry, no more masquerading).
+- Gate ACTIVE line distinguishes "Resumed INTACT" from a real rebuild.
+
+### Open, in order of value
+1. **#17 look-at target** → settles the remoteness question (the product-defining one).
+2. **#18 GC churn quantification + mitigation** → the long-session smoothness ceiling.
+3. E2 fan-out at N>2 panels; third [RTC3] feed once a panel exists; B1 layer-cost table
+   (needs a parked player and a fresh session).
