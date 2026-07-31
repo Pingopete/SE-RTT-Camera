@@ -634,3 +634,31 @@ PERF window whose watchdog line says AWAY.
 **Standing rule: grade performance only from windows where focus=GAME**, alongside the
 existing rules (equal session age, tail not mean, control player position, session-scoped
 log reads).
+
+### THE DEFINITIVE 1-vs-2-FEED A/B (2026-07-30 23:35-23:40) — phases D and E graded
+
+Conditions the whole evening lacked, finally met at once: equal session age (~2 min apart),
+FOCUS CONTROLLED (user in-game and holding it there for the measurement), both deliveries
+genuinely live (post b9d020a), no deploys inside the window, quiesced flips between phases.
+
+| | ONE feed | TWO feeds |
+|---|---|---|
+| game fps | 50.7 - 51.7 | 52.1 - 52.4 |
+| frame p50 | 19.3 - 19.7 ms | 19.0 - 19.2 ms |
+| frame p95 | 21.2 - 21.6 ms | 20.3 - 21.0 ms |
+| `>50ms` | 0 | 0 |
+| CPU submit | 2.3 - 2.4 ms | 2.3 ms |
+| VRAM | 12.35 GB | 12.35 GB |
+
+**The second feed's frame-level cost is zero** — every difference is inside the noise floor.
+The mechanism is the render slot: exactly ONE feed-render per engine frame in both
+configurations, so per-frame work is constant and what divides by N is each camera's refresh
+rate (~52 Hz at one feed, ~26 Hz each at two). Fixed total cost, fps divides by N — the
+budget model's central claim, now a measured table instead of a design intention.
+
+Both flips ran through the quiesced path (v2, with ForceDormant) — dormant-to-delivering in
+~4 s each way, both feeds 1:1 park-to-copy after each flip, zero errors throughout.
+
+Also answered for the user: the stats panel's fps is the TOTAL game frame rate (our hook
+fires once per engine frame); it does not yet show per-feed refresh, which at N=2 is
+engine/2. Worth adding to the panel when it next gets touched.
