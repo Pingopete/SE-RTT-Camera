@@ -369,3 +369,64 @@ model — this one survived two rounds of analysis before the log ordering gave 
 
 **Re-run the C3 VRAM gate on a fresh session with NO mid-run deploys**: launch, set
 `feedCount = 2`, and leave it alone for fifteen minutes.
+
+### CTD 2026-07-30 20:54: flipping feedCount LIVE is unsafe. NOT VRAM.
+
+The C3 VRAM re-run was started on a clean session — 52.4 fps, p50 19.1, `>50ms=0`, VRAM dead
+flat at 12.24 GB with **1.5 GB of headroom**, the best reference this project has had.
+`feedCount` was flipped 1 -> 2 with feed 0 live. The game died 2.5 seconds later.
+
+```
+DXGI_ERROR_DEVICE_REMOVED
+EventStack:    [CullingProxies, MainViewCulling[FirstPass], ScenePreparation + Render]
+PageFaultVA: 0x0   ExistingAllocations: 0   RecentFreedAllocations: 0
+VideoMemoryInfo:  Budget 14.93 GB   CurrentUsage 13.33 GB     <- 1.6 GB FREE
+```
+
+**This is not a memory problem.** Zero existing and zero freed allocations with
+`PageFaultVA 0x0` is a NULL BIND — something bound that was never allocated — and it happened
+inside CULLING, which is exactly what the DrawContextManager owns.
+
+The mod's own log, scoped to that session:
+
+```
+20:53:58.908  [feed 0] FEED VRAM CAP: max resident feeds = 2 (headroom 1118 MB)
+20:53:58.915  [feed 0] Whole-scene Reset: VRAM 12511 -> 12385 MB (-126 MB)   <- nulls the DC
+20:53:58.917  routing: [RTC] -> feed 0, [RTC2] -> feed 1
+20:54:00.425  [feed 0] SECOND ScreenBuffers built                            <- 1.5 s later
+              <<< DEVICE_REMOVED at 20:54:01.425 >>>
+```
+
+Feed 0's ScreenBuffers came back but **there is no `SECOND DrawContextManager built` line and
+no `settled after the rebuild` line.** The rebuild was still in progress, and it was unusually
+slow — 1.5 s between the Reset and the ScreenBuffers, against ~30 ms in a normal gate cycle,
+because the feedCount change re-routes panels and rebuilds both feeds at once.
+
+**It did NOT reproduce.** The next launch came up with `feedCount = 2` already set, built both
+feeds from a dormant gate, and both delivered (`HANDOVER SURVIVED` on each). So the hazard is
+not "two feeds" — it is **rebuilding under a live render**, which is the same hazard class
+already recorded for `wholeSceneAAMode` (4 CTDs) and `wholeSceneOwnProbes` (3 CTDs).
+
+**One concrete defect found while reading, worth fixing on its own merits.**
+`EnsureDrawContexts` sets its latch BEFORE the build:
+
+```csharp
+if (_dcBuilt || _ourDrawContexts != null) return;
+_dcBuilt = true;                                  // latched before anything is built
+try { _ourDrawContexts = Activator.CreateInstance(t); ... }
+```
+
+Every early return and every exception inside that `try` leaves `_dcBuilt = true` with
+`_ourDrawContexts = null`, permanently — the latch conflates ATTEMPTED with SUCCEEDED, so the
+build is never retried. That is survivable by design (a null context falls back to the
+engine's, "degraded not broken"), which is why it has never been noticed, but it means a
+transient build failure silently downgrades the feed for the rest of the session with no log
+line saying so.
+
+**The fix for the CTD itself, unbuilt:** a `feedCount` change must not rebuild in place. Take
+the gate DORMANT, let the full teardown complete, and rebuild only from the quiesced state —
+i.e. make the pause path automatic for this knob rather than relying on the operator. Until
+that exists, **`feedCount` is classified restart/pause-protocol, like `ownProbes`.**
+
+Do this with fresh crash patience, not at the end of a session. Single feed at 1024 remains
+rock solid: 52.6 fps, p50 19.1, p95 21.1, `>50ms=0`, VRAM flat, zero errors.
