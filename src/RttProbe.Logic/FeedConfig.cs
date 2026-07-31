@@ -468,6 +468,19 @@ internal static class FeedConfig
 
     public static int WholeSceneCascadeCount { get; private set; } = 3;
 
+    // Character shadow map size for OUR render only. 0 = leave the player's value alone.
+    //
+    // Found by the resource report: two 2048x2048 depth sets — first-person and third-person
+    // — were 32 MiB of a 444 MiB feed, allocated because CharacterShadowsContext sizes itself
+    // from ShadowSettings.DirectionalLight.CharacterShadowResolution and nothing scoped it.
+    // The feed is an orbital camera; the player's own character is not in the shot, and the
+    // first-person set is meaningless to it by definition.
+    //
+    // NOT zero-able: the context allocates whatever it is told, and a zero-size depth texture
+    // is a device removal waiting to happen. 256 keeps the machinery valid and costs 0.5 MiB
+    // instead of 16 — if a character ever IS in a feed's shot, their shadow is simply coarse.
+    public static int WholeSceneCharacterShadowResolution { get; private set; } = 0;
+
     // HOW MANY INDEPENDENT FEEDS ARE ACTIVE (plan phase C3). 1 = the shipped behaviour.
     //
     // IN the rebuild signature, and the first attempt had this exactly backwards.
@@ -715,6 +728,8 @@ internal static class FeedConfig
             WholeSceneOwnShadows        = Int(kv, "wholeSceneOwnShadows", WholeSceneOwnShadows);
             WholeSceneCascadeResolution = Int(kv, "wholeSceneCascadeResolution", WholeSceneCascadeResolution);
             WholeSceneCascadeCount      = Int(kv, "wholeSceneCascadeCount", WholeSceneCascadeCount);
+            WholeSceneCharacterShadowResolution =
+                Int(kv, "wholeSceneCharacterShadowResolution", WholeSceneCharacterShadowResolution);
             WholeScenePlanetEnv         = Bool(kv, "wholeScenePlanetEnv", WholeScenePlanetEnv);
             WholeSceneOwnFlares         = Bool(kv, "wholeSceneOwnFlares", WholeSceneOwnFlares);
             PanelFsrMask                = Bool(kv, "panelFsrMask", PanelFsrMask);

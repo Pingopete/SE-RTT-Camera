@@ -1,0 +1,78 @@
+FEED RESOURCE REPORT — 2026-07-30 20:15:13
+feedCount=1  1024x1024  ownShadows=1 (2x512)  ownFlares=1  ownProbes=0
+
+--- FEED 0 ---
+  ScreenBuffers                                60.0 MiB   (10 textures)
+      ScreenBuffers._depthStencilBuffer._depthTextureSlice      8.0 MiB   1024x1024 R32_Float_X8X24_Typeless mips=1
+      ScreenBuffers._depthStencilBuffer._stencilTextureSlice      8.0 MiB   1024x1024 X32_Typeless_G8X24_UInt mips=1
+      ScreenBuffers._depthStencilBuffer._depthStencilReadWrite      8.0 MiB   1024x1024 D32_Float_S8X24_UInt mips=1
+      ScreenBuffers._depthStencilBuffer._depthStencilReadOnly      8.0 MiB   1024x1024 D32_Float_S8X24_UInt mips=1
+      ScreenBuffers.GBuffer[4]._slices[0]       8.0 MiB   1024x1024 R16G16B16A16_Float mips=1
+      ScreenBuffers.GBuffer[0]._slices[0]       4.0 MiB   1024x1024 R8G8B8A8_UNorm mips=1
+      ScreenBuffers.GBuffer[1]._slices[0]       4.0 MiB   1024x1024 R16G16_UNorm mips=1
+      ScreenBuffers.GBuffer[2]._slices[0]       4.0 MiB   1024x1024 R8G8B8A8_UNorm mips=1
+      ScreenBuffers.GBuffer[3]._slices[0]       4.0 MiB   1024x1024 R8G8B8A8_UNorm mips=1
+      ScreenBuffers.FinalLDRTexture._slices[0]      4.0 MiB   1024x1024 R8G8B8A8_UNorm mips=1
+  DrawContextManager                          320.6 MiB   (300 textures)
+      DrawContextManager.MainOutputGeometryBuffers._instanceBuffersSecondPass.EntityInstancesBuffer     41.8 MiB   295936 x 148B
+      DrawContextManager.MainOutputGeometryBuffers._instanceBuffersFirstPass.EntityInstancesBuffer     41.8 MiB   295936 x 148B
+      DrawContextManager.MainViewClustering._clusterAssignBuffer     32.0 MiB   d3d alloc
+      DrawContextManager.GPUParticles._particleBuffers.ParticlePool     30.6 MiB   d3d alloc
+      DrawContextManager.MainViewClustering._clusterCollectBuffer     16.0 MiB   d3d alloc
+      DrawContextManager.VolumeRenderingContext._segmentDataBuffer     16.0 MiB   d3d alloc
+      DrawContextManager.GrassBufferContext.GrassInstancesBuffer     11.1 MiB   580000 x 20B
+      DrawContextManager.RTGIContext.DiffuseDirect.HistoryPrev._slices[0]      8.0 MiB   1024x1024 R16G16B16A16_Float mips=1
+      DrawContextManager.RTGIContext.Specular.HistoryPrev._slices[0]      8.0 MiB   1024x1024 R16G16B16A16_Float mips=1
+      DrawContextManager.RTGIContext.Specular.History._slices[0]      8.0 MiB   1024x1024 R16G16B16A16_Float mips=1
+      DrawContextManager.RTGIContext.DiffuseDirect.History._slices[0]      8.0 MiB   1024x1024 R16G16B16A16_Float mips=1
+      DrawContextManager.MainOutputGeometryBuffers._instanceBuffersSecondPass.PartInstancesBuffer      6.8 MiB   295936 x 24B
+      ... and 288 smaller
+  LDR ring                                      4.1 MiB   (3 textures)
+      LDR ring[0]._resource                     1.4 MiB   d3d alloc 512x512 
+      LDR ring[1]._resource                     1.4 MiB   d3d alloc 512x512 
+      LDR ring[2]._resource                     1.4 MiB   d3d alloc 512x512 
+  offscreen target                              0.0 MiB   (0 textures)
+  probe manager                                  (none)
+  FEED TOTAL                                  384.7 MiB
+
+ALL FEEDS                                     384.7 MiB
+
+UNSIZED (61 distinct resource-shaped TYPES the walk could not measure —
+the total above EXCLUDES these, so treat it as a lower bound):
+    <DrawnCountPerHZBMipLevel>e__FixedBuffer e.g. DrawContextManager.CascadeOcclusion[0]._lastStatsData.DrawnCountPerHZBMipLevel
+    AutoResourceState                        e.g. ScreenBuffers._depthStencilBuffer._autoResourceState
+    Buffer`1                                 e.g. DrawContextManager.LocalLightsToUpdate
+    BufferRange                              e.g. ScreenBuffers.GBuffer[0]._srvDescriptor._descriptorHeapToken._range
+    BufferRange[]                            e.g. DrawContextManager.MainViewCulling.FirstPass._materialRanges
+    BufferRenderTargetView                   e.g. ScreenBuffers.GBuffer[0]._rtvDescription.Buffer
+    BufferShaderResourceView                 e.g. ScreenBuffers.GBuffer[0]._d3dSRVDescription.Buffer
+    BufferUnorderedAccessView                e.g. ScreenBuffers.GBuffer[0]._d3dUAVDescription.Buffer
+    ClearableUavBuffer`1                     e.g. DrawContextManager.CascadeOcclusion[0]._statsBuffers[0]
+    ClearableUavBuffer`1[]                   e.g. DrawContextManager.MainViewCulling.FirstPass._countersToken.SharedBuffer._buffers
+    CullingBuffers                           e.g. DrawContextManager.GPUParticles._cullingBuffers
+    DiffuseDirectResources                   e.g. DrawContextManager.RTGIContext.DiffuseDirect
+    DirectionalLightShadowResources          e.g. DrawContextManager.DirectionalLightShadowResources
+    DrawInstanceBuffers                      e.g. DrawContextManager.MainOutputGeometryBuffers._instanceBuffersFirstPass
+    GrassBufferContext                       e.g. DrawContextManager.GrassBufferContext
+    ID3D12Resource                           e.g. ScreenBuffers._depthStencilBuffer._d3dResource
+    IndirectArgumentBuffers                  e.g. DrawContextManager.GPUParticles._indirectArgsBuffers
+    InstancedDrawInstanceBuffers             e.g. DrawContextManager.MainOutputGeometryBuffers._instancedInstanceBuffersFirstPass
+    ManagedTexturePin                        e.g. DrawContextManager.LensFlares._texturePinsByGuid[0].value.Item1
+    OutputGeometryBufferContext              e.g. DrawContextManager.MainOutputGeometryBuffers
+    ParticleBuffers                          e.g. DrawContextManager.GPUParticles._particleBuffers
+    ParticleCounterBuffers                   e.g. DrawContextManager.GPUParticles._particleCountersBuffers
+    ParticleEmissionBuffers                  e.g. DrawContextManager.GPUParticles._particleEmissionBuffers
+    RaytracingAccelerationStructureShaderResourceView e.g. ScreenBuffers.GBuffer[0]._d3dSRVDescription.RaytracingAccelerationStructure
+    ReadbackBuffer[]                         e.g. DrawContextManager.LODTransitions._statsBuffers
+    ResizableDepthStencilTexture             e.g. ScreenBuffers._depthStencilBuffer
+    ResizableRWRenderTargetTexture           e.g. ScreenBuffers.GBuffer[0]
+    ResizableRWRenderTargetTexture[]         e.g. ScreenBuffers.GBuffer
+    ResourceDescription                      e.g. ScreenBuffers._depthStencilBuffer._d3dResourceDescription
+    ShaderResourceViewDescription            e.g. ScreenBuffers.GBuffer[0]._d3dSRVDescription
+    ... and 31 more types
+
+(walked 6539 nodes, cap 20000)
+Sizes are COMPUTED from each resource's own description — resolution, format, mip
+count, array size, or element count x stride — not sampled from the driver. They
+are what we asked the GPU for; actual residency can differ through pooling,
+aliasing and driver-side padding.

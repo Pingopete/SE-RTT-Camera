@@ -1565,16 +1565,43 @@ internal static class WholeSceneRender
             // resizes itself to these values on the first flush and the engine's own set
             // keeps the player's settings. The two contexts are independent — that is the
             // whole point of owning them.
-            if (FeedConfig.WholeSceneCascadeResolution > 0 || FeedConfig.WholeSceneCascadeCount > 0)
+            if (FeedConfig.WholeSceneCascadeResolution > 0 || FeedConfig.WholeSceneCascadeCount > 0
+                || FeedConfig.WholeSceneCharacterShadowResolution > 0)
             {
                 var sets = new System.Collections.Generic.List<(string, object)>();
                 if (FeedConfig.WholeSceneCascadeResolution > 0)
                     sets.Add(("DirectionalLight.CascadeShadowResolution", FeedConfig.WholeSceneCascadeResolution));
                 if (FeedConfig.WholeSceneCascadeCount > 0)
                     sets.Add(("DirectionalLight.CascadesCount", FeedConfig.WholeSceneCascadeCount));
+
+                // CHARACTER SHADOWS — the third sizing field, and we were scoping only two.
+                //
+                // Found by the resource report, not by reading: CharacterShadows was 32 MiB
+                // of a 444 MiB feed, two 2048x2048 depth sets (first- and third-person), for
+                // a camera orbiting a ship at 100 m where the player's character is not in
+                // shot at all.
+                //
+                // Same mechanism as the cascades above, confirmed in IL rather than assumed:
+                //
+                //     CharacterShadowsContext..ctor      -> CheckShadowSettingChanged()
+                //     CharacterShadowsContext.FlushUpdates -> CheckShadowSettingChanged()
+                //     CheckShadowSettingChanged reads
+                //         CoreSystems.Settings.Shadow.DirectionalLight.CharacterShadowResolution
+                //         and calls ResizeCascades(int) when it differs from the current size.
+                //
+                // Because FlushUpdates re-checks every render, scoping is enough — no need to
+                // touch construction. OUR context flushes only inside OUR render and sees our
+                // value; the engine's flushes in the player's frame and sees theirs. Each
+                // resizes once and then stays put, so there is no per-frame thrash.
+                if (FeedConfig.WholeSceneCharacterShadowResolution > 0)
+                    sets.Add(("DirectionalLight.CharacterShadowResolution",
+                              FeedConfig.WholeSceneCharacterShadowResolution));
+
                 LogCascadeSettings();
                 ScopeSetValues("ShadowSettings",
-                    $"feed cascades {FeedConfig.WholeSceneCascadeResolution}px x {FeedConfig.WholeSceneCascadeCount}",
+                    $"feed cascades {FeedConfig.WholeSceneCascadeResolution}px x {FeedConfig.WholeSceneCascadeCount}" +
+                    (FeedConfig.WholeSceneCharacterShadowResolution > 0
+                        ? $", character shadows {FeedConfig.WholeSceneCharacterShadowResolution}px" : ""),
                     sets.ToArray());
             }
 
