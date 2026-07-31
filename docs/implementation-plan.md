@@ -430,3 +430,43 @@ that exists, **`feedCount` is classified restart/pause-protocol, like `ownProbes
 
 Do this with fresh crash patience, not at the end of a session. Single feed at 1024 remains
 rock solid: 52.6 fps, p50 19.1, p95 21.1, `>50ms=0`, VRAM flat, zero errors.
+
+### C3 EXIT GATE MET 2026-07-30 21:26-21:35 — and two feeds are essentially FREE
+
+With the quiesced-rebuild fix in, `feedCount` was flipped 1 -> 2 **live**, on the same clean
+session, and the feed came back in half a second. Measured side by side, same session, same
+position, no deploys inside either window:
+
+| | single feed | TWO feeds |
+|---|---|---|
+| fps | 52.4 - 53.3 | **53.2 - 53.9** |
+| ours p50 | 19.1 | **18.5 - 19.2** |
+| ours p95 | 20.8 - 21.2 | **20.3 - 21.3** |
+| `>50ms` | 0 | **0** (one 62.9 ms frame in eleven windows) |
+| CPU submit | 2.0 - 2.2 ms | **2.0 - 2.2 ms** |
+| VRAM | 12.24 - 12.35 GB | **12.32 - 12.38 GB** |
+
+**The second feed costs nothing measurable.** Frame time is identical — if anything marginally
+better — and the VRAM delta is inside the ±100 MB noise floor. Both feeds deliver at the same
+rate (~27 copies/s each, `skip(noFrame)=0.0`), 0 errors, 0 unscoped accesses, VRAM flat across
+a five-minute soak.
+
+**This is the phase-E budget model's core hypothesis, demonstrated.** The render slot gives at
+most one feed a render per engine frame, so TOTAL per-frame work is constant and each feed's
+own rate divides by N — 53 fps engine, ~27 renders/s per feed. "Fixed total cost, fps divides
+by N" is no longer a design intention; it is what the instrument reads.
+
+**Every earlier per-feed VRAM figure is retracted.** The "+580 MB marginal cost" came from
+windows that spanned deploys, and each deploy was orphaning ~570 MB via the `FeedGate._paused`
+bug. With that fixed and measured cleanly, the marginal cost is under 100 MB.
+
+Consequence for E1: **the cap's 580 MB constant is now far too conservative** — it would refuse
+a third feed that would fit easily. That is the safe direction to be wrong in, so it is being
+left alone tonight rather than loosened on a single N=2 measurement. Re-derive it from a 3- and
+4-feed sweep before changing it, and note the structural floor argument no longer has evidence
+behind it either: if feed 2 costs <100 MB, the "scene-sized buffers per feed" reasoning from
+the resource walk is not what dominates.
+
+**Remaining C3 nit, not a blocker:** on one rebuild feed 0's handover started ~80 s after feed
+1's (`copies=225` against `park#2323`) before catching up to an identical rate. Belongs with
+the F5 panel-freeze family rather than with instancing.

@@ -25,6 +25,25 @@ internal static class RttLog
         catch { }
     }
 
+    // For statements about the WHOLE MOD rather than about a feed — the gate quiescing, a
+    // hook registering, the boot banner. Deliberately does not consult Feeds.Cur.
+    //
+    // Not a micro-optimisation: reading the ambient from an unscoped path trips the C1b
+    // unscoped-access detector, and that detector is only worth having while its silence
+    // means something. Before this existed, every global line logged from outside a feed
+    // scope left a false positive with a full stack trace in the log — training the eye to
+    // skip exactly the entries that matter. A line that is not about a feed should not be
+    // asking which feed it is.
+    public static void Global(string msg)
+    {
+        try
+        {
+            lock (Gate) File.AppendAllText(LogFile,
+                $"[{DateTime.Now:HH:mm:ss.fff}] {msg}{Environment.NewLine}");
+        }
+        catch { }
+    }
+
     // WHICH FEED IS TALKING (phase C3).
     //
     // Silent with one feed, so every existing line and every log-reading habit is unchanged.

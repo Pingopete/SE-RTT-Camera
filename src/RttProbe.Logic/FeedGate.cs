@@ -289,13 +289,13 @@ internal static class FeedGate
         if (AllQuiesced())
         {
             _quiesceRebuild = false;
-            RttLog.Line("Feed gate: quiesced rebuild complete — every feed released its resources " +
+            RttLog.Global("Feed gate: quiesced rebuild complete — every feed released its resources " +
                         "with the renderer stopped. Feeds will re-arm from clean state on the next panel tick.");
         }
         else if (Clock.Ms - _quiesceStartedMs > QuiesceTimeoutMs)
         {
             _quiesceRebuild = false;
-            RttLog.Line($"!!! Feed gate: quiesced rebuild TIMED OUT after {QuiesceTimeoutMs} ms with a slot " +
+            RttLog.Global($"!!! Feed gate: quiesced rebuild TIMED OUT after {QuiesceTimeoutMs} ms with a slot " +
                         "still reporting active or mid-teardown. Releasing the hold so the feed can come back, " +
                         "but the rebuild it was protecting may now overlap a live render — the exact condition " +
                         "that device-removed the game on 2026-07-30. If this line ever appears, find out WHICH " +

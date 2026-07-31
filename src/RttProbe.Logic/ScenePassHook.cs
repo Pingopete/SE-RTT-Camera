@@ -57,7 +57,10 @@ internal static class ScenePassHook
         if (now - _lastRateLog >= 10000)
         {
             _lastRateLog = now;
-            RttLog.Line($"Cadence: probe-pass {_probeCalls} calls, per-frame pass {_framePasses} calls (cumulative).");
+            // Global: these are process-wide engine call counts, not one feed's, and this
+            // hook runs outside any feed scope. RttLog.Line here read the ambient and tripped
+            // the unscoped-access detector every 10 s.
+            RttLog.Global($"Cadence: probe-pass {_probeCalls} calls, per-frame pass {_framePasses} calls (cumulative).");
         }
     }
 }
