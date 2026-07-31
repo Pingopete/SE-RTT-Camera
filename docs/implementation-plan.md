@@ -470,3 +470,40 @@ the resource walk is not what dominates.
 **Remaining C3 nit, not a blocker:** on one rebuild feed 0's handover started ~80 s after feed
 1's (`copies=225` against `park#2323`) before catching up to an identical rate. Belongs with
 the F5 panel-freeze family rather than with instancing.
+
+### E2 second half, RECONNOITRED 2026-07-30: panel fan-out is a binding-list change
+
+The aspect-crop half of E2 is LANDED (090916a). The "N same-camera panels" half was
+reconnoitred offline and the answer is favourable — recorded here so the implementation
+session starts from evidence, not memory.
+
+**The design: panels are free because binding is per-panel and the target is per-feed.**
+A feed delivers into ONE OffscreenRenderTarget WE create ("RttProbe1"); a panel shows it
+because `PanelBinding.TryBind` hands that target's TextureHandle to
+`ctx.SetNewScreenMaterialHandle(renderer, baseMaterial, aspect, orientation, handle)`.
+Nothing in that call is exclusive: two panels' surface contexts can each be handed the SAME
+handle. No second render, no second copy, no second anything on the render thread.
+
+**The engine's material lifecycle is safe for it.** The "Can't remove material" assert that
+fires on gate cycles was read in IL tonight: `MaterialsManager.ChangeMaterial` is
+remove-then-add BY GUID, and the assert is the remove half running for a guid that is
+already gone (a queued RenderCommandBuffer replay landing after our unbind). The add half
+then proceeds. Benign by construction, per-material-instance, no cross-panel shared state —
+6 occurrences tonight, zero consequences. Fan-out doubles this noise and nothing else.
+
+**What actually blocks it is OUR single-panel state,** all self-inflicted:
+
+1. `FeedInstance.Bound` / `BoundRenderer` / `BoundCtx` — one latch, one weak pair. Becomes a
+   small list of (renderer, ctx) weak pairs; `TryBind` appends per claiming panel; `Unbind`
+   and `RestoreEngineState` sweep the list.
+2. `CameraFeed.Target` — the tick side publishes whichever claiming panel ticked LAST, so two
+   panels on DIFFERENT grids would thrash the orbit target. Semantic decision: the feed's
+   camera follows its FIRST claimant (the primary panel); later claimants are display-only.
+3. The router already does the right thing: a panel asking for a feed beyond `feedCount`
+   SHARES feed 0 and logs it. That means the activation test needs no new tag scheme —
+   `feedCount = 1` with both existing panels tagged puts [RTC2] on feed 0's picture iff the
+   binding fan-out works.
+
+Estimated ~100 lines across FeedInstance/PanelBinding/CameraFeed. It touches the
+double-release path (one forced-rebind CTD in its history), so it opens a session rather
+than ending one — with the ChangeMaterial groundwork above already done.
