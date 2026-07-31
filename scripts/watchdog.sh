@@ -45,10 +45,7 @@ for ((i = 0; i < MAX_ITER; i++)); do
   # focus on every line makes those windows discountable at a glance instead of
   # diagnosable-looking. (The engine does not log focus changes; asking Windows directly
   # is the only way.)
-  FOCUS=$(powershell -NoProfile -Command '
-    Add-Type "using System;using System.Runtime.InteropServices;public class W{[DllImport(\"user32.dll\")]public static extern IntPtr GetForegroundWindow();[DllImport(\"user32.dll\")]public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);}" 2>$null
-    $p=0; [W]::GetWindowThreadProcessId([W]::GetForegroundWindow(),[ref]$p) | Out-Null
-    try { (Get-Process -Id $p -ErrorAction Stop).ProcessName } catch { "?" }' 2>/dev/null | tr -d '\r')
+  FOCUS=$(powershell -NoProfile -ExecutionPolicy Bypass -File "$ROOT/scripts/focus-probe.ps1" 2>/dev/null | tr -d '\r' | tail -1)
   case "$FOCUS" in
     SpaceEngineers2) LINE="$LINE focus=GAME" ;;
     "")              LINE="$LINE focus=?" ;;
