@@ -197,6 +197,12 @@ internal sealed class FeedInstance
     // the render scope, which is precisely the job that detector exists to do.
     public bool PendingStartupLog;
 
+    // "Came back before the teardown ran, so nothing was released." Per-feed for the same
+    // reason PendingStartupLog is: Startup() runs once per feed under its own scope, and a
+    // global flag would be consumed by the first feed and read false by every other — which
+    // is the exact bug shape already fixed three times on this route tonight.
+    public bool ResumedIntact;
+
     // ---- PanelBinding: the material binding --------------------------------------
     //
     // PHASE E2 FAN-OUT: a feed can display on SEVERAL panels, so the binding is a LIST

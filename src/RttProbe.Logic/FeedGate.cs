@@ -244,6 +244,9 @@ internal static class FeedGate
         _active = alive;
         if (_active)
         {
+            // Did we get back before the teardown ran? If so NOTHING was released, and the
+            // startup line must not claim a rebuild that is not happening — see Startup().
+            _resumedIntact = _teardownIn >= 0;
             _teardownIn = -1;              // cancel a pending teardown: we are back
             _pendingStartupLog = true;
         }
@@ -342,12 +345,31 @@ internal static class FeedGate
         Shutdown();
     }
 
+    // SAYS WHICH OF THE TWO THINGS ACTUALLY HAPPENED.
+    //
+    // This line used to claim "Everything rebuilds from scratch" unconditionally, and that
+    // is FALSE for the common case: a panel that misses a couple of ticks (a hitch, a save)
+    // arms the 30-frame countdown and then cancels it on the way back, so nothing is ever
+    // released and nothing is rebuilt. Observed 2026-07-30 23:20:23 — both feeds dormant and
+    // active again 11 ms later, with the log announcing a full rebuild that did not occur.
+    //
+    // Harmless to the feed, corrosive to debugging: this project has repeatedly lost time to
+    // log lines that described intent rather than events, and a spurious "rebuilds from
+    // scratch" is exactly what someone hunting a resource leak would anchor on.
+    private static bool _resumedIntact
+    { get => Feeds.Cur.ResumedIntact; set => Feeds.Cur.ResumedIntact = value; }
+
     private static void Startup()
     {
         _cycles++;
-        RttLog.Line($"=== FEED GATE: ACTIVE (cycle {_cycles}). A tagged panel is ticking again. " +
-                    "Everything rebuilds from scratch: second ScreenBuffers, second " +
-                    "DrawContextManager, cascade set, LDR ring, panel binding. ===");
+        RttLog.Line(_resumedIntact
+            ? $"=== FEED GATE: ACTIVE (cycle {_cycles}). A tagged panel is ticking again. Resumed " +
+              "INTACT — the panel came back before the teardown ran, so nothing was released and " +
+              "nothing is being rebuilt. ==="
+            : $"=== FEED GATE: ACTIVE (cycle {_cycles}). A tagged panel is ticking again. " +
+              "Everything rebuilds from scratch: second ScreenBuffers, second " +
+              "DrawContextManager, cascade set, LDR ring, panel binding. ===");
+        _resumedIntact = false;
         _everActive = true;
     }
 
