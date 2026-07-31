@@ -2424,6 +2424,33 @@ internal static class WholeSceneRender
 
     private static FieldInfo _probeField, _envProbesToUpdateField;
     private static MethodInfo _miPrepareProbes;
+
+    // The bootstrap's parked probe managers, by reflection — the logic assembly must not
+    // reference the bootstrap at compile time (that would pin the collectible context; see
+    // LogicEntry, which reaches RttBridge the same way). Null on an older bootstrap, in
+    // which case parking silently degrades to the old per-load behaviour: one leaked set
+    // per reload, exactly as before, rather than a crash. The one-shot log names which
+    // world we are in, because a silently absent park is how the leak would come back
+    // without anyone noticing.
+    private static object[] _parkedSlots;
+    private static bool _parkResolved;
+
+    private static object[] ParkedProbeSlot()
+    {
+        if (!_parkResolved)
+        {
+            _parkResolved = true;
+            _parkedSlots = Type.GetType("RttProbe.RttBridge, RttProbe")
+                ?.GetField("ParkedProbeManagers", BindingFlags.Public | BindingFlags.Static)
+                ?.GetValue(null) as object[];
+            RttLog.Global(_parkedSlots != null
+                ? "Own probes: bootstrap park found — probe managers survive hot reloads from here on."
+                : "Own probes: NO bootstrap park (bootstrap predates it). Managers leak one RTV set per " +
+                  "hot reload until the game is restarted onto the new bootstrap — keep wholeSceneOwnProbes " +
+                  "off until then.");
+        }
+        return _parkedSlots;
+    }
     private static int _probeState         // 0 = untried, 1 = ready, -1 = unavailable
     { get => Feeds.Cur.ProbeState; set => Feeds.Cur.ProbeState = value; }
     private static bool _probeLogged
@@ -2477,6 +2504,38 @@ internal static class WholeSceneRender
                 // constructing unconditionally here would orphan the previous one — and its
                 // eight cube textures with it — on every config change. That is Rule 10's
                 // leak, arriving through the door opened to avoid a device removal.
+                //
+                // ...AND REUSED ACROSS HOT RELOADS, which the field alone cannot provide.
+                // _ourProbes lives on FeedInstance, in the COLLECTIBLE logic assembly, so
+                // "kept" was only true within one load: every reload started null, built a
+                // fresh manager, and orphaned the previous one's 8 cube textures x 6 faces
+                // of RTV descriptors — a small FIXED pool, exhausted after four reloads
+                // (the 2026-07-30 18:46 "Out of the descriptor heap" CTD, the reason
+                // wholeSceneOwnProbes has been disarmed since).
+                //
+                // The bootstrap's RttBridge.ParkedProbeManagers[] is the fix: loaded once,
+                // never unloaded, holds one slot per feed. Adoption order — parked slot
+                // first, this load's field second, construct only if both are empty — and
+                // every construction writes the park, so the NEXT reload adopts instead of
+                // building. The park is untyped object[] (the bootstrap must not touch
+                // engine types); the type check on adoption guards against a slot parked by
+                // an older, incompatible build.
+                // Adoption only fills a NULL field — i.e. the first install after a hot
+                // reload. Within one load the field survives gate cycles on FeedInstance,
+                // and it is the same reference as the park (every construction writes it),
+                // so adopting again would only produce a misleading once-per-cycle log.
+                var park = ParkedProbeSlot();
+                if (_ourProbes == null && park != null && Feeds.Cur.Id < park.Length)
+                {
+                    var parked = park[Feeds.Cur.Id];
+                    if (parked != null && mgrType.IsInstanceOfType(parked))
+                    {
+                        _ourProbes = parked;
+                        RttLog.Line($"Own probes: ADOPTED the parked EnvironmentProbeManager from the bootstrap " +
+                                    $"(feed {Feeds.Cur.Id}) — its cube textures and RTV descriptors survive the " +
+                                    "hot reload instead of leaking one set per reload.");
+                    }
+                }
                 _ourProbes ??= Activator.CreateInstance(mgrType, nonPublic: true);
                 if (_ourProbes == null)
                 {
@@ -2484,6 +2543,7 @@ internal static class WholeSceneRender
                     RttLog.Line("Own probes: could not construct an EnvironmentProbeManager — feature unavailable.");
                     return null;
                 }
+                if (park != null && Feeds.Cur.Id < park.Length) park[Feeds.Cur.Id] = _ourProbes;
                 _probeState = 1;
             }
 

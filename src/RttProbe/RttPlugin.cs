@@ -9,6 +9,42 @@ namespace RttProbe;
 // types directly — that would pin the collectible load context.
 public static class RttBridge
 {
+    // ---- PARKED PROBE MANAGERS (goal 4.4, CTD 2026-07-30 18:46) --------------------
+    //
+    // Per-feed EnvironmentProbeManager instances, held HERE rather than in the logic
+    // assembly. This is not a convenience — it is the only place they can live.
+    //
+    // The manager owns eight cube textures, each six faces of RTV descriptors. Those come
+    // from DescriptorHeapPool, a small FIXED pool that exhausts long before VRAM does. The
+    // manager is deliberately never disposed (three device removals established that
+    // disposing it mid-session removes the device), so the design depends on "kept" really
+    // meaning kept.
+    //
+    // It did not. The logic assembly is COLLECTIBLE. A field there is gone on every hot
+    // reload, so each reload built a fresh manager and left the previous one unreachable
+    // from any code that could free it. Not disposing it was the deliberate choice; losing
+    // the reference to it was not. Four reloads in one session ran the pool dry:
+    //
+    //     Assertion Failure: Out of the descriptor heap
+    //       at DescriptorHeapPool.BorrowRTV()
+    //       at RenderTargetCubeTexture.FaceMips.Initialize()
+    //       at EnvironmentProbeManager.RecreateProbes()
+    //       at WholeSceneRender.InstallProbes()
+    //     [Watchdog]: application froze, RenderThreadFreeze.
+    //
+    // The bootstrap is loaded once and never unloaded, so a reference here survives every
+    // reload and the SAME manager is reused instead of a new one being built beside it.
+    //
+    // TYPED AS object ON PURPOSE. The bootstrap must not reference engine render types any
+    // more than it references logic types — resolving them here would drag Render12 type
+    // loading into plugin init, which has already poisoned a type once (the
+    // ConfigurationNotFoundException in a CoreSystems cctor). The logic side reflects over
+    // these; the bootstrap only holds them alive.
+    //
+    // Sized to Feeds.MaxFeeds. A mismatch is not a crash — the logic side bounds-checks —
+    // but it would silently stop parking the feeds past the end, so keep them in step.
+    public static readonly object[] ParkedProbeManagers = new object[4];
+
     // (renderer, batch, surfaceContext) — the renderer is needed to rebuild a panel's
     // screen material, which is how Phase 2 points a panel at our own render target.
     public static volatile Action<object, object, object> PanelRenderHook;
