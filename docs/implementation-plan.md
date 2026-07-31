@@ -140,7 +140,7 @@ grep for high-VRAM lines returned rows from a previous day — the same trap rec
 in this project, fallen into twice. Scope every log window from the last
 `=== RttProbe bootstrap` line before reading a number off it.
 
-### C3 RESULT 2026-07-30 20:35-20:41: functional gate MET, VRAM gate NOT met
+### C3 RESULT 2026-07-30 20:35-20:41: functional gate MET; VRAM gate needs a re-run (see correction at the end)
 
 **What is proven.** Two feeds rendered and delivered simultaneously for the first time:
 
@@ -341,3 +341,31 @@ either way.
 - Known-parked: AAMode/FXAA (4 CTDs — superseded by supersampling anyway), stage 9 HBAO
   (needs the CloudJob treatment), 2048+ resolution (VRAM wall), start-of-frame submit
   (null result, kept as a hook).
+
+### CORRECTION to the C3 VRAM finding, same evening
+
+The "second independent VRAM problem" above is **withdrawn.** The ratchet was the deploy
+path, not the feeds.
+
+`FeedGate.Reset()` set `_paused = false`, so after every hot reload the gate woke believing
+it was unpaused, saw tagged panels ticking, and built a complete feed BEFORE re-reading the
+marker — then went dormant, freed nothing (the teardown ran against half-built state and
+reported `0 MB`), and rebuilt on resume. **~570 MB orphaned per deploy, by the very protocol
+that exists to make deploys safe.** Four deploys, four steps: 12.05 -> 12.23 -> 12.79 -> 13.58.
+
+Every steady-state window in between was **dead flat** — 12.79 GB for fifteen consecutive
+samples at two feeds. There is no per-rebuild leak and no evidence that two feeds approach
+the ceiling.
+
+Fixed by reading the marker inside `Reset()`, and failing CLOSED if it cannot be read.
+Verified on the next deploy: the gate stayed silent through the install and produced exactly
+one build on resume instead of two.
+
+**The lesson is about instrumentation, not about feeds.** Every VRAM number taken across a
+deploy this session was inflated by my own tooling, and the "+580 MB marginal cost of a
+second feed" was one deploy's orphan attributed to feed 1. A measurement harness that
+perturbs the quantity it measures will produce a coherent, plausible, and entirely wrong
+model — this one survived two rounds of analysis before the log ordering gave it away.
+
+**Re-run the C3 VRAM gate on a fresh session with NO mid-run deploys**: launch, set
+`feedCount = 2`, and leave it alone for fifteen minutes.
