@@ -86,3 +86,57 @@ load-bearing: a remote camera would then cost geometry residency as well as rend
 
 **Untested. Do not design goal 6's UI, terminal options or marketing around system-wide
 range until the radius test above has been run.**
+
+---
+
+## FIRST RUN 2026-07-30 22:34 — partial, and it corrects the test's own premise
+
+### Finding 1: the render does not care about distance. At all.
+
+Orbit radius swept 100 m -> 500 m -> 2 km -> 10 km, live, no gate cycle:
+
+| orbit radius | fps | CPU submit | VRAM |
+|---|---|---|---|
+| 100 m (baseline) | 53.0 | 2.3 ms | 12.32 GB |
+| 500 m | 53.8 | 2.2 ms | 12.36 GB |
+| 2 km | 54.1 | 2.3 ms | 12.33 GB |
+| **10 km** | **53.9** | **2.2 ms** | **12.34 GB** |
+
+Flat. No errors, no stutter, no VRAM movement. Whatever the streaming answer turns out to
+be, **rendering from 10 km away costs exactly what rendering from 100 m costs**, which is
+itself a real result: the route has no distance-dependent cost term.
+
+### Finding 2: `wholeSceneFarClip` CANNOT extend the far plane. It is min-only.
+
+```csharp
+private static float FarClip(float engineFar)
+    => clip > 0 && engineFar > clip ? (float)clip : engineFar;
+```
+
+It takes the SMALLER of our value and the engine's. Step 1 of the test above — "raise
+`wholeSceneFarClip` hard (50000+)" — is therefore **impossible as written**: setting 50000
+silently yielded the engine's own `FarClipping` of **15000 m**, which the log states plainly
+(`Feed far clip: 15000 m`) and which nobody had read closely because the knob had only ever
+been used to pull the plane IN as a perf lever.
+
+**So there is a RENDER-side ceiling at ~15 km that has nothing to do with streaming.**
+`VeryFarClipping` stays at 1,000,000 m and is deliberately untouched, which is why planets
+and sky are exempt — exactly as the far-clip comment says.
+
+This matters for how the remaining question is asked: **beyond 15 km, "nothing is drawn" is
+OUR far plane, not the engine's streaming.** The two limits have to be separated before any
+disappearance can be attributed. Extending the plane means RAISING `FarClipping` on our
+render view — a code change, and one with a real cost term behind it (the far plane is what
+culling reads, so widening it widens the cull).
+
+### Still open
+
+The visual verdict at 10 km, and everything past 15 km. The revised sequence:
+
+1. Change `FarClip` to allow raising the plane, behind its own config flag so the perf lever
+   keeps its current min-only behaviour by default.
+2. Re-sweep with the plane genuinely open: 20 km, 50 km, 100 km.
+3. Only THEN is a disappearance attributable to streaming.
+
+Until step 1 exists, this document's "one minute of config edits" claim is wrong and should
+not be repeated.
