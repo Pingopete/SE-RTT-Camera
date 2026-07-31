@@ -697,9 +697,20 @@ internal static class CameraRender
                     //
                     // For the whole-scene source the rect comes from ITS resolution, not
                     // the probe target's — they can legitimately differ.
+                    // PER-PANEL ASPECT CROP (phase E2). The rect type is System.Drawing.
+                    // Rectangle — the BCL type, resolved via Cecil after every game assembly
+                    // came up empty — so the 4-int ctor is unambiguously (x, y, w, h), and
+                    // ScreenQuadJob.Draw maps the getters straight into a D3D12 Viewport.
+                    //
+                    // Naming a SOURCE rect with the destination's aspect makes the blit crop
+                    // then scale, instead of squashing: a 1024x1024 render onto a 512x256
+                    // panel reads the centred 1024x512 band rather than compressing the
+                    // sphere into an ellipse. On a matching aspect the crop degenerates to
+                    // the full source rect, byte-identical to the old behaviour — which is
+                    // why this is safe to land on the current square panels.
                     object crop = null;
                     var srcRes = Prop2(Prop2(wsSource ?? rtBorrow, "Resource") ?? wsSource ?? rtBorrow, "Resolution");
-                    if (srcRes != null) crop = MakeRect(_miCopyDoWork.GetParameters()[7].ParameterType, srcRes);
+                    if (srcRes != null) crop = MakeRect(_miCopyDoWork.GetParameters()[7].ParameterType, srcRes, _feedRes);
 
                     // Identity log for the copy probe: the bootstrap's [copyprobe] lines
                     // print every unique CopyJob src->dst pair with the same #hash format,
@@ -817,7 +828,11 @@ internal static class CameraRender
     // assembly is not referenced here.
     private static bool _rectLogged;
 
-    private static object MakeRect(Type nullableRect, object resolution)
+    // Build the SOURCE rect for the blit: the largest centred region of the source whose
+    // aspect matches the destination panel. dstResolution null (or degenerate) falls back
+    // to the full source rect — the pre-E2 behaviour, and the correct one when the panel's
+    // shape is unknown.
+    private static object MakeRect(Type nullableRect, object resolution, object dstResolution)
     {
         try
         {
@@ -825,6 +840,28 @@ internal static class CameraRender
             int w = (int)(Prop2(resolution, "X") ?? 0);
             int h = (int)(Prop2(resolution, "Y") ?? 0);
             if (w <= 0 || h <= 0) return null;
+
+            // The centred aspect crop. Integer math ordered to avoid rounding drift:
+            // compare aspects as cross-products (sw*dh vs dw*sh — exact, no floats), then
+            // derive the cropped axis from the kept one.
+            int cx = 0, cy = 0, cw = w, ch = h;
+            int dw = (int)(Prop2(dstResolution, "X") ?? 0);
+            int dh = (int)(Prop2(dstResolution, "Y") ?? 0);
+            if (dw > 0 && dh > 0 && (long)w * dh != (long)dw * h)
+            {
+                if ((long)w * dh > (long)dw * h)
+                {
+                    // Source wider than the panel: keep full height, crop the sides.
+                    cw = (int)((long)h * dw / dh);
+                    cx = (w - cw) / 2;
+                }
+                else
+                {
+                    // Source taller: keep full width, crop top and bottom.
+                    ch = (int)((long)w * dh / dw);
+                    cy = (h - ch) / 2;
+                }
+            }
 
             var ctor = t.GetConstructors().FirstOrDefault(c => c.GetParameters().Length == 4
                 && c.GetParameters().All(p => p.ParameterType == typeof(int)));
@@ -834,8 +871,18 @@ internal static class CameraRender
                 return null;
             }
 
-            var r = ctor.Invoke(new object[] { 0, 0, w, h });
-            if (!_rectLogged) { _rectLogged = true; RttLog.Line($"Blit: source crop rect {w}x{h} — the blit scales to the panel instead of cropping."); }
+            // (x, y, width, height) — System.Drawing.Rectangle, so the convention is the
+            // BCL's, not a guess. Verified via Cecil: the cropRect parameter's inner type
+            // scope is System.Drawing.Primitives.
+            var r = ctor.Invoke(new object[] { cx, cy, cw, ch });
+            if (!_rectLogged)
+            {
+                _rectLogged = true;
+                RttLog.Line(cw == w && ch == h
+                    ? $"Blit: source crop rect {w}x{h} (full source; aspects match) — the blit scales to the panel instead of cropping."
+                    : $"Blit: ASPECT CROP {cw}x{ch} at ({cx},{cy}) of a {w}x{h} source, matching the panel's {dw}x{dh} — " +
+                      "centred crop then scale, no distortion.");
+            }
             return r;
         }
         catch (Exception e) { RttLog.Error("crop rect", e); return null; }
