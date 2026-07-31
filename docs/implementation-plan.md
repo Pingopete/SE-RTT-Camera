@@ -563,3 +563,41 @@ worked, but a count change REBUILDS before it releases, and it was issued into a
 already residency-thrashing at 18 fps with 216 MB of headroom. Device removed ~5 s later in
 the GPU profiler's readback at Present. Under VRAM pressure: **pause FIRST** — release with
 re-arm blocked — **then** change the count.
+
+### C3 exit gate: VISUALLY confirmed 2026-07-30 22:46
+
+The user asked whether the two feeds were genuinely distinct, having seen both panels showing
+the same angle. They were right to ask, and the answer had two halves:
+
+1. **At `feedCount = 1` both panels are the SAME feed by design** — RTC2 is an E2 mirror.
+   Identical pictures are the feature working, not a fault.
+2. **At `feedCount = 2` the per-feed orbit phase offset already existed** and had never been
+   looked at: `t += Feeds.Cur.Id * (OrbitPeriod / Feeds.Count)`, so two feeds sit half an
+   orbit apart.
+
+Capture at `feedCount = 2` (`output/frames/twofeeds-224611-227.png`):
+
+- **feed 0** — the ship side-on, silhouetted against the Milky Way, sun off-frame.
+- **feed 1** — the opposite side of the orbit: sun blazing in frame, looking along the hull
+  with thrusters lit and structure filling the corner.
+
+Nothing alike, which is the whole point of the offset. From that comment, written before the
+second feed existed: *"two feeds on panels of the SAME grid would otherwise sit at the same
+orbit angle and produce pixel-identical pictures, which is the one arrangement that makes a
+multi-feed bug invisible — cross-contamination between feeds looks exactly like correct
+output when both feeds show the same thing."*
+
+`47.3 fps, p50 21.2, p95 22.7, >50ms=0, submit 2.4 ms, VRAM 12.10 GB` with two independent
+whole-scene renders. **C3's "both feeds live and correct" is now met by inspection, not just
+by counters.**
+
+### Instrument note: the in-game FPS overlay lies during a capture
+
+The first remoteness capture showed `FPS 17 | GPU 99%` next to our own `54.3 fps`, and was
+briefly written up as a regression. It was the 4K window grab stalling the game for the
+instant the overlay sampled. The engine's own STATISTICS row read `Frame=18.5 ms` (54 fps)
+at the same moment, and a later capture that did not stall read `FPS 120`.
+
+**Never grade performance from a screenshot's overlay.** Use the engine's STATISTICS row or
+our PERF line, both of which sample continuously rather than at the instant of the stall the
+measurement itself caused.
