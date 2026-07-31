@@ -185,3 +185,28 @@ Point a camera at a KNOWN distant object and vary the distance to it:
 Step 3 is the important inversion: it is the PLAYER's distance from the content that drives
 streaming, not the camera's. Every test so far moved the camera while the player stayed put
 next to everything — which is precisely why nothing has ever disappeared.
+
+---
+
+## 2026-07-31: THE ENGINE RECON ANSWERS MOST OF THIS — see remote-object-instancing-recon.md
+
+Read from the shipped assemblies, not tested in game. The short version:
+
+- **Entities (grids/stations) exist client-side EVERYWHERE in singleplayer.** In-process
+  replication is type-based (`ServerSceneContext.ShouldReplicate` → `IsReplicatable`, IL
+  read: no position, no distance, no observers), nothing unloads them at runtime
+  (offloading = save-time mission areas; trash removal = junk). The "local security camera"
+  fear was aimed at the wrong system.
+- **Voxel terrain MESHES are the player-bound part**: every body's clipmap LODs around
+  `RenderSettings.CameraTransform` — one global slot, sole writer `SetCameraParameters`,
+  fed by the engine with the player view.
+- **The fix has an engine-native shape**: per-feed `VoxelClipmap` instances (the ctor takes
+  a WorldTransform + a quality tier; `InstantiateLowResClipmap` is the multi-clipmap
+  precedent; `Unload()` completes the owned lifecycle). Do NOT time-share the engine's
+  clipmap or the global camera slot — single-slot tug-of-war, both directions rebuilt
+  every round.
+- Procedural encounters remain player-bound by design; multiplayer unverified.
+
+The radius test this document proposed is superseded by sharper predictions: distant BUILT
+grids should be visible TODAY (needs #17's look-at target to aim at one); distant TERRAIN
+stays coarse until per-feed clipmaps exist.
