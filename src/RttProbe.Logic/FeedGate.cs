@@ -62,7 +62,38 @@ internal static class FeedGate
         _cycles = 0;
         _teardownIn = -1;
         _pendingStartupLog = false;
-        _paused = false;
+
+        // READ THE PAUSE MARKER NOW, not on the first throttled poll.
+        //
+        // This used to be `_paused = false`, and that one line leaked a whole feed's
+        // resources on EVERY DEPLOY — including every deploy made under the pause protocol
+        // that exists to prevent exactly this.
+        //
+        // A hot reload gives the new assembly fresh statics, so the gate woke up believing
+        // it was unpaused. Tagged panels never stop ticking, so it went ACTIVE, built a full
+        // ScreenBuffers set, and only then read the marker and went dormant again:
+        //
+        //     20:39:00.868  === logic installed ===
+        //     20:39:00.924  [feed 0] FEED GATE: ACTIVE
+        //     20:39:00.940  [feed 0] SECOND ScreenBuffers built — InitializeBuffers(1024x1024)
+        //     20:39:01.138  [feed 0] === FEED PAUSED by marker ===        <- 214 ms too late
+        //     20:39:01.690  [feed 0] Whole-scene Reset: VRAM 12060 -> 12060 MB (0 MB)
+        //     20:39:11.030  [feed 0] SECOND ScreenBuffers built           <- a SECOND set
+        //
+        // The teardown freed nothing (0 MB) because it ran against half-built state, so the
+        // resume rebuilt on top of an orphan. Measured at ~570 MB per deploy, and it is why
+        // VRAM ratcheted 12.05 -> 12.23 -> 12.79 -> 13.58 GB across an evening of deploys
+        // while every STEADY-STATE window in between was dead flat.
+        //
+        // It also means my own workflow was the largest contributor to every VRAM number
+        // taken tonight, and that the "two feeds are near the ceiling" reading was an
+        // artefact of measuring right after a deploy. Steady state at two feeds was flat at
+        // 12.79 GB for fifteen consecutive samples.
+        //
+        // Failing CLOSED is the right default besides: if the marker cannot be read we stay
+        // paused, because the marker's whole purpose is "do not touch GPU resources now".
+        try { _paused = File.Exists(PausePath); }
+        catch { _paused = true; }
     }
 
     // For the health watcher: a one-line machine-readable state dump.
