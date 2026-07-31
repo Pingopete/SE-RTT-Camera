@@ -507,3 +507,59 @@ then proceeds. Benign by construction, per-material-instance, no cross-panel sha
 Estimated ~100 lines across FeedInstance/PanelBinding/CameraFeed. It touches the
 double-release path (one forced-rebind CTD in its history), so it opens a session rather
 than ending one — with the ChangeMaterial groundwork above already done.
+
+### E2 COMPLETE 2026-07-30 22:28 — both halves, verified live
+
+**Aspect crop** (090916a) and **panel fan-out** (this) are in. E2's exit gate is met.
+
+The fan-out activation, `feedCount = 1` with both tagged panels present:
+
+```
+[RTC] panel located: "LCD Panel [RTC]" (1 surfaces registered)
+Feed 0: panel "LCD Panel [RTC2]" MIRRORS this feed — it shows "LCD Panel [RTC]"'s
+        camera. Display only; the orbit target is unchanged.
+Phase 2: panel material rebound to our own render target.      <- bind 1
+Phase 2: panel material rebound to our own render target.      <- bind 2
+```
+
+**Two panels, two material binds, ONE render.** Measured against the single-panel
+single-feed reference from the same session: 53.3 fps vs 52.4-53.3, p50 18.8 vs 19.1, p95
+20.4 vs 20.8-21.2, `>50ms = 0`, VRAM 12.32 GB — indistinguishable. Extra panels really are
+free, because a panel is a material binding and not a render. That is the last input the
+phase-E budget model needed: **credits are per unique CAMERA, and panels do not consume
+them.**
+
+Design decisions worth keeping:
+
+- **First claimant elects the primary.** The feed's identity — orbit target, captured panel
+  RT, LastRenderComponent — follows the panel that claimed it FIRST. Letting every tick
+  publish made the camera thrash between claimants (last-wins, twice a frame), which on two
+  different grids is a camera oscillating between two ships. Mirrors register their surfaces
+  (that is what routes their bind) and nothing else. Re-elected on every gate cycle, so a
+  destroyed primary hands over within one.
+- **Bind list, not bind latch.** Registered at ATTEMPT so a failed bind is not retried every
+  content pass, and `Unbind` sweeps every entry independently — one destroyed panel must not
+  strand the others on our runtime material.
+- **`WantsRepaint` counts live binds against claims**, so a panel joining an already-bound
+  feed re-arms the repaint drive until its own bind lands. Without that a mirror never enters
+  the content-render hook and never binds.
+
+### The quiesce needed a v2, and its own tripwire found it
+
+The first DOWNWARD count change (2 -> 1) exposed what going up never could: shrinking
+`Feeds.Count` retires a slot IMMEDIATELY, so its panel stops routing to it on the very poll
+that requested the quiesce — and **a feed nobody polls can never see itself go dormant.**
+`_active` stayed true, `AllQuiesced` never returned true, and after 10 s the timeout escape
+hatch released the hold — doing exactly its job, on its first ever firing — leaving the
+retired feed's ScreenBuffers and DrawContextManager stranded resident.
+
+`RequestQuiescedRebuild` now forces every active slot dormant itself rather than waiting to
+be polled. **The 10 s fail-open bound is why this was a diagnosable log line instead of a
+mod that silently never came back**, which is the strongest argument yet for writing the
+escape hatch at the same time as the mechanism.
+
+**Protocol lesson (CTD #6):** recovering the stranded feed by flipping the count back UP
+worked, but a count change REBUILDS before it releases, and it was issued into an allocator
+already residency-thrashing at 18 fps with 216 MB of headroom. Device removed ~5 s later in
+the GPU profiler's readback at Present. Under VRAM pressure: **pause FIRST** — release with
+re-arm blocked — **then** change the count.
