@@ -154,3 +154,78 @@ and `maxResidentFeeds`' arithmetic must eventually include it.
   system is separately convinced.
 
 Verify 1 and 2 with #17; build the per-feed clipmap prototype only after they confirm.
+
+---
+
+## ADDENDUM 2026-07-31: trees, rocks, ground clutter — and the engine's own remote-preload API
+
+The user's follow-up: what about vegetation and clutter? Answer: a THIRD architecture,
+and chasing it surfaced the best find of the whole recon.
+
+### How clutter actually works (SE2)
+
+**Trees, boulders, surface ore (the interactable clutter)** are neither entities-at-rest
+nor voxels. They live in **planet environment SECTORS**:
+
+- `PlanetEnvironmentComponent` (VRage.Voxels, one per planet) owns an
+  `EnvironmentClipmap2D` of surface sectors, a `PlanetEnvironmentSectorStorage`, and an
+  `IEntitySpawner`.
+- Sectors MATERIALIZE through the **spatial-trigger system**: the module declares trigger
+  layers (`GetTriggerLayers`), and trigger volumes riding entities tagged
+  `"EnvironmentLocal"` (players/characters) cause `OnMaterializeSector` — which SPAWNS
+  real flora entities into the hierarchy (`AddToHierarchy`), generates ores
+  (`GenerateOre`), and registers GPU render batches
+  (`FloraSystemComponent.AddFloraSector` → `SceneManager.CreateFloraSectorEntity`).
+- Sectors DEmaterialize when the triggers leave (`OnDematerializeSector`) — clutter around
+  you is a materialized bubble, not persistent world state.
+
+**Consequence for a remote feed today:** no trees, no rocks, no surface ore in shot —
+those sectors were never materialized. This is the strongest player-binding of the four
+systems, stronger than voxel LOD (the planet SHAPE at least exists coarsely; the trees do
+not exist at all).
+
+**Grass** is different again: a render-side GPU system (`GrassEntity` contracts,
+`GrassSettings`, and `GrassBufferContext` hanging off the DrawContextManager — **which
+each of our feeds already owns**). Within materialized sectors, grass generation is
+per-render-context, so it plausibly already follows our feed camera wherever sector data
+exists. Unverified visually; cheap to check once a feed is inside a materialized area.
+
+### THE FIND: the engine ships a remote-preload API, and it is exactly shaped for us
+
+```
+Keen.VRage.Core.Game.GameSystems.SpaceProbe.ISpaceProbePreloadable
+    Task PreloadAreaAsync(OrientedBoundingBoxD box, Precision precision, IPreloadCollector collector)
+    Task PreloadAreaAsync(LineD line,              Precision precision, IPreloadCollector collector)
+    Task PreloadAreaAsync(BoundingBoxD aabb,       Precision precision, IPreloadCollector collector)
+    Task PreloadAreaAsync(BoundingBoxD aabb, Vector3D vector, Precision, IPreloadCollector)
+```
+
+- Implemented by **`VoxelStorageComponentBase`** (voxel DATA at the remote point) and
+  **`PlanetEnvironmentComponent`** (environment sectors — `PreloadedSector` is an inner
+  class, `PendingSectorsTag` its bookkeeping) — very likely more implementors.
+- Surrounding machinery: `DirectionalDynamicSpaceProbe` (preload ALONG A LINE — built for
+  something travelling), `IPreloadCollector`/`IPreloaded`, `SpaceProbeAdmin` (admin
+  tools), `SpaceProbeDebugScreen`. This is a maintained, first-class system: Keen's own
+  "make the world exist at a remote location" mechanism.
+
+### The mechanism menu for feeds, now three tiers
+
+| tier | mechanism | gives | lifecycle |
+|---|---|---|---|
+| 1 | `PreloadAreaAsync(box around feed)` | voxel data + environment sectors warmed at the feed | one-shot per call — re-issue as the camera moves |
+| 2 | an `"EnvironmentLocal"`-style TRIGGER attached at the feed position | CONTINUOUS sector materialize/dematerialize, the same bubble players get — trees/rocks/ore spawn for real | engine-managed while the trigger exists; needs ISpatialTriggerSystem registration recon |
+| 3 | per-feed `VoxelClipmap` (main recon above) | near-LOD terrain MESH around the feed | ours, Unload() on teardown |
+
+The full remote-feed recipe stacks them: entities already exist everywhere (SP) →
+tier 1/2 materializes the clutter bubble → tier 3 sharpens the terrain → grass likely
+follows our own per-feed GrassBufferContext inside materialized sectors.
+
+### Open edges, honestly
+
+- Who calls PreloadAreaAsync today and with what Precision values — read before using
+  (`callers PreloadAreaAsync`, unread; the Precision enum semantics matter for cost).
+- ISpatialTriggerSystem registration surface for tier 2 — unread.
+- Whether sector MATERIALIZATION is server-side only (its spawner adds entities — in SP
+  in-process that is fine; MP another story).
+- Cost: a materialized sector bubble is real entities + physics(?) + render batches —
+  the budget/cap arithmetic gains another term, same as the clipmap tier.
