@@ -10,22 +10,62 @@ planet atmospheres, and no main-world bleed.
 
 ---
 
-> ## ⚠ THE BIGGEST OPEN QUESTION: is the feed truly remote?
+> ## ⚠ THE BIGGEST OPEN QUESTION — ANSWERED BY ENGINE RECON 2026-07-31; VERIFICATION IS NOW GOAL 10
 >
-> **See [open-question-remote-streaming.md](open-question-remote-streaming.md). Raised
-> 2026-07-30, untested, and it decides what goal 6 actually is.**
+> **See [remote-object-instancing-recon.md](remote-object-instancing-recon.md)** (and the
+> history in [open-question-remote-streaming.md](open-question-remote-streaming.md)). The
+> recon read the shipped assemblies and split "does the world exist at range" into four
+> systems with four different answers:
 >
-> The RENDER is settled: it is camera-relative, with culling, cascades, probes and planet
-> atmosphere all derived from OUR camera, not the player's. What is NOT settled is whether
-> the client has anything RESIDENT to draw at range — voxels and grids stream around the
-> player, and the feed cannot draw what was never loaded.
+> - **Entities (grids/stations): exist EVERYWHERE in singleplayer** — replication is
+>   type-based (`ShouldReplicate`/`IsReplicatable` IL: no distance, no observers), and
+>   nothing unloads them at runtime. Better than feared.
+> - **Voxel terrain meshes: player-bound** — every body's clipmap LODs around the single
+>   global `RenderSettings.CameraTransform`.
+> - **Trees/rocks/surface ore: MOST player-bound** — planet environment SECTORS that
+>   materialize/dematerialize around `"EnvironmentLocal"` trigger volumes (players). A
+>   remote feed today gets none of them.
+> - **Procedural encounters: player-bound by design.** Multiplayer: unverified.
 >
-> Two different products hang on the answer: a **system-wide remote camera**, or a **local
-> security camera** that goes blank past the streaming radius. Both are worth building; they
-> are not the same mod.
+> **And the engine ships the fix**: `ISpaceProbePreloadable.PreloadAreaAsync(box/obb/line,
+> Precision, collector)` — a first-class remote-preload API implemented by voxel storage AND
+> the planet environment — plus the trigger route for a continuous bubble, plus per-feed
+> `VoxelClipmap` instances for terrain mesh. Three tiers; the recon doc carries the full
+> menu, the rejected shortcuts, and the open edges.
 >
-> **Do not design goal 6's UI or scope around system-wide range until the radius test in
-> that document has been run.** It costs about a minute of config edits.
+> **The system-wide remote camera is therefore the product** — pending goal 10 below, which
+> is the verification and build-out of that stack. Do not skip the verification: the recon
+> is offline reading, and this project's own Rule 26 says a mechanism is only real once it
+> has been observed FIRING.
+
+---
+
+## 10. Remote world materialization — VERIFY, then build (added 2026-07-31, HIGH priority)
+
+**The goal that decides what goal 6 ships as.** Elevated at the user's direction: testing
+and verifying the recon's findings is first-class project work, not a side quest.
+
+**Step 1 — the instrument (task #17):** a config-set look-at target, so a feed can be aimed
+at a KNOWN distant object. The orbit camera only ever looks at its own grid, which is why
+every remoteness test so far has been unable to distinguish anything.
+
+**Step 2 — verify the recon's three predictions in game, in order of cheapness:**
+
+| # | prediction | how | verdict decides |
+|---|---|---|---|
+| V1 | a distant BUILT GRID is visible in a feed TODAY (entities exist everywhere) | aim a feed at a grid far from the player; fly the player away | whether the entity layer needs ANY work at all |
+| V2 | distant TERRAIN renders at coarse LOD only (clipmap is player-bound) | same shot, planet/asteroid in frame | the value of tier 3 (per-feed clipmaps) |
+| V3 | NO trees/rocks/ore near a remote feed (sectors never materialized) | feed at a planet surface point the player has left | the value of tiers 1-2 (preload/trigger) |
+
+**Step 3 — build the stack bottom-up, each tier verified before the next** (task #19):
+tier 1 `PreloadAreaAsync` (read its callers + Precision semantics FIRST), tier 2 the
+environment trigger at the feed position (ISpatialTriggerSystem registration recon first),
+tier 3 per-feed `VoxelClipmap`. Grass rides free per-DrawContextManager and gets a visual
+check inside any materialized sector.
+
+**Exit gate:** a feed parked at a location the player has never visited shows terrain,
+clutter and any built structures there — and tearing the feed down dematerializes what it
+materialized, with the cost of each tier measured and folded into the E1 cap arithmetic.
 
 ---
 

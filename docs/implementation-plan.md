@@ -722,3 +722,29 @@ toward this wall; play sessions without deploys should not.
 2. **#18 GC churn quantification + mitigation** → the long-session smoothness ceiling.
 3. E2 fan-out at N>2 panels; third [RTC3] feed once a panel exists; B1 layer-cost table
    (needs a parked player and a fresh session).
+
+---
+
+## Phase J — remote world verification & materialization (roadmap goal 10; added 2026-07-31)
+
+Elevated at the user's direction after the engine recon (remote-object-instancing-recon.md):
+verifying these systems is a STRONG project goal, sequenced ahead of further feature work on
+the feed itself. Standing discipline applies unchanged; every step below that touches the
+running game goes through the pause protocol, and every mechanism is only trusted once
+observed FIRING (Rule 26).
+
+| # | item | test / exit evidence |
+|---|---|---|
+| J1 | **Look-at target** (task #17) — config-set aim point (world coords or a tagged grid name); the feed camera points at it instead of orbiting its own grid | feed shows the target; existing orbit behaviour unchanged when the knob is unset |
+| J2 | **Verify V1: distant built grids visible today** — aim at a far grid, fly the player away in steps | grid stays in the feed at range; the distance where anything changes recorded |
+| J3 | **Verify V2: terrain coarse at range** — planet/asteroid in the remote shot | LOD visibly coarse vs local; screenshots archived |
+| J4 | **Verify V3: no clutter at range** — surface point the player has left | trees/rocks absent in the feed where the player saw them present |
+| J5 | **PreloadAreaAsync recon completion** — callers, Precision enum semantics, cost per call | documented before first use; no call until read |
+| J6 | **Tier 1 live**: preload a box around a feed; re-verify J3/J4 inside it | terrain data + sectors appear in the feed; cost measured (worker pool #18, VRAM cap) |
+| J7 | **Tier 2 recon + live**: ISpatialTriggerSystem registration; a trigger at the feed position | continuous materialize/dematerialize observed in the feed; teardown dematerializes |
+| J8 | **Tier 3**: per-feed VoxelClipmap (LOW quality, cell budget) | near-LOD terrain in the remote feed; Unload() on feed teardown leaks nothing |
+| J9 | **Grass check**: visual inside any materialized sector | grass present/absent recorded; per-DrawContextManager hypothesis confirmed or retracted |
+
+Exit gate: a feed parked where the player has never been shows terrain, clutter and built
+structures; feed teardown dematerializes what it materialized; each tier's cost is a
+measured number in the cap arithmetic.
