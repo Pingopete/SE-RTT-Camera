@@ -63,6 +63,8 @@ internal static class FeedResourceReport
 
     private static void Run()
     {
+        _nodes = 0;
+        _unsized.Clear();
         var sb = new StringBuilder();
         sb.AppendLine($"FEED RESOURCE REPORT — {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
         sb.AppendLine($"feedCount={Feeds.Count}  " +
@@ -93,9 +95,32 @@ internal static class FeedResourceReport
 
         sb.AppendLine($"{"ALL FEEDS",-42} {Mib(grand),12}");
         sb.AppendLine();
-        sb.AppendLine("Sizes are COMPUTED from each texture's resolution, format, mip count and array");
-        sb.AppendLine("size — not sampled from the driver. They are what we asked the GPU for; actual");
-        sb.AppendLine("residency can differ through pooling, aliasing and driver-side padding.");
+
+        // THE COVERAGE GAP, printed every time. A total that silently omits whole classes of
+        // resource is worse than no total, because it invites exactly the confident-and-wrong
+        // conclusion this report exists to replace.
+        if (_unsized.Count > 0)
+        {
+            sb.AppendLine($"UNSIZED ({_unsized.Count} distinct resource-shaped TYPES the walk could not measure —");
+            sb.AppendLine("the total above EXCLUDES these, so treat it as a lower bound):");
+            var list = new List<string>(_unsized.Keys);
+            list.Sort();
+            for (int i = 0; i < list.Count && i < 30; i++)
+                sb.AppendLine($"    {list[i],-40} e.g. {_unsized[list[i]]}");
+            if (list.Count > 30) sb.AppendLine($"    ... and {list.Count - 30} more types");
+            sb.AppendLine();
+        }
+        else
+        {
+            sb.AppendLine("UNSIZED: none — every resource-shaped object reached was measured.");
+            sb.AppendLine();
+        }
+
+        sb.AppendLine($"(walked {_nodes} nodes, cap {MaxNodes})");
+        sb.AppendLine("Sizes are COMPUTED from each resource's own description — resolution, format, mip");
+        sb.AppendLine("count, array size, or element count x stride — not sampled from the driver. They");
+        sb.AppendLine("are what we asked the GPU for; actual residency can differ through pooling,");
+        sb.AppendLine("aliasing and driver-side padding.");
 
         try { File.WriteAllText(ReportPath, sb.ToString()); } catch { }
         RttLog.Line(sb.ToString());
@@ -126,9 +151,13 @@ internal static class FeedResourceReport
         return total;
     }
 
-    private const int MaxDepth = 4;
-    private const int MaxNodes = 4000;
+    private const int MaxDepth = 5;
+    private const int MaxNodes = 20000;
     private static int _nodes;
+
+    // Resource-shaped objects the walk could not size. Distinct type names only — the point
+    // is to learn WHICH types need a sizing rule, not to list every instance.
+    private static readonly Dictionary<string, string> _unsized = new();
 
     private static void Walk(object node, string path, List<(string, long, string)> found,
                              HashSet<object> seen, int depth)
@@ -139,6 +168,23 @@ internal static class FeedResourceReport
         if (t.IsPrimitive || node is string || t.IsEnum) return;
         if (!t.IsValueType && !seen.Add(node)) return;
 
+        // THE UNDERLYING D3D ALLOCATION WINS, and this is a correction to the first version.
+        //
+        // A Render12 texture owns a `_d3dResourceWrap` (the actual allocation, carrying
+        // SizeInBytes) AND a set of `_slices` / typed views INTO that same memory. Counting
+        // both double-counts every texture in the report: character shadows appeared as
+        // three 16 MiB slices PLUS a 16 MiB wrap, and the LDR ring as a 1.4 MiB wrap
+        // alongside its own mip slices.
+        //
+        // The wrap is authoritative — it is the real allocation including driver padding,
+        // where summing views is an estimate that also happens to be wrong. So: if this node
+        // owns a wrap, count the wrap and DO NOT DESCEND, which drops the views with it.
+        if (TryResourceWrap(node, out long wrapBytes, out string wrapDetail))
+        {
+            found.Add((path, wrapBytes, wrapDetail));
+            return;
+        }
+
         // Is THIS a texture? Resolution + Format together is the signature — every bindable
         // texture in Render12 carries both, and nothing else does.
         if (TryTexture(node, out long bytes, out string detail))
@@ -146,6 +192,29 @@ internal static class FeedResourceReport
             found.Add((path, bytes, detail));
             return;                                  // do not descend into a texture
         }
+
+        // Is THIS a buffer? Visibility lists, occlusion contexts and geometry buffers are
+        // structured buffers, not textures — they carry no Resolution or Format, so the
+        // first version of this report could not see them at all. That matters: the code
+        // describes the geometry buffers as ranged to the WHOLE SCENE, and the engine's own
+        // accounting put a second feed at ~1.5 GB against 175 MiB of measured textures.
+        // Whatever closes that 8x gap is most likely here.
+        if (TryBuffer(node, out bytes, out detail))
+        {
+            found.Add((path, bytes, detail));
+            return;
+        }
+
+        // Buffer-shaped but unsized: report it rather than skip it silently. The member
+        // names are unknown ahead of time, so the report itself is how they get learned —
+        // same principle as the unscoped-access detector, and much cheaper than guessing
+        // at them offline and redeploying until something sticks.
+        // Keyed on the TYPE NAME, not the path: the point is to learn which TYPES need a
+        // sizing rule. The first version keyed on type+path and reported "3976 distinct
+        // types", which was really one AutoResourceState per resource — a number that told
+        // me nothing except that I had written the key wrong.
+        if (LooksLikeResource(t) && depth > 0 && !_unsized.ContainsKey(t.Name))
+            _unsized[t.Name] = path;
 
         // Collections: the GBuffer array, the cascade set, the LDR ring.
         if (node is System.Collections.IEnumerable seq && node is not string)
@@ -193,6 +262,96 @@ internal static class FeedResourceReport
     {
         int a = n.IndexOf('<'), b = n.IndexOf('>');
         return (a == 0 && b > 1) ? n.Substring(1, b - 1) : n;
+    }
+
+    // Type names that mean "this owns GPU memory", used only to decide whether an object we
+    // could NOT size is worth reporting as a gap.
+    private static bool LooksLikeResource(Type t)
+    {
+        string n = t.Name;
+        return n.IndexOf("Buffer", StringComparison.OrdinalIgnoreCase) >= 0
+            || n.IndexOf("Texture", StringComparison.OrdinalIgnoreCase) >= 0
+            || n.IndexOf("Resource", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    // Does this node own the underlying D3D allocation directly? Looks one level down for a
+    // wrapper field carrying an explicit byte size — that is the real allocation, and every
+    // view hanging off the same node is a duplicate of it.
+    private static bool TryResourceWrap(object o, out long bytes, out string detail)
+    {
+        bytes = 0; detail = null;
+        var t = o.GetType();
+        if (t.IsValueType || t.IsPrimitive) return false;
+
+        FieldInfo[] fields;
+        try { fields = t.GetFields(Any); } catch { return false; }
+
+        foreach (var f in fields)
+        {
+            if (f.Name.IndexOf("d3dResource", StringComparison.OrdinalIgnoreCase) < 0) continue;
+            object w;
+            try { w = f.GetValue(o); } catch { continue; }
+            if (w == null) continue;
+
+            var size = AsLong(Member(w, w.GetType(), "SizeInBytes"))
+                    ?? AsLong(Member(w, w.GetType(), "ByteSize"));
+            if (size is > 0)
+            {
+                bytes = size.Value;
+                // Keep the shape in the detail line — a bare byte count is unreadable, and
+                // the resolution is what makes "this is character shadows at 2048" obvious.
+                string shape = "";
+                var res = Member(o, t, "Resolution");
+                if (res != null && Vec2(res, out int w2, out int h2) && w2 > 0)
+                    shape = $" {w2}x{h2} {Member(o, t, "Format")}";
+                detail = $"d3d alloc{shape}";
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Buffers, sized by whatever the type actually exposes. Tried in order of directness:
+    // an explicit byte size beats a count x stride, which beats nothing.
+    private static bool TryBuffer(object o, out long bytes, out string detail)
+    {
+        bytes = 0; detail = null;
+        var t = o.GetType();
+        if (!LooksLikeResource(t)) return false;
+
+        // A texture already handled above would also match some of these names.
+        if (Member(o, t, "Resolution") != null) return false;
+
+        foreach (var name in new[] { "SizeInBytes", "ByteWidth", "TotalSizeInBytes",
+                                     "ByteSize", "TotalBytes", "BufferSize" })
+        {
+            var v = AsLong(Member(o, t, name));
+            if (v is > 0)
+            {
+                bytes = v.Value;
+                detail = $"{name}={v.Value}";
+                return true;
+            }
+        }
+
+        long? count = AsLong(Member(o, t, "ElementCount")) ?? AsLong(Member(o, t, "Count"))
+                   ?? AsLong(Member(o, t, "Capacity")) ?? AsLong(Member(o, t, "NumElements"));
+        long? stride = AsLong(Member(o, t, "Stride")) ?? AsLong(Member(o, t, "ElementSize"))
+                    ?? AsLong(Member(o, t, "StructureByteStride")) ?? AsLong(Member(o, t, "ElementStride"));
+
+        if (count is > 0 && stride is > 0)
+        {
+            bytes = count.Value * stride.Value;
+            detail = $"{count.Value} x {stride.Value}B";
+            return true;
+        }
+        return false;
+    }
+
+    private static long? AsLong(object o)
+    {
+        if (o == null) return null;
+        try { return Convert.ToInt64(o); } catch { return null; }
     }
 
     private static bool TryTexture(object o, out long bytes, out string detail)
