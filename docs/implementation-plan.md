@@ -601,3 +601,36 @@ at the same moment, and a later capture that did not stall read `FPS 120`.
 **Never grade performance from a screenshot's overlay.** Use the engine's STATISTICS row or
 our PERF line, both of which sample continuously rather than at the instant of the stall the
 measurement itself caused.
+
+### Methodology rule (user-reported 2026-07-30): the game is FRAME-CAPPED while alt-tabbed
+
+The user: alt-tabbing to the second screen drops the game's frame rate hard. Not a bug —
+a background cap — but it contaminates every measurement window it touches, and the user
+is BY DEFINITION alt-tabbed whenever they are typing in this chat. So the windows most
+likely to be read during a conversation are exactly the windows most likely to be capped.
+
+**The signature, from tonight's data:** frame time PINNED at ~52-54 ms with a tight
+distribution (p50 52.x, p95 ~56, max ~60, >50ms ≈ n). Organic load looks different —
+variable heavy frames, wide p95-max spread. A pinned tight distribution at a round
+period is a cap, not a workload.
+
+**Detection is now automatic:** the watchdog stamps `focus=GAME` / `focus=AWAY(proc)` on
+every line (Windows `GetForegroundWindow` — the engine does not log focus). Discount any
+PERF window whose watchdog line says AWAY.
+
+**Retroactive re-attributions, in honesty:**
+- The 23:30:46-23:31:11 "sustained stutter" windows (19 fps, p50 52-53) — the user was
+  typing the message that arrived at 23:31. Alt-tab cap, not load. The monitor alerted on
+  all of them; all were noise.
+- The 22:07-22:08 "residency thrash" windows (18.5 fps, p50 54, tight) carry the same
+  pinned signature and the user was away between messages. The STRANDED FEED those windows
+  decorated was independently real (proved by counters: 2 feeds resident, releases logged),
+  and CTD #6 (rebuild into pressure) stands — but the "sustained thrash" reading that
+  justified the urgency was probably substantially alt-tab.
+- The 20:49 episode mixes both: VRAM was genuinely over budget (13.71 vs 13.60) and the
+  user was watching in-game at first ("im watching the fps rapidly drop"), then typing.
+  Real pressure, cap-contaminated tail.
+
+**Standing rule: grade performance only from windows where focus=GAME**, alongside the
+existing rules (equal session age, tail not mean, control player position, session-scoped
+log reads).

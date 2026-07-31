@@ -38,6 +38,23 @@ for ((i = 0; i < MAX_ITER; i++)); do
     LINE="$LINE CRASH=$(basename "$CRASH") at=${WHERE}"
   fi
 
+  # FOCUS. The user reports (2026-07-30) that alt-tabbing to the second screen drops the
+  # game's frame rate hard — a background frame cap, not a bug. Every PERF window taken
+  # while the game is backgrounded is therefore contaminated, and several of tonight's
+  # "sustained stutter" alerts were exactly that: the user was typing in chat. Stamping
+  # focus on every line makes those windows discountable at a glance instead of
+  # diagnosable-looking. (The engine does not log focus changes; asking Windows directly
+  # is the only way.)
+  FOCUS=$(powershell -NoProfile -Command '
+    Add-Type "using System;using System.Runtime.InteropServices;public class W{[DllImport(\"user32.dll\")]public static extern IntPtr GetForegroundWindow();[DllImport(\"user32.dll\")]public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);}" 2>$null
+    $p=0; [W]::GetWindowThreadProcessId([W]::GetForegroundWindow(),[ref]$p) | Out-Null
+    try { (Get-Process -Id $p -ErrorAction Stop).ProcessName } catch { "?" }' 2>/dev/null | tr -d '\r')
+  case "$FOCUS" in
+    SpaceEngineers2) LINE="$LINE focus=GAME" ;;
+    "")              LINE="$LINE focus=?" ;;
+    *)               LINE="$LINE focus=AWAY($FOCUS)" ;;
+  esac
+
   if [ -f "$LOG" ]; then
     SR=$(grep -a "secondRenders" "$LOG" | tail -1 | grep -oE "secondRenders=[0-9]+" || true)
     GATE=$(grep -a "FEED GATE\|FEED PAUSED\|FEED UNPAUSED" "$LOG" | tail -1 | grep -oE "ACTIVE \(cycle [0-9]+\)|DORMANT|PAUSED|UNPAUSED" || true)
