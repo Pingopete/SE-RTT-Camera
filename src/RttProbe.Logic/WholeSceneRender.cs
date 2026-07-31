@@ -709,8 +709,18 @@ internal static class WholeSceneRender
         // cycle and cost a device removal.
         FeedGate.PumpAll();
 
-        using (Feeds.Enter(Feeds.NextForRender()))
-            OnWholeSceneScoped(sceneDrawSystem, finalLdrBuffer);
+        // Allocation attribution for the GC-spike hunt (see Perf.NoteRenderAlloc). This
+        // wrap covers EVERYTHING our mod does per frame on the render thread except the
+        // UI-stage handover — the nested Draw, the camera pass, the copy, the gate, the
+        // config poll. Same-thread deltas only; GetAllocatedBytesForCurrentThread is
+        // per-thread by contract.
+        long alloc0 = GC.GetAllocatedBytesForCurrentThread();
+        try
+        {
+            using (Feeds.Enter(Feeds.NextForRender()))
+                OnWholeSceneScoped(sceneDrawSystem, finalLdrBuffer);
+        }
+        finally { Perf.NoteRenderAlloc(GC.GetAllocatedBytesForCurrentThread() - alloc0); }
     }
 
     private static void OnWholeSceneScoped(object sceneDrawSystem, object finalLdrBuffer)

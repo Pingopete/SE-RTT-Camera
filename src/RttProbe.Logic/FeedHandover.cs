@@ -353,13 +353,20 @@ internal static class FeedHandover
     {
         if (args == null || args.Length == 0) return;
 
-        // TARGET-DRIVEN (phase C1b, resolved for real in C3). The engine names the offscreen
-        // target it is drawing, so the feed is whoever parked a frame for it. The component
-        // is picked out of the args here rather than below, because the scope has to be open
-        // before ANY per-feed state is touched — including the _panelHandleText the
-        // ownership test itself reads.
-        using (Feeds.Enter(Feeds.ForTarget(TargetComponentOf(args))))
-            OnOffscreenUiDrawScoped(args);
+        // Allocation attribution for the GC-spike hunt — the UI-stage half. See
+        // Perf.NoteUiAlloc; the whole-scene hook carries the other counter.
+        long alloc0 = GC.GetAllocatedBytesForCurrentThread();
+        try
+        {
+            // TARGET-DRIVEN (phase C1b, resolved for real in C3). The engine names the offscreen
+            // target it is drawing, so the feed is whoever parked a frame for it. The component
+            // is picked out of the args here rather than below, because the scope has to be open
+            // before ANY per-feed state is touched — including the _panelHandleText the
+            // ownership test itself reads.
+            using (Feeds.Enter(Feeds.ForTarget(TargetComponentOf(args))))
+                OnOffscreenUiDrawScoped(args);
+        }
+        finally { Perf.NoteUiAlloc(GC.GetAllocatedBytesForCurrentThread() - alloc0); }
     }
 
     private static object TargetComponentOf(object[] args)

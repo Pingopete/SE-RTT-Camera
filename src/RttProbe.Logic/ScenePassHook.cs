@@ -48,10 +48,22 @@ internal static class ScenePassHook
         // force-run when ownProbes is on) the ambient is already set to that same instance,
         // and Scope restores the previous value rather than nulling — so nesting is a no-op
         // rather than a hazard.
+        // Allocation attribution, third entry point (the GC-spike hunt). The first split
+        // acquitted the other two: whole-scene hook 5.2 MB/s, UI stage 0.2, against ~32
+        // total that provably stops when the feed pauses. The camera/copy pass rides THIS
+        // hook — outside both earlier wraps — so it was the unmeasured remainder's prime
+        // home. Counted into the render bucket: same thread, same PERF line.
         int want = FeedConfig.PassOnFrameHook ? 1 : 0;
         if (which == want)
-            using (Feeds.Enter(Feeds.NextForRender()))
-                CameraRender.OnProbePass(sceneDrawSystem, commandList);
+        {
+            long alloc0 = GC.GetAllocatedBytesForCurrentThread();
+            try
+            {
+                using (Feeds.Enter(Feeds.NextForRender()))
+                    CameraRender.OnProbePass(sceneDrawSystem, commandList);
+            }
+            finally { Perf.NoteRenderAlloc(GC.GetAllocatedBytesForCurrentThread() - alloc0); }
+        }
 
         var now = Environment.TickCount64;
         if (now - _lastRateLog >= 10000)

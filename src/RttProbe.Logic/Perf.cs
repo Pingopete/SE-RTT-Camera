@@ -109,6 +109,24 @@ internal static class Perf
     // Set by RunSecondRender around the Draw invoke.
     public static void NoteOurDraw(double ms) => _ourDraw.Add(ms);
 
+    // ---- MANAGED ALLOCATION ATTRIBUTION (the GC-spike hunt, 2026-07-30) --------------
+    //
+    // The user, standing still with both panels in view, sees 100-270 ms hitches every few
+    // seconds. Engine stats attribute them to GC: CLRStalls 0.009 -> 12, GC churn 3-5 GB
+    // per interval, sim-thread maxima ~200 ms while the render thread stays at 4 ms. Our
+    // heap telemetry shows ~32 MB/s of linear growth — and the dormant-minute experiment
+    // proved the churn is OURS: pausing the feed all but stopped it.
+    //
+    // ~32 MB/s at ~52 fps is ~600 KB per engine frame, far too much for reflection glue —
+    // something per-frame is allocating ARRAYS. Guessing the site has been wrong twice
+    // tonight, so these counters attribute it instead: GC.GetAllocatedBytesForCurrentThread
+    // deltas around our two per-frame entry points, printed per PERF window. Wraps run on
+    // the render thread only, where both entry points live.
+    private static long _allocRender, _allocUi;
+
+    public static void NoteRenderAlloc(long bytes) { if (bytes > 0) _allocRender += bytes; }
+    public static void NoteUiAlloc(long bytes)     { if (bytes > 0) _allocUi += bytes; }
+
     // Called once per engine frame from the whole-scene hook, AFTER the render decision
     // so `oursRan` is known.
     public static void NoteFrame(bool oursRan)
@@ -169,7 +187,9 @@ internal static class Perf
                 $"idle n={_idle.Count} mean={_idle.Mean:F1} p50={_idle.Pct(0.50):F1} " +
                 $"p95={_idle.Pct(0.95):F1} max={_idle.Max:F1} >50ms={_idle.Over(50)} | " +
                 $"ourDraw(cpu submit) n={_ourDraw.Count} mean={_ourDraw.Mean:F1} " +
-                $"p95={_ourDraw.Pct(0.95):F1} max={_ourDraw.Max:F1} | {vram}");
+                $"p95={_ourDraw.Pct(0.95):F1} max={_ourDraw.Max:F1} | " +
+                $"alloc render={_allocRender / windowMs * 1000 / 1048576.0:F1}MB/s " +
+                $"ui={_allocUi / windowMs * 1000 / 1048576.0:F1}MB/s | {vram}");
 
             // Publish BEFORE clearing — see the Stats comment.
             _latest = new Stats
@@ -191,6 +211,7 @@ internal static class Perf
             };
 
             _oursRan.Clear(); _idle.Clear(); _ourDraw.Clear();
+            _allocRender = _allocUi = 0;
         }
         catch (Exception e) { RttLog.Error("perf report", e); }
     }
