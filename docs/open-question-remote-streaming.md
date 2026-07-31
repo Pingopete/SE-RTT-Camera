@@ -140,3 +140,48 @@ The visual verdict at 10 km, and everything past 15 km. The revised sequence:
 
 Until step 1 exists, this document's "one minute of config edits" claim is wrong and should
 not be repeated.
+
+## SECOND RUN 2026-07-30 22:39 — the plane opened to 50 km, camera out to 50 km
+
+`wholeSceneFarClipExtend` was built (ac7a9f6) so the plane could genuinely be pushed out,
+then the camera was swept to a **50 km orbit with a 50 km far plane**.
+
+| | fps | GPU time | frame time | CPU submit | VRAM |
+|---|---|---|---|---|---|
+| 100 m orbit, 2.5 km plane | 53.0 | — | — | 2.3 ms | 12.32 GB |
+| **50 km orbit, 50 km plane** | **54.0** | **18.3 ms** | **18.5 ms** | **2.3 ms** | 12.32 GB |
+
+Engine's own STATISTICS row, not just our counters. **Distance and plane width are free.**
+
+**What the feed actually showed at 50 km** (window capture, `output/frames/`): a ringed
+planet, the sun, the Milky Way band and a full starfield — rendering cleanly, no black
+screen, no artefacts. The global-data layers behave exactly as predicted: they are not
+streamed, so they render at any range.
+
+### What this does NOT answer, stated plainly
+
+**Nothing streamed was ever in frame.** The orbit camera looks inward at the tagged panel's
+grid, and at 50 km that grid subtends almost nothing; no other ship, station or asteroid
+happened to lie along the view. So "we saw only planets and stars" is consistent with BOTH
+hypotheses and distinguishes neither:
+
+- streaming dropped the local geometry, or
+- there was no local geometry in that direction to begin with.
+
+`ourDraw` cannot arbitrate either: it stayed 2.2-2.3 ms from 100 m to 50 km, because submit
+is dominated by the whole-scene CULL (proportional to world entity count, unchanged) rather
+than by the drawn subset. **Submit is not a visibility proxy — do not use it as one.**
+
+### The test that would actually settle it
+
+Point a camera at a KNOWN distant object and vary the distance to it:
+
+1. Park a second grid (or note an asteroid) at a known position.
+2. Aim the feed camera at it — needs an aim mode, since the orbit always looks inward at its
+   own grid. This is the real blocker, and it is a small feature: a config-set look-at target.
+3. Fly the PLAYER away from it in steps, leaving the camera on it. The distance at which it
+   disappears from the feed is the streaming radius, and it is the product specification.
+
+Step 3 is the important inversion: it is the PLAYER's distance from the content that drives
+streaming, not the camera's. Every test so far moved the camera while the player stayed put
+next to everything — which is precisely why nothing has ever disappeared.
