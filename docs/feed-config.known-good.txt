@@ -1,3 +1,18 @@
+# KNOWN-GOOD SNAPSHOT — copy over output/feed-config.txt to restore this state.
+#
+# Taken 2026-07-30 22:32, from a configuration soaked clean with EVERYTHING on: own
+# probes, own shadows, own flares, atmosphere LUTs, 1024 SSAA, and two panels sharing
+# one render.
+#
+#   fps 52.4-53.3   p50 18.8-19.2   p95 20.4-20.8   max <=29   >50ms=0
+#   submit 2.2-2.3ms   VRAM 12.32-12.34 GB flat   errors 0   unscoped 0
+#
+# output/ is gitignored, so THIS file is the only tracked record of a working config —
+# the previous snapshot was from 2026-07-29 and had drifted a full evening behind
+# (512 render, no own-probes, and none of the feedCount / VRAM-cap knobs existed).
+# Re-copy this whenever a config is soaked and worth keeping.
+#
+# ------------------------------------------------------------------------------------
 # RTT camera feed — edit and save; picked up within ~2s, no restart.
 #
 # Rewritten 2026-07-28 alongside the code tidy-up. The previous file was 1217 lines,
@@ -20,8 +35,14 @@
 wholeSceneRender     = 1     # master switch for the second SceneDrawSystem.Draw
 wholeSceneToPanel    = 1     # deliver its image to the panel
 wholeSceneBuildBuffers = 1   # build our own ScreenBuffers (required)
-wholeSceneWidth      = 512
-wholeSceneHeight     = 512
+# SUPERSAMPLING (goal 4.2, route chosen 2026-07-29). The panel target is 512x512, so
+# rendering ABOVE it is true SSAA: the CopyJob blit names the full source rect and scales
+# down, which is what turns the extra pixels into anti-aliasing (see CameraRender.cs:549 —
+# leaving that rect null copies the top-left quadrant 1:1 instead, the "zoomed into the
+# top left" symptom). 768 = 1.5x linear, 2.25x the samples. Costs 2.25x our
+# resolution-dependent GPU work; CPU submit is resolution-independent and should not move.
+wholeSceneWidth      = 1024
+wholeSceneHeight     = 1024
 
 # Render period, ms between feed renders. NO FLOOR: 0 = render every engine frame
 wholeSceneIntervalMs = 0
@@ -37,16 +58,108 @@ wholeSceneOwnDrawContexts = 1
 
 # Our own shadow cascades. 1 = adaptive, 2 = force all. Requires stage 3 to run; the
 # code force-runs it and logs why if you try to skip it.
-wholeSceneOwnShadows        = 1
+wholeSceneOwnShadows = 1
 wholeSceneCascadeCount      = 2
 wholeSceneCascadeResolution = 512
+
+# CHARACTER SHADOW MAP SIZE for the feed only. 0 = leave the player's value alone.
+#
+# Found by the resource report (output/feed-resources.txt), NOT by reading code: two
+# 2048x2048 depth sets — first-person and third-person — were 32 MiB of a 444 MiB feed.
+# CharacterShadowsContext sizes itself from ShadowSettings.DirectionalLight
+# .CharacterShadowResolution, and we were already scoping the other two shadow-sizing
+# fields (CascadeShadowResolution, CascadesCount) but had never noticed this third one.
+#
+# The feed is an orbital camera: the player's character is not in the shot, and a
+# FIRST-PERSON character shadow set is meaningless to it by definition.
+#
+# Do not try to switch this off with a degenerate value — the context allocates exactly
+# what it is told, and a 1px or 0px depth texture is a device removal waiting to happen.
+# 256 keeps every code path valid at 0.5 MiB instead of 16.
+wholeSceneCharacterShadowResolution = 256
 
 # Rebuild PlanetEnvironmentGroup's setup CBs from the orbit camera. Fixes the
 # detached-atmosphere bug (the atmosphere rendering at the player's aim angle rather
 # than on the planet).
 wholeScenePlanetEnv = 1
 
+# LENS FLARES IN THE FEED (goal 4.3). Keeps OUR FlaresContext installed and shares only
+# the engine's DEFINITION members into it, so the feed renders real flares against our own
+# occlusion buffers and can never advance the player's flare readback. Forces stage 21 to
+# run. 0 = the old arrangement (engine's context installed, stage 21 skipped, no flares).
+# Attempt 1 CTD'd on 2026-07-29: NullReferenceException in FlaresContext.GetFlareConstants
+# (null _flaresBuffer) because stage 21 was force-run on this flag ALONE, while the
+# definition mirror silently no-ops after a hot reload nulls its statics. Now guarded by a
+# real readiness check, so a failed mirror means "no flares" rather than a crash.
+wholeSceneOwnFlares = 1
+
+# Flare intensity for the FEED ONLY (negative = leave the engine's value alone). The feed
+# has a FIXED exposure, so it cannot pull a blown highlight back the way the player's
+# adapting view does, and the panel then multiplies by emissivity — which is why the sun
+# flare saturated and showed its texture's square alpha border. Scoped onto
+# LightSettings.FlaresIntensity, which GetFlareConstants reads straight into the flare
+# pass, so it touches nothing else. NOT in the rebuild signature: retune it live and the
+# next render picks it up, no gate cycle.
+wholeSceneFlareIntensity = 0.2
+
+# OWN ENVIRONMENT PROBES (goal 4.4). The feed samples the PLAYER'S probe atlas, which is
+# centred on the player — so its reflections and ambient bounce are right for where the
+# player stands, not where the camera is. Subtle at 100 m, visibly wrong at real remote
+# distances. This owns a second EnvironmentProbeManager, swaps it in for our render, fills
+# our own EnvProbesToUpdate from its own PrepareProbes(), and force-runs stage 2.
+# Most expensive feature on the roadmap: a probe update is six cube faces of scene geometry,
+# and CPU submit is this route's bottleneck. Watch ourDraw and VRAM, not just fps.
+# DISARMED 2026-07-30 18:46 AFTER A CTD. The fix is IN: the bootstrap now carries
+# RttBridge.ParkedProbeManagers[] and the logic adopts the parked manager on every hot
+# reload instead of building a fresh one beside it. The new bootstrap is ON DISK
+# (deployed 21:40) but a bootstrap only loads at game start — so:
+#
+#   AFTER THE NEXT GAME RESTART, set this to 1.
+#
+# The log then says which world you are in: "bootstrap park found" (fixed) vs "NO
+# bootstrap park (bootstrap predates it)" (old leak profile — one RTV set per reload,
+# do not run own-probes through repeated hot reloads on that).
+#
+#   Assertion Failure: Out of the descriptor heap
+#     at DescriptorHeapPool.BorrowRTV()  <- RTV descriptors, a small FIXED pool, not VRAM
+#     at RenderTargetCubeTexture.FaceMips.Initialize()
+#     at EnvironmentProbeManager.RecreateProbes()
+#     at EnvironmentProbeManager.PrepareProbes_Patch1()
+#     at RttProbe.WholeSceneRender.InstallProbes()      <- our call
+#   ...then: [Watchdog] application froze, RenderThreadFreeze. Capturing dump.
+#
+# FIRST occurrence in ANY SpaceEngineers2 log, so this is new behaviour, not a latent
+# engine limit we finally noticed.
+#
+# THE MECHANISM, and it is yesterday's fix biting from an angle nobody checked. The
+# "never dispose the probe manager" decision (three device removals bought it) assumed
+# KEPT meant kept. It does not survive a HOT RELOAD: the logic assembly is collectible,
+# _ourProbes lives in it, so every reload starts null, Activator builds a FRESH manager
+# with 8 probes x 6 faces x mips of RTV descriptors — and the previous manager is now
+# unreachable from any code that could free it. Kept became LEAKED, once per reload.
+#
+# Yesterday's comment said the cost was "eight cube textures resident until the game
+# restarts... VRAM, not correctness". Two things wrong with that: it is DESCRIPTORS, which
+# exhaust far sooner than VRAM (VRAM sat flat at 12.2 GB all session while this built up),
+# and it is one set PER RELOAD, not one set total. This session did four.
+#
+# CONFIDENCE: the stack is certain; the accumulation is inferred. The competing story is
+# that our per-gate-cycle ScreenBuffers/DrawContextManager/cascade/LDR-ring rebuilds leak
+# RTVs and probes merely hit the wall first. Against that: 178 gate cycles across all
+# previous logs never triggered it, and own-probes is ~1 day old — it is the only new
+# allocator in the window where this appeared.
+wholeSceneOwnProbes = 1
+
+# FSR REACTIVE MASK for the panel — the accumulating star-smear fix. The engine marks a
+# panel FSR-reactive for only 5 frames after RebuildSurfaceContent, and our feed bypasses
+# that path, so the player's FSR accumulates history over content we replace every frame.
+# EXONERATED by the CTD stack trace (the fault was the flares pass, not this).
+panelFsrMask = 1
+
 wholeSceneAAMode        = -1  # -1 = do not scope DRS.AAMode at all (see stage 19/20)
+# GOAL 4.2 ATTEMPT 1 FAILED, 2026-07-29: AAMode=1 (FXAA) CRASHED THE GAME ~2s after the
+# first feed render. This is the FOURTH CTD behind this knob. Do not retry without a new
+# mechanism — see docs/roadmap.md goal 4.2.
 wholeSceneNativeScaling = 0
 wholeSceneExposure      = 0   # inert while skip id 25 is on; the feed follows the
                               # player's live adaptation instead
@@ -79,7 +192,75 @@ wholeSceneRtFlags =
 #                                     CONFIRMED device removal (DRED page fault in
 #                                     CloudShading). Costs the feed volumetric clouds
 #                                     only; planet atmospheres are unaffected.
-wholeSceneSkipStages = 0,1,2,5,7,9,16,19,20,21,24,25,26
+wholeSceneSkipStages = 0,1,2,5,7,9,16,19,20,21,25,26   # 24 REMOVED 2026-07-29 (goal 4.1)
+
+
+# =============================================================================
+# MULTI-FEED (plan phase C3)
+# =============================================================================
+
+# How many INDEPENDENT feeds are active. 1 = everything as before.
+#
+# Each feed owns its own camera, ScreenBuffers, DrawContextManager, cascade set, LDR ring,
+# panel binding and gate. They take turns: at most one renders per engine frame, strict
+# rotation, so raising this divides feed fps rather than multiplying engine cost.
+#
+# WHICH PANEL GETS WHICH FEED IS EXPLICIT, from the tag on the block name:
+#
+#     [RTC]  or [RTC1]   -> feed 0
+#     [RTC2]             -> feed 1
+#     [RTC3]             -> feed 2        ... i.e. [RTCn] -> feed n-1
+#
+# Deliberately not "whichever panel ticks first": tick order belongs to the engine, so
+# discovery-order assignment could swap the two panels between sessions — and a swapped
+# assignment looks exactly like a routing bug. Naming the feed on the block makes it stable
+# and readable off the panel itself.
+#
+# A panel asking for a feed beyond feedCount SHARES feed 0 and says so in the log, rather
+# than silently mirroring.
+#
+# COSTS A GATE CYCLE. This IS in the rebuild signature, and the first attempt had it the
+# other way round on the reasoning "adding a feed should not drag the others through a
+# rebuild". That is wrong: changing this changes WHICH PANEL EACH FEED OWNS, and every feed
+# caches its panel's identity (resolved id, offscreen target, the handle text the handover
+# matches on). Re-routing under those caches leaves each feed matching another panel's
+# handle — observed 2026-07-30 as a frozen picture with drawOne(ours)=0.0, correct routing
+# in the log, and no error anywhere. The rebuild is what clears them.
+feedCount = 1
+
+
+# --- the VRAM admission cap (phase E1) ---------------------------------------
+#
+# feedCount is what you ASK for. These decide what you GET.
+#
+# WHY IT EXISTS: two feeds at 1024 SSAA were run on 2026-07-30 and the game device-removed
+# 40 seconds later, with UsedVRAM at 13.70 GB against a 13.61 GB budget. Nothing noticed.
+# The analytic resource walk then measured a feed at 384.7 MiB — so "does the next feed
+# fit" is arithmetic that can be done BEFORE building it. Every 2 s the mod reads used and
+# available VRAM, subtracts the reserve, divides by the measured per-feed cost, and clamps
+# feedCount to what is left.
+#
+# THIS IS THE ONLY AUTOMATIC THROTTLE IN THE MOD, on purpose. Quality settings are a manual
+# lever and stay one; the single thing the mod decides on its own is how many feeds it will
+# hold at once.
+#
+# It never tears down a feed that is already running — it only refuses to admit a new one.
+# Lowering the cap is immediate; raising it needs three consecutive polls to agree, because
+# VRAM swings +/-200 MB frame to frame and a flapping cap would rebuild on every swing.
+#
+# Watch for "FEED VRAM CAP:" in rtt.log. It says loudly when it is clamping.
+
+# Hard ceiling regardless of memory. Set 1 to pin single-feed behaviour permanently.
+maxResidentFeeds = 4
+
+# Headroom held back from the arithmetic. 512 because the fatal run was only ~90 MB over
+# budget while VRAM noise alone is +/-200 MB — the margin between "tight" and "dead" is
+# smaller than the noise, so the reserve has to clear both.
+feedVramReserveMb = 512
+
+# 0 = never consult VRAM, trust maxResidentFeeds alone. The escape hatch if the cap ever
+# refuses a feed that would have been fine.
+feedVramGuard = 1
 
 
 # =============================================================================
