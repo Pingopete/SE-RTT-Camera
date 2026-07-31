@@ -465,6 +465,10 @@ internal static class WholeSceneRender
         // thread".
         _probeState = 0; _probeLogged = false;
         _dcBuilt = false;
+        // The failure budget resets with the thing it was counting. A gate cycle IS the
+        // documented retry for a feed that gave up, so leaving this at 3 would make that
+        // retry a no-op.
+        _dcFailures = 0;
         _dcField = null;
         _cascFld = _charCascFld = null;
         _ownShadowsLogged = _cascadeSettingsLogged = false;
@@ -2090,11 +2094,26 @@ internal static class WholeSceneRender
     private static void EnsureDrawContexts()
     {
         if (_dcBuilt || _ourDrawContexts != null) return;
-        _dcBuilt = true;
+
+        // THE LATCH MEANS "SUCCEEDED", NOT "ATTEMPTED". It used to be set right here, before
+        // a single line of construction ran — so the `if (t == null) return` below, and any
+        // exception inside the try, left _dcBuilt = true with _ourDrawContexts = null, for
+        // the rest of the session, never retried.
+        //
+        // That never crashed anything, which is exactly why it survived: a null context is
+        // survivable by design (our render falls back to the engine's contexts — degraded,
+        // not broken). But it means a transient build failure silently downgrades the feed
+        // permanently, and the ONLY evidence would be the absence of a log line. This is the
+        // same shape as the CopyToFeed view-lookup latch that made feed 1 render 291 frames
+        // into a black panel, and it was found the same way: looking for what did NOT get
+        // logged.
+        //
+        // Now: the success latch is set on success, and failure gets its own budget so a
+        // genuinely broken build stops retrying — and SAYS SO, once, instead of going quiet.
         try
         {
             var t = Type.GetType("Keen.VRage.Render12.Core.Systems.DrawContextManager, VRage.Render12");
-            if (t == null) { RttLog.Line("Whole-scene: DrawContextManager type not found."); return; }
+            if (t == null) { RttLog.Line("Whole-scene: DrawContextManager type not found."); NoteDcFailure(); return; }
 
             _ourDrawContexts = Activator.CreateInstance(t);
 
@@ -2199,8 +2218,37 @@ internal static class WholeSceneRender
                                 ? "SHARED from the engine (read-only in the mask draw)."
                                 : "NOT shared — engine manager unreachable.") +
                         " LensFlares " + flareState + ".");
+
+            // ONLY here, with the manager actually constructed and configured.
+            _dcBuilt = true;
+            _dcFailures = 0;
         }
-        catch (Exception e) { RttLog.Error("build second DrawContextManager", e); }
+        catch (Exception e)
+        {
+            RttLog.Error("build second DrawContextManager", e);
+            NoteDcFailure();
+        }
+    }
+
+    // Give up after a few consecutive failures so a genuinely broken build is not retried
+    // every frame forever, and say so ONCE when that happens. Silence is what made the
+    // original latch invisible; a feed running on the engine's shared contexts is a real
+    // degradation and the log should name it rather than leave it to be inferred.
+    // PER-FEED, like _dcBuilt itself. A shared counter would let feed 0's three failures
+    // latch feed 1 out of ever building its own contexts — which is precisely the bug shape
+    // fixed twice already tonight (the copy budget, and the gate's startup flag).
+    private static int _dcFailures
+    { get => Feeds.Cur.DcFailures; set => Feeds.Cur.DcFailures = value; }
+
+    private static void NoteDcFailure()
+    {
+        _ourDrawContexts = null;                 // never leave a half-built manager installed
+        if (++_dcFailures < 3) return;
+        _dcBuilt = true;                         // stop retrying
+        RttLog.Line("!!! Whole-scene: our DrawContextManager failed to build 3 times running. Giving up " +
+                    "for this feed — it will render against the ENGINE'S shared contexts, which is degraded " +
+                    "(the player's visibility lists and counters get written by our render too). A gate cycle " +
+                    "retries. This line exists because the previous behaviour was to fail silently and forever.");
     }
 
     // ---- OWN FLARES CONTEXT, SHARED DEFINITIONS (goal 4.3) ----------------------------

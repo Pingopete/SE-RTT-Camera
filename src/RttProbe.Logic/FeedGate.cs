@@ -172,9 +172,47 @@ internal static class FeedGate
     // PER-FEED, every call. Two timestamp comparisons — cheap enough that throttling it was
     // never buying anything, and expensive in a way nothing measured: a feed whose gate is
     // never evaluated is a feed that never runs.
+    // ---- the quiesced rebuild (CTD 2026-07-30 20:54) ------------------------------
+    //
+    // Set when something needs EVERY feed rebuilt from a stopped renderer rather than in
+    // place — today only a feed-count change, which re-routes which panel each feed owns.
+    // While it is set every feed reads as not-alive, so they all go dormant, run their
+    // normal 30-frame teardown and release everything through the proven Shutdown path.
+    // Once the last one has finished, this clears itself and the panels bring the feeds
+    // straight back up against clean state.
+    //
+    // This is the pause protocol, applied by the code instead of by whoever remembered to
+    // create the marker. It is process-global for the same reason _paused is: the whole mod
+    // quiesces together, and a half-quiesced rebuild is the thing being avoided.
+    private static bool _quiesceRebuild;
+    private static long _quiesceStartedMs;
+
+    // Escape hatch. AllQuiesced needs every slot to report itself released, and a feed whose
+    // panel stopped ticking at the exact moment the quiesce began would keep its stale
+    // _active and never be re-polled — leaving the mod dormant forever. That is a soft-lock
+    // rather than a crash, but "the feed silently never came back" is the least debuggable
+    // failure this project produces, so it gets a bound and a loud line rather than patience.
+    private const long QuiesceTimeoutMs = 10000;
+
+    public static void RequestQuiescedRebuild()
+    {
+        _quiesceRebuild = true;
+        _quiesceStartedMs = Clock.Ms;
+    }
+
+    // Every slot released and none active. Checked after each Shutdown rather than on a
+    // timer, so the wait is exactly as long as the teardowns actually take.
+    private static bool AllQuiesced()
+    {
+        bool all = true;
+        Feeds.ForEachSlot(() => { if (_active || _teardownIn >= 0) all = false; });
+        return all;
+    }
+
     private static void PollFeed(long now)
     {
-        bool alive = !_paused && _lastPanelMs != 0 && (now - _lastPanelMs) < FeedConfig.PanelIdleMs;
+        bool alive = !_paused && !_quiesceRebuild
+                     && _lastPanelMs != 0 && (now - _lastPanelMs) < FeedConfig.PanelIdleMs;
         if (alive == _active) return;
 
         _active = alive;
@@ -238,7 +276,32 @@ internal static class FeedGate
     // ForEachSlot, not ForEach: a slot dropped out of Count by a feedCount change or the
     // VRAM cap is the one most in need of releasing, and it is invisible to every
     // Count-bounded sweep from the instant it is retired.
-    public static void PumpAll() => Feeds.ForEachSlot(PumpOne);
+    public static void PumpAll()
+    {
+        Feeds.ForEachSlot(PumpOne);
+
+        // Release the quiesce only once every slot has actually finished. Checked AFTER the
+        // sweep, so the Shutdown that completed this frame is included — releasing a frame
+        // early would let a panel tick re-arm a feed while another was still tearing down,
+        // which is the overlap this whole mechanism exists to prevent.
+        if (!_quiesceRebuild) return;
+
+        if (AllQuiesced())
+        {
+            _quiesceRebuild = false;
+            RttLog.Line("Feed gate: quiesced rebuild complete — every feed released its resources " +
+                        "with the renderer stopped. Feeds will re-arm from clean state on the next panel tick.");
+        }
+        else if (Clock.Ms - _quiesceStartedMs > QuiesceTimeoutMs)
+        {
+            _quiesceRebuild = false;
+            RttLog.Line($"!!! Feed gate: quiesced rebuild TIMED OUT after {QuiesceTimeoutMs} ms with a slot " +
+                        "still reporting active or mid-teardown. Releasing the hold so the feed can come back, " +
+                        "but the rebuild it was protecting may now overlap a live render — the exact condition " +
+                        "that device-removed the game on 2026-07-30. If this line ever appears, find out WHICH " +
+                        "slot never quiesced before trusting the feed again.");
+        }
+    }
 
     // INSIDE the per-feed scope, both halves of it. Startup() writes GateCycles and
     // GateEverActive — per-feed state — so draining a global flag here would have written

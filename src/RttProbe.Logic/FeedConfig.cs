@@ -527,6 +527,12 @@ internal static class FeedConfig
     // switch the automatic half off without losing the manual ceiling.
     public static bool FeedVramGuard { get; private set; } = true;
 
+    // Last EFFECTIVE feed count seen by Poll, for detecting the re-route that has to take the
+    // dormant path. Starts at -1 so the first poll can never read as a change (the first poll
+    // rebuilds everything anyway, from a gate that has not started).
+    private static int _lastCount = -1;
+    private static int _lastCountLogged = 1;
+
     // Render our OWN sun-shadow cascades, around OUR camera.
     //
     // 0 = off: our DrawContextManager borrows the ENGINE'S DirectionalLightShadowResources
@@ -790,12 +796,58 @@ internal static class FeedConfig
             // what it replaced. (Reset defers itself when called from inside a render; the
             // drain in RunSecondRender's finally sweeps all feeds the same way.)
             string after = WholeSceneSignature();
+            int countAfter = Feeds.Count;
+
+            // A COUNT CHANGE TAKES THE DORMANT PATH. Everything else rebuilds in place.
+            //
+            // CTD 2026-07-30 20:54, on the cleanest baseline this project has had (52.4 fps,
+            // >50ms=0, 1.5 GB of VRAM headroom): feedCount was flipped 1 -> 2 with feed 0
+            // live, and the game device-removed 2.5 s later with a NULL BIND inside culling —
+            // PageFaultVA 0x0, ExistingAllocations 0, RecentFreedAllocations 0, and 1.6 GB
+            // still free. Not memory.
+            //
+            //     20:53:58.915  [feed 0] Whole-scene Reset: 12511 -> 12385 MB
+            //     20:54:00.425  [feed 0] SECOND ScreenBuffers built, secondRenders=0
+            //                   <<< DEVICE_REMOVED, no DC build, no settle line, no ERROR >>>
+            //
+            // The exact null resource was never identified, and this fix does not depend on
+            // identifying it. What IS established is the window: a count change re-routes
+            // every panel and rebuilds every feed AT ONCE, underneath a render that is still
+            // running. This project now has CTDs from that same window on three separate
+            // knobs — wholeSceneAAMode (4), wholeSceneOwnProbes (3), and now feedCount — and
+            // both of the other two were ultimately resolved by refusing to change them under
+            // a live render rather than by making the change safe.
+            //
+            // The dormant path is already proven: the relaunch after this crash came up with
+            // feedCount=2 and built both feeds from a dormant gate with no trouble, and every
+            // pause-protocol deploy all evening did the same. So instead of asking the
+            // operator to remember the pause protocol for this knob, take it automatically.
+            //
+            // Deliberately scoped to COUNT changes only. Resolution and layer changes have
+            // rebuilt in place many times without incident, and widening this would be
+            // changing two things at once on the most crash-prone path in the codebase.
+            bool countChanged = !_firstPoll && countAfter != _lastCount;
+            _lastCount = countAfter;
+
+            if (countChanged)
+            {
+                RttLog.Line($"Config: feed count {_lastCountLogged} -> {countAfter}. Re-routing panels " +
+                            "requires rebuilding EVERY feed, so the gate goes dormant first and rebuilds " +
+                            "from a quiesced renderer — changing this under a live render device-removed " +
+                            "the game on 2026-07-30. The feed returns on its own in about a second.");
+                _lastCountLogged = countAfter;
+                FeedGate.RequestQuiescedRebuild();
+                // No Reset here on purpose: the gate's Shutdown already calls
+                // WholeSceneRender.Reset per feed, on the render thread, with nothing in
+                // flight. Doing it here as well would be the very in-place teardown this is
+                // avoiding.
+            }
             // Reset RELEASES, so it sweeps EVERY slot — shrinking feedCount (or the VRAM cap
             // clamping it) is precisely the case where a slot leaves Count while still owning
             // a ScreenBuffers and a DrawContextManager, and a Count-bounded sweep would skip
             // it at the one moment it needed freeing. Rearm only re-arms latches on feeds
             // that will run, so it stays bounded by Count.
-            if (_firstPoll || before != after) Feeds.ForEachSlot(RttProbe.WholeSceneRender.Reset);
+            else if (_firstPoll || before != after) Feeds.ForEachSlot(RttProbe.WholeSceneRender.Reset);
             else Feeds.ForEach(RttProbe.WholeSceneRender.Rearm);
             _firstPoll = false;
 

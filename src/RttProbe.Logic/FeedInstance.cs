@@ -62,6 +62,10 @@ internal sealed class FeedInstance
     public bool SbBuilt;
     public object OurDrawContexts;
     public bool DcBuilt;
+
+    // Consecutive failed attempts to build DcBuilt's manager. Per-feed so one feed's broken
+    // build cannot latch another out of ever trying. See WholeSceneRender.NoteDcFailure.
+    public int DcFailures;
     public object OurFreshShadowResources;
     public object OurFreshFlares;
     public object PanelSourceTex;
