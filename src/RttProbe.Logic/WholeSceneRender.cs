@@ -695,6 +695,16 @@ internal static class WholeSceneRender
     public static void OnWholeScene(object sceneDrawSystem, object finalLdrBuffer)
     {
         if (_inOurRender) return;               // our own nested Draw — do nothing
+
+        // OUTSIDE the render-slot scope, and deliberately so. The render thread is the only
+        // place the gate may RELEASE anything (disposing from the LCD tick raced the frame
+        // recorder and page-faulted), but WHICH feed gets released must not depend on which
+        // feed holds this frame's render slot — the slot stops advancing the moment feeds go
+        // dormant, which is exactly when the countdowns need to run. See FeedGate.PumpAll:
+        // scheduling teardown on the render slot orphaned a whole feed's resources per gate
+        // cycle and cost a device removal.
+        FeedGate.PumpAll();
+
         using (Feeds.Enter(Feeds.NextForRender()))
             OnWholeSceneScoped(sceneDrawSystem, finalLdrBuffer);
     }
@@ -705,9 +715,6 @@ internal static class WholeSceneRender
         // frame regardless of what else is switched on. Polled before the disabled-state
         // check so a dormant mod still notices the panel coming back.
         FeedGate.Poll();
-        // The render thread is the only place the gate is allowed to RELEASE anything —
-        // disposing from the LCD tick raced the frame recorder and page-faulted.
-        FeedGate.PumpRenderThread();
         if (!FeedGate.Active) return;
 
         if (_state == -1) return;
@@ -1127,7 +1134,12 @@ internal static class WholeSceneRender
                     // the render slot when Poll() fired would keep ScreenBuffers at the old
                     // size indefinitely, and nothing would ever tell us. At Count == 1 this
                     // is the single Reset it always was.
-                    Feeds.ForEach(Reset);
+                    //
+                    // ForEachSlot: Reset RELEASES, so it must reach slots that have just
+                    // dropped out of Count — a signature change is exactly how feedCount
+                    // shrinks, and the feed being retired is the one still holding a
+                    // ScreenBuffers nothing will ask for again.
+                    Feeds.ForEachSlot(Reset);
                 }
             }
         }

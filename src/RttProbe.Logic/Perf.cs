@@ -198,6 +198,12 @@ internal static class Perf
     // For one-off before/after probes around a dispose, in MB. 0 if unavailable.
     public static long SampleVramMb() { long b = ReadVram("UsedVRAM"); return b > 0 ? b / 1048576 : 0; }
 
+    // The BUDGET, in MB, not the free space — AvailableVRAM is what the driver is willing
+    // to let this process hold, and the CTD that motivated the phase E1 cap was used
+    // (13.70 GB) exceeding exactly this (13.61 GB) for ~40 s. 0 if unavailable, which
+    // callers must treat as "no reading" rather than "no memory".
+    public static long SampleVramAvailMb() { long b = ReadVram("AvailableVRAM"); return b > 0 ? b / 1048576 : 0; }
+
     // CoreSystems.VideoMemoryMonitor exposes UsedVRAM / AvailableVRAM as Int64
     // properties. Resolved once and cached; a failure here must never cost a frame.
     private static object _vram;

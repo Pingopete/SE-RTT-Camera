@@ -507,6 +507,26 @@ internal static class FeedConfig
     // graceful-cut contract (goal 7) doing its job, not a failure.
     public static int FeedCount { get; private set; } = 1;
 
+    // ---- the VRAM admission cap (phase E1) ---------------------------------------
+    //
+    // feedCount is what the user ASKS for; these three decide what they GET. See
+    // Feeds.UpdateResidentCap for the arithmetic and the crash that motivated it.
+
+    // Hard user ceiling, independent of memory. Set it to 1 to pin single-feed behaviour
+    // regardless of how much VRAM is free.
+    public static int MaxResidentFeeds { get; private set; } = 4;
+
+    // Headroom held back from the admission arithmetic. 512 MB because VRAM was measured
+    // swinging +/-200 MB frame to frame during the D3 sweeps, and because the device
+    // removal that motivated this happened only ~90 MB over budget — the margin between
+    // "tight" and "dead" is smaller than the noise, so the reserve has to clear both.
+    public static int FeedVramReserveMb { get; private set; } = 512;
+
+    // Off = trust maxResidentFeeds alone and never consult VRAM. Kept as an escape hatch:
+    // if the cap ever misjudges and refuses a feed that would have been fine, the user can
+    // switch the automatic half off without losing the manual ceiling.
+    public static bool FeedVramGuard { get; private set; } = true;
+
     // Render our OWN sun-shadow cascades, around OUR camera.
     //
     // 0 = off: our DrawContextManager borrows the ENGINE'S DirectionalLightShadowResources
@@ -709,6 +729,15 @@ internal static class FeedConfig
             string before = WholeSceneSignature();
 
             FeedCount               = Int(kv, "feedCount", FeedCount);
+            MaxResidentFeeds        = Int(kv, "maxResidentFeeds", MaxResidentFeeds);
+            FeedVramReserveMb       = Int(kv, "feedVramReserveMb", FeedVramReserveMb);
+            FeedVramGuard           = Bool(kv, "feedVramGuard", FeedVramGuard);
+
+            // INSIDE the signature window, and after the three knobs above are read, so a
+            // cap change is detected as a signature change and re-routes panels through the
+            // same rebuild a feedCount change uses. Evaluating it before the `before`
+            // snapshot would make a cap move invisible to the comparison.
+            Feeds.UpdateResidentCap();
             WholeSceneEnabled       = Bool(kv, "wholeSceneRender", WholeSceneEnabled);
             WholeSceneBuildBuffers  = Bool(kv, "wholeSceneBuildBuffers", WholeSceneBuildBuffers);
             WholeSceneWidth         = Int(kv, "wholeSceneWidth", WholeSceneWidth);
@@ -761,7 +790,12 @@ internal static class FeedConfig
             // what it replaced. (Reset defers itself when called from inside a render; the
             // drain in RunSecondRender's finally sweeps all feeds the same way.)
             string after = WholeSceneSignature();
-            if (_firstPoll || before != after) Feeds.ForEach(RttProbe.WholeSceneRender.Reset);
+            // Reset RELEASES, so it sweeps EVERY slot — shrinking feedCount (or the VRAM cap
+            // clamping it) is precisely the case where a slot leaves Count while still owning
+            // a ScreenBuffers and a DrawContextManager, and a Count-bounded sweep would skip
+            // it at the one moment it needed freeing. Rearm only re-arms latches on feeds
+            // that will run, so it stays bounded by Count.
+            if (_firstPoll || before != after) Feeds.ForEachSlot(RttProbe.WholeSceneRender.Reset);
             else Feeds.ForEach(RttProbe.WholeSceneRender.Rearm);
             _firstPoll = false;
 
@@ -782,13 +816,19 @@ internal static class FeedConfig
     // Everything the second ScreenBuffers / DrawContexts build depends on.
     private static string WholeSceneSignature() =>
         string.Join("|", WholeSceneBuildBuffers, WholeSceneWidth, WholeSceneHeight,
-                         // FeedCount IS here. Changing it re-routes which panel each feed
-                         // owns, and every feed caches its panel's identity (resolved id,
-                         // offscreen target, handle text, render target). Without a rebuild
-                         // those caches survive the re-route and each feed keeps matching
-                         // another panel's handle — which is a silent frozen picture, not an
-                         // error. See the FeedCount field comment for the observed failure.
-                         FeedCount,
+                         // THE EFFECTIVE COUNT is here, not the raw feedCount. Changing it
+                         // re-routes which panel each feed owns, and every feed caches its
+                         // panel's identity (resolved id, offscreen target, handle text,
+                         // render target). Without a rebuild those caches survive the
+                         // re-route and each feed keeps matching another panel's handle —
+                         // which is a silent frozen picture, not an error. See the FeedCount
+                         // field comment for the observed failure.
+                         //
+                         // Feeds.Count rather than FeedCount so the phase-E1 VRAM cap gets
+                         // the identical treatment: a cap that clamps 2 feeds to 1 is the
+                         // same re-route as a user editing feedCount from 2 to 1, and it
+                         // would leave the same stale caches behind if it were invisible here.
+                         Feeds.Count,
                          // WholeSceneIntervalMs is deliberately ABSENT (plan phase A2).
                          // Its only consumer is TryRender's rate gate, which reads
                          // FeedConfig fresh every frame, so a change needs no rebuild:

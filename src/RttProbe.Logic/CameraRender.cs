@@ -91,6 +91,10 @@ internal static class CameraRender
         _lastRender = _lastArmCheck = _lastDisarmCheck = 0; _errors = 0;
         Array.Clear(_ldrRing, 0, _ldrRing.Length); _ldrReady = null; _ringIndex = -1; _ldrMips = 1;
         _resolvedPanelId = null; _blitLogged = _blitResLogged = false; _farClipLogged = double.NaN;
+        // The retry streak AND its log budget. Clearing the streak without clearing the
+        // budget would make the second startup silent, which is the failure mode this whole
+        // fix exists to stop: a feed that says nothing while producing nothing.
+        _viewLookupFails = _viewLookupLogs = 0;
         _baseViewSnapshot = null; _baseViewMismatches = 0; _mismatchLogged = false;
         _viewSkips = _viewSkipLogs = 0;
         _firstPassAt = 0; _startupLogged = _startupDoneLogged = false;
@@ -399,6 +403,15 @@ internal static class CameraRender
     private static int _copyLogs
     { get => Feeds.Cur.CopyLogs; set => Feeds.Cur.CopyLogs = value; }
 
+    // The view-lookup retry budget. ~20 s at the observed ~30 passes/s — long enough to
+    // cover any plausible "first render has not landed yet" window, short enough that a
+    // genuinely broken feed stops re-attempting a copy for the rest of the session.
+    private const int ViewLookupGiveUp = 600;
+    private static int _viewLookupFails
+    { get => Feeds.Cur.ViewLookupFails; set => Feeds.Cur.ViewLookupFails = value; }
+    private static int _viewLookupLogs
+    { get => Feeds.Cur.ViewLookupLogs; set => Feeds.Cur.ViewLookupLogs = value; }
+
     // Separately gated from the render. The camera pass alone has run for 17
     // minutes without incident; the copy is the part that killed the game, so it
     // must not ride on the same switch.
@@ -618,14 +631,47 @@ internal static class CameraRender
                         }
                     }
 
+                    // RETRY, DO NOT LATCH — and this is the SECOND time this exact bug has
+                    // been written on this route. ResolveFeedTexture's comment already
+                    // records the first (a startup-ordering race turned into a permanent
+                    // disable because the retry gate only fires at 0, never at -1); this
+                    // call site latched -1 on the very first failure and nobody noticed,
+                    // because at one feed the failure window is usually shorter than the
+                    // arm delay.
+                    //
+                    // At two feeds it is not. Feed 1's camera pass legitimately runs before
+                    // its OWN whole-scene render has produced a frame, so PanelSource is
+                    // null for the first second or so of that feed's life. Measured
+                    // 2026-07-30 19:21: one such failure at 19:21:00.565, first render
+                    // completed 19:21:01.639, and the feed then rendered 291 more frames
+                    // into a panel that never received one — park#0 copies=0 for its whole
+                    // life while feed 0 sat at park#290. The panel was black and every
+                    // counter except these two read healthy.
+                    //
+                    // So: a streak, not a single sample. The budget is deliberately generous
+                    // (~20 s at 30 passes/s) because the only thing on the other side of it
+                    // is log spam, whereas the cost of latching early is a dead feed. Its
+                    // own counter, NOT _copyLogs: that one is the EXCEPTION budget and
+                    // trips -1 at three, so priming it here would arm a latch this path has
+                    // just been proven not to deserve.
                     if (dstRtv == null || (srcSrv == null && wsSrv == null))
                     {
-                        if (_copyLogs++ < 2)
+                        _viewLookupFails++;
+                        if (_viewLookupLogs++ < 2)
                             RttLog.Line($"Feed copy: view lookup failed (dstRtv={dstRtv != null}, " +
-                                        $"srcSrv={srcSrv != null}, wholeSceneSrv={wsSrv != null}).");
-                        _feedState = -1;
+                                        $"srcSrv={srcSrv != null}, wholeSceneSrv={wsSrv != null}) — " +
+                                        $"retrying, {ViewLookupGiveUp - _viewLookupFails} pass(es) of budget left. " +
+                                        "Expected once or twice at feed start, before the first whole-scene render lands.");
+                        if (_viewLookupFails == ViewLookupGiveUp)
+                            RttLog.Line($"Feed copy: view lookup has failed {ViewLookupGiveUp} consecutive passes — " +
+                                        "giving up on THIS feed (others are unaffected). A gate cycle re-arms it.");
+                        if (_viewLookupFails >= ViewLookupGiveUp) _feedState = -1;
                         return;
                     }
+
+                    // A good pass clears the streak, so an intermittent failure can never
+                    // accumulate its way to the give-up threshold across a whole session.
+                    _viewLookupFails = 0;
 
                     // The CopyJob is what lands the frame in the exact-sized ring slot the
                     // panel copy reads from.

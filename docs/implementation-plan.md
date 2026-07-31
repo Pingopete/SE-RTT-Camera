@@ -85,6 +85,61 @@ The enabling work for everything after it. A1 has already rehearsed the shape.
 
 Exit gate: two independent feeds, independently killable, no cross-contamination.
 
+### C3 postmortem 2026-07-30: BOTH two-feed failures were bugs, not limits
+
+The first two-feed run produced a black second panel and, half an hour later, a device
+removal. Both were read at the time as "two feeds at 1024 do not fit in VRAM". **Neither
+was.** Two feeds cost **+580 MB** and ran at 12.78 GB against a 13.61 GB budget — roughly
+850 MB of headroom, stable, 45-47 fps, `>50ms=0` for two minutes.
+
+**Bug 1 — the black panel: a transient failure latched permanently.**
+`CameraRender.CopyToFeed` set `_feedState = -1` on the FIRST view-lookup failure, with no
+retry. A feed's camera pass legitimately runs before its own whole-scene render has produced
+a frame, so `WholeSceneRender.PanelSource` is null for the first second of that feed's life.
+Feed 1 failed that test once at 19:21:00.565, its first render landed at 19:21:01.639, and it
+then rendered 291 more frames into a panel that never received one — `park#0 copies=0` for
+its entire life while feed 0 sat at `park#290`.
+
+`ResolveFeedTexture` already carried a comment describing this exact bug (a startup-ordering
+race turned into a permanent disable by a retry gate that only fires at 0, never at -1). The
+same mistake sat forty lines away in the same file and was not caught, because **at one feed
+the failure window is usually shorter than the arm delay** — the bug needed a second feed to
+become observable. Fixed with a per-feed consecutive-failure streak (~20 s of budget) that a
+single good pass clears.
+
+**Bug 2 — the device removal: a gate cycle orphaned a whole feed.**
+`FeedGate.PumpRenderThread` was called from inside `using (Feeds.Enter(Feeds.NextForRender()))`,
+so only the feed holding the render slot counted down to teardown. `AdvanceSlot()` runs only
+after a render COMPLETES, and a dormant feed never completes one — so the moment both feeds
+went dormant the slot froze, one feed released, and the other's countdown stayed pinned at 30
+forever:
+
+```
+[19:20:51.364] [feed 0] === FEED GATE: DORMANT. ... releasing resources in 30 frames. ===
+[19:20:51.364] [feed 1] === FEED GATE: DORMANT. ... releasing resources in 30 frames. ===
+[19:20:52.357] [feed 1] Feed gate: releasing resources now.
+[19:20:52.364] [feed 1] Whole-scene Reset: VRAM 12847 MB -> 12720 MB (-127 MB)
+               ...and nothing whatsoever from feed 0.
+```
+
+The next cycle rebuilt BOTH feeds, allocating a fresh ScreenBuffers and DrawContextManager
+for feed 0 on top of the set never freed. VRAM went **12.78 -> 13.70 GB in one gate cycle and
+stayed flat there** — retention, not churn — against a 13.61 GB budget. Device removed 40 s
+later. Fixed by pumping every slot's countdown once per frame, outside the render scope.
+
+**The principle:** a teardown countdown is per-feed BOOKKEEPING, not per-feed RENDERING.
+Scheduling it on the render slot tied the freeing of resources to the activity that had just
+stopped. Generalised into `Feeds.ForEachSlot`: **sweeping to RUN covers the ACTIVE feeds;
+sweeping to RELEASE covers ALL slots** — a slot retired by a `feedCount` change or by the
+VRAM cap is invisible to every Count-bounded sweep from the instant it stops being active,
+which is exactly when its resources became garbage.
+
+**Methodological note.** The "two feeds do not fit" conclusion came from comparing VRAM
+readings without scoping them to a session. `rtt.log` carries times but no dates, so a naive
+grep for high-VRAM lines returned rows from a previous day — the same trap recorded earlier
+in this project, fallen into twice. Scope every log window from the last
+`=== RttProbe bootstrap` line before reading a number off it.
+
 **THE C2 BASELINE IS NOT `reference/every-frame-baseline`.** That pin is 512x512 with no flares,
 no own probes and no atmosphere LUTs — a materially cheaper build. Grading today's 1024 SSAA
 full-fidelity build against its 66 fps / 2.1 ms would show a large "regression" that is entirely
@@ -145,6 +200,25 @@ The measurements the budget model is built on. Cheap once two feeds exist.
 | D3 | **VRAM per instantiated feed** (measured, per quality preset) | the max-resident-feeds constant, per preset |
 
 Exit gate: the two budget constants are numbers with measurements behind them.
+
+### D3 result 2026-07-30: the per-feed footprint, and why the analytic walk is not the input
+
+Two independent measurements of the same quantity, and they disagree by ~1.5x:
+
+| method | figure at 1024x1024 | status |
+|---|---|---|
+| analytic resource walk (`FeedResourceReport`) | 384.7 MiB | **lower bound, self-declared** — it prints an UNSIZED list of types it cannot measure |
+| measured marginal cost of `feedCount` 1 -> 2 | **~580 MB** | what actually happened |
+
+The admission cap uses the **measured** figure. Using the analytic one would let it admit
+feeds ~1.5x smaller than they really are, which is precisely the failure it exists to
+prevent. The walk keeps its value for finding WHAT to cut — it is how character shadows were
+found — but "does another one fit" is answered by the number that was watched happening.
+
+Split for the cap: ~92 MB scales with our pixel count (ScreenBuffers 60, RTGI histories 32),
+~488 MB is structural. **The structural part is the floor under `maxResidentFeeds`** and no
+quality preset can remove it, because owning a second culling context means owning
+scene-sized entity-instance and light-clustering buffers.
 
 ## Phase E — the credit scheduler (goal 3 realized; 1-2 sessions)
 

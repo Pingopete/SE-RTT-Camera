@@ -161,6 +161,13 @@ internal sealed class FeedInstance
     public bool PanelRtDiag;
     public int CopyLogs;
 
+    // CONSECUTIVE view-lookup failures in CopyToFeed, and its own log budget. Per-feed for
+    // the same reason CopyLogs is: feed 1 starts its render AFTER feed 0 is already warm, so
+    // its "source not ready yet" window is a normal part of its startup and must not be
+    // graded against feed 0's. A streak, not a count — one good pass zeroes it.
+    public int ViewLookupFails;
+    public int ViewLookupLogs;
+
     // ---- BlitProbe: the target and its batch -------------------------------------
     public OffscreenRenderTarget? Rt;
     public bool RtTried;
@@ -233,13 +240,135 @@ internal static class Feeds
     // ACTIVE feed count. Clamped hard: a typo in the config must not index past the slots
     // or drop to zero, because zero feeds means NextForRender has nothing to return and
     // every lookup would have to invent an answer.
+    //
+    // ALSO clamped by the VRAM admission cap (phase E1) — see UpdateResidentCap. The user
+    // asks for N feeds; they get min(N, what fits). Deliberately the ONLY automatic
+    // throttle in the system: quality stays a manual lever, by explicit user decision
+    // ("i dont want the quality setting to be adjusted as an automatic thorttle"), so the
+    // one thing the mod may decide on its own is how many feeds it will hold at once.
     internal static int Count
     {
         get
         {
             int n = FeedConfig.FeedCount;
-            return n < 1 ? 1 : n > MaxFeeds ? MaxFeeds : n;
+            if (n < 1) n = 1;
+            if (n > MaxFeeds) n = MaxFeeds;
+            return n < _residentCap ? n : _residentCap;
         }
+    }
+
+    // ---- the VRAM admission cap (phase E1) ---------------------------------------
+    //
+    // WHY THIS EXISTS, from measurement rather than principle. Two feeds at 1024 SSAA were
+    // run on 2026-07-30 and the game device-removed 40 s later, with UsedVRAM at 13.70 GB
+    // against an AvailableVRAM budget of 13.61 GB. Nothing in the mod noticed. The analytic
+    // resource walk then put a feed at 384.7 MiB, so "will the next feed fit" is arithmetic
+    // we can do BEFORE building it instead of a crash we discover afterwards.
+    //
+    // The cap only ever bounds Count. It never tears a resident feed down on its own: the
+    // config asking for fewer feeds is the user's decision and is honoured instantly, but a
+    // VRAM dip must not start a teardown storm on the render thread. It bites where it is
+    // cheap — at the moment a feed would be ADMITTED.
+    private static int _residentCap = MaxFeeds;
+    private static int _capRaiseVotes;
+    private static int _lastLoggedCap = MaxFeeds;
+
+    internal static int ResidentCap => _residentCap;
+
+    // Per-feed footprint, split by what it scales with. ScreenBuffers (60.0 MiB) and the
+    // RTGI temporal histories (32.0 MiB) scale with OUR pixel count; everything else —
+    // entity instance buffers, light clustering, the rest of the DrawContextManager, the
+    // panel-sized LDR ring — does not.
+    //
+    // THE TOTAL IS THE MEASURED MARGINAL COST, NOT THE ANALYTIC SUM. The resource walk in
+    // docs/feed-resources-1024-charshadow256.txt adds up to 384.7 MiB and says in its own
+    // output that it is a LOWER BOUND, because it prints an UNSIZED list of types it cannot
+    // measure. The observed cost of switching feedCount 1 -> 2 on 2026-07-30 was
+    // 12.20 -> 12.78 GB, i.e. ~580 MB. Using the analytic figure here would let the cap
+    // admit feeds ~1.5x smaller than they really are, which is the precise failure this cap
+    // exists to prevent — so the number that decides admission is the one that was watched
+    // happening, per Rule 26. The walk stays valuable for finding WHAT to cut; it is just
+    // not the right input for "does another one fit".
+    //
+    // The structural remainder is the important number for the roadmap: no quality preset
+    // can remove it, because owning a second culling context means owning scene-sized
+    // buffers. It is the floor under max-resident-feeds.
+    private const double ResScaledMbAt1024 = 92.0;
+    private const double StructuralMb      = 488.0;
+
+    private static double PerFeedMb()
+    {
+        double px = (double)FeedConfig.WholeSceneWidth * FeedConfig.WholeSceneHeight;
+        return StructuralMb + ResScaledMbAt1024 * (px / (1024.0 * 1024.0));
+    }
+
+    // Feeds actually holding GPU resources right now. SbBuilt is the honest test — a slot
+    // that is configured but has never built its ScreenBuffers costs nothing, so counting
+    // configured feeds instead would reserve memory for feeds that are not there.
+    private static int ResidentCount()
+    {
+        int n = 0;
+        for (int i = 0; i < MaxFeeds; i++) if (All[i].SbBuilt) n++;
+        return n;
+    }
+
+    // Called from FeedConfig.Poll (every 2 s), INSIDE the rebuild-signature window so a cap
+    // change re-routes panels through exactly the same machinery a feedCount change does.
+    internal static void UpdateResidentCap()
+    {
+        int userCap = FeedConfig.MaxResidentFeeds;
+        if (userCap < 1) userCap = 1;
+        if (userCap > MaxFeeds) userCap = MaxFeeds;
+
+        if (!FeedConfig.FeedVramGuard) { ApplyCap(userCap, "guard off"); return; }
+
+        long usedMb = Perf.SampleVramMb(), availMb = Perf.SampleVramAvailMb();
+
+        // NO READING IS NOT ZERO HEADROOM. Perf returns 0 before the first frame and
+        // whenever VideoMemoryMonitor cannot be resolved; treating that as "nothing fits"
+        // would clamp every feed away during startup, when the cap has nothing useful to
+        // say anyway. Fall back to the user's ceiling and let them own the decision.
+        if (usedMb <= 0 || availMb <= 0) { ApplyCap(userCap, "no VRAM reading"); return; }
+
+        int resident = ResidentCount();
+        double perFeed = PerFeedMb();
+        long headroom = availMb - usedMb - FeedConfig.FeedVramReserveMb;
+        int extra = headroom <= 0 ? 0 : (int)(headroom / perFeed);
+
+        int fits = resident + extra;
+        if (fits < 1) fits = 1;              // never cap the last feed away
+        int want = fits < userCap ? fits : userCap;
+
+        // ASYMMETRIC HYSTERESIS. Lowering is immediate — it is the safety direction, and a
+        // late clamp is the crash it exists to prevent. Raising needs three consecutive
+        // polls (~6 s) to agree, because VRAM swings +/-200 MiB frame to frame (measured
+        // during the failed B1/D3 sweeps) and a cap that flaps across the requested count
+        // would trigger a rebuild every time it moved.
+        if (want < _residentCap) { _capRaiseVotes = 0; ApplyCap(want, Why(headroom, perFeed, resident, availMb, usedMb)); }
+        else if (want > _residentCap)
+        {
+            if (++_capRaiseVotes >= 3) { _capRaiseVotes = 0; ApplyCap(want, Why(headroom, perFeed, resident, availMb, usedMb)); }
+        }
+        else _capRaiseVotes = 0;
+    }
+
+    private static string Why(long headroom, double perFeed, int resident, long availMb, long usedMb) =>
+        $"used {usedMb} MB of a {availMb} MB budget, reserve {FeedConfig.FeedVramReserveMb} MB, " +
+        $"headroom {headroom} MB, {resident} feed(s) resident at ~{perFeed:F0} MB each";
+
+    private static void ApplyCap(int cap, string why)
+    {
+        _residentCap = cap;
+        if (cap == _lastLoggedCap) return;
+        _lastLoggedCap = cap;
+
+        // Loud on the way down, because a silently reduced feed count is indistinguishable
+        // from a broken feed — a black panel with every counter reading healthy is the
+        // single most expensive failure shape this project has produced.
+        RttLog.Line($"FEED VRAM CAP: max resident feeds = {cap} ({why}). " +
+                    (cap < FeedConfig.FeedCount
+                        ? $"feedCount={FeedConfig.FeedCount} is being CLAMPED to {cap} — the extra feed(s) will not be built."
+                        : "not currently limiting anything."));
     }
 
     // Enumerate the ACTIVE feeds. Anything sweeping the registry uses this, so shrinking
@@ -360,6 +489,26 @@ internal static class Feeds
     {
         int n = Count;
         for (int i = 0; i < n; i++)
+            using (Enter(All[i]))
+                body();
+    }
+
+    // EVERY slot, active or not. The distinction is not cosmetic:
+    //
+    //   sweeping to RUN something covers the ACTIVE feeds  -> ForEach
+    //   sweeping to RELEASE something covers ALL slots     -> ForEachSlot
+    //
+    // A slot that has just been retired (feedCount 2 -> 1, or the VRAM cap clamping) is
+    // precisely the one still holding a ScreenBuffers and a DrawContextManager that nothing
+    // will ever ask for again. Sweeping it with ForEach skips it at exactly the moment its
+    // resources became garbage, and there is no later pass that would catch it — the feed is
+    // outside Count from then on, so it is invisible to every subsequent sweep.
+    //
+    // Untouched slots cost nothing to visit: their state is null and their countdowns are
+    // -1, so every release path returns immediately.
+    internal static void ForEachSlot(Action body)
+    {
+        for (int i = 0; i < MaxFeeds; i++)
             using (Enter(All[i]))
                 body();
     }

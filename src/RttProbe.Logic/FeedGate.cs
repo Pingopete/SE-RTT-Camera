@@ -176,10 +176,44 @@ internal static class FeedGate
 
     private static bool _pendingStartupLog;
 
-    public static void PumpRenderThread()
+    // EVERY feed's countdown, every engine frame. Call from OUTSIDE the render-slot scope.
+    //
+    // THE BUG THIS FIXES, and it is the most expensive one the two-feed work has produced.
+    // This used to be called from inside `using (Feeds.Enter(Feeds.NextForRender()))`, so
+    // only the feed holding the render slot counted down. AdvanceSlot() runs only after a
+    // render COMPLETES — and a dormant feed never completes one. So the moment both feeds
+    // went dormant the slot froze, whichever feed it happened to be pointing at reached zero
+    // and released, and every other feed's countdown stayed pinned at 30 forever.
+    //
+    // Observed 2026-07-30 19:20:51, two feeds dormant together:
+    //
+    //     [feed 1] Feed gate: releasing resources now.
+    //     [feed 1] Whole-scene Reset: VRAM 12847 MB -> 12720 MB (-127 MB)
+    //     ...and nothing at all from feed 0.
+    //
+    // The next gate cycle then rebuilt BOTH feeds — allocating a fresh ScreenBuffers and
+    // DrawContextManager for feed 0 on top of the set that was never freed. VRAM went
+    // 12.78 -> 13.70 GB across that one cycle and stayed flat there, which is retention and
+    // not churn. AvailableVRAM was 13.61 GB. The device was removed 40 seconds later.
+    //
+    // It reads as a VRAM-ceiling problem and it is not: two feeds cost +580 MB and fit with
+    // ~850 MB to spare. What did not fit was two feeds plus an orphaned copy of one of them.
+    //
+    // The principle, which is the part worth keeping: a teardown countdown is per-feed
+    // BOOKKEEPING, not per-feed RENDERING. Scheduling it on the render slot tied the freeing
+    // of resources to the very activity that had just stopped.
+    //
+    // ForEachSlot, not ForEach: a slot dropped out of Count by a feedCount change or the
+    // VRAM cap is the one most in need of releasing, and it is invisible to every
+    // Count-bounded sweep from the instant it is retired.
+    public static void PumpAll()
     {
         if (_pendingStartupLog) { _pendingStartupLog = false; Startup(); }
+        Feeds.ForEachSlot(PumpOne);
+    }
 
+    private static void PumpOne()
+    {
         if (_teardownIn < 0) return;
         if (--_teardownIn > 0) return;
         _teardownIn = -1;
