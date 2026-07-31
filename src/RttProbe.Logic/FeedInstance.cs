@@ -198,9 +198,32 @@ internal sealed class FeedInstance
     public bool PendingStartupLog;
 
     // ---- PanelBinding: the material binding --------------------------------------
-    public bool Bound;
-    public WeakReference BoundRenderer;
-    public WeakReference BoundCtx;
+    //
+    // PHASE E2 FAN-OUT: a feed can display on SEVERAL panels, so the binding is a LIST
+    // of weak (renderer, ctx) pairs — one entry per claiming panel — instead of the
+    // single latch + pair it used to be. Weak for the same reason the pair was: a
+    // destroyed panel must not keep its LCD material alive through us.
+    //
+    // A pair is appended at bind ATTEMPT (not success), preserving the old "one attempt
+    // per panel per activation" semantics: the old code set _bound=true and stored the
+    // pair before invoking the engine, so a failed bind was never retried and Unbind
+    // still swept it. Same here, per panel.
+    public readonly List<(WeakReference Renderer, WeakReference Ctx)> BoundPanels = new();
+
+    // WHICH PANEL THIS FEED'S CAMERA FOLLOWS. First claimant wins: with two panels on
+    // one feed, letting every tick publish the orbit target made the camera thrash
+    // between the two panels' grids (last-claimant-wins, twice per frame). The feed's
+    // identity — orbit target, captured panel RT, LastRenderComponent — follows the
+    // panel that claimed it FIRST; later claimants are display-only mirrors. Cleared by
+    // CameraFeed.Reset so a gate cycle re-elects from whatever is actually ticking.
+    public string PrimaryPanelName;
+
+    // Distinct tagged panel names currently claiming this feed. Drives WantsRepaint:
+    // binding runs inside the content-render hook, which an idle panel never enters, so
+    // repaints are forced while any claimant is unbound. Cleared with PrimaryPanelName —
+    // a destroyed panel's stale claim heals at the next gate cycle, when only live
+    // panels re-claim.
+    public readonly HashSet<string> ClaimedPanelNames = new();
 }
 
 // The registry, and the ambient that decides WHOSE state `Feeds.Cur` means.

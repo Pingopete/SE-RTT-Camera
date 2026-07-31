@@ -48,6 +48,10 @@ internal static class CameraFeed
     private static int _findLogs, _errLogs;
     private static readonly HashSet<string> _seenNames = new();
 
+    // "Announced this panel as a mirror" — a log latch about a NAME, process-level like
+    // the other said-once latches, so gate cycles do not re-announce every mirror.
+    private static readonly HashSet<string> _mirrorLogs = new();
+
     // The tagged panel's surface contexts, by reference. The render-side hook is
     // handed a surface context with no name on it, so identity recorded here is
     // how it recognises the panel to draw on.
@@ -131,6 +135,14 @@ internal static class CameraFeed
         _seenNames.Clear();
         _targetSurfaces.Clear();
         _surfaceTrims = 0;
+
+        // The primary election and the claim set re-form from live ticks (phase E2
+        // fan-out): a destroyed primary hands the feed to the next ticking claimant, and
+        // a destroyed mirror's stale claim stops driving repaints. _mirrorLogs is kept —
+        // it is a "said this once" latch about a NAME, and re-announcing every mirror on
+        // every gate cycle is noise.
+        Feeds.Cur.PrimaryPanelName = null;
+        Feeds.Cur.ClaimedPanelNames.Clear();
     }
 
     // ---------------------------------------------------------------- discovery
@@ -174,6 +186,39 @@ internal static class CameraFeed
             if (!IsPanelPowered(renderComponent)) return;
             FeedGate.NotePanelAlive();
 
+            // FIRST CLAIMANT WINS (phase E2 fan-out). With two panels routed to one feed,
+            // letting every tick publish made the orbit target, the captured panel RT and
+            // LastRenderComponent thrash between the panels — last claimant wins, twice a
+            // frame, and on different grids that is a camera oscillating between two ships.
+            // The feed's IDENTITY follows the panel that claimed it first; later claimants
+            // are display-only mirrors (their surfaces still register below, which is what
+            // routes their material bind). Cleared in Reset, so a gate cycle re-elects
+            // from whatever is actually ticking — a destroyed primary hands over within
+            // one cycle.
+            var feed = Feeds.Cur;
+            feed.ClaimedPanelNames.Add(name);
+            feed.PrimaryPanelName ??= name;
+            bool primary = feed.PrimaryPanelName == name;
+
+            // Remember this panel's surfaces so the render-side hook can recognise them
+            // by identity — for EVERY claimant, primary or not: the surface map is what
+            // routes a mirror panel's content pass to this feed so its material can bind.
+            var surfaces = renderComponent.GetType().GetField("_surfaces", Any)?.GetValue(renderComponent);
+            int added = 0;
+            if (surfaces is System.Collections.IEnumerable list)
+                foreach (var s in list) { if (s != null && !_targetSurfaces.Contains(s)) { TrackSurface(s); added++; } }
+
+            if (!primary)
+            {
+                if (_mirrorLogs.Add(name))
+                    RttLog.Line($"Feed {feed.Id}: panel \"{name}\" MIRRORS this feed ({added} surfaces registered) — " +
+                                $"it shows \"{feed.PrimaryPanelName}\"'s camera. Display only; the orbit target is unchanged.");
+                // The mirror still needs repaints while its bind is pending — the bind
+                // runs inside the content-render hook, which an idle panel never enters.
+                if (PanelBinding.WantsRepaint) ForceRepaint(renderComponent);
+                return;
+            }
+
             var pos = WorldPositionOf(entity);
             if (pos == null) return;
 
@@ -191,13 +236,6 @@ internal static class CameraFeed
                 Name = name,
             };
             EverFound = true;
-
-            // Remember this panel's surfaces so the render-side hook can recognise
-            // them by identity.
-            var surfaces = renderComponent.GetType().GetField("_surfaces", Any)?.GetValue(renderComponent);
-            int added = 0;
-            if (surfaces is System.Collections.IEnumerable list)
-                foreach (var s in list) { if (s != null && !_targetSurfaces.Contains(s)) { TrackSurface(s); added++; } }
 
             if (_findLogs++ < 3)
                 RttLog.Line($"[RTC] panel located: \"{name}\" at {pos.Value.X:F1},{pos.Value.Y:F1},{pos.Value.Z:F1} ({added} surfaces registered)");

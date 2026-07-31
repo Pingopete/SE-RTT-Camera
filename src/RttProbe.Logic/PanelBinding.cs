@@ -34,22 +34,52 @@ internal static class PanelBinding
     private static readonly string ArmPath = Path.Combine(RttLog.OutDir, "bind-armed.marker");
     private static readonly string LivePath = Path.Combine(RttLog.OutDir, "bind-live.marker");
 
-    // PER-FEED: whether THIS feed's panel is bound to our material. The survey and the
-    // disarm marker stay process-global — one describes the engine's LCD types, the
-    // other is a file on disk that switches the whole route off.
-    private static bool _bound
-    { get => Feeds.Cur.Bound; set => Feeds.Cur.Bound = value; }
+    // PER-FEED, and per PANEL within the feed (phase E2 fan-out): the list of panels this
+    // feed has bound — or attempted to bind — to our material. The survey and the disarm
+    // marker stay process-global — one describes the engine's LCD types, the other is a
+    // file on disk that switches the whole route off.
+    private static List<(WeakReference Renderer, WeakReference Ctx)> _boundPanels => Feeds.Cur.BoundPanels;
+
+    // Has THIS surface context had its bind attempt? Reference identity, dead entries
+    // ignored — a panel the engine rebuilt gets a fresh ctx and legitimately binds again.
+    private static bool IsAttempted(object ctx)
+    {
+        var list = _boundPanels;
+        for (int i = 0; i < list.Count; i++)
+            if (ReferenceEquals(list[i].Ctx.Target, ctx)) return true;
+        return false;
+    }
 
     private static bool _surveyed, _disarmed;
 
     // The bind happens inside the content-render hook, which an idle panel never
     // enters. While this is true the tick hook drives repaints to get us in there.
-    public static bool WantsRepaint => !_bound && !_disarmed && File.Exists(ArmPath);
+    //
+    // FAN-OUT: true while any CLAIMING panel is still unbound — live bound pairs counted
+    // against the claim set, so a second panel joining an already-bound feed re-arms the
+    // repaint drive until its own bind lands.
+    public static bool WantsRepaint
+    {
+        get
+        {
+            if (_disarmed || !File.Exists(ArmPath)) return false;
+            int alive = 0;
+            var list = _boundPanels;
+            for (int i = 0; i < list.Count; i++) if (list[i].Ctx.IsAlive) alive++;
+            int claimed = Feeds.Cur.ClaimedPanelNames.Count;
+            return alive < (claimed > 0 ? claimed : 1);
+        }
+    }
     private static int _errLogs;
 
     public static void Reset()
     {
-        _surveyed = _bound = false;
+        // NOT the bound list. Reset runs in FeedGate.Shutdown BEFORE RestoreEngineState
+        // calls Unbind, and Unbind is what consumes the list — clearing it here would
+        // leave every panel wearing our runtime material with nothing left knowing how
+        // to put the stock one back. (The old code had the same shape: it cleared the
+        // _bound flag but left the weak pair for Unbind.)
+        _surveyed = false;
         _errLogs = 0;
         _emissivityApplied = double.NaN;
         _emissivityBlocked = false;
@@ -84,7 +114,9 @@ internal static class PanelBinding
             ApplyEmissivity(ctx);
             ApplyFsrMask(ctx);
 
-            if (_bound) return;
+            // Per-PANEL, not per-feed (phase E2 fan-out): a feed that already bound one
+            // panel still binds a second claimant when its ctx arrives here.
+            if (IsAttempted(ctx)) return;
 
             TryBind(renderer, ctx);
         }
@@ -356,13 +388,6 @@ internal static class PanelBinding
         catch (Exception e) { RttLog.Error("survey write", e); }
     }
 
-    // PER-FEED: the renderer and surface context THIS feed bound, held weakly so a
-    // destroyed panel does not keep its LCD material alive through us.
-    private static WeakReference _boundRenderer
-    { get => Feeds.Cur.BoundRenderer; set => Feeds.Cur.BoundRenderer = value; }
-    private static WeakReference _boundCtx
-    { get => Feeds.Cur.BoundCtx; set => Feeds.Cur.BoundCtx = value; }
-
     // Put the panel back on its STOCK screen material through the engine's own path.
     //
     // The game's deferred-assert log showed "Can't remove material <guid>. It is not
@@ -380,26 +405,39 @@ internal static class PanelBinding
     // Render thread only (FeedGate.Shutdown runs there, same thread the bind ran on).
     public static void Unbind()
     {
-        var renderer = _boundRenderer?.Target;
-        var ctx = _boundCtx?.Target;
-        _boundRenderer = _boundCtx = null;
-        if (renderer == null || ctx == null) return;   // never bound, or panel destroyed
-
-        try
+        // EVERY bound panel (phase E2 fan-out), each restored independently — one panel
+        // having been destroyed must not stop the others being put back. Consume-and-clear:
+        // the list is this feed's record of what it changed, and after this it has changed
+        // nothing.
+        var list = _boundPanels;
+        int restored = 0, gone = 0;
+        for (int i = 0; i < list.Count; i++)
         {
-            var mi = ctx.GetType().GetMethods(Any).FirstOrDefault(m => m.Name == "SetNewScreenMaterialHandle");
-            var def = Prop(ctx, "Definition");
-            var baseMaterial = Prop(def, "DefaultScreenMaterial");
-            var aspect = Prop(def, "AspectRatio");
-            var orientation = Prop(Prop(ctx, "State"), "Orientation");
-            if (mi == null || baseMaterial == null) return;
+            var renderer = list[i].Renderer.Target;
+            var ctx = list[i].Ctx.Target;
+            if (renderer == null || ctx == null) { gone++; continue; }   // panel destroyed
 
-            mi.Invoke(ctx, new[] { renderer, baseMaterial, aspect, orientation, null });
-            RttLog.Line("Panel material: rebound to the STOCK screen material (no override) — our runtime " +
-                        "material released through the engine's own path, so nothing dangles for the " +
-                        "\"Can't remove material\" double-release.");
+            try
+            {
+                var mi = ctx.GetType().GetMethods(Any).FirstOrDefault(m => m.Name == "SetNewScreenMaterialHandle");
+                var def = Prop(ctx, "Definition");
+                var baseMaterial = Prop(def, "DefaultScreenMaterial");
+                var aspect = Prop(def, "AspectRatio");
+                var orientation = Prop(Prop(ctx, "State"), "Orientation");
+                if (mi == null || baseMaterial == null) continue;
+
+                mi.Invoke(ctx, new[] { renderer, baseMaterial, aspect, orientation, null });
+                restored++;
+            }
+            catch (Exception e) { RttLog.Error("panel unbind", e); }
         }
-        catch (Exception e) { RttLog.Error("panel unbind", e); }
+        list.Clear();
+
+        if (restored > 0 || gone > 0)
+            RttLog.Line($"Panel material: {restored} panel(s) rebound to the STOCK screen material " +
+                        (gone > 0 ? $"({gone} already destroyed) " : "") +
+                        "— our runtime material released through the engine's own path, so nothing " +
+                        "dangles for the \"Can't remove material\" double-release.");
     }
 
     // Rebuild the panel's screen material so it samples OUR render target.
@@ -414,19 +452,17 @@ internal static class PanelBinding
         var rt = BlitProbe.FeedTarget;
         if (rt == null) { RttLog.Line("Phase 2: no render target of ours yet — waiting."); return; }
 
-        _bound = true;   // one attempt per load; a retry loop on the render thread is a bad idea
+        // Registered at ATTEMPT, so a failed bind is not retried every content pass (a
+        // retry loop on the render thread is a bad idea) and Unbind still sweeps it.
+        // Weak, because the panel can be destroyed (world unload, block grinding) while
+        // we hold these, and a strong reference would keep dead render objects alive.
+        _boundPanels.Add((new WeakReference(renderer), new WeakReference(ctx)));
         try
         {
             File.WriteAllText(LivePath, $"binding attempted {DateTime.Now:O}\n");
 
             var mi = ctx.GetType().GetMethods(Any).FirstOrDefault(m => m.Name == "SetNewScreenMaterialHandle");
             if (mi == null) { RttLog.Line("Phase 2: SetNewScreenMaterialHandle not found."); return; }
-
-            // Remembered for Unbind. Weak, because the panel can be destroyed (world
-            // unload, block grinding) while we hold these, and a strong reference would
-            // keep dead render objects alive.
-            _boundRenderer = new WeakReference(renderer);
-            _boundCtx = new WeakReference(ctx);
 
             var def = Prop(ctx, "Definition");
             var baseMaterial = Prop(def, "DefaultScreenMaterial");

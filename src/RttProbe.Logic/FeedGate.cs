@@ -198,6 +198,32 @@ internal static class FeedGate
     {
         _quiesceRebuild = true;
         _quiesceStartedMs = Clock.Ms;
+
+        // FORCE every slot dormant, rather than waiting for each feed's own poll to
+        // notice. The first version waited, and the very first downward count change
+        // proved that wrong (2026-07-30 22:05): shrinking feedCount changes Feeds.Count
+        // IMMEDIATELY, so the retired feed's panel stops routing to it on the same poll —
+        // and a feed nobody polls can never see itself go dormant. Its _active stayed
+        // true, AllQuiesced stayed false for the full 10 s, the timeout escape hatch
+        // released the hold (doing exactly its job), and the retired feed's ScreenBuffers
+        // and DrawContextManager were left stranded resident — the same orphan shape as
+        // the deploy leak, arriving through the mechanism built to prevent it.
+        //
+        // Going UP never hit this, because no ACTIVE slot leaves Count in that direction.
+        //
+        // Same thread as PollFeed's own transitions (this is called from FeedConfig.Poll),
+        // and the same two writes PollFeed's dormant branch makes.
+        Feeds.ForEachSlot(ForceDormant);
+    }
+
+    private static void ForceDormant()
+    {
+        if (!_active) return;
+        _active = false;
+        _teardownIn = TeardownDelayFrames;
+        RttLog.Line("=== FEED GATE: DORMANT (forced by the quiesced rebuild — a slot being retired by a " +
+                    "count change is unreachable by polling from the moment the count moves, so it is told " +
+                    $"directly). Releasing resources in {TeardownDelayFrames} frames. ===");
     }
 
     // Every slot released and none active. Checked after each Shutdown rather than on a
