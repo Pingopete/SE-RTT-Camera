@@ -1,3 +1,24 @@
+# KNOWN-GOOD SNAPSHOT — copy over output/feed-config.txt to restore this state.
+#
+# Taken 2026-07-30 22:30, from a configuration soaked clean with EVERYTHING on: own
+# probes, own shadows, own flares, atmosphere LUTs, 1024 SSAA, and two panels sharing
+# one render.
+#
+#   fps 52.4-53.3   p50 18.8-19.2   p95 20.4-20.8   max <=29   >50ms=0
+#   submit 2.2-2.3ms   VRAM 12.32-12.34 GB flat   errors 0   unscoped 0
+#
+# output/ is gitignored, so THIS file is the only tracked record of a working config —
+# the previous snapshot was from 2026-07-29 and had drifted a full evening behind
+# (512 render, no own-probes, and none of the feedCount / VRAM-cap knobs existed).
+# Re-copy this whenever a config is soaked and worth keeping.
+#
+# NOT the experiment values. orbitRadius, wholeSceneFarClip and wholeSceneFarClipExtend
+# are deliberately reset to their soaked defaults (100 m / 2500 m / off) rather than the
+# remoteness-sweep settings (10 km / 50 km / on) that happened to be live when this was
+# copied. A snapshot captured mid-experiment is worse than a stale one: it looks
+# authoritative and silently restores a test rig.
+#
+# ------------------------------------------------------------------------------------
 # RTT camera feed — edit and save; picked up within ~2s, no restart.
 #
 # Rewritten 2026-07-28 alongside the code tidy-up. The previous file was 1217 lines,
@@ -258,7 +279,7 @@ startupDelayMs = 2000    # hold off issuing GPU work this long after load
 panelIdleMs    = 1500    # no tagged panel ticking for this long -> gate goes dormant
 perfReportMs   = 5000    # PERF line period
 
-orbitRadius    = 10000    # metres from the panel
+orbitRadius    = 100      # metres from the panel
 orbitPeriod    = 30      # seconds per revolution
 orbitHeight    = 15      # metres above the panel
 orbitClearance = 2.2     # multiplier on the grid's bounding radius
@@ -291,7 +312,7 @@ wholeSceneNoBloom = 0
 # Far plane for the FEED VIEW only, metres. 0 = player's far plane. The render's
 # cost is CPU submit (draw count), so this is the main perf lever. VeryFarClipping
 # is untouched: planets and their atmospheres still render. Try 3000-5000.
-wholeSceneFarClip = 50000
+wholeSceneFarClip = 2500
 
 # A/B gate on the FinalLDR resize (the phantom-bleed fix). 1 = resize to feed size
 # (default). 0 = leave it at swapchain size — re-tests the pre-fix behaviour.
@@ -310,4 +331,4 @@ wholeSceneSubmitEarly = 0
 # at the engine's own FarClipping (~15 km), which made "nothing renders out there"
 # ambiguous between OUR far plane and the engine's streaming. Costs draw count: the far
 # plane is what culling reads. Off by default; the perf lever keeps its old behaviour.
-wholeSceneFarClipExtend = 1
+wholeSceneFarClipExtend = 0
