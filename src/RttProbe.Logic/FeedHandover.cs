@@ -61,6 +61,7 @@ internal static class FeedHandover
         _argsLogged = _survivedLogged = false;
         _handovers = _errLogs = _parkGeneration = _copiesInterval = 0;
         _lastArmCheck = 0;
+        _lastRequestRender = 0;
         _srcTransitionOff = _dstTransitionOff = false;
         _transitionState = 0;
         _autoStateDiag.Clear();
@@ -84,7 +85,21 @@ internal static class FeedHandover
     private static MethodInfo _miRequestRender;
     private static ConstructorInfo _genHandleCtor;
     private static bool _requestDiag;
-    private static long _lastRequestRender;
+
+    // PER-FEED (the user caught this one). The throttle is per-TARGET — each feed owns its
+    // own offscreen target and must be able to request it every window. As a process-global
+    // it admitted ONE request per window across the mod, and with both feeds' cadences
+    // locked to the engine frame clock the same feed won every window until a hitch shifted
+    // the phase: one panel live, one frozen on its last frame, swapping in minute-long
+    // stretches. The counters half-hid it because the RATE counters here are process-wide
+    // aggregates printed under whichever feed's tag fired the log — only the per-feed
+    // cumulative `copies=` told the truth (feed 0: park#2158, copies 0 for 63 s).
+    //
+    // Same defect, same fix as FeedGate._lastPollMs on the first two-feed run: the throttle
+    // covers the shared thing (there, a file stat; here, nothing — the targets are
+    // disjoint), so it splits per feed.
+    private static long _lastRequestRender
+    { get => Feeds.Cur.LastRequestRender; set => Feeds.Cur.LastRequestRender = value; }
 
     public static void RequestPanelRender(object panelRenderTarget)
     {
@@ -319,11 +334,16 @@ internal static class FeedHandover
         if (now - _lastRateLog < 500) return;   // fast: crashes have come inside 1s
 
         double secs = (now - _lastRateLog) / 1000.0;
-        RttLog.Line($"Rates/s: request={_requestCount / secs:F1} drawOne(ours)={_drawOneOurs / secs:F1} " +
+        // "all:" prefixes the PROCESS-WIDE counters, "this:" the per-feed ones. They used
+        // to print undifferentiated under whichever feed's tag fired the log, which made a
+        // feed that was copying NOTHING look healthy — the aggregate rate (the other
+        // feed's traffic) sat right next to its own park counter. That misattribution is
+        // what let the alternating-delivery bug survive its first minute of diagnosis.
+        RttLog.Line($"Rates/s all: request={_requestCount / secs:F1} drawOne(ours)={_drawOneOurs / secs:F1} " +
                     $"drawOne(other)={_drawOneOther / secs:F1} copies={_copiesInterval / secs:F1} " +
                     $"skip(noFrame)={_skipNoFrame / secs:F1} skip(off)={_skipDisabled / secs:F1} " +
-                    $"| heap={GC.GetTotalMemory(false) >> 20}MB pending={PendingRenderCount()} " +
-                    $"park#{_parkGeneration} copies={_handovers}");
+                    $"heap={GC.GetTotalMemory(false) >> 20}MB pending={PendingRenderCount()} " +
+                    $"| this: park#{_parkGeneration} copies={_handovers}");
 
         _lastRateLog = now;
         _requestCount = _drawOneOurs = _drawOneOther = _skipNoFrame = _skipNotAlive = _copiesInterval = _skipDisabled = 0;

@@ -152,6 +152,17 @@ internal sealed class FeedInstance
     public int ParkGeneration;
     public string PanelHandleText;
 
+    // Last RequestPanelRender, for the per-TARGET rate limit. Per-feed because each feed
+    // owns its own offscreen target and the throttle exists to keep ONE target from being
+    // re-requested faster than the panel rate — not to admit one request per window across
+    // the whole mod. As a process-global it made the two feeds compete for the window, and
+    // since both cadences are locked to the engine frame clock the same feed kept winning
+    // until a hitch shifted the phase: one panel live, one frozen, swapping in minute-long
+    // stretches. User-observed 2026-07-30 23:2x; the FIFTH process-global-starves-a-feed
+    // bug of the day (gate poll throttle, startup flag, DC failure count, resumed-intact,
+    // now this).
+    public long LastRequestRender;
+
     // DELIVERY PROOF, per feed (phase C3). These were process-global "log once" latches,
     // classified during the C1a inventory as statements about the ENGINE. They are not —
     // "this feed's frames reached its panel" is the most feed-specific fact in the mod, and
