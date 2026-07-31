@@ -185,6 +185,14 @@ internal sealed class FeedInstance
     public int GateCycles;
     public int TeardownIn = -1;
 
+    // "This feed went active; log its startup from the render thread." Per-feed because
+    // Startup() writes GateCycles and GateEverActive, which are per-feed — as one global
+    // flag the first feed to drain it consumed every other feed's startup, so feed 1's
+    // shutdown then reported "(Nothing had been started yet.)" while it was demonstrably
+    // rendering. Caught by the unscoped-access detector the moment PumpAll moved outside
+    // the render scope, which is precisely the job that detector exists to do.
+    public bool PendingStartupLog;
+
     // ---- PanelBinding: the material binding --------------------------------------
     public bool Bound;
     public WeakReference BoundRenderer;

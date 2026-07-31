@@ -140,6 +140,65 @@ grep for high-VRAM lines returned rows from a previous day — the same trap rec
 in this project, fallen into twice. Scope every log window from the last
 `=== RttProbe bootstrap` line before reading a number off it.
 
+### C3 RESULT 2026-07-30 20:35-20:41: functional gate MET, VRAM gate NOT met
+
+**What is proven.** Two feeds rendered and delivered simultaneously for the first time:
+
+```
+[feed 0] park#617 copies=504      [feed 1] park#306 copies=156
+[feed 0] HANDOVER SURVIVED 30 copies — the feed is on the panel.
+[feed 1] HANDOVER SURVIVED 30 copies — the feed is on the panel.
+```
+
+Steady state was excellent and better than expected: **45.7 fps vs 48.2 single-feed, p50 21.9
+vs 20.6, p95 24.5 vs 22.8, `>50ms = 0`, and CPU submit UNCHANGED at 2.1 ms.** Rule 9 holds at
+two feeds — the second render costs almost nothing in submit, which is the route's bottleneck.
+
+The teardown fix was observed firing, three separate times, both feeds each time:
+
+```
+[feed 0] Whole-scene Reset: VRAM 12457 MB -> 12331 MB (-126 MB)
+[feed 1] Whole-scene Reset: VRAM 12331 MB -> 12205 MB (-126 MB)
+```
+
+Against the broken build, where feed 0 released nothing at all.
+
+**What is NOT proven, and why the gate is not met.** VRAM RATCHETED across gate cycles and
+never came back:
+
+| time | state | VRAM | avail |
+|---|---|---|---|
+| 20:29 | 1 feed | 12.05 GB | 13.61 |
+| 20:36 | 2 feeds | 12.23 GB | 13.62 |
+| 20:39 | 2 feeds, after a rebuild | 12.79 GB | 13.59 |
+| 20:40:59 | 2 feeds, after another rebuild | **13.58 GB (+1225 MB in one step)** | 13.52 |
+| 20:42 | back to 1 feed | 13.45 GB | 13.98 |
+
+Each teardown returns a consistent **126 MB per feed** while each rebuild consumes several
+hundred. The run was stopped by hand at 13.58 GB against a 13.52 GB budget — the same
+condition that preceded the 19:21 device removal, reached this time without the orphaned-feed
+bug, so **there is a second and independent VRAM problem still open.**
+
+Two candidate explanations, not yet distinguished, and the difference matters:
+
+1. **Allocator pooling.** `UsedVRAM` counts blocks the D3D allocator holds, not blocks in
+   use. Dispose returns memory to the pool without lowering the counter, and the next
+   rebuild reuses it. Supported by: single-feed VRAM was dead flat across many gate cycles
+   all evening. If this is it, the ratchet is cosmetic and the real ceiling is higher.
+2. **A genuine per-rebuild leak that only shows at N>1.** Supported by: the -126 MB figure is
+   suspiciously constant and far below the ~380 MiB the resource walk attributes to a feed,
+   so `DrawContextManager.Dispose` may not be releasing what the walk says it owns.
+
+**Next test, and it is cheap:** cycle the gate ~5 times at ONE feed on a fresh boot, watching
+VRAM. Flat = pooling (candidate 1), and two feeds are viable. Climbing = a real leak
+(candidate 2) present all along and merely invisible at one feed. Do it on a fresh session:
+tonight's readings all sit on top of an already-elevated engine footprint.
+
+**Do not run two feeds at 1024 unattended until this is settled.** The E1 cap is a real
+backstop — it clamped itself to 1 as soon as headroom tightened, exactly as designed — but a
+cap calibrated on a per-feed constant cannot protect against a per-REBUILD cost it does not
+model.
+
 **THE C2 BASELINE IS NOT `reference/every-frame-baseline`.** That pin is 512x512 with no flares,
 no own probes and no atmosphere LUTs — a materially cheaper build. Grading today's 1024 SSAA
 full-fidelity build against its 66 fps / 2.1 ms would show a large "regression" that is entirely

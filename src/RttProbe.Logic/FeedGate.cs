@@ -174,7 +174,8 @@ internal static class FeedGate
     private static int _teardownIn
     { get => Feeds.Cur.TeardownIn; set => Feeds.Cur.TeardownIn = value; }
 
-    private static bool _pendingStartupLog;
+    private static bool _pendingStartupLog
+    { get => Feeds.Cur.PendingStartupLog; set => Feeds.Cur.PendingStartupLog = value; }
 
     // EVERY feed's countdown, every engine frame. Call from OUTSIDE the render-slot scope.
     //
@@ -206,14 +207,15 @@ internal static class FeedGate
     // ForEachSlot, not ForEach: a slot dropped out of Count by a feedCount change or the
     // VRAM cap is the one most in need of releasing, and it is invisible to every
     // Count-bounded sweep from the instant it is retired.
-    public static void PumpAll()
-    {
-        if (_pendingStartupLog) { _pendingStartupLog = false; Startup(); }
-        Feeds.ForEachSlot(PumpOne);
-    }
+    public static void PumpAll() => Feeds.ForEachSlot(PumpOne);
 
+    // INSIDE the per-feed scope, both halves of it. Startup() writes GateCycles and
+    // GateEverActive — per-feed state — so draining a global flag here would have written
+    // feed 0's counters on every feed's behalf.
     private static void PumpOne()
     {
+        if (_pendingStartupLog) { _pendingStartupLog = false; Startup(); }
+
         if (_teardownIn < 0) return;
         if (--_teardownIn > 0) return;
         _teardownIn = -1;

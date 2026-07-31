@@ -132,12 +132,23 @@ internal static class FeedRouter
 
         int n = Feeds.Count;
         FeedInstance feed;
+
+        // EACH LOG IS SCOPED TO THE FEED IT IS ABOUT. RttLog.Line stamps [feed N] from the
+        // ambient, and this method is the one DECIDING the ambient — so logging unscoped
+        // here reads the enclosing scope (or none at all) and tags the line with a feed that
+        // is not the one the sentence names.
+        //
+        // Caught by the unscoped-access detector during the first clean two-feed run. Harmless
+        // in itself: these lines name their feed in the text, so nothing was ever misread. It
+        // is fixed anyway because the detector's whole value is that its SILENCE is evidence,
+        // and a known-benign entry sitting in the log trains the eye to skip past the next one.
         if (index < n)
         {
             feed = Feeds.At(index);
             if (_claimLogs++ < 8)
-                RttLog.Line($"Feed routing: panel \"{name}\" -> FEED {feed.Id}. Its own camera, " +
-                            $"ScreenBuffers, LDR ring and gate. (feedCount={n}.)");
+                using (Feeds.Enter(feed))
+                    RttLog.Line($"Feed routing: panel \"{name}\" -> FEED {feed.Id}. Its own camera, " +
+                                $"ScreenBuffers, LDR ring and gate. (feedCount={n}.)");
         }
         else
         {
@@ -145,10 +156,11 @@ internal static class FeedRouter
             // symptom is "my second panel just mirrors the first" with nothing in the log.
             feed = Feeds.Primary;
             if (_claimLogs++ < 8)
-                RttLog.Line($"Feed routing: panel \"{name}\" asks for feed {index}, but only " +
-                            $"{n} feed(s) are active (feedCount={n}). It will SHARE feed " +
-                            $"{feed.Id} and show that camera's picture. Raise feedCount to " +
-                            $"{index + 1} to give it its own.");
+                using (Feeds.Enter(feed))
+                    RttLog.Line($"Feed routing: panel \"{name}\" asks for feed {index}, but only " +
+                                $"{n} feed(s) are active (feedCount={n}). It will SHARE feed " +
+                                $"{feed.Id} and show that camera's picture. Raise feedCount to " +
+                                $"{index + 1} to give it its own.");
         }
 
         _byName[name] = feed;
