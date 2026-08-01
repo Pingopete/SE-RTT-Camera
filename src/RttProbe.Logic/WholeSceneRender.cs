@@ -1929,6 +1929,7 @@ internal static class WholeSceneRender
     // dump that would have named the right field could never print. A run-once log that
     // guards a DIFFERENT run-once log is a bug factory.
     private static bool _planetUpFailLogged, _planetUpShapeLogged, _planetUpOkLogged, _planetUpRelLogged;
+    private static bool _planetUpNoSubjectLogged;
     private static int _planetUpCountdown;
 
     // The group fields that could carry a planet centre. _allPlanetSpheresData was the
@@ -2437,14 +2438,38 @@ internal static class WholeSceneRender
             // the scan walks a list with one element in it.
             if (--_planetUpCountdown <= 0)
             {
-                _planetUpCountdown = 60;
                 // The tick publishes the very position the orbit looks at. Reading
                 // Feeds.Cur.Target across the thread boundary returned 0,0,0 here while the
                 // tick was logging a real one, so this takes the value by the same route
                 // PlanetUpCache travels back on.
                 var subject = CameraFeed.SubjectCentreCache;
-                if (subject.LengthSquared() > 1.0)
+                if (subject.LengthSquared() <= 1.0)
                 {
+                    // A SKIP MUST NOT CONSUME THE ATTEMPT.
+                    //
+                    // The render thread can reach here before the LCD tick has published a
+                    // subject, and the FIRST successful rebuild is exactly when that race is
+                    // most likely. Counting it as an attempt cost the entire 15:12 session:
+                    // the retry is gated behind 60 MORE successful rebuilds, and a success
+                    // needs a planet in our frustum (see the early return above), which at
+                    // night is rare. The orbit ran on the subject-transform fallback all
+                    // session and said nothing, because the skip was silent.
+                    //
+                    // Leaving the countdown at 0 retries on the very next rebuild. Once
+                    // PlanetUpCache is set it persists, so a single success is enough.
+                    _planetUpCountdown = 0;
+                    if (!_planetUpNoSubjectLogged)
+                    {
+                        _planetUpNoSubjectLogged = true;
+                        RttLog.Line("Orbit up: no subject published yet (SubjectCentreCache is zero) — the " +
+                                    "planet scan is DEFERRED, not counted as an attempt, and retries on the " +
+                                    "next planet-env rebuild. If this is the last word on the subject, the " +
+                                    "LCD tick never published and the orbit is on its fallback up.");
+                    }
+                }
+                else
+                {
+                    _planetUpCountdown = 60;
                     var radial = PlanetUpAt(subject);
                     if (radial.HasValue) CameraFeed.PlanetUpCache = radial.Value;
                 }
