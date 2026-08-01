@@ -276,11 +276,12 @@ internal static class CameraFeed
             if (_seenNames.Add(name) && _seenNames.Count <= 20)
                 RttLog.Line($"LCD panel seen: \"{name}\"" +
                             (surfaceIndex >= 0
-                                ? $"   <-- TAGGED, feed {surfaceFeed}, from SURFACE {surfaceIndex}'s text " +
-                                  $"(\"{surfaceText}\") on block \"{blockName}\""
+                                ? $"   <-- TAGGED {(surfaceFeed < 0 ? "(unnumbered — takes the next free feed)" : $"feed {surfaceFeed}")}, " +
+                                  $"from SURFACE {surfaceIndex}'s text (\"{surfaceText}\") on block \"{blockName}\""
                                 : FeedRouter.TryParseTag(name, out int tagged)
-                                    ? $"   <-- TAGGED, feed {tagged}, from the BLOCK NAME (no surface carries " +
-                                      "the tag in its text — type it into the screen itself to pick one)"
+                                    ? $"   <-- TAGGED {(tagged < 0 ? "(unnumbered)" : $"feed {tagged}")}, from the " +
+                                      "BLOCK NAME (no surface carries the tag in its text — type it into the " +
+                                      "screen itself to pick one)"
                                     : ""));
 
             // ONE tag test for the whole mod (FeedRouter.IsFeedPanel), so [RTC2] cannot be
@@ -304,9 +305,11 @@ internal static class CameraFeed
             // re-entering a scope in the middle of a half-done claim. One dropped tick, ~16 ms,
             // against a mis-scoped one that would write this panel's identity into the wrong
             // feed's state.
-            if (FeedRouter.TryParseTag(name, out int wantIdx))
+            // ResolveByName, not FeedForIndex: an UNNUMBERED tag has no index to resolve, and
+            // its feed is whatever the router auto-assigned and cached. The router is the one
+            // place that knows, for both forms.
             {
-                var want = FeedRouter.FeedForIndex(wantIdx);
+                var want = FeedRouter.ResolveByName(name);
                 if (!ReferenceEquals(want, Feeds.Cur))
                 {
                     int wasId = Feeds.Cur.Id;
@@ -507,28 +510,25 @@ internal static class CameraFeed
     // Normalised to [RTCn] rather than echoing the raw text, so "[RTC]" and "[RTC1]" are one
     // key and a user who writes "[RTC2] forward camera" does not get a claim key that changes
     // when they edit the prose after it.
+    // feedIndex < 0 = the tag was UNNUMBERED ("[RTT]"), which is a meaningful state and must
+    // survive into the key: the router reads the key back to decide between "you asked for
+    // feed N" and "give me the next free feed", and baking a number in here would silently
+    // turn every unnumbered panel into a request for feed 0.
     private static string SurfaceClaimKey(int feedIndex, int surfaceIndex, string blockName) =>
-        $"[RTC{feedIndex + 1}] #{surfaceIndex} @{blockName ?? "?"}";
+        feedIndex < 0
+            ? $"[RTT] #{surfaceIndex} @{blockName ?? "?"}"
+            : $"[RTT{feedIndex + 1}] #{surfaceIndex} @{blockName ?? "?"}";
 
-    private static string NameOf(object entity, object lcd)
-    {
-        // The user tags the block's name, so prefer the entity's name; fall back
-        // to the surface display name, which is where GS2 looks.
-        var dbg = Prop(entity, "DebugName") as string;
-        if (FeedRouter.IsFeedPanel(dbg)) return dbg;
-
-        try
-        {
-            var mi = lcd.GetType().GetMethod("GetSurfaceEffectiveDisplayName", Any);
-            if (mi != null)
-            {
-                var n = mi.Invoke(lcd, new object[] { 0 }) as string;
-                if (!string.IsNullOrEmpty(n)) return n;
-            }
-        }
-        catch { }
-        return dbg;
-    }
+    // TWO SOURCES OF TRUTH, NOT THREE (2026-08-01, user): the surface's TEXT (preferred, and
+    // handled by the caller) and the BLOCK NAME. The surface DISPLAY NAME is explicitly
+    // ignored.
+    //
+    // It used to be the second fallback here, because GS2 reads it. That made three places a
+    // tag could live and only one of them visible in the terminal list the user actually tags
+    // in — so a panel could be "found" via a display name nobody typed, and the log would name
+    // a panel the user could not locate. Two sources are already one more than ideal; the
+    // third bought nothing.
+    private static string NameOf(object entity, object lcd) => Prop(entity, "DebugName") as string;
 
     // block -> grid -> GetWorldTransform(blockPosition) -> Position
     // Each step reports itself once: this failed silently on the first run, and a

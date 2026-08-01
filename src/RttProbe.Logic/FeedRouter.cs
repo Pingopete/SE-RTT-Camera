@@ -151,6 +151,28 @@ internal static class FeedRouter
     // tag makes it the user's decision, stable across sessions, and readable off the block.
     //
     // Backwards compatible: a plain [RTC] is feed 0, which is what every existing world has.
+    // The single source of truth for "which feed does this claim key belong to", including
+    // the auto-assignment an unnumbered tag needs. Discovery calls this when it re-derives a
+    // panel's tag from live text and wants to know whether the route still agrees.
+    internal static FeedInstance ResolveByName(string name) => ClaimByName(name);
+
+    // The lowest feed not already claimed by some other panel, or -1 if they are all taken.
+    //
+    // Scanning _byName rather than keeping a counter, because the map IS the record of what
+    // has been handed out and a counter would drift from it on every Reset. N is at most 4 and
+    // this runs once per panel per session, so the nested scan costs nothing worth naming.
+    private static int NextFreeSlot(int n)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            bool taken = false;
+            foreach (var kv in _byName)
+                if (kv.Value.Id == i) { taken = true; break; }
+            if (!taken) return i;
+        }
+        return -1;
+    }
+
     private static FeedInstance ClaimByName(string name)
     {
         if (_byName.TryGetValue(name, out var already)) return already;
@@ -159,6 +181,32 @@ internal static class FeedRouter
 
         int n = Feeds.Count;
         FeedInstance feed;
+
+        // UNNUMBERED: "give me the next free feed" (2026-08-01). Tag N panels [RTT] and they
+        // take feeds 0..N-1 in the order they first tick, which is the simple case the user
+        // asked for — no numbering to keep straight while the tag is still a stand-in for
+        // Keen's eventual per-panel app selection.
+        //
+        // Say plainly that the assignment came from tick ORDER, because that is the one thing
+        // about it that can surprise: the engine decides tick order, so the same two panels
+        // can swap feeds between sessions. Numbering a panel [RTT2] pins it.
+        if (index < 0)
+        {
+            int slot = NextFreeSlot(n);
+            feed = slot >= 0 ? Feeds.At(slot) : Feeds.Primary;
+            if (_claimLogs++ < 8)
+                using (Feeds.Enter(feed))
+                    RttLog.Line(slot >= 0
+                        ? $"Feed routing: panel \"{name}\" is UNNUMBERED, so it takes the next free " +
+                          $"feed — FEED {feed.Id}. Assigned by the order panels first tick, which is " +
+                          "the engine's business, so this can differ between sessions. Write [RTT" +
+                          $"{feed.Id + 1}] on the screen to pin it."
+                        : $"Feed routing: panel \"{name}\" is UNNUMBERED but all {n} feed(s) are already " +
+                          $"claimed, so it SHARES feed {feed.Id} and shows that camera. Raise feedCount " +
+                          "to give it its own.");
+            _byName[name] = feed;
+            return feed;
+        }
 
         // EACH LOG IS SCOPED TO THE FEED IT IS ABOUT. RttLog.Line stamps [feed N] from the
         // ambient, and this method is the one DECIDING the ambient — so logging unscoped
@@ -196,20 +244,36 @@ internal static class FeedRouter
 
     // Does this name carry a feed tag, and which feed does it ask for?
     //
-    // Matches "[RTC" + optional digits + "]" so [RTC] and [RTC2] are both recognised, while
-    // an untagged panel and a near-miss like [RTCX] are not. Returns the ZERO-BASED feed
-    // index; the tag is one-based because "RTC2" reading as "the second camera" is the whole
-    // point of letting the user write it.
+    // Accepts "[RTT" or "[RTC" + optional digits + "]". RTT is the current spelling; RTC is
+    // kept as an alias so a world tagged the old way keeps working rather than going dark on
+    // a rename. Neither is meant to last: both are stand-ins until Keen ships per-panel app
+    // selection, at which point choosing "this screen is a camera feed" moves into that UI and
+    // this parser retires.
+    //
+    // THE NUMBER IS OPTIONAL, and its absence MEANS SOMETHING (2026-08-01, user):
+    //
+    //   [RTT]    unnumbered — "give me the next free feed". Tag N panels this way and they
+    //            take feeds 0..N-1 in the order they first tick. index = -1.
+    //   [RTT2]   numbered — explicitly feed 1, deterministic across sessions. index = 1.
+    //
+    // The unnumbered form is the simple case and the default the user asked for. The numbered
+    // form stays because tick order is the ENGINE'S business: unnumbered assignment is stable
+    // within a session and may swap between them, and this project has already lost time to
+    // that once — a routing bug and an assignment flip produce identical symptoms. Pinning a
+    // panel with a number is the answer when that matters.
+    //
+    // Returns the ZERO-BASED index; the tag is one-based because "RTT2" reading as "the second
+    // camera" is the whole point of letting a user write it.
     internal static bool TryParseTag(string name, out int index)
     {
-        index = 0;
+        index = -1;
         if (string.IsNullOrEmpty(name)) return false;
 
-        const string open = "[RTC";
-        int at = name.IndexOf(open, StringComparison.OrdinalIgnoreCase);
+        int at = name.IndexOf("[RTT", StringComparison.OrdinalIgnoreCase);
+        if (at < 0) at = name.IndexOf("[RTC", StringComparison.OrdinalIgnoreCase);
         if (at < 0) return false;
 
-        int i = at + open.Length;
+        int i = at + 4;                            // past "[RTT" / "[RTC"
         int digits = 0, value = 0;
         while (i < name.Length && name[i] >= '0' && name[i] <= '9')
         {
@@ -219,8 +283,8 @@ internal static class FeedRouter
         }
         if (i >= name.Length || name[i] != ']') return false;
 
-        // [RTC] and [RTC1] both mean the first feed.
-        index = digits == 0 ? 0 : Math.Max(0, value - 1);
+        // No digits = "assign me one". [RTT1] still means the first feed explicitly.
+        index = digits == 0 ? -1 : Math.Max(0, value - 1);
         return true;
     }
 
@@ -238,13 +302,12 @@ internal static class FeedRouter
             var lcd = renderComponent.GetType().GetField("_lcdBlock", Any)?.GetValue(renderComponent);
             if (lcd == null) return null;
 
+            // BLOCK NAME ONLY. The surface DISPLAY NAME was a second fallback here and is
+            // deliberately gone (see CameraFeed.NameOf): the tag lives in the surface's text
+            // or in the block name the terminal list shows, and a third hiding place made
+            // "why isn't my panel found" unanswerable.
             var entity = lcd.GetType().GetProperty("Entity", Any)?.GetValue(lcd);
-            var dbg = entity?.GetType().GetProperty("DebugName", Any)?.GetValue(entity) as string;
-            if (IsFeedPanel(dbg)) return dbg;
-
-            var mi = lcd.GetType().GetMethod("GetSurfaceEffectiveDisplayName", Any);
-            var n = mi?.Invoke(lcd, new object[] { 0 }) as string;
-            return string.IsNullOrEmpty(n) ? dbg : n;
+            return entity?.GetType().GetProperty("DebugName", Any)?.GetValue(entity) as string;
         }
         catch { return null; }
     }
