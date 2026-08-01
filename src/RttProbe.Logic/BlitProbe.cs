@@ -20,7 +20,28 @@ internal static class BlitProbe
 {
     private const string TagSafe = "[RTT]";
     private const string TagArmed = "[RTT!]";
-    private const int RtSize = 512;
+
+    // 1024 was deployed 2026-08-01 as a FAILED fix for the [RTS] mirror, and stays only
+    // because reverting costs a hot reload the VRAM ratchet cannot currently afford. The
+    // size is NOT load-bearing; treat it as 512-with-history.
+    //
+    // The theory it tested: CreateOffscreenTarget registers our texture in the same
+    // registry the LCD system borrows panel content targets from, so at 512x512 a
+    // size-matched borrow could hand the [RTS] panel OUR texture. DISPROVEN in game —
+    // the mirror survived the change to 1024 unchanged.
+    //
+    // What the mirror evidence actually established (see task #31 for the trail):
+    //   * teardown of our ONE bound panel heals BOTH panels; re-bind mirrors both
+    //   * the [RTS] ctx's _screenMaterialHandle stays DIFFERENT from ours throughout
+    //     (mirror forensics, 15:36) — so it is not wearing our material at ctx level
+    //   * therefore the leak is at the level the MESH resolves its material from, and
+    //     the one shared object in the bind is the session-wide
+    //     LcdContentRendererSessionComponent we pass into SetNewScreenMaterialHandle.
+    //
+    // The panel samples in UVs, so this size is otherwise behaviour-neutral; the ring
+    // and handover size themselves from the target automatically. ~4 MB VRAM per feed
+    // over 512, and finer minification for the panel as a side effect.
+    private const int RtSize = 1024;
 
     private static readonly string MarkerPath = Path.Combine(RttLog.OutDir, "blit-armed.marker");
 
@@ -296,6 +317,40 @@ internal static class BlitProbe
         catch (Exception e) { if (_errLogs++ < 5) RttLog.Error("stage3 paint", e); }
     }
 
+    // ---- mirror forensics (2026-08-01) -------------------------------------------
+    //
+    // Logs the [RTS] surface's screen-material handle whenever it CHANGES, plus the
+    // material state. PROCESS-global on purpose: it describes one physical panel that
+    // belongs to no feed, and the whole point is a stable identity across gate cycles.
+    private static string _mirrorLastHandle;
+
+    private static void MirrorDiag(LcdPanelSurfaceContext ctx)
+    {
+        try
+        {
+            object handle = null, state = null;
+            var t = ctx.GetType();
+            var f = t.GetField("_screenMaterialHandle",
+                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (f != null) handle = f.GetValue(ctx);
+            // ctx.State is a STRUCT — no null-conditional on it.
+            try { state = ctx.State.GetType().GetProperty("CurrentMaterialState")?.GetValue(ctx.State); } catch { }
+
+            // Identity, not ToString: a handle struct prints its type name, which never
+            // changes. Hash the boxed VALUE so a swapped material reads as a new string.
+            string now = handle == null ? "<null>" : $"{handle.GetType().Name}#{handle.GetHashCode():x8}";
+            if (now == _mirrorLastHandle) return;
+
+            RttLog.Global($"[RTS diag] screen material handle CHANGED: {_mirrorLastHandle ?? "<first look>"} -> {now} " +
+                          $"(materialState={state ?? "?"}). The mirror theory predicts this flips to a new value " +
+                          "within ~500 ms of a feed's material bind and back at its teardown; if the picture " +
+                          "changes while THIS stays constant, the corruption is in the target's contents instead.");
+            _mirrorLastHandle = now;
+        }
+        catch (Exception e) { if (_mirrorDiagErrs++ < 2) RttLog.Error("mirror diag", e); }
+    }
+    private static int _mirrorDiagErrs;
+
     // Draw the camera feed across the whole tagged surface.
     private static int _feedDrawLogs;
 
@@ -380,6 +435,19 @@ internal static class BlitProbe
             // we are still drawing on would make that comparison a lie.
             if (text != null && text.Contains(StatsPanel.Tag, StringComparison.OrdinalIgnoreCase))
             {
+                // MIRROR FORENSICS (2026-08-01). The [RTS] panel repeatedly turns into a copy
+                // of the camera feed: deterministically ON within ~500 ms of a feed's material
+                // bind, deterministically OFF at its teardown — we bind ONE panel and both
+                // change, which no per-panel path explains. Working theory: the LCD material
+                // system caches runtime materials by the SHARED LCDScreen_On definition (its
+                // teardown assert is guid-keyed), so this panel's 500 ms content rebuild
+                // fetches OUR runtime material — camera texture included — by the shared key.
+                //
+                // This logs the material handle THIS ctx actually holds, on every change. The
+                // theory predicts: handle A while the feed is dormant, handle B (ours) while
+                // it is bound, back to A after teardown. Target-content overwrite instead
+                // predicts the handle NEVER changes while the picture does.
+                MirrorDiag(ctx);
                 if (!FeedGate.Paused) StatsPanel.Draw(batch, ctx);
                 return;
             }

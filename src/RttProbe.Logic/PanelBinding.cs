@@ -548,6 +548,23 @@ internal static class PanelBinding
             mi.Invoke(ctx, new[] { renderer, baseMaterial, aspect, orientation, converted });
             RttLog.Line("=== PHASE 2: panel material rebound to our own render target. ===");
 
+            // MIRROR FORENSICS (2026-08-01): say which runtime material the engine just
+            // created for US, in the same identity format the [RTS diag] uses. If the stats
+            // panel's handle flips to THIS value on its next 500 ms rebuild, the LCD material
+            // system is serving our runtime material to other panels — the shared-definition
+            // cache collision — and the fix is binding with a per-panel material definition
+            // rather than the shared LCDScreen_On.
+            try
+            {
+                var fh = ctx.GetType().GetField("_screenMaterialHandle",
+                             BindingFlags.Instance | BindingFlags.NonPublic);
+                var ours = fh?.GetValue(ctx);
+                RttLog.Line($"Phase 2: OUR runtime material handle = " +
+                            (ours == null ? "<null>" : $"{ours.GetType().Name}#{ours.GetHashCode():x8}") +
+                            " (compare against [RTS diag] lines).");
+            }
+            catch { }
+
             // The block's renderer has to pick the new material up.
             var rc = CameraFeed.LastRenderComponent;
             var upd = rc?.GetType().GetMethod("UpdateMaterialReplacements", Any);
