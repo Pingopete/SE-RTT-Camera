@@ -293,6 +293,45 @@ internal static class FeedGate
             _resumedIntact = _teardownIn >= 0;
             _teardownIn = -1;              // cancel a pending teardown: we are back
             _pendingStartupLog = true;
+
+            // A FEED MAY NOT BUILD ITS GPU RESOURCES WHILE ANOTHER FEED IS RENDERING.
+            //
+            // Bought with two device removals in twelve minutes, 2026-08-01 11:30:24 and
+            // 11:41:38, both DXGI_ERROR_DEVICE_REMOVED with a NON-ZERO PageFaultVA — the GPU
+            // dereferencing memory that had been freed or recycled under it, not the null
+            // bind of the 2026-07-29 fault. VRAM had 1.5 GB spare, so it is not exhaustion.
+            //
+            // The correlation is with the REBUILD and it is tight: crash 5-6 s after a feed
+            // rebuilt, 27-71 s after any teardown. And the rebuilds that did NOT kill it —
+            // two world loads and a hot reload — all built every feed together while nothing
+            // of ours was rendering. Building a second ScreenBuffers and DrawContextManager
+            // takes blocks from the engine's shared borrowed pool, and doing that while
+            // another feed's frames are in flight appears to hand one of them out twice; the
+            // fault lands a few seconds later, once the aliased block is actually written.
+            //
+            // The settle window does not cover this. It defers the new feed's first DRAW,
+            // which is necessary and was verified firing — the feed rendered cleanly for four
+            // seconds before the device died. The ALLOCATION is the hazard, and it happens
+            // before any window can help.
+            //
+            // So a returning feed takes the quiesced rebuild instead: every feed stops, every
+            // feed releases, and they all come back together from a stopped renderer, which
+            // is the one arrangement observed never to fault. That is the same path a
+            // feedCount change has taken since 2026-07-30, for the same underlying reason.
+            //
+            // The cost is real and is accepted deliberately: bringing one feed back briefly
+            // interrupts the others. Losing a feed stays cheap — no quiesce, the survivors
+            // never stop — which is the direction that matters when a panel is destroyed
+            // under fire. Paying a blink to come back is a fair trade for not crashing.
+            if (!_resumedIntact && !Feeds.Cur.SbBuilt && Feeds.AnyOtherRendering())
+            {
+                RttLog.Line("=== FEED GATE: this feed is back and must REBUILD its GPU resources, but " +
+                            "another feed is rendering. Allocating into a live renderer device-removed " +
+                            "the game twice on 2026-08-01, so the whole mod quiesces first: every feed " +
+                            "releases, then all of them rebuild together from a stopped renderer. Expect " +
+                            "a second or so with no feeds. ===");
+                RequestQuiescedRebuild();
+            }
         }
         else
         {

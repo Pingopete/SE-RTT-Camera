@@ -622,12 +622,25 @@ internal static class Feeds
     private static bool Eligible(FeedInstance f) =>
         f.GateActive && f.RouteState != -1;
 
-    // Is ANY feed inside its post-rebuild settle window? The probe reprocess a rebuild
+    // Is any LIVE feed inside its post-rebuild settle window? The probe reprocess a rebuild
     // triggers is engine-wide, so the answer that matters to "may a second render run right
     // now" is global, even though the countdown itself is per feed.
+    //
+    // GATE-ACTIVE IS PART OF THE QUESTION, and leaving it out deadlocked the whole mod
+    // (2026-08-01 11:36, secondRenders stuck at 0 with both panels frozen). FeedConfig's
+    // first poll resets EVERY SLOT — ForEachSlot, correctly, since a retired slot is exactly
+    // the one holding resources nobody will ask for again — and Reset arms the settle window.
+    // So slots 2 and 3, which have never held a feed and never will unless feedCount rises,
+    // sat at 30 frames forever: they cannot drain, because TickSettle only drains a feed
+    // whose gate is active, and their gate never is.
+    //
+    // Two changes made in the same commit, each right on its own, combining into a permanent
+    // false answer. A dormant slot is not settling — it is parked, it renders nothing and it
+    // triggers no reprocess — so it has no vote here.
     internal static bool AnySettling()
     {
-        for (int i = 0; i < MaxFeeds; i++) if (All[i].SettleFrames > 0) return true;
+        for (int i = 0; i < MaxFeeds; i++)
+            if (All[i].GateActive && All[i].SettleFrames > 0) return true;
         return false;
     }
 
@@ -749,6 +762,26 @@ internal static class Feeds
                 : "on");
         }
         return sb.ToString();
+    }
+
+    // Is any feed OTHER than the current one actually PRODUCING FRAMES right now?
+    //
+    // Not "resident" and not "gate active" — those are both true of a feed that is built but
+    // still settling, which is the state every feed is in during the normal all-feeds-start-
+    // together burst at world load. The question this answers is narrower and is the one that
+    // matters for admitting a rebuild: is another feed's work in flight on the GPU.
+    //
+    // RenderCount is cleared by Reset, so after a quiesce every feed reads false here and the
+    // rebuild burst that follows cannot re-trigger the quiesce that produced it.
+    internal static bool AnyOtherRendering()
+    {
+        var me = Cur;
+        for (int i = 0; i < MaxFeeds; i++)
+        {
+            var f = All[i];
+            if (!ReferenceEquals(f, me) && f.SbBuilt && f.RenderCount > 0) return true;
+        }
+        return false;
     }
 
     // Is any feed OTHER than the current one still live or still holding GPU resources?
