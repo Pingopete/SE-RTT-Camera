@@ -514,6 +514,22 @@ headroom 1136 MB). Panel `[RTC2]` powered off, then powered back on with feed 0 
 rebuild, so 35 s clean is well past the window. Zero errors, zero rotation stalls. The blink
 cost is ~0.5 s of both feeds down, exactly as designed.
 
+**And the mirror image, 12:11:56 — feed 0 lost while feed 1 runs.** Strictly the harder case,
+because feed 0 is `Feeds.Primary`: the fallback that every unscoped access, unknown surface and
+unknown target resolves to. Anything accidentally keyed to "feed 0 is always there" fails here
+and nowhere else.
+
+```
+feed fps 0:off  1:47.4      against an engine 47.4 — feed 1 takes every frame
+[feed 0] Other feed(s) are still live (0=dormant 1=render), so the shared LCD material, the
+         probe settings and the panel-discovery state are left alone
+[feed 0] Whole-scene Reset: VRAM 12631 MB -> 12505 MB (-126 MB)
+[feed 0] Panel material: 1 panel(s) rebound to the STOCK screen material
+```
+
+The shared-state guard mattering in this direction is the point: `EverFound` and the surface set
+are precisely what feed 1 needs to keep drawing, and Primary's teardown left them alone.
+
 One instrument lesson from grading this: a bare grep for `STALL` matches `INSTALLED`, which
 appears in the camera-CB line every rebuild writes, and it produced a false alarm on this very
 run. The watchdog now anchors on the `!!!` prefix. It also reads per-feed rates from the PERF
