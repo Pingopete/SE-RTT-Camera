@@ -347,6 +347,133 @@ internal static class WorldGrids
         }
     }
 
+    // MATERIALIZE ONE MANAGED AREA — the goal-10 tier-2 pathfinder.
+    //
+    // Calls the engine's own ManagedWorldArea.TryLoad() on the named area: the exact method
+    // its spatial trigger invokes when a player walks in, so the content spawns by the
+    // supported path with all its own lifecycle. This is deliberately NOT a new trigger
+    // registration yet — it answers the prior question: does the load path work at all when
+    // something other than a player's proximity asks for it? If yes, the continuous version
+    // (a trigger volume riding the feed camera) has a proven foundation; if it faults, we
+    // learned that BEFORE building machinery on top of it.
+    //
+    // The mutation runs where the request is consumed — the panel-locate tick, the same
+    // context the engine's own trigger callbacks use for their load kicks (TryLoad hands the
+    // real work to an async task internally either way).
+    internal static void LoadAreaByName(object anyEntityInScene, string wantName)
+    {
+        try
+        {
+            // SERVER-CAPTURED AREAS ONLY. The area list reachable from the panel's grid is
+            // the CLIENT mirror, and TryLoad on a client-scene area throws
+            // KeyNotFoundException from Scene.FinishBefore<SpawnSyncPoint> — it crashed the
+            // game twice on 2026-08-01 (loading is a server concern; only the server scene
+            // registers the spawn sync point). The bootstrap captures the server-side
+            // (area, session) pairs at world load via its OnRegistered patch; this loader
+            // refuses to fall back to the client path under any circumstance.
+            //
+            // Bridge fields are read by REFLECTION, not direct reference: a new logic
+            // running against an old bootstrap must degrade to this log line, not die with
+            // MissingFieldException the first time the method JITs.
+            var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
+            var regsField = bridge?.GetField("ManagedAreaRegistrations");
+            var lockField = bridge?.GetField("ManagedAreaLock");
+            if (regsField == null || lockField == null)
+            {
+                RttLog.Line($"LOAD AREA \"{wantName}\": this bootstrap predates the server-side area " +
+                            "capture. RESTART THE GAME to load the new bootstrap — the client-side " +
+                            "fallback is disabled because it is a confirmed crash.");
+                return;
+            }
+
+            object area = null; int captured = 0; object lastSession = null;
+            var regs = (System.Collections.Generic.List<object[]>)regsField.GetValue(null);
+            lock (lockField.GetValue(null))
+            {
+                captured = regs.Count;
+                if (captured > 0)
+                {
+                    // A world reload appends a fresh batch with a NEW session component;
+                    // only the latest session's areas belong to the running world.
+                    lastSession = regs[^1][1];
+                    foreach (var pair in regs)
+                    {
+                        if (!ReferenceEquals(pair[1], lastSession)) continue;
+                        var n = Prop(pair[0], "Name")?.ToString();
+                        if (n != null && n.IndexOf(wantName, StringComparison.OrdinalIgnoreCase) >= 0)
+                        { area = pair[0]; break; }
+                    }
+                }
+            }
+
+            if (captured == 0)
+            {
+                RttLog.Line($"LOAD AREA \"{wantName}\": the bootstrap has captured NO area registrations. " +
+                            "Registrations fire during world load — if the game started with the new " +
+                            "bootstrap and a world is running, the patch failed; check the boot log for " +
+                            "'Patched ManagedWorldArea.OnRegistered'.");
+                return;
+            }
+            if (area == null)
+            {
+                RttLog.Line($"LOAD AREA \"{wantName}\": no captured area matched ({captured} registration(s) " +
+                            "held). The survey's managed-areas section lists the valid names.");
+                return;
+            }
+
+            var name = Prop(area, "Name")?.ToString();
+            var state = Prop(area, "_state")?.ToString();
+            if (string.Equals(state, "Loaded", StringComparison.OrdinalIgnoreCase))
+            {
+                RttLog.Line($"LOAD AREA: \"{name}\" is already Loaded — nothing to do.");
+                return;
+            }
+
+            var tryLoad = area.GetType().GetMethod("TryLoad", Any, null, Type.EmptyTypes, null);
+            if (tryLoad == null)
+            {
+                RttLog.Line($"LOAD AREA: \"{name}\" has no TryLoad() — engine shape changed; " +
+                            "candidates: " + string.Join(", ", area.GetType()
+                                .GetMethods(Any).Where(m => m.Name.Contains("Load"))
+                                .Select(m => m.Name).Distinct()));
+                return;
+            }
+
+            RttLog.Line($"LOAD AREA: \"{name}\" state={state} -> calling the engine's TryLoad(). " +
+                        "This is the same path its own spatial trigger fires; content spawns " +
+                        "asynchronously. Watch the feed if the orbit anchor is parked on this area.");
+            tryLoad.Invoke(area, null);
+            RttLog.Line($"LOAD AREA: TryLoad() returned for \"{name}\" — state now " +
+                        $"{Prop(area, "_state")}. The spawn completes async; the area's own " +
+                        "trigger/lifecycle owns it from here, including unloading it later if " +
+                        "its rules say so.");
+        }
+        catch (Exception e) { RttLog.Error($"load area \"{wantName}\"", e); }
+    }
+
+    // The session-component hop, shared by the survey section and the loader.
+    private static object FindManagedWorldAreaComponent(object anyEntityInScene)
+    {
+        var tBlock2 = Type.GetType(
+            "Keen.Game2.Simulation.WorldObjects.CubeBlocks.CubeBlockComponent, Game2.Simulation");
+        var grid = ComponentOf(anyEntityInScene, "CubeGridComponent")
+                   ?? Prop(TryGetViaGeneric(anyEntityInScene, tBlock2), "Grid");
+        var session = Prop(grid, "Session");
+        var scEntity = Prop(session, "SessionComponents");
+        if (scEntity == null || _fComponents?.GetValue(scEntity) is not IEnumerable scComps) return null;
+        object mwa = null;
+        foreach (var c in scComps)
+        {
+            if (c == null) continue;
+            var n = c.GetType().Name;
+            if (n == "ManagedWorldAreaSessionComponent") return c;
+            if (mwa == null && n.Contains("ManagedWorldArea", StringComparison.Ordinal)
+                            && Prop(c, "_areas") != null)
+                mwa = c;
+        }
+        return mwa;
+    }
+
     // Planet-like bodies: entities carrying any component whose type name mentions Planet.
     // Name comes from DisplayName if any component offers one, else the entity's DebugName —
     // which for planets is usually the readable body name. Extent is the best "Radius"-ish

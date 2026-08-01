@@ -121,6 +121,27 @@ public static class RttBridge
     // A prefix returning false skips the original outright, which is the only lever that
     // reaches a stage the settings do not gate.
     public static volatile Func<int, bool> SkipStageHook;
+
+    // ---- MANAGED WORLD AREA REGISTRATIONS (goal 10 tier 2, 2026-08-01) -----------------
+    //
+    // (area, sessionComponent) pairs captured from ManagedWorldArea.OnRegistered — the
+    // SERVER-side objects, which is the entire point. The client's mirror component
+    // (ClientManagedWorldAreaSessionComponent) exposes the same area list, but calling
+    // TryLoad on a client-scene area throws KeyNotFoundException from
+    // Scene.FinishBefore<SpawnSyncPoint> and CRASHED THE GAME TWICE on 2026-08-01:
+    // loading is a server concern and only the server scene registers the spawn sync
+    // point. OnRegistered hands us the server component as a parameter, so whatever is
+    // in this list is by construction from the scene where TryLoad is legal.
+    //
+    // Lives in the BOOTSTRAP for two reasons: registrations fire DURING world load,
+    // before the logic assembly has attached its hooks, so a forwarding hook would miss
+    // them all; and logic statics die on every hot reload while these references must
+    // not. Entries are (area, session) object pairs, typed object for the same reason
+    // ParkedProbeManagers is. Appended only — a world reload appends a new batch with a
+    // NEW session component, and the logic side keys on the LAST entry's session to
+    // ignore stale worlds. The lock covers the racy append-during-load window.
+    public static readonly List<object[]> ManagedAreaRegistrations = new();
+    public static readonly object ManagedAreaLock = new();
 }
 
 public sealed class RttPlugin : IPlugin
@@ -181,8 +202,42 @@ public sealed class RttPlugin : IPlugin
             PatchSceneDraw(harmony);
             PatchOffscreenUi(harmony);
             PatchGhostProbes(harmony);
+            PatchManagedAreas(harmony);
         }
         catch (Exception e) { Log("Patching FAILED: " + e); }
+    }
+
+    // Managed-area registration capture — see RttBridge.ManagedAreaRegistrations for why
+    // this exists and why it must live in the bootstrap. The postfix does nothing but
+    // stash references; every decision belongs to the logic side, which can be reloaded.
+    private static void PatchManagedAreas(HarmonyLib.Harmony harmony)
+    {
+        try
+        {
+            var t = Type.GetType(
+                "Keen.VRage.Core.Game.GameSystems.ManagedWorldAreas.ManagedWorldArea, VRage.Core.Game");
+            var mi = t?.GetMethod("OnRegistered",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (mi == null) { Log("ManagedWorldArea.OnRegistered not found — area capture inactive."); return; }
+            var post = typeof(RttPlugin).GetMethod(nameof(ManagedAreaRegisteredPostfix),
+                BindingFlags.Static | BindingFlags.NonPublic);
+            harmony.Patch(mi, postfix: new HarmonyLib.HarmonyMethod(post));
+            Log("Patched ManagedWorldArea.OnRegistered (server-side area capture).");
+        }
+        catch (Exception e) { Log("Patching ManagedWorldArea FAILED: " + e.Message); }
+    }
+
+    // Harmony binds `session` to OnRegistered's first parameter by name. Keep this body
+    // trivial and exception-proof: it runs during world load, where a throw is a failed
+    // load, not a log line.
+    private static void ManagedAreaRegisteredPostfix(object __instance, object session)
+    {
+        try
+        {
+            lock (RttBridge.ManagedAreaLock)
+                RttBridge.ManagedAreaRegistrations.Add(new[] { __instance, session });
+        }
+        catch { }
     }
 
     // The UI stage's offscreen renderer. Its signature is not known ahead of time,

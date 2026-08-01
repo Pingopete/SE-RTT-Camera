@@ -521,6 +521,8 @@ internal static class CameraFeed
             // once (TakeWorldGridSurveyRequest), so a `worldGridSurvey = 1` left in the file
             // does not re-dump on every poll.
             if (FeedConfig.TakeWorldGridSurveyRequest()) WorldGrids.DumpGrids(entity);
+            var loadReq = FeedConfig.TakeLoadAreaRequest();
+            if (loadReq.Length > 0) WorldGrids.LoadAreaByName(entity, loadReq);
 
             if (_findLogs++ < 3)
                 RttLog.Line($"[RTC] panel located: \"{name}\" at {pos.Value.X:F1},{pos.Value.Y:F1},{pos.Value.Z:F1} ({added} surfaces registered)");

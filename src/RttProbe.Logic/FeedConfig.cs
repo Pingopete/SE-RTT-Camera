@@ -835,6 +835,39 @@ internal static class FeedConfig
     public static bool WorldGridSurvey { get; private set; }
     private static bool _surveyArmedLast;
 
+    // MATERIALIZE ONE MANAGED AREA BY NAME (goal 10 / tier 2 pathfinder, 2026-08-01).
+    // `loadArea = Vallis Reach` calls TryLoad() on the matching ManagedWorldArea — the
+    // engine's own load path, the one its spatial trigger fires — so the content spawns
+    // exactly as if a player had walked in. Edge-triggered and consumed once, same
+    // discipline as worldGridSurvey: a name left in the file must not re-fire on every
+    // poll, because TryLoad is a WORLD MUTATION, not a report.
+    public static string LoadAreaRequest { get; private set; } = "";
+    private static string _loadAreaLast = "";
+
+    public static string TakeLoadAreaRequest()
+    {
+        var r = LoadAreaRequest;
+        LoadAreaRequest = "";
+        return r;
+    }
+
+    private static string _loadAreaMarkerPath;
+    private static string LoadAreaMarkerPath =>
+        _loadAreaMarkerPath ??= System.IO.Path.Combine(RttLog.OutDir, "loadarea-consumed.marker");
+
+    private static string ReadLoadAreaMarker()
+    {
+        try { return System.IO.File.Exists(LoadAreaMarkerPath)
+                  ? System.IO.File.ReadAllText(LoadAreaMarkerPath).Trim() : ""; }
+        catch { return ""; }
+    }
+
+    private static void WriteLoadAreaMarker(string value)
+    {
+        try { System.IO.File.WriteAllText(LoadAreaMarkerPath, value); }
+        catch { /* an unwritable marker means a re-fire after restart; log-worthy but not fatal */ }
+    }
+
     // Consumed-and-cleared by the surveyor, so the "run once" decision lives in ONE place
     // rather than being re-derived by every caller. Returns true at most once per edit.
     public static bool TakeWorldGridSurveyRequest()
@@ -912,6 +945,22 @@ internal static class FeedConfig
             var surveyWanted = Bool(kv, "worldGridSurvey", false);
             if (surveyWanted && !_surveyArmedLast) WorldGridSurvey = true;
             _surveyArmedLast = surveyWanted;
+
+            // DURABLE consume for the area loader, not the in-memory edge the survey uses.
+            // The in-memory version re-fired after a game restart — fresh statics saw the
+            // name sitting in the file as a new edge and pulled the same trigger during
+            // world load, which was CTD #2 of 2026-08-01. A WORLD MUTATION request must
+            // survive-compare across process lifetimes, so the last consumed value lives in
+            // a marker file: same value = already done, no matter how many boots ago.
+            var loadWanted = Str(kv, "loadArea", "");
+            if (loadWanted.Length > 0
+                && !string.Equals(loadWanted, _loadAreaLast, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(loadWanted, ReadLoadAreaMarker(), StringComparison.OrdinalIgnoreCase))
+            {
+                LoadAreaRequest = loadWanted;
+                WriteLoadAreaMarker(loadWanted);
+            }
+            _loadAreaLast = loadWanted;
 
             CopyEnabled       = Bool(kv, "copyEnabled", CopyEnabled);
             SrcTransition     = Bool(kv, "srcTransition", SrcTransition);
