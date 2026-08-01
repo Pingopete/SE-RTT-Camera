@@ -1100,6 +1100,33 @@ internal static class WholeSceneRender
                 // recorder, and creating 1x1 targets put resources outside the engine's
                 // AutoResourceState tracking. Both are recorded in docs/whole-scene-status.md.
 
+                // THE SETTLE WINDOW CAN OPEN DURING THIS FRAME'S SETUP — re-check it here.
+                //
+                // EnsureDrawContexts runs ~80 lines above, and it runs THERE on purpose: the
+                // context family must size itself against OUR ScreenBuffers, which are only
+                // swapped into CoreSystems inside this method. But constructing that manager
+                // is precisely what trips the engine's context-reset path and forces the
+                // shared EnvironmentProbeManager to reprocess every probe — so TryRender's
+                // settle check ran BEFORE the hazard it guards against had been created.
+                //
+                // On 2026-08-01 11:30:24 that gap was the whole crash: DrawContextManager
+                // built at .712, Draw called at .714, DXGI_ERROR_DEVICE_REMOVED. Arming the
+                // window inside EnsureDrawContexts is necessary but cannot help by itself,
+                // because by then this frame's decision to render had already been taken.
+                //
+                // A non-zero window at this point therefore means exactly one thing: a build
+                // happened during setup. Unwind and let it settle. The finally restores every
+                // swap, same as any other exit.
+                if (_settleFrames > 0)
+                {
+                    RttLog.Line($"Whole-scene: contexts were (re)built during this frame's setup, so the " +
+                                $"first render is deferred by {_settleFrames} engine frames instead of " +
+                                "drawing into the probe reprocess that build just triggered. This is the " +
+                                "device-removal window, and it is now closed at the point the hazard is " +
+                                "created rather than at a proxy for it.");
+                    return;
+                }
+
                 if (_renderCount == 0)
                     RttLog.Line($"=== WHOLE-SCENE RENDER: calling SceneDrawSystem.Draw a second time, " +
                                 $"into our own {FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight} " +
@@ -2147,6 +2174,26 @@ internal static class WholeSceneRender
     internal static void TickSettle()
     {
         if (_settleFrames <= 0) return;
+
+        // ONLY WHILE THIS FEED IS RUNNING. A dormant feed is not settling — it is stopped,
+        // and it has not yet rebuilt the thing the window exists to wait out.
+        //
+        // This line is the fix for a CTD I caused (2026-08-01 11:30:24, DXGI_ERROR_DEVICE_
+        // REMOVED). Moving the countdown out of TryRender and into the per-frame pump was
+        // right for its stated purpose — the window is specified in ENGINE frames and used
+        // to advance only while its feed was winning render slots — but TryRender also only
+        // ran while the gate was ACTIVE, and dropping that condition was not part of the
+        // intended change. The consequence: a feed's window drained during dormancy (log:
+        // "[feed 1] settled after the rebuild" 0.55 s after that feed's own teardown, and
+        // "[feed 2]/[feed 3]" settling although those slots have never existed), so on the
+        // way back it built a ScreenBuffers, built a DrawContextManager and called Draw
+        // 2 ms later, straight into the probe reprocess.
+        //
+        // The lesson generalises past this bug: when you move a countdown to a better clock,
+        // move its GUARD with it. The old site's early-returns are part of the specification,
+        // not scaffolding around it.
+        if (!FeedGate.Active) return;
+
         if (--_settleFrames > 0) return;
         RttLog.Line($"Whole-scene: settled after the rebuild ({SettleFrames} engine frames); " +
                     "second renders resume. This window exists because a rebuild forces the " +
@@ -2288,6 +2335,23 @@ internal static class WholeSceneRender
             // ONLY here, with the manager actually constructed and configured.
             _dcBuilt = true;
             _dcFailures = 0;
+
+            // ARM THE SETTLE WINDOW AT ITS ACTUAL CAUSE, not at a proxy for it.
+            //
+            // Constructing this manager is what trips the engine's context-reset path and
+            // sets EnvironmentProbeManager._forceReprocess — so THIS line is the hazard, and
+            // the window that protects against it belongs here. Reset() also arms it, which
+            // covered the config-change case and was mistaken for coverage of every case.
+            //
+            // It was not. A feed's FIRST activation never ran Reset under its own scope
+            // (LogicEntry resets feed 0 only), so it built a DrawContextManager and rendered
+            // into the reprocess two milliseconds later with no window at all. That is a
+            // pre-existing hole; it became reachable on every gate cycle when the settle
+            // countdown started draining while feeds were dormant, and it device-removed the
+            // game on 2026-08-01 11:30:24 — Draw called 2 ms after this line, exactly the
+            // 2026-07-29 fault. Arming here cannot miss: no build, no window needed; a build,
+            // and the window is armed by the build itself.
+            _settleFrames = SettleFrames;
         }
         catch (Exception e)
         {
@@ -2693,9 +2757,20 @@ internal static class WholeSceneRender
             }
 
             _ourScreenBuffers = sb;
+
+            // Arm the settle window here too. The DrawContextManager build is the known
+            // hazard and arms it as well, but this call site is the one that also covers
+            // wholeSceneOwnDrawContexts = 0, where EnsureDrawContexts never runs at all —
+            // and a fresh allocation of a whole ScreenBuffers set is not something to follow
+            // with a nested Draw in the same frame on the strength of "the other build is
+            // the one that matters". Cheap insurance on the path that has removed the device
+            // three times. TryRender sees it on this same frame: this runs above it.
+            _settleFrames = SettleFrames;
+
             RttLog.Line($"Whole-scene: SECOND ScreenBuffers built — {how}. " +
                         $"{DescribeScreenBuffers(sb)} Nothing is wired to it; the engine still owns " +
-                        "CoreSystems.ScreenBuffers.");
+                        $"CoreSystems.ScreenBuffers. Settling {SettleFrames} engine frames before the " +
+                        "first render.");
         }
         catch (Exception e)
         {
