@@ -207,6 +207,15 @@ internal static class StatsPanel
                          $"{FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight}" +
                          (FeedConfig.WholeSceneOwnProbes ? " prb" : "") +
                          (FeedConfig.WholeSceneOwnFlares ? " flr" : ""));
+                    y += line;
+
+                    // WHICH FEEDS ARE IN THE ROTATION (phase F1). Every other number on this
+                    // panel is an aggregate, so with two feeds it reads identically whether
+                    // both are live or one has quietly gone away — and "quietly gone away" is
+                    // precisely the state this phase exists to make impossible to miss. Here
+                    // it is legible from across the room while you grind a panel down.
+                    Text(batch, font, x, y, scale * 0.7f, 150, 200, 160,
+                         "feeds " + Feeds.RotationShort());
                 }
             }
             else

@@ -733,6 +733,24 @@ internal static class Feeds
         return sb.ToString();
     }
 
+    // The same picture, short enough for the stats panel: "0:on 1:off".
+    internal static string RotationShort()
+    {
+        var sb = new System.Text.StringBuilder();
+        int n = Count;
+        for (int i = 0; i < n; i++)
+        {
+            var f = All[i];
+            if (i > 0) sb.Append(' ');
+            sb.Append(f.Id).Append(':').Append(
+                !f.GateActive ? (FeedConfig.IsFeedDisabled(f.Id) ? "dis" : "off")
+                : f.RouteState == -1 ? "ERR"
+                : f.SettleFrames > 0 ? "set"
+                : "on");
+        }
+        return sb.ToString();
+    }
+
     // Is any feed OTHER than the current one still live or still holding GPU resources?
     //
     // The question SHARED engine state has to ask before a single feed's shutdown undoes it

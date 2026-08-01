@@ -487,6 +487,7 @@ internal static class WholeSceneRender
         _skippedLogged.Clear();
         _state = 0;
         _hookCount = 0;
+        _pumpErrLogs = 0;
         _lastLogMs = 0;
         _describedTarget = false;
         _inOurRender = false;
@@ -715,8 +716,25 @@ internal static class WholeSceneRender
         // asked. See FeedGate.PollAll: that meant a feed whose panel had just been destroyed
         // was the one feed nothing could reach, since the slot only goes to feeds that are
         // still eligible.
-        FeedGate.PollAll();
-        FeedGate.PumpAll();
+        //
+        // GUARDED, unlike the render below it, which has its own catch inside the scope.
+        // This is a Harmony postfix on the engine's Draw: an exception escaping here does not
+        // land in our code, it lands in the engine's frame. The lifecycle pump is also the
+        // one thing that must keep running when something else has gone wrong — it is what
+        // releases resources and what would let a stuck feed go dormant — so it fails loudly
+        // and carries on rather than taking the frame with it.
+        try
+        {
+            FeedGate.PollAll();
+            FeedGate.PumpAll();
+        }
+        catch (Exception e)
+        {
+            if (_pumpErrLogs++ < 5)
+                RttLog.Global("!!! Feed lifecycle pump threw — gates, teardown countdowns and the " +
+                              "rotation watchdog may have been skipped for this frame. The mod keeps " +
+                              "running; if this repeats, a feed will eventually fail to release. " + e);
+        }
 
         // Allocation attribution for the GC-spike hunt (see Perf.NoteRenderAlloc). This
         // wrap covers EVERYTHING our mod does per frame on the render thread except the
@@ -818,6 +836,10 @@ internal static class WholeSceneRender
     // Set by the prefix each frame; read by the postfix. Not ThreadStatic — both hooks
     // fire on the render thread, and the prefix always precedes the postfix within a frame.
     private static bool _earlyRan, _earlyOwnsThisFrame;
+
+    // Log budget for the lifecycle-pump guard above. Process-global: it describes our own
+    // per-frame bookkeeping, which sweeps every feed, not any one feed's state.
+    private static int _pumpErrLogs;
 
     // START-OF-FRAME SUBMISSION. The targeted fix for the session drift.
     //
