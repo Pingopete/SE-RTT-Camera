@@ -305,6 +305,89 @@ The graceful-cut contract, exercised deliberately, path by path.
 
 Exit gate: the matrix is green; "a cut feed never device-removes" has evidence per row.
 
+### F1 — LOSING A FEED WITHOUT LOSING THE OTHERS (code landed 2026-08-01)
+
+Brought forward at the user's direction, ahead of phase J: *"before switching to testing
+remote world spawning, I want to get the multi feed code solidified, reliable and robust …
+1 or more active feeds can be shut down and it wont cause crashing or breaking but will
+gracefully fall back to rendering at the remaining feeds or none if present and transfer
+the frame cycle accordingly."* The listed causes — a panel destroyed or damaged, partially
+or fully deconstructed, a future connection lost, the user switching a feed off — all arrive
+at the same place, so they get one contract rather than four special cases.
+
+Read out of the code with the game closed. Four defects, the first of them fatal to the
+whole feature:
+
+**(a) THE ROTATION COULD BE HELD FOREVER — one dormant feed froze every other feed.**
+`Feeds.AdvanceSlot` is called only inside `TryRender`, after a render completes, while
+`OnWholeSceneScoped` returns *above* `TryRender` on a dormant gate or a faulted route. So the
+instant any feed went dormant, the render slot parked on it and no other feed ever got a
+turn again. The survivors' panels froze on their last delivered frame with every counter
+reading healthy — the exact signature this project has been burned by repeatedly. Same for a
+feed whose route had faulted itself off.
+
+Fixed by making the slot skip feeds that *cannot* render (`Feeds.Eligible`: gate active,
+route not faulted) instead of letting one own it. The transient decline — the rate gate —
+still keeps its turn, because it is time-based and per-feed and starves nobody. A stall
+watchdog (`Feeds.TickRenderSlot`) rotates past any holder that goes 2 s+ without rendering
+while others wait, and says so; it cannot fix such a feed but it stops one feed's fault
+becoming the mod's.
+
+*Two corrections found while writing it, both worth keeping:* settling was in the eligibility
+list for one draft and had to come out. The buffer build is lazy (`EnsureScreenBuffers`, in
+the slot-scoped hook), so a settling feed that gets no slots never rebuilds either — the
+settle window would have elapsed BEFORE the rebuild and the first render landed straight
+after it, which is precisely the ordering that device-removed the game on 2026-07-29. And
+since the reprocess being waited for is the *shared* `EnvironmentProbeManager`'s, no feed
+should render into it: `TryRender` now asks `Feeds.AnySettling()`, making global what used to
+be an accident of the slot being held.
+
+**(b) A FEED'S GATE COULD ONLY CHANGE WHILE IT WAS WINNING.** `FeedGate.Poll` was reached
+from the panel tick (which stops when the panel dies) and from inside the render-slot scope
+(which a dead feed cannot win). A feed whose panel had just gone away was the one feed
+neither path reached. `FeedGate.PollAll` now polls every slot every frame, outside the scope,
+next to `PumpAll` — the same lesson as the teardown countdown, one layer up: *per-frame
+bookkeeping must not be scheduled on the render slot.* The settle countdown and the new claim
+expiry moved into that pump for the same reason.
+
+**(c) ONE FEED'S SHUTDOWN UNDID SHARED ENGINE STATE.** `FeedGate.Shutdown` runs per feed, but
+`PanelBinding.RestoreEngineState` (the shared LCD material's `EmissivityMultiplier` and
+`FSRMaskAmount` — every panel in the world samples that definition), `CameraRender
+.RestoreEngineState` (probe `DimDistance`) and half of `CameraFeed.Reset` are process state.
+Grinding down feed 1's panel therefore pulled the FSR reactive mask out from under feed 0
+while it was still rendering, and cleared `EverFound` — the latch that stops the render pass
+falling back to the main view, i.e. the thing standing between a live feed and *the player's
+viewpoint appearing on its panel*. Both `Reset`s now take a `last` flag; shared restores wait
+for the last feed out. `CameraFeed.LastRenderComponent` became per-feed while in there: it is
+the block whose materials get refreshed after a bind, and using a neighbour's is simply wrong.
+
+**(d) CLAIMS NEVER DIED.** E2's first-claimant election and its claim set were only cleared by
+a full gate cycle, which never comes while a second panel keeps the feed alive. A destroyed
+*mirror* left `WantsRepaint` true forever (live binds < claimants), driving forced repaints at
+a panel that no longer existed; a destroyed *primary* left the feed following it — frozen
+target, stale render component — with no path to re-elect. Claims are now stamped per tick and
+expire on the same idle window the gate uses; losing the primary reopens the election and
+drops the captured panel RT so the successor captures its own. `BoundPanels` also grew one
+dead `WeakReference` pair per surface-context rebuild, walked on every tick — now pruned.
+
+**(e) THE INSTRUMENT: `feedsDisabled`.** The only existing ways to stop a feed were the global
+pause marker and `feedCount`, which takes the quiesced-rebuild path and stops *everything* —
+neither exercises "one of N goes away while the rest keep running". `feedsDisabled = 2`
+(one-based, matching the `[RTCn]` tag) makes that feed read as not-alive in `PollFeed`, so it
+takes the ordinary dormancy path while its neighbours never stop. Deliberately outside the
+rebuild signature. It is also the seam the connection framework will plug into later: "this
+feed lost its link" wants exactly this stop.
+
+**Thread safety, found by writing (d).** `ExpireClaims` runs on the render thread every frame
+while the LCD tick writes the same dictionary, and pruning made `WantsRepaint` a writer of a
+list the render thread appends to. Both were latent races before (tick-thread write vs
+render-thread `Reset`) and would have become routine ones. The claim dictionary, the mirror-log
+set and the bound-panel list are now locked at every access; the election moved inside the
+claim lock, since `??=` is a read-then-write.
+
+Not yet observed firing — that is task #24 (F5 below is unrelated and older). Nothing here is
+trusted until the matrix has been walked in game.
+
 ## Phase G — the RTT Feed API surface (goal 5; 1-2 sessions)
 
 | # | item | test / exit evidence |

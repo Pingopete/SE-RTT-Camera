@@ -232,15 +232,28 @@ internal sealed class FeedInstance
     // between the two panels' grids (last-claimant-wins, twice per frame). The feed's
     // identity — orbit target, captured panel RT, LastRenderComponent — follows the
     // panel that claimed it FIRST; later claimants are display-only mirrors. Cleared by
-    // CameraFeed.Reset so a gate cycle re-elects from whatever is actually ticking.
+    // CameraFeed.Reset so a gate cycle re-elects from whatever is actually ticking, and
+    // by CameraFeed.ExpireClaims the moment this panel itself stops ticking (phase F3).
     public string PrimaryPanelName;
 
-    // Distinct tagged panel names currently claiming this feed. Drives WantsRepaint:
-    // binding runs inside the content-render hook, which an idle panel never enters, so
-    // repaints are forced while any claimant is unbound. Cleared with PrimaryPanelName —
-    // a destroyed panel's stale claim heals at the next gate cycle, when only live
-    // panels re-claim.
-    public readonly HashSet<string> ClaimedPanelNames = new();
+    // Tagged panel names currently claiming this feed, each stamped with the last tick
+    // that renewed it. Drives WantsRepaint: binding runs inside the content-render hook,
+    // which an idle panel never enters, so repaints are forced while any claimant is
+    // unbound.
+    //
+    // A DICTIONARY RATHER THAN A SET, because a claim has to be able to DIE (phase F3).
+    // As a set, entries only ever left at a full gate cycle — so a mirror panel that was
+    // ground down while the primary kept the feed alive stayed "claimed" for the rest of
+    // the session, and WantsRepaint (alive binds < claimants) drove forced repaints
+    // forever. Worse in the other direction: a destroyed PRIMARY kept the feed following
+    // a panel that no longer exists, with no cycle coming to re-elect. The stamp is what
+    // lets both heal without a teardown.
+    public readonly Dictionary<string, long> ClaimedPanels = new(StringComparer.OrdinalIgnoreCase);
+
+    // The render component of the panel this feed's identity follows. PER-FEED (phase F2)
+    // — it was a CameraFeed static, so with two feeds the last one to tick owned it and
+    // PanelBinding.TryBind refreshed the material replacements on somebody else's block.
+    public object LastRenderComponent;
 }
 
 // The registry, and the ambient that decides WHOSE state `Feeds.Cur` means.
@@ -570,14 +583,172 @@ internal static class Feeds
     // THE RENDER SLOT (phase E1, in embryo): at most one render per engine frame, strict
     // cyclic rotation. Peek and advance are SEPARATE on purpose — the rotation must move
     // when a render actually happens, not on every frame, or a feed that declines its turn
-    // (dormant, settling, rate-gated) would hand its slot away permanently.
+    // (rate-gated) would hand its slot away permanently.
     private static int _slot;
 
-    internal static FeedInstance NextForRender() => All[_slot % Count];
+    // ---- ELIGIBILITY, and the bug it exists to kill (phase F1) --------------------
+    //
+    // "Keep your turn until you render" is right for a feed that declines TRANSIENTLY and
+    // catastrophic for one that cannot render AT ALL. The slot advances only inside
+    // TryRender, after a completed render — and OnWholeSceneScoped returns above TryRender
+    // on a dormant gate or a faulted route. So the moment ANY feed went dormant — its panel
+    // destroyed, ground down, unpowered, switched off — the slot parked on it and EVERY
+    // OTHER FEED STOPPED RENDERING, permanently, with no error anywhere. The survivors'
+    // panels simply froze on their last delivered frame while every counter read healthy.
+    //
+    // That is the exact failure shape this project keeps paying for: a process-global
+    // arbiter that a single feed can hold forever. The fix is to take the feeds that
+    // CANNOT render out of the rotation rather than let one of them own it.
+    //
+    // The two ways a feed is structurally unable to take a turn:
+    //   - its gate is dormant (no tagged panel ticking — the whole graceful-cut contract)
+    //   - its route faulted (RouteState -1: the hook threw and latched itself off)
+    //
+    // NOT in the list, and each for a reason worth keeping:
+    //
+    //   the RATE GATE is time-based and per-feed, so a rate-gated feed's turn comes back on
+    //   its own schedule and nobody is starved by it;
+    //
+    //   "has not built its ScreenBuffers yet" — a new feed needs slots precisely IN ORDER to
+    //   build them; the build runs in the slot-scoped hook, above TryRender;
+    //
+    //   SETTLING, which was in this list for one draft and was wrong twice over. The build
+    //   is lazy (EnsureScreenBuffers, in the slot-scoped hook), so a settling feed that gets
+    //   no slots does not rebuild either — the settle window would elapse BEFORE the rebuild
+    //   and the first render would land immediately after it, which is exactly the ordering
+    //   the window exists to prevent. And the probe reprocess it waits for is the SHARED
+    //   EnvironmentProbeManager's: no feed should render into it, so a settling feed holding
+    //   the rotation is protective rather than rude. See TryRender's Feeds.AnySettling.
+    private static bool Eligible(FeedInstance f) =>
+        f.GateActive && f.RouteState != -1;
+
+    // Is ANY feed inside its post-rebuild settle window? The probe reprocess a rebuild
+    // triggers is engine-wide, so the answer that matters to "may a second render run right
+    // now" is global, even though the countdown itself is per feed.
+    internal static bool AnySettling()
+    {
+        for (int i = 0; i < MaxFeeds; i++) if (All[i].SettleFrames > 0) return true;
+        return false;
+    }
+
+    // Scan forward from the rotation origin for the first feed that can actually use the
+    // slot. Pure: same answer for the prefix, the camera pass and the postfix of one frame,
+    // which is the invariant those three hooks rely on. If nobody is eligible the origin is
+    // returned unchanged — the callers all early-out on their own gate checks a moment
+    // later, and inventing a different answer would only move the no-op somewhere less
+    // obvious.
+    internal static FeedInstance NextForRender()
+    {
+        int n = Count;
+        int from = _slot % n;
+        for (int i = 0; i < n; i++)
+        {
+            var f = All[(from + i) % n];
+            if (Eligible(f)) return f;
+        }
+        return All[from];
+    }
 
     // Modulo the LIVE Count, so shrinking feedCount cannot strand the rotation on a slot
     // that is no longer active.
     internal static void AdvanceSlot() => _slot = (_slot + 1) % Count;
+
+    // ---- the rotation watchdog (phase F1) ----------------------------------------
+    //
+    // Eligibility covers the three causes above. This covers the ones not yet imagined: any
+    // state where the effective holder keeps its turn indefinitely without rendering —
+    // ScreenBuffers that never build, a DrawContextManager that fails forever, a rate gate
+    // misconfigured past sanity. It cannot fix the underlying stall, but it stops that stall
+    // spreading from one feed to all of them, which is the difference between a degraded
+    // feed and a dead mod.
+    //
+    // Deliberately silent when only ONE feed is eligible: a single feed legitimately holds
+    // every frame, and warning about that would be noise on the common case.
+    private const long StallFloorMs = 2000;
+    private static int _heldBy = -1;
+    private static long _heldSince;
+    private static int _stallLogs, _lastRotation = -1;
+
+    // Once per engine frame, from FeedGate.PumpAll — OUTSIDE every feed scope, so every
+    // line it writes is Global. Ambient-free by construction: Eligible reads the instances
+    // directly rather than through Cur.
+    internal static void TickRenderSlot()
+    {
+        int n = Count, mask = 0, live = 0;
+        for (int i = 0; i < n; i++)
+            if (Eligible(All[i])) { mask |= 1 << i; live++; }
+
+        // THE ROTATION SET CHANGING IS THE HEADLINE EVENT of a feed being lost or regained,
+        // so it is stated once, plainly, with the reason per feed. Without this line the
+        // only symptom of a feed leaving is a panel that quietly stops updating — which is
+        // indistinguishable from a bug in everything else we have built.
+        if (mask != _lastRotation)
+        {
+            int was = _lastRotation;
+            _lastRotation = mask;
+            if (was >= 0)
+                RttLog.Global($"FEED ROTATION: {RotationLine()}. " +
+                    (live == 0
+                        ? "No feed can take a render slot — the mod is idle until one comes back."
+                        : $"{live} feed(s) now share the render slot, so each renders every {n}/{live} " +
+                          "engine frame(s): whatever the departed feed was using is absorbed by the rest."));
+        }
+
+        var f = NextForRender();
+        if (f.Id != _heldBy) { _heldBy = f.Id; _heldSince = Clock.Ms; return; }
+
+        // Scaled by the render period: at wholeSceneIntervalMs = 500 a feed legitimately
+        // holds its turn for half a second, and a watchdog that fired inside that window
+        // would be fighting the cadence knob rather than a stall.
+        long limit = Math.Max(StallFloorMs, 3L * FeedConfig.WholeSceneIntervalMs);
+        if (Clock.Ms - _heldSince < limit) return;
+        _heldSince = Clock.Ms;
+        if (live < 2) return;                     // nobody else wants it
+
+        if (_stallLogs++ < 5)
+            RttLog.Global($"!!! FEED ROTATION STALL: feed {f.Id} has held the render slot for " +
+                          $"{limit} ms without completing a render while {live - 1} other eligible " +
+                          "feed(s) waited. Rotating past it so the others keep running — but it is " +
+                          "eligible and not rendering, which is a fault of its own worth finding. " +
+                          RotationLine());
+        AdvanceSlot();
+    }
+
+    // "0=render 1=dormant" — the per-feed state of the rotation, for the lines above and
+    // for the health watcher.
+    internal static string RotationLine()
+    {
+        var sb = new System.Text.StringBuilder();
+        int n = Count;
+        for (int i = 0; i < n; i++)
+        {
+            var f = All[i];
+            if (i > 0) sb.Append(' ');
+            sb.Append(f.Id).Append('=').Append(
+                !f.GateActive ? (FeedConfig.IsFeedDisabled(f.Id) ? "disabled" : "dormant")
+                : f.RouteState == -1 ? "faulted"
+                : f.SettleFrames > 0 ? "settling"
+                : "render");
+        }
+        return sb.ToString();
+    }
+
+    // Is any feed OTHER than the current one still live or still holding GPU resources?
+    //
+    // The question SHARED engine state has to ask before a single feed's shutdown undoes it
+    // (phase F2). SbBuilt is included as well as the gate, because a feed that went dormant
+    // this frame still owns its buffers until its own teardown runs — it is coming back or
+    // being released, and either way it is not gone yet.
+    internal static bool OthersLive()
+    {
+        var me = Cur;
+        for (int i = 0; i < MaxFeeds; i++)
+        {
+            var f = All[i];
+            if (!ReferenceEquals(f, me) && (f.GateActive || f.SbBuilt)) return true;
+        }
+        return false;
+    }
 
     // LOOKUP for the panel- and target-driven hooks (phase C3). The C1b stubs returned
     // All[0]; these now resolve real ownership. See FeedRouter for why claims are made on

@@ -114,6 +114,24 @@ now; migrate to Keen APIs when shipped.
   (workaround: gate cycle; still undiagnosed) and the far-distance smear (FSR suspect;
   the AA-mode discriminator test is still unrun).
 
+**BROUGHT FORWARD 2026-08-01, ahead of goal 10, at the user's direction:** solidify the
+multi-feed lifecycle before building anything else on it. *"1 or more active feeds can be
+shut down and it wont cause crashing or breaking but will gracefully fall back to rendering
+at the remaining feeds or none if present and transfer the frame cycle accordingly."*
+Destroyed, damaged, deconstructed, disconnected (future) and switched-off are one contract,
+not five cases.
+
+The code for it landed the same day — see phase F1 in `implementation-plan.md` for the four
+defects and why each existed. The headline: **the render rotation could be held forever**, so
+one feed going dormant froze every other feed permanently, with every counter still reading
+healthy. Alongside it, a feed's gate could only change while that feed was winning slots; one
+feed's shutdown reached into shared engine state a live neighbour depended on (including the
+latch that keeps the player's own viewpoint off a feed's panel); and panel claims never
+expired, so a destroyed primary could never hand over.
+
+None of it is trusted yet: the in-game matrix (task #24) is the exit gate, and `feedsDisabled`
+exists so it can be walked repeatably from a text editor instead of by grinding blocks down.
+
 ## 8. Fidelity presets (low / medium / high)
 
 The layer inventory in `docs/feed-render-layers.md` is the menu these presets choose

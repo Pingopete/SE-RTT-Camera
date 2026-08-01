@@ -53,12 +53,31 @@ for ((i = 0; i < MAX_ITER; i++)); do
   esac
 
   if [ -f "$LOG" ]; then
-    SR=$(grep -a "secondRenders" "$LOG" | tail -1 | grep -oE "secondRenders=[0-9]+" || true)
-    GATE=$(grep -a "FEED GATE\|FEED PAUSED\|FEED UNPAUSED" "$LOG" | tail -1 | grep -oE "ACTIVE \(cycle [0-9]+\)|DORMANT|PAUSED|UNPAUSED" || true)
-    ERR=$(grep -a "ERROR" "$LOG" | tail -1 | cut -c2-13 || true)
+    # ONLY THE RECENT TAIL. rtt.log carries no dates and spans every session ever run
+    # (79 MB at the time of writing), so a plain grep happily returns a line from three
+    # days ago and reads as current — a trap that has fired repeatedly. The last couple of
+    # megabytes is comfortably within the running session and is also far cheaper to scan
+    # every 20 s than the whole file.
+    RECENT=$(tail -c 2000000 "$LOG")
+
+    SR=$(grep -a "secondRenders" <<<"$RECENT" | tail -1 | grep -oE "secondRenders=[0-9]+" || true)
+    GATE=$(grep -a "FEED GATE\|FEED PAUSED\|FEED UNPAUSED" <<<"$RECENT" | tail -1 | grep -oE "ACTIVE \(cycle [0-9]+\)|DORMANT|PAUSED|UNPAUSED" || true)
+    ERR=$(grep -a "ERROR" <<<"$RECENT" | tail -1 | cut -c2-13 || true)
     LINE="$LINE gate=${GATE:-?} ${SR:-secondRenders=?}"
     [ "$SR" = "$lastSR" ] && [ -n "$SR" ] && LINE="$LINE (STALLED)"
     lastSR="$SR"
+
+    # WHICH FEEDS ARE ACTUALLY IN THE ROTATION (phase F1). `gate=` above is whichever feed
+    # transitioned last, which with two feeds says nothing about the other one. This is the
+    # per-feed picture: "0=render 1=dormant" means feed 0 is carrying the whole cycle.
+    ROT=$(grep -a "FEED ROTATION:" <<<"$RECENT" | tail -1 | sed -E 's/.*FEED ROTATION: ([^.]*)\..*/\1/' || true)
+    [ -n "$ROT" ] && LINE="$LINE feeds=[$ROT]"
+
+    # A rotation stall means one feed is eligible and not rendering while others wait — the
+    # backstop fired, so the mod kept running, but something is wrong with that feed.
+    STALL=$(grep -ac "FEED ROTATION STALL" <<<"$RECENT" || true)
+    [ "${STALL:-0}" != "0" ] && LINE="$LINE ROTATION-STALL x$STALL"
+
     [ -n "$ERR" ] && LINE="$LINE lastErr@$ERR"
   else
     LINE="$LINE log=missing"

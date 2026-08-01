@@ -707,6 +707,15 @@ internal static class WholeSceneRender
         // dormant, which is exactly when the countdowns need to run. See FeedGate.PumpAll:
         // scheduling teardown on the render slot orphaned a whole feed's resources per gate
         // cycle and cost a device removal.
+        // EVERY feed's gate, then every feed's countdowns — both outside the render-slot
+        // scope, and in that order so a feed that goes dormant this frame arms its teardown
+        // before the pump that will run it.
+        //
+        // The poll used to live inside the scope below, where only the slot holder was ever
+        // asked. See FeedGate.PollAll: that meant a feed whose panel had just been destroyed
+        // was the one feed nothing could reach, since the slot only goes to feeds that are
+        // still eligible.
+        FeedGate.PollAll();
         FeedGate.PumpAll();
 
         // Allocation attribution for the GC-spike hunt (see Perf.NoteRenderAlloc). This
@@ -725,10 +734,10 @@ internal static class WholeSceneRender
 
     private static void OnWholeSceneScoped(object sceneDrawSystem, object finalLdrBuffer)
     {
-        // The gate is polled HERE because this hook is the one that fires every engine
-        // frame regardless of what else is switched on. Polled before the disabled-state
-        // check so a dormant mod still notices the panel coming back.
-        FeedGate.Poll();
+        // The gate was polled for EVERY feed a moment ago, in the unscoped part of this
+        // hook (FeedGate.PollAll). Nothing is polled here any more: doing it under the
+        // render-slot scope is what made a feed's liveness depend on that feed winning the
+        // slot it can only win while it is alive.
         if (!FeedGate.Active) return;
 
         if (_state == -1) return;
@@ -833,10 +842,18 @@ internal static class WholeSceneRender
             OnWholeSceneEarlyScoped(sceneDrawSystem);
     }
 
-    // Scoped to the SAME feed the postfix will pick, because NextForRender only advances
-    // when a render completes — so the prefix and postfix of one engine frame always agree
-    // on whose frame it is. That invariant is what lets _earlyRan / _earlyOwnsThisFrame stay
-    // plain per-frame statics rather than becoming per-feed state.
+    // Scoped to the SAME feed the postfix will pick. NextForRender is a pure function of the
+    // rotation origin and eligibility, and the origin moves only when a render completes, so
+    // the prefix and postfix of one engine frame normally agree on whose frame it is. That
+    // is what lets _earlyRan / _earlyOwnsThisFrame stay plain per-frame statics rather than
+    // becoming per-feed state.
+    //
+    // "Normally", because eligibility CAN move between the two (phase F1): the postfix polls
+    // every gate before it scopes, and a panel tick on the LCD thread can revive a feed at
+    // any moment. The one-render-per-frame invariant survives that intact, which is the part
+    // that matters — whoever renders does so under a gate check of their own, and the
+    // postfix will not render at all when the prefix owns the frame. The cost of a
+    // disagreement is that one feed misses one turn, which is what a rotation is for.
     private static void OnWholeSceneEarlyScoped(object sceneDrawSystem)
     {
         // Cleared HERE, at frame start, not just after the postfix reads it. If the postfix
@@ -885,16 +902,19 @@ internal static class WholeSceneRender
             // So: after any (re)build, let the engine have a few frames to itself. Frames,
             // not milliseconds — the thing being waited for is engine frames completing, and
             // during a mass probe reprocess those frames are long.
-            if (_settleFrames > 0)
-            {
-                _settleFrames--;
-                if (_settleFrames == 0)
-                    RttLog.Line($"Whole-scene: settled after the rebuild ({SettleFrames} frames); " +
-                                "second renders resume. This window exists because a rebuild forces the " +
-                                "shared EnvironmentProbeManager to reprocess every probe, and rendering " +
-                                "into that batch is a device removal.");
-            return false;
-        }
+            // Counted down by TickSettle from the per-frame pump, NOT here (phase F1).
+            // Ticking it on the render slot meant a settling feed only settled while it was
+            // winning turns, so with two feeds a 30-frame window took 60 engine frames — the
+            // countdown is specified in ENGINE frames, because engine frames are what the
+            // probe reprocess drains on.
+            //
+            // ASKED OF EVERY FEED, not just this one. The thing being waited for is the
+            // SHARED EnvironmentProbeManager reprocessing every probe after a rebuild, and
+            // "rendering into that batch is a device removal" does not become safe because
+            // it is a different feed doing the rendering. Until now this was accidental —
+            // a settling feed happened to hold the render slot, so nobody else got one —
+            // and the accident goes away as soon as the rotation is allowed to move.
+            if (_settleFrames > 0 || Feeds.AnySettling()) return false;
 
         // No hard floor any more (was Math.Max(33, ...)). The 30fps cap was a safety rail
         // from the era when a fault cost a CTD per attempt; the route is stable now and the
@@ -2097,6 +2117,20 @@ internal static class WholeSceneRender
     { get => Feeds.Cur.SettleFrames; set => Feeds.Cur.SettleFrames = value; }
     private static int _renderCount
     { get => Feeds.Cur.RenderCount; set => Feeds.Cur.RenderCount = value; }
+
+    // ONE ENGINE FRAME OF SETTLING, for the feed currently scoped. Called from
+    // FeedGate.PumpOne, which visits every slot every frame — so the window is measured in
+    // engine frames, which is what it was always specified in, rather than in "frames this
+    // feed happened to win" (phase F1).
+    internal static void TickSettle()
+    {
+        if (_settleFrames <= 0) return;
+        if (--_settleFrames > 0) return;
+        RttLog.Line($"Whole-scene: settled after the rebuild ({SettleFrames} engine frames); " +
+                    "second renders resume. This window exists because a rebuild forces the " +
+                    "shared EnvironmentProbeManager to reprocess every probe, and rendering " +
+                    "into that batch is a device removal.");
+    }
 
     // Construct the second DrawContextManager. One attempt per load, hot-reloadable,
     // falls back to the shared one (current behaviour) on any failure rather than

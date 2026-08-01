@@ -539,6 +539,60 @@ internal static class FeedConfig
     // switch the automatic half off without losing the manual ceiling.
     public static bool FeedVramGuard { get; private set; } = true;
 
+    // ---- the per-feed off switch (phase F4) --------------------------------------
+    //
+    // `feedsDisabled = 2` or `feedsDisabled = 1,3` — ONE-BASED, matching the [RTCn] tags on
+    // the panels rather than the internal ids, because the number the user types on a block
+    // is the number they should be able to type here.
+    //
+    // WHY IT IS NOT feedCount. Lowering feedCount RE-ROUTES which panel each feed owns, so
+    // it has to drag every feed through a quiesced rebuild (see FeedCount's comment). This
+    // knob changes nothing about routing: feed n stays feed n, it simply stops being alive.
+    // That makes it the only lever that reproduces what actually happens in game when a
+    // panel is destroyed or switched off — one feed leaves, the others carry on — and it
+    // does it repeatably, from outside the game, without grinding a block down.
+    //
+    // It is also the seam the connection framework will use later: "this feed has lost its
+    // link" and "this feed is switched off" both want precisely this graceful stop.
+    //
+    // Stored as a MASK so the hot path (FeedGate.PollFeed, every feed every frame) is a bit
+    // test rather than a string parse.
+    private static int _disabledMask;
+
+    public static bool IsFeedDisabled(int feedId) =>
+        feedId >= 0 && feedId < 32 && (_disabledMask & (1 << feedId)) != 0;
+
+    private static void ReadDisabledFeeds(Dictionary<string, string> kv)
+    {
+        int mask = 0;
+        foreach (int oneBased in Ints(kv, "feedsDisabled", System.Array.Empty<int>()))
+        {
+            int id = oneBased - 1;
+            if (id >= 0 && id < 32) mask |= 1 << id;
+        }
+        if (mask == _disabledMask) return;
+
+        int was = _disabledMask;
+        _disabledMask = mask;
+
+        // LOUD, in both directions. A silently disabled feed is a black panel with every
+        // counter reading healthy, which is the single most expensive failure shape this
+        // project has produced — so the lever that can cause it announces itself.
+        RttLog.Global($"Config: feedsDisabled {Describe(was)} -> {Describe(mask)}. " +
+                      "A disabled feed goes DORMANT by the ordinary path — gate off, teardown 30 " +
+                      "frames later, resources released — and the remaining feeds absorb its share " +
+                      "of the render slot. No rebuild, and nothing else is disturbed.");
+    }
+
+    private static string Describe(int mask)
+    {
+        if (mask == 0) return "(none)";
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < 32; i++)
+            if ((mask & (1 << i)) != 0) { if (sb.Length > 0) sb.Append(','); sb.Append(i + 1); }
+        return sb.ToString();
+    }
+
     // Last EFFECTIVE feed count seen by Poll, for detecting the re-route that has to take the
     // dormant path. Starts at -1 so the first poll can never read as a change (the first poll
     // rebuilds everything anyway, from a gate that has not started).
@@ -742,6 +796,14 @@ internal static class FeedConfig
             // NOT read here. FeedCount is part of the whole-scene signature (see the field
             // comment: re-routing panels invalidates every feed's cached panel identity), so
             // it is read inside the signature block below, between the two snapshots.
+
+            // DELIBERATELY OUTSIDE THE SIGNATURE WINDOW (phase F4). Disabling a feed must
+            // take the ordinary dormancy path — that feed's gate goes dormant, its teardown
+            // runs 30 frames later, its neighbours never stop rendering — and NOT the
+            // quiesced rebuild a feedCount change triggers, which stops every feed in the
+            // mod. The whole point of the lever is to exercise "one of N goes away while the
+            // rest keep running", so it must not be able to take the rest with it.
+            ReadDisabledFeeds(kv);
 
             // ---- the whole-scene route -------------------------------------------
             string before = WholeSceneSignature();

@@ -144,6 +144,40 @@ internal static class FeedGate
         PollFeed(now);
     }
 
+    // EVERY feed, every engine frame. Call from OUTSIDE the render-slot scope.
+    //
+    // THE SECOND HALF OF THE STARVATION BUG (phase F1). Poll() above is reached from two
+    // places: BlitProbe.OnTick, which is PANEL-driven — so it only ever polls the gate of a
+    // feed whose panel is still ticking — and the whole-scene hook, which polled INSIDE
+    // `using (Feeds.Enter(NextForRender()))`, i.e. only the feed holding the render slot.
+    //
+    // Between them those two cover every feed only while every feed is healthy. A feed
+    // whose panel has just gone away is exactly the one neither reaches: its own ticks have
+    // stopped, and it can only be handed the render slot if it is already eligible, which
+    // it no longer is. Its gate would sit ACTIVE with nothing behind it, and nothing would
+    // ever arm its teardown.
+    //
+    // The per-feed half of a poll is two timestamp comparisons (see PollFeed), so running
+    // it for all four slots every frame costs nothing measurable and removes the whole
+    // class of "that feed's state can only change while it is winning".
+    public static void PollAll()
+    {
+        long now = Clock.Ms;
+        if (now - _lastPollMs >= 250)
+        {
+            _lastPollMs = now;
+            PollPauseMarker();
+        }
+
+        // Cached delegate, not a lambda: this runs every engine frame, and a closure over
+        // `now` would allocate a display class per frame. Small, but the GC-churn hunt
+        // (task #18) is live and self-inflicted garbage on the render thread is exactly what
+        // it is trying to account for.
+        Feeds.ForEachSlot(_pollOne);
+    }
+
+    private static readonly Action _pollOne = () => PollFeed(Clock.Ms);
+
     // Process-global: the pause marker is one file that stops the WHOLE mod.
     private static void PollPauseMarker()
     {
@@ -161,7 +195,10 @@ internal static class FeedGate
         if (paused != _paused)
         {
             _paused = paused;
-            RttLog.Line(paused
+            // Global: the marker stops the WHOLE mod, and PollAll reaches here with no
+            // ambient set — RttLog.Line would trip the unscoped-access detector and stamp a
+            // process-wide statement with one arbitrary feed's tag.
+            RttLog.Global(paused
                 ? "=== FEED PAUSED by marker (output/feed-paused.marker). Going dormant; safe to " +
                   "rebuild or edit anything. Delete the marker to resume. ==="
                 : "=== FEED UNPAUSED (marker removed). Resuming. ===");
@@ -237,7 +274,14 @@ internal static class FeedGate
 
     private static void PollFeed(long now)
     {
+        // feedsDisabled is a PER-FEED off switch that takes the ordinary dormancy path
+        // (phase F4): gate dormant -> 30-frame teardown -> resources released, while the
+        // other feeds carry on untouched. Deliberately here rather than in the rebuild
+        // signature — switching one feed off must not quiesce the whole mod, and the point
+        // of the lever is to exercise exactly the "one of N goes away" contract that a
+        // destroyed panel exercises, repeatably and without grinding a block down.
         bool alive = !_paused && !_quiesceRebuild
+                     && !FeedConfig.IsFeedDisabled(Feeds.Cur.Id)
                      && _lastPanelMs != 0 && (now - _lastPanelMs) < FeedConfig.PanelIdleMs;
         if (alive == _active) return;
 
@@ -255,9 +299,21 @@ internal static class FeedGate
             // Work has already stopped, this frame. Give the frames that were mid-flight
             // when it stopped time to be submitted and retired before anything is freed.
             _teardownIn = TeardownDelayFrames;
-            RttLog.Line("=== FEED GATE: DORMANT. No tagged panel has ticked for " +
-                        $"{FeedConfig.PanelIdleMs} ms. All work has stopped; releasing resources in " +
-                        $"{TeardownDelayFrames} frames. ===");
+
+            // SAY WHICH OF THE REASONS IT WAS. All four end here — the panel was destroyed
+            // or ground down, it was switched off, the mod was paused, or this feed was
+            // disabled — and they call for completely different next moves. A single
+            // "no panel has ticked" line for all of them is how a deliberately disabled feed
+            // reads as a broken one.
+            string why = FeedConfig.IsFeedDisabled(Feeds.Cur.Id)
+                ? $"feedsDisabled lists feed {Feeds.Cur.Id + 1}"
+                : _paused ? "the mod is paused by marker"
+                : _quiesceRebuild ? "a quiesced rebuild is in progress"
+                : $"no tagged panel has ticked for {FeedConfig.PanelIdleMs} ms";
+
+            RttLog.Line($"=== FEED GATE: DORMANT — {why}. This feed's work has stopped; releasing its " +
+                        $"resources in {TeardownDelayFrames} frames. Other feeds are unaffected and " +
+                        $"absorb its share of the render slot. ===");
         }
     }
 
@@ -307,7 +363,12 @@ internal static class FeedGate
     // Count-bounded sweep from the instant it is retired.
     public static void PumpAll()
     {
-        Feeds.ForEachSlot(PumpOne);
+        Feeds.ForEachSlot(_pumpOne);
+
+        // The rotation watchdog rides the same once-per-frame pump, for the same reason the
+        // countdowns do: it is bookkeeping ABOUT the render slot, so it must not be
+        // scheduled ON it. Unscoped by design — see Feeds.TickRenderSlot.
+        Feeds.TickRenderSlot();
 
         // Release the quiesce only once every slot has actually finished. Checked AFTER the
         // sweep, so the Shutdown that completed this frame is included — releasing a frame
@@ -332,12 +393,29 @@ internal static class FeedGate
         }
     }
 
+    private static readonly Action _pumpOne = PumpOne;
+
     // INSIDE the per-feed scope, both halves of it. Startup() writes GateCycles and
     // GateEverActive — per-feed state — so draining a global flag here would have written
     // feed 0's counters on every feed's behalf.
     private static void PumpOne()
     {
         if (_pendingStartupLog) { _pendingStartupLog = false; Startup(); }
+
+        // PER-FRAME BOOKKEEPING BELONGS HERE, not on the render slot (phase F1). Both of
+        // these used to advance only while their feed was winning turns:
+        //
+        //   the settle countdown ticked inside TryRender, so a window specified in ENGINE
+        //   frames actually took 30 x N of them — and it is the engine's probe reprocess it
+        //   is waiting on, which drains on engine frames and cares nothing for our rotation;
+        //
+        //   the claim stamps were only ever cleared by a full gate cycle, so a feed kept
+        //   alive by one panel never noticed another of its panels being destroyed.
+        //
+        // This pump visits every slot every engine frame regardless of who is rendering,
+        // which is exactly the schedule both of them actually want.
+        WholeSceneRender.TickSettle();
+        CameraFeed.ExpireClaims();
 
         if (_teardownIn < 0) return;
         if (--_teardownIn > 0) return;
@@ -381,8 +459,28 @@ internal static class FeedGate
     // than either state.
     private static void Shutdown()
     {
-        RttLog.Line("Feed gate: releasing resources now. The game should render exactly as it does " +
-                    "without this mod. Turn the panel back on to restart.");
+        // IS THIS THE LAST FEED OUT? (phase F2)
+        //
+        // Shutdown runs PER FEED, but four of its steps touch state that belongs to the
+        // PROCESS: the LCD material's EmissivityMultiplier and FSRMaskAmount are on a shared
+        // definition every panel in the world samples, the probe DimDistance is the engine's,
+        // and CameraFeed's discovery sets and EverFound latch describe "has this mod found a
+        // panel at all". Undoing those on ONE feed's teardown reaches straight into a
+        // neighbour that is still running: the FSR reactive mask comes off, the star-smear it
+        // fixes comes back, and EverFound going false lets the render pass fall back to the
+        // PLAYER'S viewpoint on a live feed's panel.
+        //
+        // So the shared half of the teardown waits for the last feed out. The per-feed half —
+        // our buffers, our contexts, our ring, our binding — runs unconditionally, because
+        // that is this feed's own property and releasing it is the entire point.
+        bool last = !Feeds.OthersLive();
+
+        RttLog.Line("Feed gate: releasing resources now. " + (last
+            ? "This is the LAST live feed, so the shared engine state goes back to stock too — " +
+              "the game should render exactly as it does without this mod."
+            : $"Other feed(s) are still live ({Feeds.RotationLine()}), so the shared LCD material, " +
+              "the probe settings and the panel-discovery state are left alone. Only this feed's " +
+              "own resources are released."));
 
         // 1. Stop issuing work. The whole-scene route and the probe pass both gate on
         //    Active, so they are already inert by the time this runs; these calls release
@@ -409,18 +507,25 @@ internal static class FeedGate
         //     counter healthy — and the panel's screen material still points at the OLD
         //     target from the previous cycle. A black screen with park/copy rates
         //     climbing is exactly this signature.
-        Try("panel binding teardown", PanelBinding.Reset);
+        Try("panel binding teardown", () => PanelBinding.Reset(last));
 
         // 4. Undo the PERSISTENT engine mutations. These are the ones that would
         //    otherwise survive a dormant gate and quietly invalidate the comparison:
         //    the LCD material's emissive multiplier is a shared definition affecting
         //    every panel in the world, and DimDistance reaches the engine's own probes.
-        Try("restore panel material", PanelBinding.RestoreEngineState);
-        Try("restore probe settings", CameraRender.RestoreEngineState);
+        //
+        //    LAST FEED ONLY. They are not ours to put back while another feed is still
+        //    relying on them being ours.
+        if (last)
+        {
+            Try("restore panel material", PanelBinding.RestoreEngineState);
+            Try("restore probe settings", CameraRender.RestoreEngineState);
+        }
 
         // 5. Forget the panel, so coming back is a genuinely fresh discovery rather than
-        //    a resumption with stale state.
-        Try("forget panel", CameraFeed.Reset);
+        //    a resumption with stale state. The per-feed half always; the shared discovery
+        //    state (seen names, surface set, EverFound) only when nobody else needs it.
+        Try("forget panel", () => CameraFeed.Reset(last));
 
         RttLog.Line("Feed gate: shutdown complete." +
                     (_everActive ? "" : " (Nothing had been started yet.)"));

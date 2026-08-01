@@ -40,13 +40,20 @@ internal static class PanelBinding
     // file on disk that switches the whole route off.
     private static List<(WeakReference Renderer, WeakReference Ctx)> _boundPanels => Feeds.Cur.BoundPanels;
 
-    // Has THIS surface context had its bind attempt? Reference identity, dead entries
-    // ignored — a panel the engine rebuilt gets a fresh ctx and legitimately binds again.
+    // THE BOUND LIST IS TOUCHED FROM TWO THREADS, so every access to it is locked.
+    //
+    // It always was — TryBind appends from the render thread while WantsRepaint is read
+    // from the LCD tick — and reading a List<T> that another thread is growing was already
+    // a latent race. Pruning (below) makes the read path a WRITER as well, which turns a
+    // latent race into a routine one, so this stops being something to note and starts
+    // being something to fix. The list is per feed and holds a handful of entries; the lock
+    // is uncontended in the normal case and covers a few instructions.
     private static bool IsAttempted(object ctx)
     {
         var list = _boundPanels;
-        for (int i = 0; i < list.Count; i++)
-            if (ReferenceEquals(list[i].Ctx.Target, ctx)) return true;
+        lock (list)
+            for (int i = 0; i < list.Count; i++)
+                if (ReferenceEquals(list[i].Ctx.Target, ctx)) return true;
         return false;
     }
 
@@ -63,26 +70,59 @@ internal static class PanelBinding
         get
         {
             if (_disarmed || !File.Exists(ArmPath)) return false;
-            int alive = 0;
-            var list = _boundPanels;
-            for (int i = 0; i < list.Count; i++) if (list[i].Ctx.IsAlive) alive++;
-            int claimed = Feeds.Cur.ClaimedPanelNames.Count;
+            int alive = PruneDead();
+            int claimed = Feeds.Cur.ClaimedPanels.Count;
             return alive < (claimed > 0 ? claimed : 1);
+        }
+    }
+
+    // Drop entries whose panel is gone, and return how many are left alive.
+    //
+    // The list is APPEND-ONLY otherwise, and it is appended to per bind ATTEMPT — which
+    // means once per surface context, and RebuildSurfaceContent replaces those contexts on
+    // every forced repaint. Over a long session with repaints being driven that is a slowly
+    // growing list of dead WeakReference pairs, walked on every panel tick. Pruning here
+    // costs nothing (this walk already happened) and bounds it by the number of LIVE panels.
+    //
+    // Order is not load-bearing — Unbind restores each entry independently — so the cheap
+    // swap-with-last removal is safe.
+    private static int PruneDead()
+    {
+        var list = _boundPanels;
+        lock (list)
+        {
+            for (int i = list.Count - 1; i >= 0; i--)
+            {
+                if (list[i].Ctx.IsAlive && list[i].Renderer.IsAlive) continue;
+                list[i] = list[list.Count - 1];
+                list.RemoveAt(list.Count - 1);
+            }
+            return list.Count;
         }
     }
     private static int _errLogs;
 
-    public static void Reset()
+    public static void Reset() => Reset(true);
+
+    // `last` = no other feed is still live (phase F2). Everything this method clears is
+    // PROCESS state — the survey latch and the emissivity bookkeeping describe the shared
+    // LCD material, not a feed — so a single feed's teardown must not clear it while a
+    // neighbour is still relying on it. The per-feed part of a binding teardown is the
+    // BoundPanels list, and that is consumed by Unbind, not here.
+    public static void Reset(bool last)
     {
         // NOT the bound list. Reset runs in FeedGate.Shutdown BEFORE RestoreEngineState
         // calls Unbind, and Unbind is what consumes the list — clearing it here would
         // leave every panel wearing our runtime material with nothing left knowing how
         // to put the stock one back. (The old code had the same shape: it cleared the
         // _bound flag but left the weak pair for Unbind.)
-        _surveyed = false;
         _errLogs = 0;
-        _emissivityApplied = double.NaN;
-        _emissivityBlocked = false;
+        if (last)
+        {
+            _surveyed = false;
+            _emissivityApplied = double.NaN;
+            _emissivityBlocked = false;
+        }
 
 
         if (File.Exists(LivePath))
@@ -411,27 +451,35 @@ internal static class PanelBinding
         // nothing.
         var list = _boundPanels;
         int restored = 0, gone = 0;
-        for (int i = 0; i < list.Count; i++)
+
+        // Locked for the same reason every other access is (see IsAttempted). Held across
+        // the engine calls deliberately: this is the render thread putting the panels back
+        // on their stock material, and a bind attempt arriving from a repaint half way
+        // through would be appending to a list that is about to be cleared.
+        lock (list)
         {
-            var renderer = list[i].Renderer.Target;
-            var ctx = list[i].Ctx.Target;
-            if (renderer == null || ctx == null) { gone++; continue; }   // panel destroyed
-
-            try
+            for (int i = 0; i < list.Count; i++)
             {
-                var mi = ctx.GetType().GetMethods(Any).FirstOrDefault(m => m.Name == "SetNewScreenMaterialHandle");
-                var def = Prop(ctx, "Definition");
-                var baseMaterial = Prop(def, "DefaultScreenMaterial");
-                var aspect = Prop(def, "AspectRatio");
-                var orientation = Prop(Prop(ctx, "State"), "Orientation");
-                if (mi == null || baseMaterial == null) continue;
+                var renderer = list[i].Renderer.Target;
+                var ctx = list[i].Ctx.Target;
+                if (renderer == null || ctx == null) { gone++; continue; }   // panel destroyed
 
-                mi.Invoke(ctx, new[] { renderer, baseMaterial, aspect, orientation, null });
-                restored++;
+                try
+                {
+                    var mi = ctx.GetType().GetMethods(Any).FirstOrDefault(m => m.Name == "SetNewScreenMaterialHandle");
+                    var def = Prop(ctx, "Definition");
+                    var baseMaterial = Prop(def, "DefaultScreenMaterial");
+                    var aspect = Prop(def, "AspectRatio");
+                    var orientation = Prop(Prop(ctx, "State"), "Orientation");
+                    if (mi == null || baseMaterial == null) continue;
+
+                    mi.Invoke(ctx, new[] { renderer, baseMaterial, aspect, orientation, null });
+                    restored++;
+                }
+                catch (Exception e) { RttLog.Error("panel unbind", e); }
             }
-            catch (Exception e) { RttLog.Error("panel unbind", e); }
+            list.Clear();
         }
-        list.Clear();
 
         if (restored > 0 || gone > 0)
             RttLog.Line($"Panel material: {restored} panel(s) rebound to the STOCK screen material " +
@@ -456,7 +504,8 @@ internal static class PanelBinding
         // retry loop on the render thread is a bad idea) and Unbind still sweeps it.
         // Weak, because the panel can be destroyed (world unload, block grinding) while
         // we hold these, and a strong reference would keep dead render objects alive.
-        _boundPanels.Add((new WeakReference(renderer), new WeakReference(ctx)));
+        var bound = _boundPanels;
+        lock (bound) bound.Add((new WeakReference(renderer), new WeakReference(ctx)));
         try
         {
             File.WriteAllText(LivePath, $"binding attempted {DateTime.Now:O}\n");

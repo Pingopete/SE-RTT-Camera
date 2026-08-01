@@ -42,9 +42,13 @@ internal static class ScenePassHook
         // that fires during the PLAYER'S frame, where no pump has set an ambient. So it
         // gets one here, from the same slot holder the whole-scene render will use.
         //
-        // Consistent by construction: NextForRender only PEEKS, and the slot advances only
-        // after a render completes, so the camera pass and the render it feeds always agree
-        // on whose frame this is. When this fires INSIDE our nested render (stage 2 is
+        // Consistent by construction: NextForRender only PEEKS, and the rotation origin
+        // advances only after a render completes, so the camera pass and the render it feeds
+        // agree on whose frame this is. It also SKIPS feeds that cannot render at all
+        // (phase F1), which this hook wants for exactly the same reason the renderer does —
+        // there is no point advancing the orbit of a feed whose panel has gone away, and
+        // OnProbePass gates on the same dormant flag a moment later regardless.
+        // When this fires INSIDE our nested render (stage 2 is
         // force-run when ownProbes is on) the ambient is already set to that same instance,
         // and Scope restores the previous value rather than nulling — so nesting is a no-op
         // rather than a hazard.

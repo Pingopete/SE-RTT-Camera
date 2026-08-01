@@ -125,24 +125,111 @@ internal static class CameraFeed
         catch { return true; }
     }
 
-    public static void Reset()
+    public static void Reset() => Reset(true);
+
+    // `last` = no other feed is still live (phase F2). The split matters because half of
+    // what this method clears is PROCESS state, not feed state, and one feed's teardown
+    // reaching into it is a live neighbour's bug:
+    //
+    //   EverFound is the latch that stops the render pass falling back to the main view —
+    //   clearing it while another feed renders puts the PLAYER'S VIEWPOINT on that feed's
+    //   panel, the single worst-looking failure this route has;
+    //   _targetSurfaces is how the render-side hook recognises a panel it may draw on, so
+    //   emptying it makes a live feed's panels unrecognisable until they are rediscovered;
+    //   _seenNames/_powerLog/_boundsDiag/_closedTryGet are "we already said this about the
+    //   engine" latches, whose whole value is being said once.
+    public static void Reset(bool last)
     {
+        // ---- always: THIS feed's own state ----
         _target = null;
+        _boundsGrid = null; _boundsAt = 0;
+        LastRenderComponent = null;
+
+        // The primary election and the claim set re-form from live ticks (phase E2
+        // fan-out): a destroyed primary hands the feed to the next ticking claimant, and
+        // a destroyed mirror's stale claim stops driving repaints. ExpireClaims does the
+        // same job continuously now, so this is the coarse version for a full cycle.
+        lock (Feeds.Cur.ClaimedPanels)
+        {
+            Feeds.Cur.PrimaryPanelName = null;
+            Feeds.Cur.ClaimedPanels.Clear();
+        }
+
+        if (!last) return;
+
+        // ---- last feed out only: the shared discovery state ----
         EverFound = false;
         _powerLog = null;
-        _boundsGrid = null; _boundsAt = 0; _boundsDiag = _orbitLogged = false; _closedTryGet = null;
+        _boundsDiag = _orbitLogged = false; _closedTryGet = null;
         _findLogs = _errLogs = 0;
         _seenNames.Clear();
         _targetSurfaces.Clear();
         _surfaceTrims = 0;
+    }
 
-        // The primary election and the claim set re-form from live ticks (phase E2
-        // fan-out): a destroyed primary hands the feed to the next ticking claimant, and
-        // a destroyed mirror's stale claim stops driving repaints. _mirrorLogs is kept —
-        // it is a "said this once" latch about a NAME, and re-announcing every mirror on
-        // every gate cycle is noise.
-        Feeds.Cur.PrimaryPanelName = null;
-        Feeds.Cur.ClaimedPanelNames.Clear();
+    // ---- claim expiry and re-election (phase F3) ---------------------------------
+    //
+    // A claim is renewed by its panel's tick. When a panel is destroyed, ground down,
+    // unpowered or switched off, its ticks stop and its claim goes stale — but with two
+    // panels on one feed the FEED does not go dormant, so no gate cycle ever comes to clear
+    // it. Two consequences, both silent:
+    //
+    //   a dead MIRROR keeps PanelBinding.WantsRepaint true forever (live binds < claimants),
+    //   so we drive forced repaints on a panel that no longer exists for the rest of the
+    //   session;
+    //
+    //   a dead PRIMARY keeps the feed's identity — orbit target, captured render target,
+    //   render component — pinned to it. The camera freezes at its last published position
+    //   and the surviving panel can never take over, because PrimaryPanelName is only ever
+    //   set when it is null.
+    //
+    // Same idle window the gate uses, so "this panel is gone" means one thing across the mod.
+    // Called once per engine frame per slot from FeedGate.PumpOne; at most one expiry per
+    // call, which keeps it allocation-free (the dictionary enumerator is a struct) and is
+    // plenty — claims are counted in single digits.
+    internal static void ExpireClaims()
+    {
+        var feed = Feeds.Cur;
+        if (feed.ClaimedPanels.Count == 0) return;    // unlocked fast path: an int read
+
+        long now = Clock.Ms, idle = FeedConfig.PanelIdleMs;
+        string dead = null;
+        int left;
+        bool wasPrimary;
+
+        // Same lock as the claim in OnLcdTick — see there for why. Everything that decides
+        // and mutates happens inside; the log is written outside, because formatting a
+        // sentence is not something to do while holding a lock the LCD thread wants.
+        lock (feed.ClaimedPanels)
+        {
+            foreach (var kv in feed.ClaimedPanels)
+                if (now - kv.Value > idle) { dead = kv.Key; break; }
+            if (dead == null) return;
+
+            feed.ClaimedPanels.Remove(dead);
+            left = feed.ClaimedPanels.Count;
+            wasPrimary = string.Equals(feed.PrimaryPanelName, dead, StringComparison.OrdinalIgnoreCase);
+            if (wasPrimary) feed.PrimaryPanelName = null;   // next claimant to tick elects itself
+        }
+
+        if (wasPrimary)
+        {
+            lock (_mirrorLogs) _mirrorLogs.Remove(dead);    // so a rebuilt panel is announced again
+
+            // Drop the captured render target with it. It belongs to the panel that just
+            // died, and a re-elected primary must capture its OWN — otherwise the feed
+            // spends the rest of its life delivering into a target nothing displays.
+            // Nulling it is also what re-arms the forced repaints that get us there.
+            _panelRt = null;
+        }
+
+        RttLog.Line($"Panel claim EXPIRED: \"{dead}\" has not ticked for {idle} ms — destroyed, " +
+                    $"deconstructed, unpowered or switched off. " + (wasPrimary
+                        ? $"It was this feed's PRIMARY, so the election is reopened: the next of the " +
+                          $"{left} remaining claimant(s) to tick takes over the camera. " +
+                          (left == 0 ? "None remain — the gate will go dormant on its own idle window." : "")
+                        : $"It was a mirror; {left} claimant(s) remain and the feed is otherwise " +
+                          "unaffected."));
     }
 
     // ---------------------------------------------------------------- discovery
@@ -195,10 +282,24 @@ internal static class CameraFeed
             // routes their material bind). Cleared in Reset, so a gate cycle re-elects
             // from whatever is actually ticking — a destroyed primary hands over within
             // one cycle.
+            // LOCKED, because the claim set is now touched from BOTH threads (phase F3).
+            // This tick runs on the LCD thread; ExpireClaims runs from the render thread's
+            // per-frame pump, every frame. A Dictionary being written on one thread while
+            // another rehashes it is the classic silent corruption — a lost entry if you are
+            // lucky, a spin inside a bucket chain if you are not. The lock is uncontended in
+            // the normal case and covers a handful of instructions.
+            //
+            // The ELECTION is inside it too: `??=` is a read-then-write, and two panels
+            // claiming the same feed in the same instant could otherwise both believe they
+            // won.
             var feed = Feeds.Cur;
-            feed.ClaimedPanelNames.Add(name);
-            feed.PrimaryPanelName ??= name;
-            bool primary = feed.PrimaryPanelName == name;
+            bool primary;
+            lock (feed.ClaimedPanels)
+            {
+                feed.ClaimedPanels[name] = Clock.Ms;   // stamped, so the claim can expire
+                feed.PrimaryPanelName ??= name;
+                primary = string.Equals(feed.PrimaryPanelName, name, StringComparison.OrdinalIgnoreCase);
+            }
 
             // Remember this panel's surfaces so the render-side hook can recognise them
             // by identity — for EVERY claimant, primary or not: the surface map is what
@@ -210,7 +311,8 @@ internal static class CameraFeed
 
             if (!primary)
             {
-                if (_mirrorLogs.Add(name))
+                bool announce; lock (_mirrorLogs) announce = _mirrorLogs.Add(name);
+                if (announce)
                     RttLog.Line($"Feed {feed.Id}: panel \"{name}\" MIRRORS this feed ({added} surfaces registered) — " +
                                 $"it shows \"{feed.PrimaryPanelName}\"'s camera. Display only; the orbit target is unchanged.");
                 // The mirror still needs repaints while its bind is pending — the bind
@@ -672,7 +774,14 @@ internal static class CameraFeed
 
     // The render component for the tagged panel, needed to refresh its material
     // replacements after a rebind.
-    public static object LastRenderComponent { get; private set; }
+    //
+    // PER-FEED (phase F2). This was a plain static, so with two feeds whichever panel
+    // ticked last owned it and PanelBinding.TryBind called UpdateMaterialReplacements on
+    // the OTHER feed's block — refreshing a panel that had not been rebound while leaving
+    // the one that had waiting for its own panel to happen to repaint. It is written only
+    // by the primary election, which is the definition of a per-feed fact.
+    public static object LastRenderComponent
+    { get => Feeds.Cur.LastRenderComponent; private set => Feeds.Cur.LastRenderComponent = value; }
     // PER-FEED: "did THIS feed capture its panel's render target" is the first thing that
     // has to be true for a panel to show anything, so it must be answerable per feed.
     private static bool _panelRtDiag
