@@ -811,6 +811,39 @@ internal static class FeedConfig
     // the close-up shot; grid-centred is the one that looks like a drone camera.
     public static bool OrbitGrid { get; private set; } = true;
 
+    // ORBIT SOMEWHERE ELSE (phase J, 2026-08-01). Empty = today's behaviour, orbit the
+    // panel's OWN grid.
+    //
+    // Set it to part of another grid's display name (case-insensitive substring) and the
+    // orbit centre moves to that grid instead. This is the instrument goal 10 has been
+    // blocked on: every render this project has ever done was ~100 m from the player, so
+    // "nothing ever disappeared" was never evidence of anything. Point the camera at a grid
+    // the player is NOWHERE near and the streaming/materialization question answers itself.
+    //
+    // Run `worldGridSurvey = 1` first — it writes output/world-grids.txt with every grid's
+    // name, id, position and distance, which is where the string for this knob comes from.
+    //
+    // DELIBERATELY OUTSIDE THE WHOLE-SCENE REBUILD SIGNATURE: moving the orbit centre
+    // allocates nothing and resizes nothing, so it is safe to edit on a running feed, the
+    // same way orbitRadius and orbitPeriod are. Keep it that way — a signature knob edited
+    // live is what removed the device at 15:08 on 2026-08-01.
+    public static string OrbitAnchor { get; private set; } = "";
+
+    // One-shot world inventory. Self-clearing: the dump runs once and the flag is forgotten
+    // until the file is edited again, so leaving `= 1` in the file does not re-dump every
+    // poll. Writes output/world-grids.txt.
+    public static bool WorldGridSurvey { get; private set; }
+    private static bool _surveyArmedLast;
+
+    // Consumed-and-cleared by the surveyor, so the "run once" decision lives in ONE place
+    // rather than being re-derived by every caller. Returns true at most once per edit.
+    public static bool TakeWorldGridSurveyRequest()
+    {
+        if (!WorldGridSurvey) return false;
+        WorldGridSurvey = false;
+        return true;
+    }
+
     public static double OrbitRadius { get; private set; } = 100.0;
 
     public static double OrbitPeriod { get; private set; } = 30.0;
@@ -859,6 +892,26 @@ internal static class FeedConfig
             OrbitHeight    = Dbl(kv, "orbitHeight", OrbitHeight);
             OrbitClearance = Dbl(kv, "orbitClearance", OrbitClearance);
             OrbitGrid      = Bool(kv, "orbitGrid", OrbitGrid);
+
+            // ANCHOR CHANGES ARE ANNOUNCED. Moving the orbit to another grid changes what
+            // the feed shows completely, so a silent pickup would look like a bug in the
+            // camera rather than a config edit that took. Compare before assigning.
+            var anchorWas = OrbitAnchor;
+            OrbitAnchor = Str(kv, "orbitAnchor", "");
+            if (!string.Equals(anchorWas, OrbitAnchor, StringComparison.Ordinal))
+                RttLog.Global($"Config: orbitAnchor \"{anchorWas}\" -> \"{OrbitAnchor}\". " +
+                    (OrbitAnchor.Length == 0
+                        ? "Empty — the orbit returns to the panel's OWN grid."
+                        : "The orbit will re-centre on the first grid whose display name contains " +
+                          "this, once the world walk resolves it. Watch for \"ORBIT ANCHOR:\" in the log; " +
+                          "if it does not appear, the name matched nothing and the feed stays on its own grid."));
+
+            // Edge-triggered, not level-triggered: only a false->true transition arms it.
+            // Level-triggered would re-dump on every config poll for as long as the line
+            // said 1, which is this project's house bug wearing a survey hat.
+            var surveyWanted = Bool(kv, "worldGridSurvey", false);
+            if (surveyWanted && !_surveyArmedLast) WorldGridSurvey = true;
+            _surveyArmedLast = surveyWanted;
 
             CopyEnabled       = Bool(kv, "copyEnabled", CopyEnabled);
             SrcTransition     = Bool(kv, "srcTransition", SrcTransition);
@@ -1098,6 +1151,11 @@ internal static class FeedConfig
         catch { }
         return kv;
     }
+
+    // Trimmed, never null. An absent key and an empty value mean the same thing to every
+    // caller here ("not set"), so they are collapsed rather than distinguished.
+    private static string Str(Dictionary<string, string> kv, string key, string fallback) =>
+        kv.TryGetValue(key, out var v) && !string.IsNullOrWhiteSpace(v) ? v.Trim() : fallback;
 
     private static int Int(Dictionary<string, string> kv, string key, int fallback) =>
         kv.TryGetValue(key, out var v) && int.TryParse(v, NumberStyles.Integer,

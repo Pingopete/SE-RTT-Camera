@@ -462,6 +462,36 @@ internal static class CameraFeed
             // grid — which is the clipping seen on the feed, not a projection bug.
             var (centre, extent) = GridBounds(entity, pos.Value);
 
+            // PHASE J: ORBIT SOMEWHERE ELSE.
+            //
+            // Everything above found the PANEL and its own grid, which is still exactly what
+            // we want for the panel binding, the claim key and the render-target capture.
+            // Only the orbit CENTRE moves. Keeping the two separate is the point: the feed is
+            // still delivered to this panel, on this grid, next to the player — it is merely
+            // looking somewhere else.
+            //
+            // This is the configuration goal 10 has never been able to test. Up to now the
+            // camera has always been ~100 m from the player, so "nothing disappeared from the
+            // feed" was never evidence about streaming; there was simply never any distance.
+            var anchor = WorldGrids.ResolveAnchor(entity);
+            if (anchor.HasValue)
+            {
+                // BOTH Position AND Centre, deliberately. The camera pass gates on
+                // `OrbitGrid && Extent > 0` and orbits Target.Position when the gate is
+                // false — and extent lookups fail quietly (the world survey printed 0 m for
+                // every grid). The first deploy of this feature set only Centre, the gate
+                // chose Position, and the camera silently never left the base: the ORBIT
+                // ANCHOR log said "re-centred" while the flash detector showed no 273 km
+                // eye jump. Overriding both makes the anchor independent of which side of
+                // that gate the pass takes.
+                pos = anchor.Value.Position;
+                centre = anchor.Value.Position;
+                // Take the anchor's own size when it has one. A 100 m orbit around a station
+                // whose hull is 200 m across spends its whole arc inside the hull — the same
+                // clipping the "orbit the SHIP, not the panel" comment above was written for.
+                if (anchor.Value.Extent > 0) extent = anchor.Value.Extent;
+            }
+
             // Built fully, then published in one reference write.
             // PLANET RADIAL FIRST, block rotation only as a fallback. The planet's centre
             // gives the surface normal by definition; a grid's own up is the surface normal
@@ -485,6 +515,12 @@ internal static class CameraFeed
             OrbitUpIsPlanet = planetUp.HasValue;
             SubjectCentreCache = centre;      // for the render thread's planet scan
             EverFound = true;
+
+            // The inventory runs from HERE because this is the one place holding a live
+            // entity, which is the only handle we have on the Scene. Request is consumed
+            // once (TakeWorldGridSurveyRequest), so a `worldGridSurvey = 1` left in the file
+            // does not re-dump on every poll.
+            if (FeedConfig.TakeWorldGridSurveyRequest()) WorldGrids.DumpGrids(entity);
 
             if (_findLogs++ < 3)
                 RttLog.Line($"[RTC] panel located: \"{name}\" at {pos.Value.X:F1},{pos.Value.Y:F1},{pos.Value.Z:F1} ({added} surfaces registered)");
