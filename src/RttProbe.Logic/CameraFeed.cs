@@ -53,6 +53,18 @@ internal static class CameraFeed
     // at a fixed base does not change — so a plain field beats any synchronisation.
     internal static Vector3D PlanetUpCache;
 
+    // THE SUBJECT'S WORLD POSITION, going the other way: published by the LCD tick, read by
+    // the render thread's planet scan.
+    //
+    // The scan needs a world position to decide WHICH of the four planets in the setup we are
+    // standing on, and to sanity-check that a candidate centre is world-space rather than
+    // camera-relative. It first read Feeds.Cur.Target.Centre directly and got 0,0,0 while the
+    // tick was logging the panel at 124917,613,-262239 — so that cross-thread read is not
+    // seeing what the tick wrote. Publishing the value the orbit itself uses removes the
+    // question: if this is ever zero, the orbit is looking at the origin too, and the source
+    // dump now says so out loud instead of silently scanning against a wrong position.
+    internal static Vector3D SubjectCentreCache;
+
     // Did OrbitUp come from the planet (exact) or from the subject's rotation (a guess)?
     // Reported in the orbit-plane proof so the two are never confused again.
     internal static bool OrbitUpIsPlanet;
@@ -471,6 +483,7 @@ internal static class CameraFeed
             };
             OrbitUp = chosenUp;
             OrbitUpIsPlanet = planetUp.HasValue;
+            SubjectCentreCache = centre;      // for the render thread's planet scan
             EverFound = true;
 
             if (_findLogs++ < 3)
@@ -1088,7 +1101,8 @@ internal static class CameraFeed
             double acrossUp = Math.Sqrt(Math.Max(0.0, d.LengthSquared() - alongUp * alongUp));
             RttLog.Line($"Orbit plane: angle={a * 180.0 / Math.PI:F0}deg  along-up={alongUp:F1}m  " +
                         $"across-up={acrossUp:F1}m  up={upAxis.X:F2},{upAxis.Y:F2},{upAxis.Z:F2}  " +
-                        $"(source={(OrbitUp.LengthSquared() > 0.5 ? "subject transform" : "WORLD Y fallback")}). " +
+                        $"(source={(OrbitUp.LengthSquared() <= 0.5 ? "WORLD Y fallback"
+                                    : OrbitUpIsPlanet ? "PLANET RADIAL" : "subject transform")}). " +
                         "along-up CONSTANT across angles = orbit parallel to the surface; " +
                         "along-up swinging +/-radius = orbit still vertical.");
         }

@@ -1923,129 +1923,383 @@ internal static class WholeSceneRender
     // by name (a Vector3D for the centre, a big number for the radius), because guessing field
     // names blind is exactly what has cost time today. Radius must be kilometre-scale, which
     // rejects anything that is not a planet.
-    private static bool _planetUpLogged;
+    // EACH OUTCOME GETS ITS OWN LATCH. One shared flag meant the first failure silenced
+    // every later message for the session — and that is precisely what happened: the
+    // spheres list is empty for the first rebuilds, "list is empty" latched, and the shape
+    // dump that would have named the right field could never print. A run-once log that
+    // guards a DIFFERENT run-once log is a bug factory.
+    private static bool _planetUpFailLogged, _planetUpShapeLogged, _planetUpOkLogged, _planetUpRelLogged;
+    private static int _planetUpCountdown;
+
+    // The group fields that could carry a planet centre. _allPlanetSpheresData was the
+    // first guess and is empty in flight; the setups list is the one actually populated
+    // ("Planet env counts: setups=1" alongside an empty spheres list). All are scanned and
+    // the best match wins, so this no longer depends on picking the right name up front.
+    private static readonly string[] PlanetUpSources =
+    {
+        "_allPlanetSpheresData", "_allPlanetSpheres",
+        "_allPlanetEnvSetupsData", "_planetEnvSetupFirstData",
+    };
 
     internal static Vector3D? PlanetUpAt(Vector3D pos)
     {
         try
         {
-            if (_planetEnvGroup == null || _fPeSpheresData == null)
+            if (_planetEnvGroup == null)
             {
-                if (!_planetUpLogged)
+                if (!_planetUpFailLogged)
                 {
-                    _planetUpLogged = true;
-                    RttLog.Line($"Orbit up: planet spheres unreachable (group={(_planetEnvGroup == null ? "NULL" : "ok")}, " +
-                                $"spheresData field={(_fPeSpheresData == null ? "NULL" : "ok")}) — falling back to the " +
-                                "subject's block rotation, which for a WALL-MOUNTED panel is the screen's facing and " +
-                                "not the ground normal.");
-                }
-                return null;
-            }
-            if (_fPeSpheresData.GetValue(_planetEnvGroup) is not System.Collections.IList list
-                || list.Count == 0)
-            {
-                if (!_planetUpLogged)
-                {
-                    _planetUpLogged = true;
-                    RttLog.Line("Orbit up: planet spheres list is empty — no planet in the render's view data.");
+                    _planetUpFailLogged = true;
+                    RttLog.Line("Orbit up: PlanetEnvironmentGroup is null — falling back to the subject's block " +
+                                "rotation, which for a WALL-MOUNTED panel is the screen's facing, not the ground normal.");
                 }
                 return null;
             }
 
-            // ONE-SHOT SHAPE DUMP. The type-based scan below guessed Vector3D + a big double,
-            // and got nothing — so the element is some other shape (float vectors for shader
-            // constants, or camera-relative positions under the floating origin, both likely).
-            // Print what is actually there rather than guess a third time.
-            if (!_planetUpLogged)
+            var gt = _planetEnvGroup.GetType();
+            if (!_planetUpShapeLogged) DumpPlanetSources(gt, pos);
+
+            // EVERY PLANET VECTOR ON THIS SIDE IS VIEW-SPACE. The field is named ViewPosition
+            // and the dump proved it: the same planet reads 31887,41155,32358 from one orbit
+            // angle and -60389,-9132,-6324 from another. Nothing here can be compared against
+            // a world position until it is rotated back, which is what the rejection guard
+            // was catching. The basis comes from the view we just installed, so these
+            // vectors are relative to OUR orbit camera, not the player's.
+            var basis = InstalledViewBasis();
+            if (basis == null)
             {
-                _planetUpLogged = true;
-                var e0 = list[0];
-                var sb = new System.Text.StringBuilder();
-                sb.Append("Orbit up: PLANET SPHERE SHAPE — count=").Append(list.Count)
-                  .Append(" element=").Append(e0?.GetType().FullName);
-                if (e0 != null)
+                if (!_planetUpFailLogged)
                 {
-                    foreach (var f in e0.GetType().GetFields(Any))
-                    {
-                        object v = null; try { v = f.GetValue(e0); } catch { }
-                        sb.Append("\n    field ").Append(f.FieldType.Name).Append(' ')
-                          .Append(f.Name).Append(" = ").Append(v);
-                    }
-                    foreach (var p in e0.GetType().GetProperties(Any))
-                    {
-                        object v = null; try { v = p.GetValue(e0); } catch { }
-                        sb.Append("\n    prop  ").Append(p.PropertyType.Name).Append(' ')
-                          .Append(p.Name).Append(" = ").Append(v);
-                    }
+                    _planetUpFailLogged = true;
+                    RttLog.Line("Orbit up: the installed view matrix is unreadable, so view-space planet " +
+                                "positions cannot be rotated back to world. Falling back.");
                 }
-                sb.Append("\n    subject is at ").Append($"{pos.X:F0},{pos.Y:F0},{pos.Z:F0}")
-                  .Append(" — the centre we want is ~60 km from that for an SE2 planet.");
-                RttLog.Line(sb.ToString());
+                return null;
             }
 
-            Vector3D bestCentre = default;
-            double bestRadius = 0, bestErr = double.MaxValue;
-
-            foreach (var s in list)
+            var best = new SphereHit();
+            foreach (var name in PlanetUpSources)
             {
-                if (s == null) continue;
-                if (!SphereOf(s, out var centre, out double radius)) continue;
-                if (radius < 1000.0) continue;                    // not a planet
+                object v = null;
+                try { v = gt.GetField(name, Any)?.GetValue(_planetEnvGroup); } catch { }
+                if (v == null) continue;
 
-                double dist = (pos - centre).Length();
-                double err = Math.Abs(dist - radius) / radius;     // on the surface => ~0
-                if (err < bestErr) { bestErr = err; bestCentre = centre; bestRadius = radius; }
+                var items = v as System.Collections.IList;
+                int n = items?.Count ?? 1;
+                for (int i = 0; i < n; i++)
+                    ScanForSphere(items != null ? items[i] : v, pos, name, 3, best, basis);
             }
 
-            if (bestRadius <= 0) return null;
+            Vector3D bestCentre = best.Centre;
+            double bestRadius = best.Radius, bestErr = best.Err;
+            string bestFrom = best.From;
+
+            if (bestRadius <= 0)
+            {
+                if (!_planetUpFailLogged)
+                {
+                    _planetUpFailLogged = true;
+                    RttLog.Line("Orbit up: no planet-sized sphere in any candidate source yet. Retrying on a slow " +
+                                "cadence — the lists fill once the render's frustum actually contains the planet.");
+                }
+                return null;
+            }
+
+            // THE CAMERA-RELATIVE TRAP. Render constant buffers routinely store the planet
+            // centre relative to the camera under a floating origin. Such a value is a
+            // perfectly well-formed vector carrying a planet-sized radius, and using it
+            // would produce a confidently wrong up rather than an obvious failure. A subject
+            // standing on the surface must be ~radius from a WORLD-SPACE centre; anything
+            // else is rejected instead of trusted.
+            if (bestErr > 0.05)
+            {
+                if (!_planetUpRelLogged)
+                {
+                    _planetUpRelLogged = true;
+                    RttLog.Line($"Orbit up: REJECTED the candidate from {bestFrom} — centre " +
+                                $"{bestCentre.X:F0},{bestCentre.Y:F0},{bestCentre.Z:F0} radius {bestRadius:F0} m puts the " +
+                                $"subject {(pos - bestCentre).Length():F0} m out, an error of {bestErr * 100:F0}% of the " +
+                                "radius. That is almost certainly a camera-relative centre (floating origin), so the orbit " +
+                                "falls back rather than turning around a confidently wrong axis. The SOURCE DUMP above " +
+                                "names the fields actually present.");
+                }
+                return null;
+            }
 
             var up = pos - bestCentre;
             double len = up.Length();
             if (len < 1.0) return null;
             up = new Vector3D(up.X / len, up.Y / len, up.Z / len);
 
-            if (!_planetUpLogged)
+            if (!_planetUpOkLogged)
             {
-                _planetUpLogged = true;
-                RttLog.Line($"Orbit up: PLANET RADIAL — centre {bestCentre.X:F0},{bestCentre.Y:F0},{bestCentre.Z:F0} " +
-                            $"radius {bestRadius:F0} m, subject {len:F0} m from centre ({(len - bestRadius):F0} m " +
-                            $"above the sphere). up = {up.X:F3},{up.Y:F3},{up.Z:F3}. This is the surface normal by " +
-                            "definition and replaces the subject's block rotation, which is only the surface normal " +
-                            "if the grid happened to be built gravity-aligned.");
+                _planetUpOkLogged = true;
+                RttLog.Line($"Orbit up: PLANET RADIAL from {bestFrom} — centre " +
+                            $"{bestCentre.X:F0},{bestCentre.Y:F0},{bestCentre.Z:F0} radius {bestRadius:F0} m, subject " +
+                            $"{len:F0} m from centre ({(len - bestRadius):F0} m above the sphere, {bestErr * 100:F2}% " +
+                            $"error). up = {up.X:F3},{up.Y:F3},{up.Z:F3}. This is the surface normal by definition and " +
+                            "replaces the subject's block rotation, which is only the surface normal if the grid " +
+                            "happened to be built gravity-aligned.");
             }
             return up;
         }
         catch { return null; }
     }
 
-    // A centre and a radius out of an unknown struct, found by type.
-    private static bool SphereOf(object s, out Vector3D centre, out double radius)
+    // Print what is ACTUALLY in each candidate source, one level into nested structs.
+    // Three guesses at field shapes have been spent today; this costs one message and
+    // ends the guessing. Latches only once something was genuinely there to look at, so
+    // an early empty call cannot silence it.
+    private static void DumpPlanetSources(Type gt, Vector3D pos)
     {
-        centre = default; radius = 0;
-        var t = s.GetType();
-        foreach (var f in t.GetFields(Any))
+        var sb = new System.Text.StringBuilder();
+        var viaTarget = CameraFeed.Current;
+        sb.Append("Orbit up: PLANET SOURCE DUMP — subject at ")
+          .Append($"{pos.X:F0},{pos.Y:F0},{pos.Z:F0}")
+          .Append(" (published by the tick). For an SE2 planet the centre we want is tens of km from that.")
+          .Append("\n  cross-check: Feeds.Cur.Target read from THIS thread = ")
+          .Append(viaTarget == null
+                  ? "<null>"
+                  : $"{viaTarget.Centre.X:F0},{viaTarget.Centre.Y:F0},{viaTarget.Centre.Z:F0}")
+          .Append(". If those two disagree, the per-feed Target is not visible from the render thread ")
+          .Append("and every render-side reader of it is suspect.");
+        bool sawAny = false;
+
+        foreach (var name in PlanetUpSources)
         {
             object v = null;
-            try { v = f.GetValue(s); } catch { }
-            if (v is Vector3D vd && centre == default) centre = vd;
-            else if (radius <= 0 && v != null && (v is double || v is float))
+            try { v = gt.GetField(name, Any)?.GetValue(_planetEnvGroup); } catch { }
+            if (v == null) { sb.Append("\n  ").Append(name).Append(" = <null or absent>"); continue; }
+
+            var items = v as System.Collections.IList;
+            int n = items?.Count ?? 1;
+            sb.Append("\n  ").Append(name).Append("  count=").Append(n);
+            if (n == 0) continue;
+
+            object e = items != null ? items[0] : v;
+            if (e == null) { sb.Append("  [0] = null"); continue; }
+            sawAny = true;
+            sb.Append("  element=").Append(e.GetType().Name);
+            AppendMembers(sb, e, "      ", 2);
+        }
+
+        if (!sawAny) return;                  // nothing populated yet — try again next rebuild
+        _planetUpShapeLogged = true;
+        RttLog.Line(sb.ToString());
+    }
+
+    private static void AppendMembers(System.Text.StringBuilder sb, object o, string indent, int depth)
+    {
+        var t = o.GetType();
+
+        // THE PLANET DATA LIVES BEHIND AN InlineArray, AND ONLY THE INDEXER REACHES IT.
+        // Its StorageSpan is a Span<T>, which cannot be boxed, so reflection returns nothing
+        // for it — the first dump printed "StorageSpan = " and looked empty when the array
+        // actually held four planets. The int indexer boxes each element and works fine.
+        var idx = Indexer(t);
+        if (idx != null)
+        {
+            int n = Math.Min(InlineLength(o, t), 8);
+            for (int i = 0; i < n; i++)
             {
-                double d = Convert.ToDouble(v);
-                if (d > 1000.0) radius = d;
+                object e = null; try { e = idx.GetValue(o, new object[] { i }); } catch { break; }
+                if (e == null) continue;
+                sb.Append('\n').Append(indent).Append('[').Append(i).Append("] ").Append(e.GetType().Name);
+                if (depth > 0) AppendMembers(sb, e, indent + "  ", depth - 1);
             }
+        }
+
+        foreach (var f in t.GetFields(Any))
+        {
+            object v = null; try { v = f.GetValue(o); } catch { }
+            sb.Append('\n').Append(indent).Append(f.FieldType.Name).Append(' ').Append(f.Name).Append(" = ").Append(v);
+            if (depth > 0 && v != null && Nested(f.FieldType)) AppendMembers(sb, v, indent + "  ", depth - 1);
         }
         foreach (var p in t.GetProperties(Any))
         {
-            object v = null;
-            try { v = p.GetValue(s); } catch { }
-            if (v is Vector3D vd && centre == default) centre = vd;
-            else if (radius <= 0 && v != null && (v is double || v is float))
+            if (p.GetIndexParameters().Length != 0) continue;
+            object v = null; try { v = p.GetValue(o); } catch { }
+            sb.Append('\n').Append(indent).Append(p.PropertyType.Name).Append(' ').Append(p.Name).Append(" = ").Append(v);
+        }
+    }
+
+    private static System.Reflection.PropertyInfo Indexer(Type t)
+    {
+        foreach (var p in t.GetProperties(Any))
+        {
+            var ps = p.GetIndexParameters();
+            if (ps.Length == 1 && ps[0].ParameterType == typeof(int)) return p;
+        }
+        return null;
+    }
+
+    private static int InlineLength(object o, Type t)
+    {
+        try
+        {
+            var lp = t.GetProperty("Length", Any);
+            if (lp != null) return Convert.ToInt32(lp.GetValue(o));
+        }
+        catch { }
+        return 0;
+    }
+
+    // The best world-space planet candidate found so far.
+    private sealed class SphereHit
+    {
+        public Vector3D Centre;
+        public double Radius;
+        public double Err = double.MaxValue;
+        public string From;
+    }
+
+    // Walk an unknown object graph looking for anything shaped like a planet: a vector
+    // centre next to a kilometre-scale radius. Descends through nested structs AND through
+    // InlineArray indexers, because the spheres sit inside one.
+    //
+    // The centre found is VIEW-space and is rotated to world before being scored, so the
+    // error is a genuine "is the subject standing on this sphere" test. That test is also
+    // what picks the right planet out of the four in the setup: the one we are on scores
+    // ~0.003, the next nearest ~2.
+    private static void ScanForSphere(object o, Vector3D pos, string path, int depth, SphereHit best, ViewBasis basis)
+    {
+        if (o == null || depth < 0) return;
+
+        if (SphereOf(o, out var viewCentre, out double r) && r >= 1000.0)
+        {
+            var c = basis.ToWorld(viewCentre);
+            double err = Math.Abs((pos - c).Length() - r) / r;      // on the surface => ~0
+            if (err < best.Err) { best.Err = err; best.Centre = c; best.Radius = r; best.From = path; }
+        }
+        if (depth == 0) return;
+
+        var t = o.GetType();
+        var idx = Indexer(t);
+        if (idx != null)
+        {
+            int n = Math.Min(InlineLength(o, t), 16);
+            for (int i = 0; i < n; i++)
             {
-                double d = Convert.ToDouble(v);
-                if (d > 1000.0) radius = d;
+                object e = null; try { e = idx.GetValue(o, new object[] { i }); } catch { break; }
+                ScanForSphere(e, pos, $"{path}[{i}]", depth - 1, best, basis);
             }
         }
-        return centre != default && radius > 0;
+        foreach (var f in t.GetFields(Any))
+        {
+            if (!Nested(f.FieldType)) continue;
+            object v = null; try { v = f.GetValue(o); } catch { }
+            ScanForSphere(v, pos, path + "." + f.Name, depth - 1, best, basis);
+        }
+    }
+
+    // THE VIEW BASIS, FOR UNDOING VIEW SPACE.
+    //
+    // VRage uses the row-vector convention: viewPos = (worldPos - cam) * Rt, where Rt is the
+    // view matrix's upper 3x3 and is the transpose of the camera's world rotation. Both are
+    // orthonormal, so undoing it needs no inversion — just a dot against each ROW:
+    //
+    //     worldOffset_j = viewPos . row_j        cam_j = -(translation . row_j)
+    //
+    // Read as doubles through reflection so this works whether the engine hands back a
+    // MatrixD or a float Matrix.
+    private sealed class ViewBasis
+    {
+        public double[] R = new double[9];      // rows 1..3 of the view matrix
+        public Vector3D Cam;
+
+        public Vector3D ToWorld(Vector3D v) => new Vector3D(
+            v.X * R[0] + v.Y * R[1] + v.Z * R[2] + Cam.X,
+            v.X * R[3] + v.Y * R[4] + v.Z * R[5] + Cam.Y,
+            v.X * R[6] + v.Y * R[7] + v.Z * R[8] + Cam.Z);
+    }
+
+    private static ViewBasis InstalledViewBasis()
+    {
+        try
+        {
+            var settings = _coreType?.GetField("Settings", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var rv = settings?.GetType().GetProperty("RenderView", Any)?.GetValue(settings);
+            var view = rv?.GetType().GetProperty("ViewD", Any)?.GetValue(rv);
+            if (view == null) return null;
+
+            var b = new ViewBasis();
+            string[] rows = { "M11", "M12", "M13", "M21", "M22", "M23", "M31", "M32", "M33" };
+            for (int i = 0; i < 9; i++)
+                if (!Comp(view, view.GetType(), rows[i], out b.R[i])) return null;
+
+            if (!Comp(view, view.GetType(), "M41", out double t1)
+                || !Comp(view, view.GetType(), "M42", out double t2)
+                || !Comp(view, view.GetType(), "M43", out double t3)) return null;
+
+            b.Cam = new Vector3D(
+                -(t1 * b.R[0] + t2 * b.R[1] + t3 * b.R[2]),
+                -(t1 * b.R[3] + t2 * b.R[4] + t3 * b.R[5]),
+                -(t1 * b.R[6] + t2 * b.R[7] + t3 * b.R[8]));
+            return b;
+        }
+        catch { return null; }
+    }
+
+    private static bool Nested(Type t) =>
+        t.IsValueType && !t.IsPrimitive && !t.IsEnum && t != typeof(decimal)
+        && !t.Name.StartsWith("Vector") && !t.Name.StartsWith("Matrix") && !t.Name.StartsWith("Quaternion");
+
+    // A centre and a radius out of an unknown struct, found by TYPE rather than by name —
+    // guessing field names blind is what cost the day. Float vectors count: render-side
+    // data is as likely to be float3 as double3.
+    private static bool SphereOf(object s, out Vector3D centre, out double radius)
+    {
+        centre = default; radius = 0;
+        bool haveCentre = false;
+        var t = s.GetType();
+
+        foreach (var f in t.GetFields(Any))
+        {
+            object v = null; try { v = f.GetValue(s); } catch { }
+            Consider(v, ref centre, ref haveCentre, ref radius);
+        }
+        foreach (var p in t.GetProperties(Any))
+        {
+            if (p.GetIndexParameters().Length != 0) continue;
+            object v = null; try { v = p.GetValue(s); } catch { }
+            Consider(v, ref centre, ref haveCentre, ref radius);
+        }
+        return haveCentre && radius > 0;
+    }
+
+    // haveCentre rather than "centre == default": a centre legitimately at the origin
+    // would otherwise be overwritten by the next vector member that came along.
+    private static void Consider(object v, ref Vector3D centre, ref bool haveCentre, ref double radius)
+    {
+        if (v == null) return;
+        if (!haveCentre && AsVec3(v, out var vec)) { centre = vec; haveCentre = true; return; }
+        if (radius <= 0 && (v is double || v is float))
+        {
+            double d = Convert.ToDouble(v);
+            if (d > 1000.0) radius = d;
+        }
+    }
+
+    private static bool AsVec3(object v, out Vector3D r)
+    {
+        r = default;
+        if (v is Vector3D vd) { r = vd; return true; }
+        var t = v.GetType();
+        if (!t.IsValueType || !t.Name.StartsWith("Vector3")) return false;
+        if (!Comp(v, t, "X", out double x) || !Comp(v, t, "Y", out double y) || !Comp(v, t, "Z", out double z))
+            return false;
+        r = new Vector3D(x, y, z);
+        return true;
+    }
+
+    private static bool Comp(object o, Type t, string name, out double d)
+    {
+        d = 0;
+        object v = null;
+        try { v = t.GetField(name, Any)?.GetValue(o) ?? t.GetProperty(name, Any)?.GetValue(o); } catch { }
+        if (!(v is double || v is float)) return false;
+        d = Convert.ToDouble(v);
+        return true;
     }
     private static MethodInfo _miPeFillSetups, _miPeFillSlim, _miPeSetMatrix, _miPeCreateCb;
     private static System.Reflection.PropertyInfo _pPeModifiersCtx;
@@ -2165,25 +2419,40 @@ internal static class WholeSceneRender
             }
 
             if (!RebuildFromInstalledView("our view")) return false;
+
+            // THE ORBIT'S UP, COMPUTED WHERE THE DATA IS LIVE.
+            //
+            // PlanetUpAt needs _planetEnvGroup, which is resolved lazily by THIS method on
+            // the render thread. Discovery runs on the LCD tick and kept finding it null,
+            // so the orbit silently fell back to the subject's block rotation — which for a
+            // wall-mounted panel is the screen's facing, not the ground normal. Same shape
+            // as the config-poll bootstrap: state read from a thread that cannot see it.
+            //
+            // Cached for discovery to pick up instead of asking across the thread boundary.
+            //
+            // DELIBERATELY NOT ONE-SHOT. This used to live inside the run-once logging block
+            // below, so the single early call — made while the planet lists were still empty —
+            // was the only attempt ever made, and a moving subject never updated its axis.
+            // Retried on a slow cadence instead: up changes only as the subject travels, and
+            // the scan walks a list with one element in it.
+            if (--_planetUpCountdown <= 0)
+            {
+                _planetUpCountdown = 60;
+                // The tick publishes the very position the orbit looks at. Reading
+                // Feeds.Cur.Target across the thread boundary returned 0,0,0 here while the
+                // tick was logging a real one, so this takes the value by the same route
+                // PlanetUpCache travels back on.
+                var subject = CameraFeed.SubjectCentreCache;
+                if (subject.LengthSquared() > 1.0)
+                {
+                    var radial = PlanetUpAt(subject);
+                    if (radial.HasValue) CameraFeed.PlanetUpCache = radial.Value;
+                }
+            }
+
             if (!_planetEnvLogged)
             {
                 _planetEnvLogged = true;
-                // THE ORBIT'S UP, COMPUTED WHERE THE DATA IS LIVE.
-                //
-                // PlanetUpAt needs _planetEnvGroup, which is resolved lazily by THIS method on
-                // the render thread. Discovery runs on the LCD tick and kept finding it null,
-                // so the orbit silently fell back to the subject's block rotation — which for a
-                // wall-mounted panel is the screen's facing, not the ground normal. Same shape
-                // as the config-poll bootstrap: state read from a thread that cannot see it.
-                //
-                // Cached for discovery to pick up instead of asking across the thread boundary.
-                var feedTarget = CameraFeed.Current;
-                if (feedTarget != null)
-                {
-                    var radial = PlanetUpAt(feedTarget.Centre);
-                    if (radial.HasValue) CameraFeed.PlanetUpCache = radial.Value;
-                }
-
                 RttLog.Line("=== PLANET ENV REBUILT (narrow) for our render: the setup CBs and planet " +
                             "spheres now come from the ORBIT camera — atmosphere on the planet, not on " +
                             "the player's aim. SortEntities and the LUT/weather TABLE fills are NOT " +
