@@ -209,13 +209,18 @@ internal static class StatsPanel
                          (FeedConfig.WholeSceneOwnFlares ? " flr" : ""));
                     y += line;
 
-                    // WHICH FEEDS ARE IN THE ROTATION (phase F1). Every other number on this
-                    // panel is an aggregate, so with two feeds it reads identically whether
-                    // both are live or one has quietly gone away — and "quietly gone away" is
-                    // precisely the state this phase exists to make impossible to miss. Here
-                    // it is legible from across the room while you grind a panel down.
+                    // EACH FEED'S OWN FRAME RATE (phase F1). Every other number on this panel
+                    // is an aggregate — including the headline fps above, which is the
+                    // ENGINE'S — so with two feeds they read identically whether the work is
+                    // split evenly, split 8:1, or being done entirely by one feed while the
+                    // other is frozen. That last case is exactly what this phase exists to
+                    // make impossible to miss, and it is legible here from across the room
+                    // while you grind a panel down.
+                    //
+                    // A feed that is not rendering shows why (off / dis / ERR / set) rather
+                    // than 0.0, because those want different reactions.
                     Text(batch, font, x, y, scale * 0.7f, 150, 200, 160,
-                         "feeds " + Feeds.RotationShort());
+                         "feed fps " + Feeds.FeedFpsLine());
                 }
             }
             else

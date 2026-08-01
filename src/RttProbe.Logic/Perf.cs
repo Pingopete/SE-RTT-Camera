@@ -189,7 +189,14 @@ internal static class Perf
                 $"ourDraw(cpu submit) n={_ourDraw.Count} mean={_ourDraw.Mean:F1} " +
                 $"p95={_ourDraw.Pct(0.95):F1} max={_ourDraw.Max:F1} | " +
                 $"alloc render={_allocRender / windowMs * 1000 / 1048576.0:F1}MB/s " +
-                $"ui={_allocUi / windowMs * 1000 / 1048576.0:F1}MB/s | {vram}");
+                $"ui={_allocUi / windowMs * 1000 / 1048576.0:F1}MB/s | {vram} | " +
+                // PER-FEED RATES, on the line the watchdog already reads. Everything else
+                // here is an aggregate across feeds by design (the fixed budget is the
+                // invariant), which leaves "is feed 1 actually producing anything" answerable
+                // only by eye. It cost an hour on 2026-08-01: the per-feed status line rides
+                // a process-global 5 s timer, so sampling secondRenders per feed out of the
+                // log gave an 8:1 split that was pure artefact — the real split was 26.6/25.9.
+                $"feed fps {Feeds.FeedFpsLine()}");
 
             // Publish BEFORE clearing — see the Stats comment.
             _latest = new Stats

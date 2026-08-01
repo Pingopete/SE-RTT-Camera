@@ -82,6 +82,38 @@ internal sealed class FeedInstance
     public int SettleFrames;
     public int RenderCount;
 
+    // THIS FEED'S OWN FRAME RATE — renders per second, sampled over ~1 s.
+    //
+    // Every other rate instrument in the mod is an aggregate: the PERF window, the stats
+    // panel's headline fps and the watchdog's secondRenders all count what the MOD did, so
+    // with two feeds they read the same whether the work is split evenly, split 8:1, or
+    // being done entirely by one feed while the other is frozen. That is not a hypothetical
+    // failure mode — it is the one this phase exists to catch, and on 2026-08-01 it also
+    // sent me chasing a phantom uneven split that turned out to be a sampling artefact of
+    // the per-feed status line riding a process-global 5 s timer.
+    //
+    // Sampled rather than instantaneous because a feed's turn comes round every N frames by
+    // design: measured per frame it would read 0 or the full engine rate and never the truth
+    // in between.
+    public double RenderFps;
+    private int _fpsLastCount;
+    private long _fpsLastMs;
+
+    internal void SampleFps(long now)
+    {
+        if (_fpsLastMs == 0) { _fpsLastMs = now; _fpsLastCount = RenderCount; return; }
+
+        long dt = now - _fpsLastMs;
+        if (dt < 1000) return;
+
+        // RenderCount is zeroed by WholeSceneRender.Reset, so the delta can go negative
+        // across a teardown. Report nothing rather than a nonsense spike.
+        int d = RenderCount - _fpsLastCount;
+        RenderFps = d < 0 ? 0.0 : d * 1000.0 / dt;
+        _fpsLastMs = now;
+        _fpsLastCount = RenderCount;
+    }
+
     // Our own environment probe manager (goal 4.4). NOT disposed on a config change —
     // three device removals established that, see WholeSceneRender.Reset.
     public object OurProbes;
@@ -691,6 +723,11 @@ internal static class Feeds
         for (int i = 0; i < n; i++)
             if (Eligible(All[i])) { mask |= 1 << i; live++; }
 
+        // Every slot, not just the active ones: a feed that has just stopped needs one more
+        // sample to fall to zero rather than freezing at its last good rate.
+        long sampleAt = Clock.Ms;
+        for (int i = 0; i < MaxFeeds; i++) All[i].SampleFps(sampleAt);
+
         // THE ROTATION SET CHANGING IS THE HEADLINE EVENT of a feed being lost or regained,
         // so it is stated once, plainly, with the reason per feed. Without this line the
         // only symptom of a feed leaving is a panel that quietly stops updating — which is
@@ -746,20 +783,24 @@ internal static class Feeds
         return sb.ToString();
     }
 
-    // The same picture, short enough for the stats panel: "0:on 1:off".
-    internal static string RotationShort()
+    // EACH FEED'S OWN FRAME RATE, short enough for the stats panel: "0:26.6  1:25.9".
+    //
+    // A feed that is not rendering shows WHY instead of a number, because 0.0 does not
+    // distinguish "switched off" from "faulted" from "stuck", and those want different
+    // reactions. The states are the same ones RotationLine reports to the log.
+    internal static string FeedFpsLine()
     {
         var sb = new System.Text.StringBuilder();
         int n = Count;
         for (int i = 0; i < n; i++)
         {
             var f = All[i];
-            if (i > 0) sb.Append(' ');
-            sb.Append(f.Id).Append(':').Append(
-                !f.GateActive ? (FeedConfig.IsFeedDisabled(f.Id) ? "dis" : "off")
-                : f.RouteState == -1 ? "ERR"
-                : f.SettleFrames > 0 ? "set"
-                : "on");
+            if (i > 0) sb.Append("  ");
+            sb.Append(f.Id).Append(':');
+            if (!f.GateActive) sb.Append(FeedConfig.IsFeedDisabled(f.Id) ? "dis" : "off");
+            else if (f.RouteState == -1) sb.Append("ERR");
+            else if (f.SettleFrames > 0) sb.Append("set");
+            else sb.Append(f.RenderFps.ToString("F1"));
         }
         return sb.ToString();
     }

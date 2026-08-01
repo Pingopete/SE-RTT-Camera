@@ -1,40 +1,34 @@
 #!/usr/bin/env bash
-# Per-feed render rate, sampled from rtt.log over a window.
+# Each feed's OWN frame rate, read off the newest PERF line.
 #
-# The evidence for "the survivors absorb the departed feed's share of the frame cycle"
-# (phase F1). Every other instrument in the mod is an aggregate — the PERF line, the stats
-# panel, secondRenders in the watchdog — so with two feeds they read the same whether both
-# are rendering or one has gone away. This is the per-feed split.
+#   scripts/feed-rate.sh
 #
-#   scripts/feed-rate.sh [seconds]     default 15
+# The mod samples this itself now (FeedInstance.SampleFps) and prints it on the PERF line as
+# "feed fps 0:26.6  1:25.9", so this script just reads it. A feed that is not rendering shows
+# why instead of a number: off (no panel ticking), dis (feedsDisabled), set (settling after a
+# rebuild), ERR (its route faulted).
 #
-# Reads the "[feed N] Whole-scene hook: ... secondRenders=X" line each feed prints every 5 s,
-# so the window wants to be comfortably longer than 5 s to catch at least one per feed.
+# THE VERSION THIS REPLACES SAMPLED THE LOG, AND IT LIED. It diffed the per-feed
+# "Whole-scene hook: ... secondRenders=N" line, which rides a PROCESS-GLOBAL 5 s timer — so
+# only whichever feed holds the render slot when that timer expires prints at all, and the
+# other feed's last-known count can be many seconds stale. On 2026-08-01 that produced a
+# 52.0 vs 6.5 split out of a run whose real split was 26.6 vs 25.9, and cost an hour chasing
+# a rotation bug that did not exist. Any instrument that samples a log line has to know how
+# often that line is written.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="$ROOT/output/rtt.log"
-WINDOW="${1:-15}"
 
-# Only the recent tail: rtt.log carries no dates and spans every session ever run, so a
-# plain grep will happily return a line from days ago and read as current.
-snap() {
-  tail -c 4000000 "$LOG" | grep -a "Whole-scene hook:" | tail -40 |
-    sed -nE 's/.*\[feed ([0-9]+)\].*secondRenders=([0-9]+).*/\1 \2/p' |
-    awk '{ last[$1] = $2 } END { for (f in last) printf "%s %s\n", f, last[f] }' | sort
-}
+# Only the recent tail: rtt.log carries no dates and spans every session ever run.
+LINE=$(tail -c 2000000 "$LOG" | grep -a "feed fps" | tail -1)
 
-BEFORE=$(snap)
-sleep "$WINDOW"
-AFTER=$(snap)
+if [ -z "$LINE" ]; then
+  echo "no 'feed fps' on any recent PERF line — the mod may be paused, dormant, or running a"
+  echo "build from before this field existed."
+  exit 1
+fi
 
-echo "per-feed second renders over ${WINDOW}s   ($(date '+%H:%M:%S'))"
-join <(echo "$BEFORE") <(echo "$AFTER") 2>/dev/null |
-  awk -v w="$WINDOW" '{ d = $3 - $2; printf "  feed %s: %6d -> %6d   %+5d   %5.1f/s\n", $1, $2, $3, d, d / w }'
-
-# A feed that printed nothing at all in the window is not slow, it is ABSENT — and that is
-# a different finding from "0/s", so say which.
-for f in 0 1 2 3; do
-  echo "$AFTER" | grep -q "^$f " || {
-    echo "$BEFORE" | grep -q "^$f " && echo "  feed $f: stopped logging during the window"
-  }
-done
+echo "${LINE%%]*}]"                                   # the timestamp, so staleness is visible
+echo "  ${LINE##*feed fps }"
+echo
+echo "  engine: $(sed -nE 's/.*PERF ([0-9.]+) fps.*/\1/p' <<<"$LINE") fps"
