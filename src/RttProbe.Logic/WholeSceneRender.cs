@@ -725,6 +725,30 @@ internal static class WholeSceneRender
         // and carries on rather than taking the frame with it.
         try
         {
+            // THE CONFIG POLL RIDES THIS HOOK, which fires every engine frame no matter what
+            // is switched on or which feed is live.
+            //
+            // Until 2026-08-01 its only caller was the camera pass — which is gated on
+            // FeedGate.Active AND on which of the two scene hooks the pass rides, and that
+            // choice is ITSELF a config value. So the poll that loads the configuration could
+            // only run once the configuration was already loaded and a feed already live.
+            //
+            // WholeSceneEnabled, WholeSceneBuildBuffers and WholeSceneCamera are auto-property
+            // bools with no initialiser — false until first read. A hot reload gives the new
+            // assembly fresh statics, so the whole route boots OFF and stays off if anything
+            // keeps that one caller from running. Observed live: "ourScreenBuffers=not built,
+            // secondRenders=0, camera=player's" for three minutes against a config file that
+            // said render=1, camera=1.
+            //
+            // Same shape as the gate poll fixed this morning, one layer down: state that can
+            // only change while the thing it controls is already working. Poll throttles
+            // itself, so calling it from the one hook that always fires costs a file stat
+            // every couple of seconds and removes the bootstrap dependency entirely.
+            //
+            // Scoped to Primary for its log lines: the configuration is process-wide, and this
+            // runs outside any feed scope.
+            using (Feeds.Enter(Feeds.Primary)) FeedConfig.Poll();
+
             FeedGate.PollAll();
             FeedGate.PumpAll();
         }
