@@ -386,23 +386,27 @@ internal static class WorldGrids
                 return;
             }
 
-            object area = null; int captured = 0; object lastSession = null;
+            // EVERY matching candidate, from EVERY captured session — then choose by PROOF.
+            //
+            // The "use the last batch's session" heuristic picked an area whose scene threw
+            // the same KeyNotFoundException (CTD #3): OnRegistered fires for the client
+            // mirror's areas too, and which batch lands last is an accident of load order.
+            // Scene job tables (_jobSystemsIndex / _jobGroupToIndex) are sealed at scene
+            // construction, so whether a given area is LOADABLE is a readable fact: its
+            // scene's table either contains ManagedWorldArea+SpawnSyncPoint or it does not.
+            // Read the dictionaries and only ever call TryLoad where the key exists — the
+            // crash becomes a log line saying which scenes were probed and what they held.
+            var candidates = new System.Collections.Generic.List<object>();
+            int captured;
             var regs = (System.Collections.Generic.List<object[]>)regsField.GetValue(null);
             lock (lockField.GetValue(null))
             {
                 captured = regs.Count;
-                if (captured > 0)
+                foreach (var pair in regs)
                 {
-                    // A world reload appends a fresh batch with a NEW session component;
-                    // only the latest session's areas belong to the running world.
-                    lastSession = regs[^1][1];
-                    foreach (var pair in regs)
-                    {
-                        if (!ReferenceEquals(pair[1], lastSession)) continue;
-                        var n = Prop(pair[0], "Name")?.ToString();
-                        if (n != null && n.IndexOf(wantName, StringComparison.OrdinalIgnoreCase) >= 0)
-                        { area = pair[0]; break; }
-                    }
+                    var n = Prop(pair[0], "Name")?.ToString();
+                    if (n != null && n.IndexOf(wantName, StringComparison.OrdinalIgnoreCase) >= 0)
+                        candidates.Add(pair[0]);
                 }
             }
 
@@ -414,12 +418,81 @@ internal static class WorldGrids
                             "'Patched ManagedWorldArea.OnRegistered'.");
                 return;
             }
-            if (area == null)
+            if (candidates.Count == 0)
             {
                 RttLog.Line($"LOAD AREA \"{wantName}\": no captured area matched ({captured} registration(s) " +
                             "held). The survey's managed-areas section lists the valid names.");
                 return;
             }
+
+            var tSync = Type.GetType(
+                "Keen.VRage.Core.Game.GameSystems.ManagedWorldAreas.ManagedWorldArea+SpawnSyncPoint, VRage.Core.Game");
+            object area = null;
+            var probeReport = new StringBuilder();
+            foreach (var cand in candidates)
+            {
+                var scene = Prop(Prop(Prop(cand, "Session"), "Entity"), "Scene");
+                bool loadable = false;
+                if (scene != null && tSync != null)
+                {
+                    var sys = Prop(scene, "_jobSystemsIndex") as System.Collections.IDictionary;
+                    var grp = Prop(scene, "_jobGroupToIndex") as System.Collections.IDictionary;
+                    loadable = (sys?.Contains(tSync) ?? false) || (grp?.Contains(tSync) ?? false);
+                    probeReport.Append($"\n    scene #{scene.GetHashCode():x8}: " +
+                        $"jobSystems={(sys?.Contains(tSync) == true ? "HAS" : "lacks")} " +
+                        $"jobGroups={(grp?.Contains(tSync) == true ? "HAS" : "lacks")} SpawnSyncPoint " +
+                        $"(state={Prop(cand, "_state")})");
+                }
+                else probeReport.Append($"\n    scene unreadable for one candidate " +
+                                        $"(scene={(scene == null ? "null" : "ok")}, syncType={(tSync == null ? "NOT FOUND" : "ok")})");
+                if (loadable && area == null) area = cand;
+            }
+
+            if (area == null)
+            {
+                RttLog.Line($"LOAD AREA \"{wantName}\": {candidates.Count} candidate(s) across the captured " +
+                            "sessions, and NO scene's job table contains ManagedWorldArea+SpawnSyncPoint — " +
+                            "TryLoad would throw in every one of them (this exact throw has cost three CTDs " +
+                            "today, so it is refused). Scenes probed:" + probeReport +
+                            "\n    CONCLUSION if all scenes lack it: this session type was built without the " +
+                            "area-load job group, and materialization needs a different route (the area's own " +
+                            "spatial trigger, or the offloading component's LoadAsync).");
+                return;
+            }
+            // THE CALL IS REFUSED. Read this before re-enabling it.
+            //
+            // With the right scene chosen, TryLoad DID work — no crash, state went
+            // Unloaded -> Loading — and then the SIM THREAD DEADLOCKED while the render
+            // thread kept running perfectly (cadence counters climbing, config poll
+            // answering, game "frozen but responding" for the user).
+            //
+            // The IL says why. TryLoad is:
+            //     var t = TryStartLoading(false); SkipWait(t);
+            //     if (!t.IsCompleted) Session.Entity.Scene.FinishBefore<SpawnSyncPoint>(ref t);
+            // and the load task itself parks on ContinueOnDCS<SpawnSyncPoint>(task, scene).
+            // FinishBefore INSERTS A BLOCKING TASK into the scene scheduler's dependency
+            // graph at that job group. Done from inside the sim frame that is a normal
+            // ordering constraint; done from our panel tick it is a dependency the pump
+            // never satisfies, and the sim stops.
+            //
+            // So the seat matters even when the scene is right. Two legitimate routes
+            // remain, and both are the ORIGINAL tier-2 plan rather than this shortcut:
+            //   1. a spatial trigger volume riding the feed camera, so the engine's OWN
+            //      trigger callback fires the load from its own correct context;
+            //   2. a Harmony hook on a method that genuinely runs inside the sim update,
+            //      issuing the deferred request from there.
+            // Four incidents (3 CTDs + this freeze) came from calling engine world
+            // mutation off-thread. The probe above stays because it is READ-ONLY and it
+            // is what makes route 1 verifiable; the call does not.
+            RttLog.Line($"LOAD AREA \"{wantName}\": scene probe:{probeReport}" +
+                        "\n    -> CALL REFUSED. TryLoad from this thread deadlocks the sim: it plants a " +
+                        "blocking task in the scene scheduler (FinishBefore<SpawnSyncPoint>) that only the " +
+                        "sim pump can clear. Verified 2026-08-01 — render thread stayed alive while the " +
+                        "world froze. Materialization needs a spatial trigger on the camera, or a hook " +
+                        "inside the sim update. See the comment at this line.");
+            return;
+#pragma warning disable CS0162 // unreachable — kept so the working call sequence is not lost
+
 
             var name = Prop(area, "Name")?.ToString();
             var state = Prop(area, "_state")?.ToString();
@@ -447,6 +520,7 @@ internal static class WorldGrids
                         $"{Prop(area, "_state")}. The spawn completes async; the area's own " +
                         "trigger/lifecycle owns it from here, including unloading it later if " +
                         "its rules say so.");
+#pragma warning restore CS0162
         }
         catch (Exception e) { RttLog.Error($"load area \"{wantName}\"", e); }
     }
