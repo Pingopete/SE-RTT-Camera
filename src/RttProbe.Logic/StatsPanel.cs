@@ -46,7 +46,7 @@ internal static class StatsPanel
         // and every "logged once" latch has to fall with them — a surviving latch would
         // swallow the line that proves the fix took, which is the failure mode this
         // project has lost the most time to.
-        _rebuildMi = null; _ctxField = null; _ctxFieldIsKvp = false; _scanDiag = false;
+        _rebuildMi = null; _ctxField = null; _ctxFieldIsKvp = false; _scanDiag = false; _pokedText = null;
     }
 
     private const System.Reflection.BindingFlags Any =
@@ -56,6 +56,10 @@ internal static class StatsPanel
     private static System.Reflection.MethodInfo _rebuildMi;
     private static System.Reflection.FieldInfo _ctxField;
     private static bool _ctxFieldIsKvp, _scanDiag;
+
+    // The text of the first [RTS] surface we poked, kept for the identifying log — the loop
+    // variable it comes from is long out of scope by the time that line is written.
+    private static string _pokedText;
 
     // Called from the LCD tick for EVERY render component, tagged or not — stats panels
     // are not [RTC] panels, so CameraFeed.OnLcdTick returns before ever seeing them.
@@ -115,13 +119,36 @@ internal static class StatsPanel
                 c.ContentDirty = true;
                 _rebuildMi.Invoke(renderComponent, new object[] { c });
                 poked = true;
+                _pokedText ??= text;      // for the identifying log below; loop-scoped otherwise
             }
 
             if (poked)
             {
                 _lastPoke = now;
                 _pokes++;
-                if (!_scanDiag) { _scanDiag = true; RttLog.Line($"Stats panel: found a [RTS] surface; repainting every {FeedConfig.StatsPanelMs} ms."); }
+                // SAY WHICH SURFACE, ON WHICH BLOCK. "Found a [RTS] surface" was true and
+                // useless: with several LCDs of the same model on a wall it cannot settle
+                // "the stats are on the wrong panel", which is exactly the question asked of
+                // it on 2026-08-01. The resolution does not discriminate either — panel
+                // texture size has nothing to do with physical size.
+                if (!_scanDiag)
+                {
+                    _scanDiag = true;
+                    string owner = null, display = null;
+                    try
+                    {
+                        var lcd = renderComponent.GetType().GetField("_lcdBlock", Any)?.GetValue(renderComponent);
+                        var ent = lcd?.GetType().GetProperty("Entity", Any)?.GetValue(lcd);
+                        owner = ent?.GetType().GetProperty("DebugName", Any)?.GetValue(ent) as string;
+                        var dmi = lcd?.GetType().GetMethod("GetSurfaceEffectiveDisplayName", Any);
+                        display = dmi?.Invoke(lcd, new object[] { 0 }) as string;
+                    }
+                    catch { }
+                    RttLog.Line($"Stats panel: found a [RTS] surface — text=\"{_pokedText}\" on block \"{owner}\" " +
+                                $"(terminal name \"{display}\"); repainting every {FeedConfig.StatsPanelMs} ms. " +
+                                "If that is not the panel you tagged [RTS], the tag is on a different screen " +
+                                "than you think.");
+                }
             }
         }
         catch (Exception e) { if (_errLogs++ < 3) RttLog.Error("stats panel poke", e); }

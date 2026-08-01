@@ -292,10 +292,105 @@ internal static class FeedRouter
     // cannot be recognised by one call site and ignored by another.
     internal static bool IsFeedPanel(string name) => TryParseTag(name, out _);
 
-    // The panel's user-facing name, by the same route CameraFeed uses for discovery. Kept
-    // here rather than called through CameraFeed so the router has no ordering dependency on
-    // discovery having run — the router is what tells discovery which feed it is running as.
+    // ---- THE ONE PLACE A PANEL'S IDENTITY IS DECIDED (2026-08-01) -----------------
+    //
+    // THE TAG LIVES IN THE SURFACE'S TEXT FIELD AND NOWHERE ELSE, at the user's direction.
+    // Block-name tagging is gone: it could only ever mean "some screen on this block", and
+    // carrying two sources meant two things to keep in agreement for no gain.
+    //
+    // The KEY must be unique per SURFACE, and the first version was not. It read
+    // "[RTT] #<surface> @<DebugName>", and DebugName is the COMPOSITION name — every LCD of
+    // the same model shares it ("LCDFlat150_ServerComposition"). Two panels of one model both
+    // tagged [RTT] therefore produced the SAME key, so the second collided with the first,
+    // routed to its feed as a mirror, and the second feed never got a panel at all. Observed
+    // 2026-08-01 as "feed fps 0:50.5 1:off" with two tagged panels plainly on the wall.
+    //
+    // EntityId is the identifier that is actually per block; DebugName is only a fallback for
+    // the shape where it is missing, and is at least stable within a session.
+    // Property first, then field — the engine's types use both, and guessing wrong reads as
+    // "this member does not exist" rather than as an error.
+    private static object Member(object o, string name)
+    {
+        if (o == null) return null;
+        try
+        {
+            var p = o.GetType().GetProperty(name, Any);
+            if (p != null) return p.GetValue(o);
+            return o.GetType().GetField(name, Any)?.GetValue(o);
+        }
+        catch { return null; }
+    }
+
+    internal static string SurfaceKey(int feedIndex, int surfaceIndex, object entity)
+    {
+        // Member(), not GetProperty() — the same trap that had just silenced discovery: these
+        // are as often fields as properties, and a miss reads as "no such member" rather than
+        // as an error.
+        object id = Member(entity, "EntityId");
+
+        // LAST RESORT, AND IT MUST NOT BE THE BLOCK NAME. DebugName is the composition name,
+        // shared by every LCD of a model — falling back to it is what made two tagged panels
+        // collide on one key in the first place, so a fallback that reintroduces the collision
+        // is worse than useless. The object's own identity hash is unique per block and stable
+        // for as long as the object lives, which is exactly the lifetime a claim has.
+        if (id == null && entity != null)
+            id = "obj" + System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(entity);
+
+        string tag = feedIndex < 0 ? "[RTT]" : $"[RTT{feedIndex + 1}]";
+        return $"{tag} #{surfaceIndex} @{id ?? "?"}";
+    }
+
+    // Find the surface whose TEXT carries a feed tag. Returns its index, or -1.
+    internal static int FindTaggedSurface(object renderComponent, out string tagText, out int feedIndex)
+    {
+        tagText = null;
+        feedIndex = -1;
+        try
+        {
+            if (renderComponent?.GetType().GetField("_surfaces", Any)?.GetValue(renderComponent)
+                is not System.Collections.IEnumerable list) return -1;
+
+            int i = -1;
+            foreach (var s in list)
+            {
+                i++;
+                if (s == null) continue;
+                // PROPERTY OR FIELD. The helper this was lifted from tried both, and the
+                // rewrite tried only properties — so State resolved to null on every surface,
+                // no panel carried a tag, and discovery went silent across the whole grid.
+                // Reflection lookups that "obviously" match are exactly the ones to copy
+                // wholesale rather than retype.
+                string text = Member(Member(s, "State"), "Text") as string;
+                if (string.IsNullOrEmpty(text)) continue;
+                if (!TryParseTag(text, out int idx)) continue;
+                tagText = text;
+                feedIndex = idx;
+                return i;
+            }
+        }
+        catch { }
+        return -1;
+    }
+
+    // The panel's identity for routing: the claim key of its tagged surface, or null when no
+    // surface carries a tag. The router derives this itself rather than waiting on discovery,
+    // because it is what TELLS discovery which feed it is running as.
     internal static string PanelNameOf(object renderComponent)
+    {
+        try
+        {
+            int si = FindTaggedSurface(renderComponent, out _, out int feedIdx);
+            if (si < 0) return null;
+
+            var lcdBlock = renderComponent.GetType().GetField("_lcdBlock", Any)?.GetValue(renderComponent);
+            var ent = lcdBlock?.GetType().GetProperty("Entity", Any)?.GetValue(lcdBlock);
+            return SurfaceKey(feedIdx, si, ent);
+        }
+        catch { return null; }
+    }
+
+    // Retained only for the diagnostic dump — nothing routes on it any more.
+    internal static string BlockNameOf(object renderComponent)
     {
         try
         {

@@ -259,14 +259,18 @@ internal static class CameraFeed
             if (lcd == null) return;
 
             var entity = Prop(lcd, "Entity");
+            DumpNameSources(renderComponent, entity, lcd);
 
-            // SURFACE TEXT FIRST, block name as the fallback. See FindTaggedSurface.
+            // SURFACE TEXT ONLY (2026-08-01, user). No block-name fallback: the tag lives in
+            // the screen's own text field and nowhere else, so a block with no tagged surface
+            // is simply not ours. FeedRouter owns both the scan and the key, because it is
+            // what tells this method which feed it is running as — two copies of the rule is
+            // how the route and the claim disagreed earlier today.
             string blockName = Prop(entity, "DebugName") as string;
-            int surfaceIndex = FindTaggedSurface(renderComponent, out string surfaceText, out int surfaceFeed);
+            int surfaceIndex = FeedRouter.FindTaggedSurface(renderComponent, out string surfaceText, out int surfaceFeed);
+            if (surfaceIndex < 0) return;                       // no tagged screen on this block
 
-            string name = surfaceIndex >= 0
-                ? SurfaceClaimKey(surfaceFeed, surfaceIndex, blockName)
-                : NameOf(entity, lcd);
+            string name = FeedRouter.SurfaceKey(surfaceFeed, surfaceIndex, entity);
             if (string.IsNullOrEmpty(name)) return;
 
             // Log every distinct panel once — makes "why isn't it finding my panel"
@@ -274,15 +278,9 @@ internal static class CameraFeed
             // WHAT WAS TYPED on it, because with multi-surface blocks "the panel" is no
             // longer a thing that has one answer.
             if (_seenNames.Add(name) && _seenNames.Count <= 20)
-                RttLog.Line($"LCD panel seen: \"{name}\"" +
-                            (surfaceIndex >= 0
-                                ? $"   <-- TAGGED {(surfaceFeed < 0 ? "(unnumbered — takes the next free feed)" : $"feed {surfaceFeed}")}, " +
-                                  $"from SURFACE {surfaceIndex}'s text (\"{surfaceText}\") on block \"{blockName}\""
-                                : FeedRouter.TryParseTag(name, out int tagged)
-                                    ? $"   <-- TAGGED {(tagged < 0 ? "(unnumbered)" : $"feed {tagged}")}, from the " +
-                                      "BLOCK NAME (no surface carries the tag in its text — type it into the " +
-                                      "screen itself to pick one)"
-                                    : ""));
+                RttLog.Line($"LCD panel seen: \"{name}\"   <-- TAGGED " +
+                            (surfaceFeed < 0 ? "(unnumbered — takes the next free feed)" : $"feed {surfaceFeed}") +
+                            $", from SURFACE {surfaceIndex}'s text (\"{surfaceText}\") on block \"{blockName}\"");
 
             // ONE tag test for the whole mod (FeedRouter.IsFeedPanel), so [RTC2] cannot be
             // recognised here and quietly ignored by the panel-render hook — which is exactly
@@ -529,6 +527,79 @@ internal static class CameraFeed
     // a panel the user could not locate. Two sources are already one more than ideal; the
     // third bought nothing.
     private static string NameOf(object entity, object lcd) => Prop(entity, "DebugName") as string;
+
+    // ---- WHERE DOES THE NAME THE USER TYPED ACTUALLY LIVE? ------------------------
+    //
+    // Asked because guessing was wrong once already. Removing GetSurfaceEffectiveDisplayName
+    // on the instruction "the display name should be ignored" left DebugName as the only
+    // block-level source — and DebugName returns the COMPOSITION name for a block the user
+    // has not renamed ("LCDFlat150_ServerComposition"), not the name shown in the terminal.
+    // Earlier in the same session the log read "LCD Panel [RTS]", and that string was coming
+    // from the call I deleted. So the block-name tag went invisible.
+    //
+    // One line per LCD block, first time it is seen, listing every candidate side by side
+    // with every surface's text. Costs a handful of reflection calls once per block per
+    // session and replaces a guess with a fact.
+    private static readonly HashSet<string> _nameDump = new();
+
+    private static void DumpNameSources(object renderComponent, object entity, object lcd)
+    {
+        try
+        {
+            var dbg = Prop(entity, "DebugName") as string;
+
+            // DEDUPE ON SOMETHING UNIQUE. The first version keyed on DebugName alone, and
+            // DebugName is the COMPOSITION name — every LCD of the same model shares it. So
+            // two different panels on one grid collapsed to one line and the dump hid exactly
+            // the panel being investigated. An instrument that silently drops half its
+            // subjects is worse than none.
+            string display = null;
+            try
+            {
+                var dmi = lcd.GetType().GetMethod("GetSurfaceEffectiveDisplayName", Any);
+                display = dmi?.Invoke(lcd, new object[] { 0 }) as string;
+            }
+            catch { }
+
+            string key = dbg + "|" + display + "|" + Prop(Prop(renderComponent, "State"), "Text");
+            if (!_nameDump.Add(key)) return;
+            if (_nameDump.Count > 16) return;
+
+            var sb = new System.Text.StringBuilder();
+            sb.Append("PANEL NAME SOURCES: DebugName=\"").Append(dbg).Append('"');
+
+            foreach (var candidate in new[] { "DisplayName", "CustomName", "Name" })
+            {
+                var v = Prop(entity, candidate) as string ?? Prop(lcd, candidate) as string;
+                if (v != null) sb.Append("  ").Append(candidate).Append("=\"").Append(v).Append('"');
+            }
+
+            try
+            {
+                var mi = lcd.GetType().GetMethod("GetSurfaceEffectiveDisplayName", Any);
+                if (mi != null)
+                    sb.Append("  SurfaceDisplayName(0)=\"")
+                      .Append(mi.Invoke(lcd, new object[] { 0 }) as string).Append('"');
+            }
+            catch { }
+
+            if (renderComponent.GetType().GetField("_surfaces", Any)?.GetValue(renderComponent)
+                is System.Collections.IEnumerable surfaces)
+            {
+                int i = -1;
+                foreach (var s in surfaces)
+                {
+                    i++;
+                    if (s == null) continue;
+                    sb.Append("  |surface ").Append(i).Append(" text=\"")
+                      .Append(Prop(Prop(s, "State"), "Text") as string).Append('"');
+                }
+            }
+
+            RttLog.Line(sb.ToString());
+        }
+        catch { }
+    }
 
     // block -> grid -> GetWorldTransform(blockPosition) -> Position
     // Each step reports itself once: this failed silently on the first run, and a
