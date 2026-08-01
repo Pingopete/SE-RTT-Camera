@@ -1,8 +1,14 @@
 # Relaunch SE2 after a crash and load the last save, unattended.
 #
-# Authorised by the user 2026-08-01 for exactly this: launch the exe, then press Enter at the
-# main menu (which activates Continue and loads the test grid on the planet). Nothing else is
-# automated - this script clicks no other button and types nothing else.
+# Authorised by the user 2026-08-01 for exactly this: launch the game, then get past the menu
+# to the saved world. That is now TWO prompts rather than one - Continue on the main menu, and
+# then a "This savegame was altered with Debug Menu ... Continue?" warning the user's current
+# debug setup raises, whose Yes button carries the focus highlight. Both are answered with
+# Enter.
+#
+# Nothing else is automated. The scope is "reach the saved world", not "dismiss whatever
+# appears": the game window is re-verified as foreground before EVERY keystroke, so nothing can
+# land in another application, and no other button is ever clicked.
 #
 # It is deliberately conservative about the one keystroke it sends: it focuses the game window
 # first and verifies it HAS focus before sending, so the Enter cannot land in another
@@ -131,6 +137,33 @@ for ($attempt = 1; $attempt -le 12; $attempt++) {
     [Win]::keybd_event(0x0D, 0x1C, 0, [UIntPtr]::Zero)
     Start-Sleep -Milliseconds 90
     [Win]::keybd_event(0x0D, 0x1C, 2, [UIntPtr]::Zero)
+
+    # SECOND ENTER: THE DEBUG-MENU WARNING (added 2026-08-01, user's save now trips it).
+    #
+    #     "This savegame was altered with Debug Menu. The game can become unstable. Continue?"
+    #                                [Yes]   [No]
+    #
+    # It appears AFTER Continue is pressed and blocks the load until answered. Yes carries the
+    # focus highlight, so a second Enter takes it.
+    #
+    # This is still only the ONE authorised interaction - getting past the menu to the saved
+    # world - now spread over the two prompts the game puts in the way. It is deliberately NOT
+    # a general "press Enter at anything that appears": the window is re-verified first, so the
+    # keystroke can never land in another application, and if no dialog is present the extra
+    # Enter simply re-activates Continue on a menu that is already loading, which is harmless.
+    #
+    # If Keen ever changes the default button to No, this becomes a click on Yes by position
+    # instead - do not "fix" it by pressing more keys.
+    Start-Sleep -Milliseconds 2500
+    $p2 = Game
+    if ($p2 -and [Win]::GetForegroundWindow() -eq $p2.MainWindowHandle) {
+        Write-Output "attempt ${attempt}: confirming the Debug Menu warning (Yes)"
+        [Win]::keybd_event(0x0D, 0x1C, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 90
+        [Win]::keybd_event(0x0D, 0x1C, 2, [UIntPtr]::Zero)
+    } else {
+        Write-Output "attempt ${attempt}: lost focus before the warning could be confirmed, NOT sending"
+    }
 
     # ONLY LINES WRITTEN SINCE WE LAUNCHED COUNT. The first version grepped the last 400 lines
     # for "FEED GATE: ACTIVE" and matched a line from BEFORE the crash, so it reported
