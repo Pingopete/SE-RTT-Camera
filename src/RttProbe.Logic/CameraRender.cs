@@ -71,6 +71,11 @@ internal static class CameraRender
     // Which OutputGeometryBufferContext this pass writes its draw commands into.
     // See the resolve-time comment: the choice is between a buffer eighteen engine
     private static MethodInfo _miBorrowRt, _miBorrowResizableRt, _miCreateCb;
+
+    // Exposed for WholeSceneRender.EnsureOwnFinalLdr: the feed's own FinalLDR is borrowed
+    // from the same pool as the LDR ring, and the resolve already happens here.
+    internal static MethodInfo BorrowResizableRt => _miBorrowResizableRt;
+    internal static object TexPool => _texPool;
     private static Type _tRenderViewSlim, _tTrackedCam, _tCamSettings;
     private static object _hdrFormat;
 
@@ -403,7 +408,7 @@ internal static class CameraRender
             // gave it down to the feed size. Here because this hook has what Resize needs
             // — the render thread and a live DirectCommandList (a CopyCommandList by
             // inheritance). See WholeSceneRender.EnsureFinalLdrSize for the full story.
-            WholeSceneRender.EnsureFinalLdrSize(commandList);
+            WholeSceneRender.EnsureOwnFinalLdr(commandList);
 
             // Advances the orbit. The return value is only checked for failure; the side
             // effect on _lastCamWorld / _lastViewD is what the whole-scene route reads.

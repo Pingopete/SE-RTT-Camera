@@ -297,6 +297,19 @@ internal sealed class FeedInstance
     // — it was a CameraFeed static, so with two feeds the last one to tick owned it and
     // PanelBinding.TryBind refreshed the material replacements on somebody else's block.
     public object LastRenderComponent;
+
+    // ---- the feed's OWN FinalLDR (2026-08-01) -------------------------------------
+    //
+    // OwnFinalLdr is a pool borrow at the FEED's resolution, under a per-feed name so it
+    // cannot alias the player's swapchain-sized targets — which is what the phantom ghost
+    // travelled through. Allocated once per feed and reused across gate cycles, because a
+    // per-cycle borrow would just be a slower version of the realloc churn it replaces
+    // (measured at 56 MB/min on the resize path).
+    //
+    // EngineFinalLdr is the buffer ScreenBuffers made for itself, held so it can be put back
+    // before Dispose — otherwise Dispose frees OUR borrow and leaks the engine's.
+    public object OwnFinalLdr;
+    public object EngineFinalLdr;
 }
 
 // The registry, and the ambient that decides WHOSE state `Feeds.Cur` means.

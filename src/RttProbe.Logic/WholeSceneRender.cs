@@ -94,17 +94,248 @@ internal static class WholeSceneRender
     private static bool _ldrResized
     { get => Feeds.Cur.LdrResized; set => Feeds.Cur.LdrResized = value; }
 
+    // OWN THE BUFFER INSTEAD OF FIGHTING OVER IT (2026-08-01).
+    //
+    // The resize below is superseded. Measured A/B over ~5.5 min each at ~42 fps:
+    //
+    //                    resize ON      resize OFF
+    //     VRAM drift     +56 MB/min     -11 MB/min
+    //     >50ms frames   1.22/window    0.89/window
+    //     worst hitch    432 ms         228 ms
+    //     phantom ghost  absent         IMMEDIATE, over the whole main world
+    //
+    // So the resize was buying ghost-freedom at the price of a 56 MB/min leak — and that leak
+    // is what drove the VRAM ratchet into streaming eviction, i.e. the object popping.
+    //
+    // WHY EITHER SETTING WAS WRONG. Our ScreenBuffers' FinalLDRTexture is sized from the
+    // PLAYER'S SWAPCHAIN — the one buffer our InitializeBuffers(feed size) does not cover — so
+    // it shares a pool bucket with the player's same-sized targets. Without the resize we
+    // upscale the feed across the full 3840x2160 of a texture the player's pass then presents:
+    // the ghost. With it we write only the 1024 corner, which narrows the blast radius without
+    // ending the sharing — and because SceneDrawSystem.Draw resizes whatever buffer it is
+    // handed to the render resolution, the player's Draw sizes it back and ours sizes it down,
+    // forever, reallocating each time. That realloc traffic IS the leak.
+    //
+    // The fix is ownership: borrow a resizable target at OUR size under a per-feed name, so it
+    // lands in its own pool bucket and can never alias the player's, and install it once. With
+    // the buffer already at render resolution, Draw has nothing to resize.
+    //
+    // Allocated ONCE PER FEED and reused across gate cycles — a per-cycle borrow would just be
+    // a slower version of the churn this replaces.
+    private static object _ownFinalLdr
+    { get => Feeds.Cur.OwnFinalLdr; set => Feeds.Cur.OwnFinalLdr = value; }
+    private static object _engineFinalLdr
+    { get => Feeds.Cur.EngineFinalLdr; set => Feeds.Cur.EngineFinalLdr = value; }
+
+    public static void EnsureOwnFinalLdr(object commandList)
+    {
+        if (_ldrResized || _ourScreenBuffers == null) return;
+        _ldrResized = true;
+        try
+        {
+            var sbType = _ourScreenBuffers.GetType();
+            var prop = sbType.GetProperty("FinalLDRTexture", Any);
+            var current = prop?.GetValue(_ourScreenBuffers);
+            if (prop == null || current == null || !prop.CanWrite)
+            {
+                RttLog.Line("Own FinalLDR: FinalLDRTexture is not settable — falling back to the RESIZE " +
+                            "path, which works but leaks ~56 MB/min. See EnsureFinalLdrSize.");
+                EnsureFinalLdrSize(commandList);
+                return;
+            }
+
+            int w = FeedConfig.WholeSceneWidth, h = FeedConfig.WholeSceneHeight;
+
+            if (_ownFinalLdr == null)
+            {
+                // Format from the buffer we are replacing, never guessed: the panel blit and
+                // the handover both key off it, and a mismatched format is a device removal
+                // rather than a wrong colour.
+                // THE BACKING FIELD, because the property is UNREACHABLE BY NAME.
+                //
+                // ResizableRWRenderTargetTexture exposes Format only as EXPLICIT interface
+                // implementations — ITexture2DView.Format, IRenderTargetView.Format,
+                // IRWTexture2DView.Format — whose reflected names are interface-qualified, so
+                // GetProperty("Format") returns null however many times you try it. The
+                // member dump is what showed this; guessing would not have.
+                //
+                // _resourceFormat is the resource's own format, and the LDR ring already
+                // passes one format for both the resource and the view slots.
+                var fmt = MemberValue(current, "_resourceFormat")
+                       ?? MemberValue(current, "_rtvFormat")
+                       ?? MemberValue(current, "Format");
+                var res = MakeVector2I(w, h);
+                if (fmt == null || res == null || CameraRender.BorrowResizableRt == null)
+                {
+                    // SAY WHAT IS ACTUALLY THERE. "format=?" on its own cost a deploy: it names
+                    // the symptom and not one fact that would fix it.
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append($"Own FinalLDR: cannot allocate (format={(fmt == null ? "?" : "ok")}, ")
+                      .Append($"res={(res == null ? "?" : "ok")}, borrow=")
+                      .Append($"{(CameraRender.BorrowResizableRt == null ? "MISSING" : "ok")}) — ")
+                      .Append("falling back to the resize path. Members on ")
+                      .Append(current.GetType().Name).Append(':');
+                    foreach (var p in current.GetType().GetProperties(Any))
+                        sb.Append("\n    prop  ").Append(p.PropertyType.Name).Append(' ').Append(p.Name);
+                    foreach (var f in current.GetType().GetFields(Any))
+                        sb.Append("\n    field ").Append(f.FieldType.Name).Append(' ').Append(f.Name);
+                    RttLog.Line(sb.ToString());
+                    EnsureFinalLdrSize(commandList);
+                    return;
+                }
+
+                // PER-FEED NAME. "RttProbe" vs "RttProbe{Id}" already cost us a collision once:
+                // two feeds asking the pool under one name get handed each other's target.
+                string name = $"RttFinalLdr{Feeds.Cur.Id}";
+
+                // ARGUMENTS BUILT BY PARAMETER TYPE, NOT BY REMEMBERED ORDER.
+                //
+                // The resizable borrow does NOT share the non-resizable one's argument order —
+                // copying the LDR ring's (name, fmt, fmt, res, mips, null, 128) threw
+                // "Object of type 'Vortice.DXGI.Format' cannot be converted to
+                // 'Vector2I'". Matching each slot by its declared type is order-independent,
+                // so it survives both this signature and any future reshuffle, and the
+                // signature is logged once so a wrong fill is readable rather than a throw.
+                // BY PARAMETER NAME, and the VIEW formats are not the RESOURCE format.
+                //
+                //   String debugName | Format srvFormat | Vector2I maxResolution
+                //   Format uavFormat | Int32 mipMaps | Color clearColor | Int32 lifetime
+                //
+                // Filling both Format slots from _resourceFormat gave R8G8B8A8_TYPELESS in the
+                // SRV and UAV slots, which D3D rejects outright (E_INVALIDARG) — a typeless
+                // format has no defined interpretation, so it cannot back a view. That is
+                // precisely why the texture carries _resourceFormat, _srvFormat and _uavFormat
+                // as three separate fields. Copy each to its own slot.
+                //
+                // Note there is no separate "resolution": the texture is created at
+                // maxResolution, which IS the pool key — so asking for the feed size here is
+                // what puts us in our own bucket, away from the player's swapchain-sized
+                // targets. That is the whole point of the change.
+                var srvFmt = MemberValue(current, "_srvFormat") ?? fmt;
+                var uavFmt = MemberValue(current, "_uavFormat") ?? fmt;
+                var ps = CameraRender.BorrowResizableRt.GetParameters();
+                var args = new object[ps.Length];
+                var sig = new System.Text.StringBuilder();
+                for (int i = 0; i < ps.Length; i++)
+                {
+                    var pt = Nullable.GetUnderlyingType(ps[i].ParameterType) ?? ps[i].ParameterType;
+                    switch (ps[i].Name)
+                    {
+                        case "debugName":     args[i] = name;   break;
+                        case "srvFormat":     args[i] = srvFmt; break;
+                        case "uavFormat":     args[i] = uavFmt; break;
+                        case "maxResolution": args[i] = res;    break;
+                        case "mipMaps":       args[i] = 1;      break;
+                        case "lifetime":      args[i] = 128;    break;
+                        default:
+                            // Unknown slot: fall back to type, then to the declared default.
+                            if (pt == typeof(string)) args[i] = name;
+                            else if (pt == res.GetType()) args[i] = res;
+                            else args[i] = ps[i].HasDefaultValue ? ps[i].DefaultValue : null;
+                            break;
+                    }
+                    sig.Append("\n    ").Append(pt.Name).Append(' ').Append(ps[i].Name)
+                       .Append(" <- ").Append(args[i] ?? "null");
+                }
+                RttLog.Line($"Own FinalLDR: BorrowResizableRWRenderTargetTexture signature —{sig}");
+                _ownFinalLdr = CameraRender.BorrowResizableRt.Invoke(CameraRender.TexPool, args);
+                if (_ownFinalLdr == null)
+                {
+                    RttLog.Line("Own FinalLDR: the borrow returned null — falling back to the resize path.");
+                    EnsureFinalLdrSize(commandList);
+                    return;
+                }
+                RttLog.Line($"Own FinalLDR: borrowed \"{name}\" at {w}x{h} in the feed's own pool bucket. " +
+                            "It cannot alias the player's swapchain-sized targets, so the ghost has no " +
+                            "route, and nothing resizes it any more — which is where the 56 MB/min drift " +
+                            "was coming from.");
+            }
+
+            // THE POOL HANDS BACK A WRAPPER, NOT THE TEXTURE.
+            //
+            // BorrowResizableRWRenderTargetTexture returns Borrowed<ResizableRWRenderTargetTexture>
+            // — a lifetime handle. Assigning that straight to FinalLDRTexture throws, because
+            // the property wants the texture. Unwrap by finding the member whose type the
+            // property will actually accept, rather than guessing a name like .Resource or
+            // .Value: the wrapper is generic and the accessor has been renamed before.
+            object install = _ownFinalLdr;
+            if (!prop.PropertyType.IsInstanceOfType(install))
+            {
+                object inner = null;
+                foreach (var p in install.GetType().GetProperties(Any))
+                    if (p.GetIndexParameters().Length == 0 && prop.PropertyType.IsAssignableFrom(p.PropertyType))
+                    { try { inner = p.GetValue(install); } catch { } if (inner != null) break; }
+                if (inner == null)
+                    foreach (var f in install.GetType().GetFields(Any))
+                        if (prop.PropertyType.IsAssignableFrom(f.FieldType))
+                        { try { inner = f.GetValue(install); } catch { } if (inner != null) break; }
+
+                if (inner == null)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append($"Own FinalLDR: the pool returned {install.GetType().Name} and nothing on it ")
+                      .Append($"is assignable to {prop.PropertyType.Name} — falling back to the resize path. ")
+                      .Append("Members:");
+                    foreach (var p in install.GetType().GetProperties(Any))
+                        sb.Append("\n    prop  ").Append(p.PropertyType.Name).Append(' ').Append(p.Name);
+                    foreach (var f in install.GetType().GetFields(Any))
+                        sb.Append("\n    field ").Append(f.FieldType.Name).Append(' ').Append(f.Name);
+                    RttLog.Line(sb.ToString());
+                    EnsureFinalLdrSize(commandList);
+                    return;
+                }
+                install = inner;
+            }
+
+            _engineFinalLdr ??= current;
+            prop.SetValue(_ourScreenBuffers, install);
+            var wasRes = current.GetType().GetProperty("Resolution", Any)?.GetValue(current);
+            RttLog.Line($"Own FinalLDR: installed on our ScreenBuffers (was {wasRes}, " +
+                        $"now {w}x{h}). Watch the FinalLDR tripwire: it should now be SILENT.");
+        }
+        catch (Exception e)
+        {
+            RttLog.Error("own FinalLDR", e);
+            EnsureFinalLdrSize(commandList);
+        }
+    }
+
+    // Property OR field, in that order. Engine types are inconsistent about which, and
+    // asking for only one is the reflection mistake this project keeps repeating.
+    private static object MemberValue(object o, string name)
+    {
+        if (o == null) return null;
+        try
+        {
+            var t = o.GetType();
+            var p = t.GetProperty(name, Any);
+            if (p != null && p.GetIndexParameters().Length == 0) return p.GetValue(o);
+            return t.GetField(name, Any)?.GetValue(o);
+        }
+        catch { return null; }
+    }
+
+    // Put the engine's buffer back so ScreenBuffers.Dispose frees what IT allocated. Ours is a
+    // pool borrow that outlives the gate cycle deliberately.
+    private static void RestoreEngineFinalLdr()
+    {
+        try
+        {
+            if (_ourScreenBuffers == null || _engineFinalLdr == null) return;
+            _ourScreenBuffers.GetType().GetProperty("FinalLDRTexture", Any)
+                ?.SetValue(_ourScreenBuffers, _engineFinalLdr);
+            _engineFinalLdr = null;
+        }
+        catch (Exception e) { RttLog.Error("restore engine FinalLDR", e); }
+    }
+
     public static void EnsureFinalLdrSize(object commandList)
     {
-        // A/B gate. The resize killed the phantom bleed, but frame times stepped worse at
-        // the same moment (>50ms frames 5-9 -> 28-34 per window, CPU submit UNCHANGED — so
-        // GPU-side). Flipping this off on a live feed re-runs the rebuild at swapchain
-        // size, which separates "the resize costs GPU somehow" from "something else
-        // drifted". If off turns out faster AND the ghost stays gone, the ghost was the
-        // upscale WRITE, not the texture size — worth knowing either way.
+        // SUPERSEDED by EnsureOwnFinalLdr — kept as the fallback for when the FinalLDRTexture
+        // setter or the pool borrow is unavailable, because a feed that resizes and leaks is
+        // still better than a feed that ghosts over the player's whole world.
         if (!FeedConfig.WholeSceneLdrResize) return;
-        if (_ldrResized || _ourScreenBuffers == null || commandList == null) return;
-        _ldrResized = true;
+        if (_ourScreenBuffers == null || commandList == null) return;
         try
         {
             var ldr = _ourScreenBuffers.GetType().GetProperty("FinalLDRTexture", Any)?.GetValue(_ourScreenBuffers);
@@ -326,6 +557,15 @@ internal static class WholeSceneRender
         // reaching into the engine at all.
         bool haveResources = _ourScreenBuffers != null || _ourDrawContexts != null;
         long vramBefore = haveResources ? Perf.SampleVramMb() : 0;
+
+        // PUT THE ENGINE'S OWN FinalLDR BACK BEFORE DISPOSING (2026-08-01).
+        //
+        // We swap in a feed-sized buffer of our own (see EnsureOwnFinalLdr). ScreenBuffers
+        // created the original and its Dispose is what should release it — so if we left ours
+        // installed, Dispose would free OUR pooled borrow and leak the engine's
+        // swapchain-sized texture, once per gate cycle. Same reasoning as the shadow
+        // resources restored a few lines below.
+        RestoreEngineFinalLdr();
 
         if (_ourScreenBuffers is IDisposable d)
         {
