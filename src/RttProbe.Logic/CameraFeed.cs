@@ -1293,6 +1293,20 @@ internal static class CameraFeed
     // by the primary election, which is the definition of a per-feed fact.
     public static object LastRenderComponent
     { get => Feeds.Cur.LastRenderComponent; private set => Feeds.Cur.LastRenderComponent = value; }
+
+    // The Id of the render target this feed is copying frames INTO, for the [RTS] mirror
+    // probe (BlitProbe.MirrorDiag). Text rather than a number so "no target" is expressible
+    // without a sentinel, and readable straight out of the log next to the panel's own id.
+    internal static string PanelRtIdText
+    {
+        get
+        {
+            var rt = _panelRt;
+            if (rt == null) return "<none>";
+            try { return Prop(rt, "Id")?.ToString() ?? "<no id>"; }
+            catch { return "<err>"; }
+        }
+    }
     // PER-FEED: "did THIS feed capture its panel's render target" is the first thing that
     // has to be true for a panel to show anything, so it must be answerable per feed.
     private static bool _panelRtDiag

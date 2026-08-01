@@ -247,6 +247,58 @@ internal static class FeedConfig
     // at a sunlit planet needs to come DOWN more often than up.
     public static double WholeSceneExposure { get; private set; }
 
+    // ---- AUTO APERTURE (2026-08-01) ----------------------------------------------
+    //
+    // WholeSceneExposure alone is a FIXED stop, and a fixed stop cannot be right twice:
+    // -2 EV matched the world at night and blew out over a sunlit flower meadow. The feed
+    // needs to open and close like an eye — but it must NOT use the engine's eye adaptation,
+    // whose history is shared with the player (that is what made feed brightness track where
+    // the PLAYER stood), and owning a second EyeAdaptationJob removed the device twice.
+    //
+    // So: drive the stop from the SUN, on the CPU, with no new GPU resource at all. Sun
+    // elevation against the subject's local up is the variable that actually separates the
+    // two failing cases, we already compute planet-radial up for the orbit, and the whole
+    // thing costs a dot product per render.
+    //
+    // What it deliberately does NOT do is meter the picture. Pointing the camera into a cave
+    // will not open the aperture. That needs a real measurement (a readback of our own
+    // smallest mip) and belongs behind this, once this proves the seam.
+    //
+    // EVERY KNOB HERE IS OUTSIDE THE REBUILD SIGNATURE, on purpose. Tuning an exposure curve
+    // is exactly the kind of thing you do twenty times in a row, and the 15:08 device removal
+    // was a signature key edited on a live feed. These are read fresh per render.
+    // PARKED, DEFAULT OFF. Sun-driven exposure was built and then overtaken by events: with
+    // stage 25 correctly skipped, LuminanceExposure is not read at all (ConstantExposure
+    // returns the existing view), so nothing here can reach the image. Un-skipping 25 to make
+    // it reach WOULD over-expose the player's whole world — see the note on wholeSceneExposure.
+    //
+    // The scaffolding and the scan diagnostics stay because the successor needs them: a real
+    // per-feed aperture wants its own entry in EyeAdaptationJob._autoExposures (a COLLECTION,
+    // and the engine already drives a separate _environmentProbeExposureJob), at which point
+    // a curve like this one is what feeds it.
+    public static bool FeedAutoExposure { get; private set; } = false;
+
+    // EV at full day (sun overhead) and at night (sun below the horizon). Day is the more
+    // negative number: a bright scene needs a smaller aperture.
+    public static double FeedExposureDay { get; private set; } = -5.0;
+    public static double FeedExposureNight { get; private set; } = -2.0;
+
+    // Sun elevation, as dot(sunToward, localUp), over which the curve ramps. The default
+    // spans a little below the horizon to well above it, so dawn and dusk are a glide
+    // rather than a step.
+    public static double FeedExposureDawnDot { get; private set; } = -0.15;
+    public static double FeedExposureDayDot { get; private set; } = 0.25;
+
+    // Seconds for the stop to travel most of the way to its target. This is the "aperture
+    // has inertia" term; without it a cloud crossing the sun would step the panel.
+    public static double FeedExposureAdaptSeconds { get; private set; } = 4.0;
+
+    // Sign of the engine's sun vector. +1 if the field points TOWARD the sun, -1 if it is
+    // the direction light travels. Config rather than an assumption: getting it backwards
+    // makes the feed brightest at midnight, which is obvious on sight and would otherwise
+    // cost a rebuild to flip.
+    public static double FeedSunSign { get; private set; } = 1.0;
+
     // Explicit list of RaytracingSettings flags to clear during our render. Empty = use
     // the wholeSceneDisableRaytracing preset instead.
     //
@@ -858,6 +910,15 @@ internal static class FeedConfig
             WholeSceneIntervalMs    = Int(kv, "wholeSceneIntervalMs", WholeSceneIntervalMs);
             WholeSceneAAMode        = Int(kv, "wholeSceneAAMode", WholeSceneAAMode);
             WholeSceneExposure      = Dbl(kv, "wholeSceneExposure", WholeSceneExposure);
+            // Auto aperture — read INSIDE the signature window is harmless because none of
+            // these are put INTO the signature (see WholeSceneSignature). Tuning is free.
+            FeedAutoExposure         = Bool(kv, "feedAutoExposure", FeedAutoExposure);
+            FeedExposureDay          = Dbl(kv, "feedExposureDay", FeedExposureDay);
+            FeedExposureNight        = Dbl(kv, "feedExposureNight", FeedExposureNight);
+            FeedExposureDawnDot      = Dbl(kv, "feedExposureDawnDot", FeedExposureDawnDot);
+            FeedExposureDayDot       = Dbl(kv, "feedExposureDayDot", FeedExposureDayDot);
+            FeedExposureAdaptSeconds = Dbl(kv, "feedExposureAdaptSeconds", FeedExposureAdaptSeconds);
+            FeedSunSign              = Dbl(kv, "feedSunSign", FeedSunSign);
             WholeSceneNativeScaling = Bool(kv, "wholeSceneNativeScaling", WholeSceneNativeScaling);
             WholeSceneNoBloom       = Bool(kv, "wholeSceneNoBloom", WholeSceneNoBloom);
             WholeSceneLdrResize     = Bool(kv, "wholeSceneLdrResize", WholeSceneLdrResize);

@@ -1588,9 +1588,18 @@ internal static class WholeSceneRender
         // Gate is `!= 0`, not `> 0`: 0 is the engine's own value AND the neutral EV, so it
         // means "leave alone" for free, while negative values stay reachable. The label
         // carries the value so a re-tune re-logs (the once-per-label guard is by string).
-        if (FeedConfig.WholeSceneExposure != 0)
-            ScopeSetValues("PostProcessSettings", $"feed exposure {FeedConfig.WholeSceneExposure:+0.##;-0.##} EV",
-                ("LuminanceExposure", (float)FeedConfig.WholeSceneExposure));
+        //
+        // AUTO APERTURE takes precedence when it is on and has a sun to work from; the fixed
+        // value below is the fallback and the manual override. The label is deliberately
+        // CONSTANT here — the once-per-label guard is by string, and an auto value moves every
+        // frame, so a value-carrying label would log at render rate. AutoExposureEv does its
+        // own rate-limited reporting instead.
+        double ev = FeedConfig.WholeSceneExposure;
+        if (FeedConfig.FeedAutoExposure && TryAutoExposureEv(out double autoEv)) ev = autoEv;
+
+        if (ev != 0)
+            ScopeSetValues("PostProcessSettings", "feed exposure (auto aperture)",
+                ("LuminanceExposure", (float)ev));
 
         // BLOOM. Candidate for the phantom bleed, and the only remaining shared object in
         // the composite tail.
@@ -2212,6 +2221,268 @@ internal static class WholeSceneRender
             v.X * R[0] + v.Y * R[1] + v.Z * R[2] + Cam.X,
             v.X * R[3] + v.Y * R[4] + v.Z * R[5] + Cam.Y,
             v.X * R[6] + v.Y * R[7] + v.Z * R[8] + Cam.Z);
+    }
+
+    // ---- THE AUTO APERTURE ---------------------------------------------------------
+    //
+    // Returns the EV the feed should be exposed at, smoothed. False means "no sun to work
+    // from" — the caller then keeps the fixed wholeSceneExposure, so a failure here is a
+    // return to the previous behaviour rather than a black or blown panel.
+    private static double _apertureEv;          // the smoothed stop, in EV
+    private static bool _apertureStarted;
+    private static long _apertureLastMs, _apertureLogMs;
+    private static double _apertureLoggedEv = double.NaN;
+
+    private static bool TryAutoExposureEv(out double ev)
+    {
+        ev = 0;
+        // Local up: the same planet-radial vector the orbit is built on. In space there is
+        // no meaningful "sun elevation" and no up, so auto aperture simply does not engage.
+        var up = CameraFeed.PlanetUpCache;
+        if (up.LengthSquared() < 0.5) return false;
+        if (!TrySunDirection(out var sun)) return false;
+
+        double dot = (sun.X * up.X + sun.Y * up.Y + sun.Z * up.Z) * FeedConfig.FeedSunSign;
+
+        // Smoothstep across the twilight band so dawn is a glide, not a step.
+        double lo = FeedConfig.FeedExposureDawnDot, hi = FeedConfig.FeedExposureDayDot;
+        double t = hi - lo < 1e-6 ? (dot >= hi ? 1 : 0) : (dot - lo) / (hi - lo);
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        t = t * t * (3 - 2 * t);
+        double target = FeedConfig.FeedExposureNight
+                      + (FeedConfig.FeedExposureDay - FeedConfig.FeedExposureNight) * t;
+
+        // Exponential approach on a real clock, so the adaptation rate is in seconds and does
+        // not change with frame rate or with how often this feed happens to hold the slot.
+        long now = Clock.Ms;
+        if (!_apertureStarted) { _apertureStarted = true; _apertureEv = target; _apertureLastMs = now; }
+        double dt = Math.Max(0, now - _apertureLastMs) / 1000.0;
+        _apertureLastMs = now;
+        double tau = Math.Max(0.01, FeedConfig.FeedExposureAdaptSeconds);
+        _apertureEv += (target - _apertureEv) * (1.0 - Math.Exp(-dt / tau));
+
+        // Rate-limited, and only when it has actually moved: this runs every render.
+        if (now - _apertureLogMs > 5000 && Math.Abs(_apertureEv - _apertureLoggedEv) > 0.05)
+        {
+            _apertureLogMs = now; _apertureLoggedEv = _apertureEv;
+            RttLog.Line($"Auto aperture: sun·up={dot:F3} -> target {target:+0.00;-0.00} EV, " +
+                        $"now at {_apertureEv:+0.00;-0.00} EV (night {FeedConfig.FeedExposureNight:+0.##;-0.##}, " +
+                        $"day {FeedConfig.FeedExposureDay:+0.##;-0.##}, tau {tau:F1}s). If this reads bright at " +
+                        "midnight the sun vector points the other way — flip feedSunSign.");
+        }
+
+        ev = _apertureEv;
+        return true;
+    }
+
+    // The sun, as a unit vector pointing TOWARD it (subject to FeedSunSign).
+    //
+    // Found by TYPE and NAME on the engine's light settings, because guessing a field name
+    // blind has cost this project a day already. Cached once resolved. The one-shot dump on
+    // failure is the same move that cracked the planet spheres: print what is actually there
+    // rather than guess again.
+    private static FieldInfo _sunField;
+    private static object _sunSettings;
+    private static int _sunState;               // 0 untried, 1 ok, -1 unavailable
+
+    private static bool TrySunDirection(out Vector3D dir)
+    {
+        dir = default;
+        if (_sunState == -1) return false;
+        try
+        {
+            if (_sunState == 0)
+            {
+                // SEARCH EVERY SETTINGS GROUP, not just LightSettings.
+                //
+                // LightSettings turned out to hold exactly one Vector3 —
+                // DirectionalLightUpVector = {0,1,0}, a constant world up, not the sun. The
+                // first version took it anyway ("contains light"), which would have driven the
+                // aperture off a vector that never moves. So: sweep all groups, score by name,
+                // reject the basis axes, and PRINT EVERY CANDIDATE WITH ITS SCORE — a wrong
+                // pick then shows up as one readable line instead of a plausible-looking
+                // exposure curve tracking the wrong thing.
+                var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+                var settings = core?.GetField("Settings", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                if (settings == null) { _sunState = -1; return false; }
+
+                // PROPERTIES TOO, AND NESTED. The first sweep enumerated GetFields only and
+                // concluded "the sun is not in the settings" — but the assembly carries a
+                // DirectionalLightSettings type with get_Direction, i.e. the direction is a
+                // PROPERTY. A field-only scan cannot see it, and the negative result was an
+                // artefact of the instrument rather than a fact about the engine.
+                //
+                // So this is now the same recursive scored scan used for the planet data:
+                // fields AND properties, a few levels deep, every candidate printed with its
+                // score.
+                var cands = new System.Text.StringBuilder();
+                var sbest = new SunHit();
+                foreach (var gf in settings.GetType().GetFields(Any))
+                {
+                    object group = null;
+                    try { group = gf.GetValue(settings); } catch { }
+                    if (group == null || group.GetType().IsPrimitive) continue;
+                    ScanForSun(group, gf.FieldType.Name, 3, sbest, cands);
+                }
+                RttLog.Line("Auto aperture: direction-shaped vectors across ALL settings groups " +
+                            "(fields AND properties, nested) —" + cands +
+                            "\n    chosen: " + (sbest.Path ?? "<none>"));
+
+                // DIAGNOSTIC ONLY for now — see the note on TryAutoExposureEv. Even a correct
+                // sun would not fix the real problem, so this logs what it found and does not
+                // wire it up.
+                if (sbest.Path != null)
+                    RttLog.Line($"Auto aperture: a direction-shaped vector exists at {sbest.Path}, " +
+                                "but sun-driven exposure is parked — see the auto-exposure note.");
+
+                if (_sunField == null)
+                {
+                    // NOT IN THE SETTINGS AT ALL. Confirmed exhaustively: the only Vector3s
+                    // on any group are camera positions, a skybox euler, a constant world-up
+                    // and hologram offsets. The sun lives with the thing that needs it —
+                    // PlanetEnvironmentData.Atmosphere (AtmosphereConstants), because
+                    // scattering cannot be computed without a light direction.
+                    //
+                    // Scanned RECURSIVELY and by score rather than by a guessed name, through
+                    // InlineArrays as well, because that is the shape this data is in and
+                    // guessing names blind has already cost this project a day.
+                    if (TrySunFromPlanetEnv(out var pdir))
+                    {
+                        _sunFromPlanetEnv = true;
+                        _sunState = 1;
+                        dir = pdir;
+                        return true;
+                    }
+                    RttLog.Line("Auto aperture: no sun direction in the settings groups OR the planet-env " +
+                                "setup data. Auto aperture stays OFF and the feed keeps its fixed " +
+                                "wholeSceneExposure.");
+                    _sunState = -1;
+                    return false;
+                }
+                _sunState = 1;
+                RttLog.Line($"Auto aperture: sun direction resolved from " +
+                            $"{_sunSettings.GetType().Name}.{_sunField.Name}.");
+            }
+
+            // Re-read every call: the sun moves.
+            if (_sunFromPlanetEnv) return TrySunFromPlanetEnv(out dir);
+
+            if (!AsVec3(_sunField.GetValue(_sunSettings), out var v)) return false;
+            double len = v.Length();
+            if (len < 1e-6) return false;
+            dir = new Vector3D(v.X / len, v.Y / len, v.Z / len);
+            return true;
+        }
+        catch { _sunState = -1; return false; }
+    }
+
+    // ---- the sun, out of the planet's atmosphere constants -------------------------
+    private static bool _sunFromPlanetEnv;
+    private static string _sunPath;             // where it was found, for the log
+    private static bool _sunPathLogged;
+
+    // Recursive, scored search for a light direction under the planet-env setup data.
+    // Returns a WORLD-space unit vector.
+    private static bool TrySunFromPlanetEnv(out Vector3D dir)
+    {
+        dir = default;
+        if (_planetEnvGroup == null) return false;
+        try
+        {
+            object root = null;
+            try
+            {
+                root = _planetEnvGroup.GetType().GetField("_allPlanetEnvSetupsData", Any)?.GetValue(_planetEnvGroup);
+                if (root is System.Collections.IList l) root = l.Count > 0 ? l[0] : null;
+            }
+            catch { }
+            if (root == null) return false;
+
+            var best = new SunHit();
+            var log = _sunPathLogged ? null : new System.Text.StringBuilder();
+            ScanForSun(root, "setup", 5, best, log);
+
+            if (log != null)
+            {
+                _sunPathLogged = true;
+                RttLog.Line("Auto aperture: direction-shaped vectors under the planet-env setup —" + log +
+                            "\n    chosen: " + (best.Path ?? "<none>"));
+            }
+            if (best.Path == null) return false;
+
+            var v = best.Vec;
+            double len = v.Length();
+            if (len < 1e-6) return false;
+            v = new Vector3D(v.X / len, v.Y / len, v.Z / len);
+
+            // VIEW SPACE, IF THE NAME SAYS SO. Everything else on this side was view-space
+            // (ViewPosition, ViewPlanetPosition), so assume the same for anything named
+            // "view" and rotate it back. Rotation ONLY — a direction has no origin, so the
+            // camera translation must not be added.
+            if (best.Path.IndexOf("view", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                var b = InstalledViewBasis();
+                if (b != null)
+                    v = new Vector3D(
+                        v.X * b.R[0] + v.Y * b.R[1] + v.Z * b.R[2],
+                        v.X * b.R[3] + v.Y * b.R[4] + v.Z * b.R[5],
+                        v.X * b.R[6] + v.Y * b.R[7] + v.Z * b.R[8]);
+            }
+            dir = v;
+            _sunPath = best.Path;
+            return true;
+        }
+        catch { return false; }
+    }
+
+    private sealed class SunHit { public Vector3D Vec; public int Score; public string Path; }
+
+    private static void ScanForSun(object o, string path, int depth, SunHit best, System.Text.StringBuilder log)
+    {
+        if (o == null || depth < 0) return;
+        var t = o.GetType();
+
+        foreach (var f in t.GetFields(Any))
+        {
+            object v = null; try { v = f.GetValue(o); } catch { }
+            if (v == null) continue;
+            string p = path + "." + f.Name;
+
+            if (f.FieldType.Name.StartsWith("Vector3") && AsVec3(v, out var vec))
+            {
+                string n = f.Name.ToLowerInvariant();
+                bool axis = n.Contains("up") || n.Contains("right") || n.Contains("tangent")
+                         || n.Contains("position") || n.Contains("colour") || n.Contains("color");
+                int score = 0;
+                if (!axis)
+                {
+                    if (n.Contains("sun")) score += 3;
+                    if (n.Contains("direction") || n.Contains("dir")) score += 2;
+                    if (n.Contains("light")) score += 1;
+                    // A direction is unit length; a radiance or a scatter coefficient is not.
+                    double len = vec.Length();
+                    if (score > 0 && Math.Abs(len - 1.0) < 0.05) score += 2;
+                }
+                log?.Append("\n    ").Append(p).Append("  score=").Append(score)
+                    .Append(axis ? "  (rejected)" : "").Append("  value=").Append(v);
+                if (score > best.Score) { best.Score = score; best.Vec = vec; best.Path = p; }
+                continue;
+            }
+
+            if (depth > 0 && Nested(f.FieldType)) ScanForSun(v, p, depth - 1, best, log);
+        }
+
+        // InlineArray members hide behind the indexer — same as the planet spheres.
+        var idx = Indexer(t);
+        if (idx != null && depth > 0)
+        {
+            int n = Math.Min(InlineLength(o, t), 4);
+            for (int i = 0; i < n; i++)
+            {
+                object e = null; try { e = idx.GetValue(o, new object[] { i }); } catch { break; }
+                ScanForSun(e, $"{path}[{i}]", depth - 1, best, log);
+            }
+        }
     }
 
     private static ViewBasis InstalledViewBasis()

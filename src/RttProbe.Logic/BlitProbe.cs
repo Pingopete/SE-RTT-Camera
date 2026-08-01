@@ -328,6 +328,18 @@ internal static class BlitProbe
     {
         try
         {
+            // THE RENDER TARGET, not the material. The feed does NOT reach the panel through
+            // the material bind — "Feed blit identity: src=1024,1024 dst=512,512" is the
+            // handover copying our LDR into the PANEL'S OWN 512 render target. So if this
+            // panel is showing our picture, the overwhelmingly simplest explanation is that
+            // it is holding THE SAME render target we are copying into: the LCD system pools
+            // these and hands them out by need, our feed panel's own content is suppressed
+            // (so it can release), and we keep writing into the id we captured.
+            //
+            // One number settles it. If the two ids below are ever EQUAL, that is the bug and
+            // the fix is to re-verify ownership before every copy instead of trusting a
+            // captured id. If they are never equal, pooling is exonerated and the leak is
+            // upstream in what the mesh samples.
             object handle = null, state = null;
             var t = ctx.GetType();
             var f = t.GetField("_screenMaterialHandle",
@@ -336,18 +348,41 @@ internal static class BlitProbe
             // ctx.State is a STRUCT — no null-conditional on it.
             try { state = ctx.State.GetType().GetProperty("CurrentMaterialState")?.GetValue(ctx.State); } catch { }
 
-            // Identity, not ToString: a handle struct prints its type name, which never
-            // changes. Hash the boxed VALUE so a swapped material reads as a new string.
-            string now = handle == null ? "<null>" : $"{handle.GetType().Name}#{handle.GetHashCode():x8}";
+            string rtsRt = RtIdOf(ctx);
+            string feedRt = CameraFeed.PanelRtIdText;
+            string now = (handle == null ? "<null>" : $"{handle.GetType().Name}#{handle.GetHashCode():x8}")
+                       + "|rt=" + rtsRt + "|feedRt=" + feedRt;
             if (now == _mirrorLastHandle) return;
-
-            RttLog.Global($"[RTS diag] screen material handle CHANGED: {_mirrorLastHandle ?? "<first look>"} -> {now} " +
-                          $"(materialState={state ?? "?"}). The mirror theory predicts this flips to a new value " +
-                          "within ~500 ms of a feed's material bind and back at its teardown; if the picture " +
-                          "changes while THIS stays constant, the corruption is in the target's contents instead.");
             _mirrorLastHandle = now;
+
+            bool same = rtsRt != "<none>" && rtsRt == feedRt;
+            RttLog.Global($"[RTS diag] this panel's RENDER TARGET id={rtsRt}; the feed is copying into id={feedRt}. " +
+                          (same
+                            ? "*** THEY ARE THE SAME TARGET — the stats panel is being handed the render target we "
+                              + "write the feed into. That is the mirror, and it is pooling, not materials. ***"
+                            : "Different targets, so the mirror is NOT us writing into this panel's own target.")
+                          + $" (materialState={state ?? "?"}, screenMaterial={(handle == null ? "<null>" : handle.GetType().Name)})");
         }
         catch (Exception e) { if (_mirrorDiagErrs++ < 2) RttLog.Error("mirror diag", e); }
+    }
+
+    // The OffscreenRenderTarget Id a surface context currently holds, as text.
+    // Nullable<OffscreenRenderTarget> — unwrap before reading Id, same shape
+    // CameraFeed.CapturePanelRenderTarget deals with.
+    private static string RtIdOf(object ctx)
+    {
+        try
+        {
+            var rt = ctx.GetType().GetField("RenderTarget",
+                         System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public
+                         | System.Reflection.BindingFlags.NonPublic)?.GetValue(ctx);
+            if (rt == null) return "<none>";
+            var has = rt.GetType().GetProperty("HasValue")?.GetValue(rt);
+            if (has is bool b && !b) return "<none>";
+            var val = rt.GetType().GetProperty("Value")?.GetValue(rt) ?? rt;
+            return val.GetType().GetProperty("Id")?.GetValue(val)?.ToString() ?? "<no id>";
+        }
+        catch { return "<err>"; }
     }
     private static int _mirrorDiagErrs;
 

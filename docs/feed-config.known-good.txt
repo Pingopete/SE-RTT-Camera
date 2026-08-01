@@ -167,19 +167,28 @@ wholeSceneAAMode        = -1  # -1 = do not scope DRS.AAMode at all (see stage 1
 # first feed render. This is the FOURTH CTD behind this knob. Do not retry without a new
 # mechanism — see docs/roadmap.md goal 4.2.
 wholeSceneNativeScaling = 0
-# FEED EXPOSURE, in EV stops. Signed: +1 doubles, -1 halves. LIVE as of 2026-08-01.
+# FEED EXPOSURE, in EV stops. INERT, AND IT MUST STAY THAT WAY.
 #
-# THIS ONLY WORKS WITH 25 OFF THE SKIP LIST (see wholeSceneSkipStages below). Skipping
-# stage 25 makes ConstantExposure read-only — it returns the EXISTING exposure view, which
-# is the player's adapted value — so the feed inherited the player's eye adaptation and this
-# knob did nothing at all. That is why the feed looked over-exposed in dark scenes: its
-# brightness tracked where the PLAYER was standing, not what the camera saw, and at night
-# their adaptation is wide open. The symptom was lifted muddy blacks and colour banding.
+# This knob only does anything with stage 25 OFF the skip list, and taking 25 off the skip
+# list BREAKS THE PLAYER'S WORLD. Tried and reverted on 2026-08-01, reported by the user as
+# "whenever the feed becomes active my whole game main render overexposes".
 #
-# -2 EV was chosen in game: "much closer to main world exposure now this looks good".
+# The mechanism was already documented in RttPlugin.cs next to override id 25 and I removed
+# the skip anyway: ConstantExposure.hlsl writes float2(ConstantLuminance, exposure) into the
+# SHARED EyeAdaptationJob._autoExposures ping-pong. Our render is a POSTFIX, so we stamp it
+# LAST every frame and the player's adaptation then drifts from OUR constant. A per-feed
+# exposure cannot be bought with a shared write.
 #
-# IN THE REBUILD SIGNATURE — see the CAUTION on wholeSceneSkipStages below.
-wholeSceneExposure      = -2
+# WHAT TO DO INSTEAD: leave 25 skipped. ConstantExposure then returns the EXISTING exposure
+# view, so the feed inherits the engine's own eye adaptation — which means the feed already
+# auto-exposes across day and night for free, and the player's view is untouched. Confirmed
+# in game: "exposure looks much better in feed and main world now".
+#
+# If a per-feed BIAS is ever wanted on top, it needs an exposure resource of our own, not a
+# setting. The lead is EyeAdaptationJob._autoExposures being a COLLECTION, alongside a
+# separate _environmentProbeExposureJob — the engine already runs more than one independent
+# exposure, so there is a supported shape here to copy rather than fight.
+wholeSceneExposure      = 0
 
 # Ray tracing in the feed. 0 = leave RaytracingSettings completely alone.
 # rtFlags is deliberately EMPTY: scoping any RTGISettings field rebuilds the job
@@ -209,8 +218,10 @@ wholeSceneRtFlags =
 #                                     CONFIRMED device removal (DRED page fault in
 #                                     CloudShading). Costs the feed volumetric clouds
 #                                     only; planet atmospheres are unaffected.
-# 25 REMOVED 2026-08-01: keeping it made wholeSceneExposure inert and left the feed running
-# on the player's eye adaptation. See wholeSceneExposure above.
+# 25 IS BACK AND MUST STAY. It was removed earlier on 2026-08-01 to make wholeSceneExposure
+# live, and that over-exposed the PLAYER'S ENTIRE WORLD whenever the feed was active — our
+# render is a postfix, so ConstantExposure stamped the shared _autoExposures ping-pong last
+# every frame. Reverted the same session. See wholeSceneExposure above for the full note.
 #
 # CAUTION, PAID FOR: this key IS in the rebuild signature. Editing it live on a running feed
 # triggers a full rebuild mid-render, and that removed the device at 15:08 on 2026-08-01 —
@@ -225,7 +236,7 @@ wholeSceneRtFlags =
 # DisableProbeUpdates OwnDrawContexts OwnShadows CascadeResolution CascadeCount PlanetEnv
 # OwnFlares SkipStages RtFlags.  Free to tune live: intervalMs, farClip, farClipExtend,
 # ownProbes, flareIntensity, emissivity, the orbit knobs, feedsDisabled.
-wholeSceneSkipStages = 0,1,2,5,7,9,16,19,20,21,26   # 24 REMOVED 2026-07-29 (goal 4.1)
+wholeSceneSkipStages = 0,1,2,5,7,9,16,19,20,21,25,26   # 24 REMOVED 2026-07-29 (goal 4.1)
 
 
 # =============================================================================
