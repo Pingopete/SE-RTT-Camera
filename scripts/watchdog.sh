@@ -67,15 +67,23 @@ for ((i = 0; i < MAX_ITER; i++)); do
     [ "$SR" = "$lastSR" ] && [ -n "$SR" ] && LINE="$LINE (STALLED)"
     lastSR="$SR"
 
-    # WHICH FEEDS ARE ACTUALLY IN THE ROTATION (phase F1). `gate=` above is whichever feed
-    # transitioned last, which with two feeds says nothing about the other one. This is the
-    # per-feed picture: "0=render 1=dormant" means feed 0 is carrying the whole cycle.
-    ROT=$(grep -a "FEED ROTATION:" <<<"$RECENT" | tail -1 | sed -E 's/.*FEED ROTATION: ([^.]*)\..*/\1/' || true)
-    [ -n "$ROT" ] && LINE="$LINE feeds=[$ROT]"
+    # EACH FEED'S OWN RATE (phase F1). `gate=` above is whichever feed transitioned last,
+    # which with two feeds says nothing about the other one.
+    #
+    # Read from the PERF line, NOT from "FEED ROTATION:". The rotation line only fires when
+    # the eligible SET changes, and settling does not change that set — so it went stale the
+    # moment both feeds were up and reported "0=settling 1=settling" for minutes after they
+    # were both rendering happily. A field that is only correct at the instant it is written
+    # is worse than no field, because it looks live. The PERF line is written every 5 s and
+    # carries the sampled per-feed rate.
+    FEEDS=$(grep -a "feed fps" <<<"$RECENT" | tail -1 | sed -E 's/.*feed fps //' || true)
+    [ -n "$FEEDS" ] && LINE="$LINE feeds=[$FEEDS]"
 
     # A rotation stall means one feed is eligible and not rendering while others wait — the
     # backstop fired, so the mod kept running, but something is wrong with that feed.
-    STALL=$(grep -ac "FEED ROTATION STALL" <<<"$RECENT" || true)
+    # Anchored on the "!!!" prefix: a bare grep for STALL also matches "INSTALLED", which is
+    # in the camera-CB line every rebuild writes. (It cost me a false alarm today.)
+    STALL=$(grep -ac "!!! FEED ROTATION STALL" <<<"$RECENT" || true)
     [ "${STALL:-0}" != "0" ] && LINE="$LINE ROTATION-STALL x$STALL"
 
     [ -n "$ERR" ] && LINE="$LINE lastErr@$ERR"

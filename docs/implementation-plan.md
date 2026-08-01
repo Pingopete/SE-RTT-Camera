@@ -483,6 +483,45 @@ LCD panel seen: "LCD Panel [RTC2]"
         type it into the screen itself to pick one)
 ```
 
+### F1 — THE MATRIX PASSES, INCLUDING THE PATH THAT CRASHED TWICE (2026-08-01 12:09)
+
+Fresh session after the restart that cleared the allocator ratchet (VRAM cap back to 2 —
+headroom 1136 MB). Panel `[RTC2]` powered off, then powered back on with feed 0 live.
+
+**Losing a feed** — the cheap direction, no quiesce, survivors never stop:
+
+| claim | evidence |
+|---|---|
+| dormancy detected on the real signal | `[feed 1] Tagged panel is PowerOff. The feed will go dormant.` |
+| the survivor absorbs the whole cycle | `feed fps 0:50.9  1:off` against an engine 51.4 |
+| the dead feed costs nothing | ZERO ScreenBuffers/DrawContextManager builds for feed 1 all session |
+| no cost to the survivor | p50 19.5 ms, p95 21.3, **zero** frames over 50 ms |
+
+**Getting it back** — the direction that device-removed the game at 11:30:24 and 11:41:38:
+
+```
+12:09:45.067  [feed 1] this feed is back and must REBUILD its GPU resources, but another
+                       feed is rendering ... the whole mod quiesces first
+12:09:45.068  [feed 0] FEED GATE: DORMANT (forced by the quiesced rebuild)
+12:09:45.068  [feed 1] FEED GATE: DORMANT (forced by the quiesced rebuild)
+12:09:45.069  FEED ROTATION: 0=dormant 1=dormant. No feed can take a render slot
+12:09:45.579  [feed 0] + [feed 1] FEED GATE: ACTIVE (cycle 2) — both rebuild together
+12:09:46.1/8  both: contexts were (re)built during this frame's setup ... deferred
+```
+
+**The game survived**, and was still running 35 s later with both feeds at a fair split
+(`0:23.9  1:24.9` against 48.5 engine fps). Both previous crashes landed within 5-6 s of the
+rebuild, so 35 s clean is well past the window. Zero errors, zero rotation stalls. The blink
+cost is ~0.5 s of both feeds down, exactly as designed.
+
+One instrument lesson from grading this: a bare grep for `STALL` matches `INSTALLED`, which
+appears in the camera-CB line every rebuild writes, and it produced a false alarm on this very
+run. The watchdog now anchors on the `!!!` prefix. It also reads per-feed rates from the PERF
+line rather than from `FEED ROTATION:` — that line only fires when the eligible SET changes, and
+settling does not change the set, so it sat reporting `0=settling 1=settling` for minutes after
+both feeds were rendering. A field that is only correct at the instant it is written is worse
+than no field, because it looks live.
+
 STILL OPEN — one block driving SEVERAL feeds (`[RTC]` on surface 1 and `[RTC2]` on surface 3 of
 one command seat). `Feeds.ForPanel` is keyed on the render COMPONENT, so one block resolves to
 one feed; supporting several means the tick iterating tagged surfaces and entering each feed's
