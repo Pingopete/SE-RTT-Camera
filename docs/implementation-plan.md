@@ -439,6 +439,55 @@ Still to walk (task #24): panel powered off in game, panel ground down, a mirror
 while its primary lives, a primary destroyed while a mirror lives, and the re-enable path that
 crashed — which is now the first thing to re-run, since it is the one with a fix on it.
 
+### PANEL IDENTIFICATION: the tag lives in the SURFACE'S TEXT FIELD (decided 2026-08-01)
+
+User's decision, and it resolves a mismatch that had been in the code since the first panel was
+ever found. Discovery keyed on the **block** — entity `DebugName`, falling back to surface 0's
+display name — while the render-side hook keyed on the **surface** (`ctx.State.Text`). Those two
+agree on a one-screen LCD and disagree on everything else.
+
+**The rule:** a feed claims the surface whose *typed text* carries the `[RTCn]` tag. Block-name
+tagging still works as a fallback, so existing worlds keep running, but it can only ever mean
+"some screen on this block".
+
+**Why the text field**, recorded so the eventual move is a migration rather than a rediscovery:
+SE2 has no LCD app-selection screen yet. When Keen ships one, that is the natural place to pick
+"this screen shows a camera feed" and this mechanism should move there. Until then the text
+field is the only *per-surface* place a user can type something the mod can read — the selector
+by elimination, not by preference.
+
+**Why it matters now:** command seats and similar blocks carry many surfaces, and testing needs
+to target one screen of one block. Three places were block-scoped and are now surface-scoped:
+
+| what | was | now |
+|---|---|---|
+| the claim | block name, or surface 0's display name | the surface whose TEXT carries the tag; claim key `[RTCn] #index @block`, unique per surface and still parseable |
+| surface registration | every surface of the block | only the tagged surface (a command seat no longer hands the mod six screens when asked for one) |
+| **the render-target capture** | the FIRST surface with a target | the TAGGED surface |
+| the power test | any surface out of PowerOff | the tagged surface (lit navigation screens no longer hold a feed open against a dead one) |
+
+The capture is the one that was actively dangerous: the handover copies our camera into the
+render target captured there, so picking the wrong surface writes the feed onto the wrong screen
+*and* fights whatever that screen was drawing. It is the leading suspect for the 2026-08-01
+report of the `[RTS]` debug panel showing feed 0's picture — though on that particular block the
+new diagnostic shows `SURFACE 0 of 1`, so for that panel it was not the cause and the cap-clamp
+mirror explanation stands.
+
+First run of the new discovery, immediately useful:
+
+```
+LCD panel seen: "[RTC1] #0 @LCDFlat150_ServerComposition"
+    <-- TAGGED, feed 0, from SURFACE 0's text ("[RTC]") on block "LCDFlat150_ServerComposition"
+LCD panel seen: "LCD Panel [RTC2]"
+    <-- TAGGED, feed 1, from the BLOCK NAME (no surface carries the tag in its text —
+        type it into the screen itself to pick one)
+```
+
+STILL OPEN — one block driving SEVERAL feeds (`[RTC]` on surface 1 and `[RTC2]` on surface 3 of
+one command seat). `Feeds.ForPanel` is keyed on the render COMPONENT, so one block resolves to
+one feed; supporting several means the tick iterating tagged surfaces and entering each feed's
+scope in turn. The data model is ready for it (claims are per surface); the routing is not.
+
 ## Phase G — the RTT Feed API surface (goal 5; 1-2 sessions)
 
 | # | item | test / exit evidence |

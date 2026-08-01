@@ -96,7 +96,13 @@ internal static class CameraFeed
     private static string _powerLog
     { get => Feeds.Cur.PowerLog; set => Feeds.Cur.PowerLog = value; }
 
-    private static bool IsPanelPowered(object renderComponent)
+    // `wantIndex` = the tagged surface, or -1 for "any surface will do" (block-name tagging).
+    //
+    // ASKING ABOUT THE RIGHT SCREEN MATTERS on a multi-surface block: a command seat whose
+    // navigation screens are lit would report POWERED however dead the screen we were asked
+    // to feed, so the gate would hold a feed open against a panel showing nothing. Falls back
+    // to the old any-surface test only when nothing identifies a single screen.
+    private static bool IsPanelPowered(object renderComponent, int wantIndex)
     {
         try
         {
@@ -104,9 +110,12 @@ internal static class CameraFeed
                 is not System.Collections.IEnumerable surfaces) return true;
 
             bool sawAny = false, anyOn = false;
+            int i = -1;
             foreach (var s in surfaces)
             {
+                i++;
                 if (s == null) continue;
+                if (wantIndex >= 0 && i != wantIndex) continue;
                 var f = s.GetType().GetField("CurrentMaterialState", Any);
                 if (f == null) return true;                 // unknown shape: fail open
                 sawAny = true;
@@ -245,14 +254,29 @@ internal static class CameraFeed
             if (lcd == null) return;
 
             var entity = Prop(lcd, "Entity");
-            string name = NameOf(entity, lcd);
+
+            // SURFACE TEXT FIRST, block name as the fallback. See FindTaggedSurface.
+            string blockName = Prop(entity, "DebugName") as string;
+            int surfaceIndex = FindTaggedSurface(renderComponent, out string surfaceText, out int surfaceFeed);
+
+            string name = surfaceIndex >= 0
+                ? SurfaceClaimKey(surfaceFeed, surfaceIndex, blockName)
+                : NameOf(entity, lcd);
             if (string.IsNullOrEmpty(name)) return;
 
-            // Log every distinct panel name once — makes "why isn't it finding my
-            // panel" answerable without guessing at where the name lives.
+            // Log every distinct panel once — makes "why isn't it finding my panel"
+            // answerable without guessing at where the name lives. Says WHICH SURFACE and
+            // WHAT WAS TYPED on it, because with multi-surface blocks "the panel" is no
+            // longer a thing that has one answer.
             if (_seenNames.Add(name) && _seenNames.Count <= 20)
                 RttLog.Line($"LCD panel seen: \"{name}\"" +
-                            (FeedRouter.TryParseTag(name, out int tagged) ? $"   <-- TAGGED, feed {tagged}" : ""));
+                            (surfaceIndex >= 0
+                                ? $"   <-- TAGGED, feed {surfaceFeed}, from SURFACE {surfaceIndex}'s text " +
+                                  $"(\"{surfaceText}\") on block \"{blockName}\""
+                                : FeedRouter.TryParseTag(name, out int tagged)
+                                    ? $"   <-- TAGGED, feed {tagged}, from the BLOCK NAME (no surface carries " +
+                                      "the tag in its text — type it into the screen itself to pick one)"
+                                    : ""));
 
             // ONE tag test for the whole mod (FeedRouter.IsFeedPanel), so [RTC2] cannot be
             // recognised here and quietly ignored by the panel-render hook — which is exactly
@@ -271,7 +295,7 @@ internal static class CameraFeed
             // CurrentMaterialState, an LcdPanelRenderState of PowerOff=0, DefaultScreen=1
             // or CustomRender=2. A panel is alive to us only while at least one of its
             // surfaces is out of PowerOff.
-            if (!IsPanelPowered(renderComponent)) return;
+            if (!IsPanelPowered(renderComponent, surfaceIndex)) return;
             FeedGate.NotePanelAlive();
 
             // FIRST CLAIMANT WINS (phase E2 fan-out). With two panels routed to one feed,
@@ -302,13 +326,31 @@ internal static class CameraFeed
                 primary = string.Equals(feed.PrimaryPanelName, name, StringComparison.OrdinalIgnoreCase);
             }
 
-            // Remember this panel's surfaces so the render-side hook can recognise them
-            // by identity — for EVERY claimant, primary or not: the surface map is what
-            // routes a mirror panel's content pass to this feed so its material can bind.
+            // Remember this feed's surface so the render-side hook can recognise it by
+            // identity — the surface map is what routes a panel's content pass to this feed
+            // so its material can bind.
+            //
+            // ONLY THE TAGGED SURFACE, when one carries the tag. Registering every surface of
+            // the block was right while a block meant a screen, and is wrong the moment it
+            // does not: on a command seat it would hand the mod six screens when the user
+            // asked for one, and on a block whose other surface is a stats or status display
+            // it claims a screen that is doing something else. Falls back to all surfaces
+            // only for the old block-name tagging, where nothing identifies a single screen.
             var surfaces = renderComponent.GetType().GetField("_surfaces", Any)?.GetValue(renderComponent);
             int added = 0;
             if (surfaces is System.Collections.IEnumerable list)
-                foreach (var s in list) { if (s != null && !_targetSurfaces.Contains(s)) { TrackSurface(s); added++; } }
+            {
+                int si = -1;
+                foreach (var s in list)
+                {
+                    si++;
+                    if (s == null) continue;
+                    if (surfaceIndex >= 0 && si != surfaceIndex) continue;   // not the tagged one
+                    if (_targetSurfaces.Contains(s)) continue;
+                    TrackSurface(s);
+                    added++;
+                }
+            }
 
             if (!primary)
             {
@@ -344,7 +386,7 @@ internal static class CameraFeed
                 RttLog.Line($"[RTC] panel located: \"{name}\" at {pos.Value.X:F1},{pos.Value.Y:F1},{pos.Value.Z:F1} ({added} surfaces registered)");
 
             LastRenderComponent = renderComponent;
-            CapturePanelRenderTarget(renderComponent);
+            CapturePanelRenderTarget(renderComponent, surfaceIndex);
 
             // A panel only borrows a render target when it has content to paint. After
             // an out-of-range eviction nothing marks it dirty again, so without this it
@@ -357,6 +399,64 @@ internal static class CameraFeed
         }
         catch (Exception e) { if (_errLogs++ < 5) RttLog.Error("camera feed discovery", e); }
     }
+
+    // ---- THE TAG LIVES IN THE SURFACE'S TEXT FIELD (design decision, 2026-08-01) --------
+    //
+    // Stated by the user, and it settles a mismatch that has been in the code since the
+    // beginning: discovery keyed on the BLOCK (entity DebugName, falling back to surface 0's
+    // display name) while the render-side hook keyed on the SURFACE (ctx.State.Text). Those
+    // agree on a one-screen LCD and disagree on everything else — and "everything else" is
+    // where this mod is going: a command seat carries many surfaces, and the feed has to be
+    // able to name ONE of them.
+    //
+    // WHY THE TEXT FIELD, specifically. SE2 has no LCD app-selection screen yet. When Keen
+    // ships one, that becomes the natural place to choose "this screen shows a camera feed"
+    // and this whole mechanism should move there. Until then the text field is the only
+    // per-surface place a user can type something the mod can read, which makes it the
+    // selector by elimination rather than by preference. Recorded so the eventual move is a
+    // deliberate migration and not a rediscovery.
+    //
+    // Returns the index of the first surface whose TEXT carries a feed tag, or -1 if none —
+    // in which case the caller falls back to the block name, so every world tagged the old
+    // way keeps working.
+    private static int FindTaggedSurface(object renderComponent, out string tagText, out int feedIndex)
+    {
+        tagText = null;
+        feedIndex = 0;
+        try
+        {
+            if (renderComponent.GetType().GetField("_surfaces", Any)?.GetValue(renderComponent)
+                is not System.Collections.IEnumerable list) return -1;
+
+            int i = -1;
+            foreach (var s in list)
+            {
+                i++;
+                if (s == null) continue;
+                var text = Prop(Prop(s, "State"), "Text") as string;
+                if (string.IsNullOrEmpty(text)) continue;
+                if (!FeedRouter.TryParseTag(text, out int idx)) continue;
+                tagText = text;
+                feedIndex = idx;
+                return i;
+            }
+        }
+        catch { }
+        return -1;
+    }
+
+    // A claim key that is unique PER SURFACE and still carries its tag.
+    //
+    // The tag comes first on purpose. FeedRouter.TryParseTag takes the FIRST "[RTCn]" it
+    // finds, and a block called "LCD Panel [RTC]" whose surface 3 reads "[RTC2]" would
+    // otherwise resolve to feed 0 — the block's tag winning over the surface's, which is
+    // precisely the confusion this change exists to end.
+    //
+    // Normalised to [RTCn] rather than echoing the raw text, so "[RTC]" and "[RTC1]" are one
+    // key and a user who writes "[RTC2] forward camera" does not get a claim key that changes
+    // when they edit the prose after it.
+    private static string SurfaceClaimKey(int feedIndex, int surfaceIndex, string blockName) =>
+        $"[RTC{feedIndex + 1}] #{surfaceIndex} @{blockName ?? "?"}";
 
     private static string NameOf(object entity, object lcd)
     {
@@ -788,16 +888,45 @@ internal static class CameraFeed
     private static bool _panelRtDiag
     { get => Feeds.Cur.PanelRtDiag; set => Feeds.Cur.PanelRtDiag = value; }
 
-    private static void CapturePanelRenderTarget(object renderComponent)
+    // How many surfaces this block exposes — for the capture diagnostic below. A count of 1
+    // rules out the multi-surface hazard entirely; anything higher makes "the first surface
+    // with a target" a guess rather than a rule.
+    private static int _surfaceCount(System.Collections.IEnumerable list)
+    {
+        int n = 0;
+        try { foreach (var _ in list) n++; } catch { }
+        return n;
+    }
+
+    // `wantIndex` = the surface whose TEXT carries the feed tag, or -1 when the tag came from
+    // the block name and no single screen is identified.
+    //
+    // THIS IS WHERE THE FEED ACTUALLY LANDS. The handover copies our camera into the render
+    // target captured here, so picking the wrong surface writes the feed onto the wrong
+    // screen — and, because the panel keeps drawing its own content into that same target,
+    // silently destroys whatever that screen was for. "The first surface that has a render
+    // target" was a safe rule while a block meant a screen and a guess as soon as it did not.
+    private static void CapturePanelRenderTarget(object renderComponent, int wantIndex)
     {
         try
         {
             var surfaces = renderComponent.GetType().GetField("_surfaces", Any)?.GetValue(renderComponent);
             if (surfaces is not System.Collections.IEnumerable list) return;
 
+            // WHICH SURFACE, AND WHAT IS WRITTEN ON IT. "The first surface that has a render
+            // target" is a fine rule while a block carries one screen and a fatal one if it
+            // carries several: an LCD block exposes ALL its surfaces here, so a console whose
+            // first surface is a stats or status screen would have the feed written straight
+            // into it — the panel then shows the camera and whatever it was drawing itself is
+            // overwritten. Reported 2026-08-01 (the [RTS] debug panel showing feed 0's
+            // picture) and not diagnosable from the old log line, which named neither the
+            // surface nor its text.
+            int index = -1;
             foreach (var ctx in list)
             {
+                index++;
                 if (ctx == null) continue;
+                if (wantIndex >= 0 && index != wantIndex) continue;   // the tagged screen only
                 var rtField = ctx.GetType().GetField("RenderTarget", Any);
                 var rt = rtField?.GetValue(ctx);
                 if (rt == null) continue;
@@ -807,11 +936,21 @@ internal static class CameraFeed
                 if (hasValue is bool b && !b) continue;
                 var value = rt.GetType().GetProperty("Value")?.GetValue(rt) ?? rt;
 
+                // Reflected rather than cast: CameraFeed does not reference the LCD types
+                // (BlitProbe does), and a diagnostic is not worth a new using on a file this
+                // size. Prop walks properties then fields, so State.Text resolves either way.
+                string surfaceText = null;
+                try { surfaceText = Prop(Prop(ctx, "State"), "Text") as string; } catch { }
+
                 _panelRt = value;
                 if (!_panelRtDiag)
                 {
                     _panelRtDiag = true;
-                    RttLog.Line($"  panel RT captured: {value.GetType().Name} Id={Prop(value, "Id")} valid={Prop(value, "IsValid")}");
+                    RttLog.Line($"  panel RT captured: {value.GetType().Name} Id={Prop(value, "Id")} " +
+                                $"valid={Prop(value, "IsValid")} from SURFACE {index} of {_surfaceCount(list)} " +
+                                $"on this block, whose text is \"{surfaceText}\". If that text is not this " +
+                                "feed's tag, the feed is being written into the wrong screen of a " +
+                                "multi-surface block.");
                 }
                 return;
             }
