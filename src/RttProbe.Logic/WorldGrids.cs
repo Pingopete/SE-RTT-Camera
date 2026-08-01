@@ -656,15 +656,24 @@ internal static class WorldGrids
         catch { return null; }
     }
 
+    // WALKS THE HIERARCHY FOR FIELDS, deliberately. GetField on a derived type never
+    // returns a BASE class's private fields — which is how `_areas` (private on
+    // ManagedWorldAreaSessionComponent) read as null through its Client subclass and made
+    // the correct component fail its own sanity check. Properties don't need the walk
+    // (non-public inherited getters are rare here); private fields do, always.
     private static object Prop(object o, string name)
     {
         if (o == null) return null;
-        var t = o.GetType();
         try
         {
-            var p = t.GetProperty(name, Any);
+            var p = o.GetType().GetProperty(name, Any);
             if (p != null && p.GetIndexParameters().Length == 0) return p.GetValue(o);
-            return t.GetField(name, Any)?.GetValue(o);
+            for (var t = o.GetType(); t != null; t = t.BaseType)
+            {
+                var f = t.GetField(name, Any);
+                if (f != null) return f.GetValue(o);
+            }
+            return null;
         }
         catch { return null; }
     }
