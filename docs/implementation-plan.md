@@ -385,8 +385,59 @@ render-thread `Reset`) and would have become routine ones. The claim dictionary,
 set and the bound-panel list are now locked at every access; the election moved inside the
 claim lock, since `??=` is a read-then-write.
 
-Not yet observed firing — that is task #24 (F5 below is unrelated and older). Nothing here is
-trusted until the matrix has been walked in game.
+### F1 — FIRST RUN: three of four confirmed, and a CTD of my own making (2026-08-01 11:28-11:31)
+
+Two feeds live, world loaded 11:28, `feedsDisabled = 2` applied live at 11:29:12.
+
+**Confirmed firing, all from one config edit:**
+
+| claim | evidence |
+|---|---|
+| the lever works | `Config: feedsDisabled (none) -> 2` |
+| per-feed dormancy, right reason | `[feed 1] FEED GATE: DORMANT — feedsDisabled lists feed 2` |
+| the rotation set is announced | `FEED ROTATION: 0=render 1=disabled. 1 feed(s) now share the render slot` |
+| **the frame cycle transfers** | feed 0 **25.8 -> 50.8 renders/s**, feed 1 0.0/s — the survivor exactly doubled |
+| **F2 last-one-out holds** | `[feed 1] Feed gate: releasing resources now. Other feed(s) are still live (0=render 1=disabled), so the shared LCD material, the probe settings and the panel-discovery state are left alone` — and no FSR/emissivity restore lines, unlike a full shutdown |
+| the feed really released | `[feed 1] Whole-scene Reset: VRAM 12606 -> 12480 MB (-126 MB)` |
+| the departed panel goes back to stock | `[feed 1] Panel material: 1 panel(s) rebound to the STOCK screen material` |
+| F2 other branch | earlier, at a genuine all-feeds-down: `[feed 0] ... This is the LAST live feed, so the shared engine state goes back to stock too` |
+| **F3 claim expiry + re-election** | `Panel claim EXPIRED: "LCD Panel [RTC]" ... It was this feed's PRIMARY, so the election is reopened` / `"LCD Panel [RTC2]" ... It was a mirror` |
+| operational visibility | watchdog line: `feeds=[0=render 1=disabled]` |
+
+**Then re-enabling feed 1 device-removed the game, and it was my regression.** Full analysis in
+the commit; the short version is that moving the settle countdown out of `TryRender` into the
+per-frame pump dropped the `FeedGate.Active` condition that call site also carried, so every
+feed's post-rebuild window drained while it was DORMANT — visible in the log as
+`[feed 1] settled after the rebuild` 0.55 s after that feed's own teardown, and as feeds 2 and
+3 "settling" although those slots have never existed. Feed 1 therefore came back with no
+window: ScreenBuffers at 11:30:18.660, DrawContextManager at .712, `SceneDrawSystem.Draw` at
+.714, `DXGI_ERROR_DEVICE_REMOVED` at :24.261. That is the 2026-07-29 fault exactly — a nested
+Draw inside the probe reprocess a context rebuild has just forced.
+
+**The lesson worth keeping: when you move a countdown to a better clock, move its GUARD with
+it.** The old call site's early-returns were part of the specification, not scaffolding around
+it. This is the second time on this route that relocating per-frame bookkeeping has been
+correct in its stated purpose and wrong in a condition it silently dropped (the first was the
+teardown countdown riding the render slot).
+
+Fixed in three places rather than one, because restoring the guard alone would have left a
+hole that was already there:
+
+1. `TickSettle` drains only while the gate is active — prior semantics restored.
+2. The window is **armed where the hazard is created** (after a successful DrawContextManager
+   or ScreenBuffers build), not only in `Reset()`, which was a proxy. A feed's FIRST activation
+   never ran Reset under its own scope — `LogicEntry` resets feed 0 only — so it built a
+   context family and rendered into the reprocess with no window at all. Pre-existing, and what
+   made this crash reachable rather than merely possible.
+3. `RunSecondRender` re-checks the window immediately before `Draw`. `EnsureDrawContexts` runs
+   *inside* that method by design (the context family must size against our ScreenBuffers,
+   which are only swapped into CoreSystems there), so `TryRender`'s check necessarily ran
+   before the hazard existed. Arming inside the builder cannot help on its own — by then the
+   frame's decision to render has been taken.
+
+Still to walk (task #24): panel powered off in game, panel ground down, a mirror destroyed
+while its primary lives, a primary destroyed while a mirror lives, and the re-enable path that
+crashed — which is now the first thing to re-run, since it is the one with a fix on it.
 
 ## Phase G — the RTT Feed API surface (goal 5; 1-2 sessions)
 
