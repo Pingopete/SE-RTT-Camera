@@ -562,6 +562,36 @@ internal static class FeedConfig
     public static bool IsFeedDisabled(int feedId) =>
         feedId >= 0 && feedId < 32 && (_disabledMask & (1 << feedId)) != 0;
 
+    // READ feedCount BEFORE THE FIRST PANEL TICK, and nothing else.
+    //
+    // FeedCount defaults to 1 and only becomes the configured value on the first Poll, which
+    // is a couple of seconds into a load. Every tagged panel that ticks inside that window
+    // sees Feeds.Count == 1, and at one feed the router sends EVERY [RTCn] to feed 0 — by
+    // design, that is what "asked for a feed that is not active" means. So on every load,
+    // briefly, feed 1's panel is claimed and bound by feed 0. Feed 0's next teardown then
+    // restores that panel to its stock material, taking away the binding feed 1 had correctly
+    // made, and the screen shows stale or torn content. Observed 2026-08-01 as a corrupted
+    // static image on the second feed's panel, and earlier the same day as the second panel
+    // "mirroring" the first.
+    //
+    // Deliberately NOT the whole of Poll. Poll calls Feeds.UpdateResidentCap, which samples
+    // VRAM through engine types, and this runs during plugin install — the exact situation
+    // that once threw ConfigurationNotFoundException and permanently poisoned a type (see the
+    // note in Feeds). This touches a file and an int, nothing else.
+    internal static void PrimeFeedCount()
+    {
+        try
+        {
+            var kv = Read();
+            FeedCount = Int(kv, "feedCount", FeedCount);
+            ReadDisabledFeeds(kv);
+            RttLog.Global($"Config primed at install: feedCount={FeedCount}. Read before the first " +
+                          "panel tick so routing is correct from the first one — at the default of 1, " +
+                          "every tagged panel would briefly claim feed 0.");
+        }
+        catch { }   // the full Poll is moments away and will report anything real
+    }
+
     private static void ReadDisabledFeeds(Dictionary<string, string> kv)
     {
         int mask = 0;

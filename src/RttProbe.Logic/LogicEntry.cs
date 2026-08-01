@@ -34,6 +34,11 @@ public static class LogicEntry
             // than inheriting a map pointing at objects that no longer exist.
             FeedRouter.Reset();
 
+            // BEFORE anything can route a panel. Feeds.Count is read by the router on the very
+            // first tick, and until the config has been read it answers 1 — at which point
+            // every [RTCn] panel claims feed 0. See FeedConfig.PrimeFeedCount.
+            FeedConfig.PrimeFeedCount();
+
             using (Feeds.Enter(Feeds.Primary))
             {
                 FeedGate.Reset();

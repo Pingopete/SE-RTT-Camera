@@ -53,6 +53,11 @@ internal static class FeedGate
     // draw to and no reason to build anything.
     public static bool Active => _active;
 
+    // PROCESS-WIDE, and deliberately not per-feed: the marker stops the WHOLE mod. Read by
+    // anything that is a statement about the mod rather than about a feed — the stats panel
+    // is the first, since gating it on a feed made it go dark exactly when a feed died.
+    public static bool Paused => _paused;
+
     public static void Reset()
     {
         _lastPanelMs = 0;

@@ -46,6 +46,11 @@ internal static class CameraFeed
     public static bool EverFound { get; private set; }
 
     private static int _findLogs, _errLogs;
+
+    // Budget for the re-route line. Process-level: it is a statement about the ROUTER, which
+    // is shared, and a retag is a rare deliberate act — eight of them is plenty of evidence
+    // and stops a pathological flip-flop filling the log.
+    private static int _rerouteLogs;
     private static readonly HashSet<string> _seenNames = new();
 
     // "Announced this panel as a mirror" — a log latch about a NAME, process-level like
@@ -283,6 +288,38 @@ internal static class CameraFeed
             // the kind of split that makes a panel "found" in the log and black on screen.
             if (!FeedRouter.IsFeedPanel(name)) return;
 
+            // DOES THE TAG STILL AGREE WITH THE ROUTE WE ARE SCOPED TO?
+            //
+            // BlitProbe.OnTick entered a feed scope before calling us, using FeedRouter's
+            // component cache — and that cache was built the first time this component was
+            // seen. Fine while the tag lived in a block name. Now that it lives in an editable
+            // TEXT FIELD, retagging is the normal way to configure the mod, and the cache is
+            // the thing standing between the user's edit and the mod noticing it.
+            //
+            // Observed 2026-08-01: a panel retagged [RTC] -> [RTC2] produced the claim
+            // "[RTC2] #0 @block" recorded ON FEED 0 — the fresh name and the stale route
+            // disagreeing inside a single log line — leaving feed 1 with no panel to aim at.
+            //
+            // Correct the caches and let the NEXT tick arrive properly scoped, rather than
+            // re-entering a scope in the middle of a half-done claim. One dropped tick, ~16 ms,
+            // against a mis-scoped one that would write this panel's identity into the wrong
+            // feed's state.
+            if (FeedRouter.TryParseTag(name, out int wantIdx))
+            {
+                var want = FeedRouter.FeedForIndex(wantIdx);
+                if (!ReferenceEquals(want, Feeds.Cur))
+                {
+                    int wasId = Feeds.Cur.Id;
+                    FeedRouter.Recache(renderComponent, name, want);
+                    if (_rerouteLogs++ < 8)
+                        RttLog.Line($"Feed routing CHANGED: \"{name}\" now belongs to FEED {want.Id} " +
+                                    $"(was feed {wasId}). The tag on the screen was edited, so the route " +
+                                    "follows it. This tick is dropped; the next one arrives correctly " +
+                                    "scoped and the panel re-claims its surface for its new feed.");
+                    return;
+                }
+            }
+
             // THE LIVENESS SIGNAL for the whole mod.
             //
             // The first version stamped unconditionally here, on the assumption that
@@ -346,7 +383,22 @@ internal static class CameraFeed
                     si++;
                     if (s == null) continue;
                     if (surfaceIndex >= 0 && si != surfaceIndex) continue;   // not the tagged one
-                    if (_targetSurfaces.Contains(s)) continue;
+
+                    // NO "already seen, skip". TrackSurface does two things — it adds to the
+                    // global seen-set AND it records WHICH FEED owns this surface — and the
+                    // second one has to be re-asserted every tick, because ownership can move.
+                    //
+                    // Skipping on _targetSurfaces.Contains meant a panel retagged from [RTC]
+                    // to [RTC2] never re-claimed its surface: the seen-set still held it from
+                    // its old life, so ClaimSurface was never called and _bySurface went on
+                    // naming feed 0 as the owner. The panel-render hook then scoped that
+                    // panel's binding to the OLD feed while discovery claimed it for the new
+                    // one, and the two feeds bound and unbound the same panel against each
+                    // other. Reported 2026-08-01 as a corrupted, static image on the feed.
+                    //
+                    // Both operations are idempotent — a HashSet add and a dictionary write —
+                    // so re-asserting costs nothing and is the only version that is correct
+                    // when the tag is a thing the user edits.
                     TrackSurface(s);
                     added++;
                 }

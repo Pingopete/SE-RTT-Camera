@@ -344,9 +344,6 @@ internal static class BlitProbe
 
     private static void OnPanelRenderScoped(object rendererObj, object batchObj, object ctxObj)
     {
-        // Dormant means the panel draws its own content, exactly as it would without
-        // this mod installed.
-        if (!FeedGate.Active) return;
         if (batchObj is not IDrawBatch batch || ctxObj is not LcdPanelSurfaceContext ctx) return;
         try
         {
@@ -363,14 +360,34 @@ internal static class BlitProbe
                 RttLog.Line($"Panel render hook firing (text=\"{text}\", rt={_rt != null}).");
             }
 
-            // THE STATS PANEL, checked before the feed tag and returning immediately.
-            // A surface is one or the other; the stats panel draws into the panel's own
-            // batch and touches none of the feed machinery.
+            // THE STATS PANEL FIRST, AND NOT BEHIND THIS SURFACE'S FEED GATE.
+            //
+            // It used to sit below `if (!FeedGate.Active) return`, and the scope wrapping this
+            // method is Feeds.ForSurface(ctx) — which resolves an [RTS] surface to PRIMARY,
+            // because nothing ever registers a stats surface to a feed. So the debug panel was
+            // gated on FEED 0 specifically. Grind down feed 0's panel and the stats panel goes
+            // blank, which is the exact moment it is most worth reading; observed 2026-08-01,
+            // reported as "only shows a blank screen with the [RTS] text".
+            //
+            // Seventh instance of the same family — something keyed to Primary that has no
+            // business being keyed to a feed at all. The stats panel is a statement about the
+            // MOD: it draws into the panel's own batch, touches no feed machinery, and its most
+            // valuable reading is "feed fps 0:off 1:47.4", which by definition happens when a
+            // feed is down.
+            //
+            // The one thing that still silences it is the PAUSE MARKER, and that is deliberate:
+            // paused means the game renders exactly as it would without this mod, and a panel
+            // we are still drawing on would make that comparison a lie.
             if (text != null && text.Contains(StatsPanel.Tag, StringComparison.OrdinalIgnoreCase))
             {
-                StatsPanel.Draw(batch, ctx);
+                if (!FeedGate.Paused) StatsPanel.Draw(batch, ctx);
                 return;
             }
+
+            // Dormant means the panel draws its own content, exactly as it would without
+            // this mod installed. BELOW the stats branch: this gate is about whether THIS
+            // SURFACE'S FEED is live, which is a question only feed panels are asking.
+            if (!FeedGate.Active) return;
 
             // DrawImage with a render-target-backed handle is fatal: UISystemComponent
             // .GetTexture asserts IsGuid(), and an OffscreenRenderTarget's handle is a

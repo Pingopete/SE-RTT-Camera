@@ -110,6 +110,33 @@ internal static class FeedRouter
         _byComponent[component] = feed;
     }
 
+    // THE TAG CAN CHANGE UNDER US NOW (2026-08-01).
+    //
+    // Every map in this file is a cache in front of a name that was assumed immutable, and
+    // that assumption was fair while the tag lived in a block name: renaming a block is a
+    // rare, deliberate act. The moment the tag moved into the surface's TEXT FIELD, editing
+    // it became the NORMAL way to configure the mod — and a permanent component -> feed cache
+    // turned into a bug you hit on your first retag.
+    //
+    // Observed the same evening the text-field rule landed: a panel retagged from [RTC] to
+    // [RTC2] kept routing to feed 0, so the claim was recorded as "[RTC2] #0 @block" ON FEED
+    // 0 — the fresh name and the stale route disagreeing inside one log line. Feed 1 was left
+    // with no panel to aim at, and a feed with no target renders whatever its camera last
+    // had, which is how the player's own viewpoint ended up on a panel.
+    //
+    // Called by discovery, which re-derives the tag from the live text on every tick and so
+    // is the one place that always knows the truth.
+    internal static void Recache(object component, string name, FeedInstance feed)
+    {
+        if (component != null) Remember(component, feed);
+        if (!string.IsNullOrEmpty(name)) _byName[name] = feed;
+    }
+
+    // Which feed does a tag index mean right now? Clamped the same way ClaimByName clamps —
+    // asking for a feed beyond the active count shares Primary rather than indexing past it.
+    internal static FeedInstance FeedForIndex(int index) =>
+        index >= 0 && index < Feeds.Count ? Feeds.At(index) : Feeds.Primary;
+
     // Assignment is EXPLICIT, from the tag itself:
     //
     //     [RTC]  or [RTC1]  -> feed 0
