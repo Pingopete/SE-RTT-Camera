@@ -1120,11 +1120,47 @@ internal static class CameraFeed
         if (double.IsNaN(right.X)) right = new Vector3D(1, 0, 0);   // looking straight up/down
         var up = Cross(fwd, right);
 
-        // Roll 180 degrees about the view direction: the feed was upside down. Negating
-        // BOTH perpendicular axes is the roll — negating only one would mirror the image
-        // instead, which flips handedness and inverts the winding.
-        right = new Vector3D(-right.X, -right.Y, -right.Z);
-        up = new Vector3D(-up.X, -up.Y, -up.Z);
+        // NO 180-DEGREE ROLL HERE ANY MORE (2026-08-01).
+        //
+        // A roll was applied at this point because "the feed was upside down". It was a
+        // stale compensation for the fwd bug fixed immediately above: while fwd was built
+        // as (target - eye) the whole basis came out inverted, the roll cancelled it, and
+        // when fwd was corrected nobody removed the cancellation. Two compensating fixes,
+        // the second one silently making the first wrong.
+        //
+        // Worked through at angle 0 with up = world Y: eye sits at target + (0,130,-100),
+        // giving fwd (0,0.79,-0.61), right (-1,0,0) and up (0,0.61,0.79). That up already
+        // has positive Y, so the horizon is level and the sky is at the top of the frame.
+        // Negating both axes from there is what put the sky at the BOTTOM, which is how
+        // the planet capture came out: ground filling the frame with a bright horizon
+        // along the bottom edge.
+
+        // WHICH WAY IS UP IN THE FEED, AS A NUMBER.
+        //
+        // Two screenshots were read two different ways and both readings were wrong: at a 52
+        // degree look-down the horizon is off the top of the frame entirely, so the pale band
+        // in the picture is hazed distant terrain, not sky — and at eye level on a hillside
+        // the bright edge is a hill silhouette, which can sit at any angle. Neither image can
+        // settle the orientation, so stop asking them.
+        //
+        // The camera's up row IS the screen's up direction. Project local up onto the basis:
+        //
+        //     up.upRow  =  +cos(look-down)   upright        (0.61 at the 130/100 orbit)
+        //                  -cos(look-down)   upside down
+        //     up.rightRow != 0               rolled by atan2 of the two — a tilted horizon
+        //
+        // This measures the CAMERA only. If it reads upright and the panel still looks wrong,
+        // the flip is downstream in the blit, and that is a different fix.
+        if (nowMs - _orbitPlaneDiagMs == 0)      // same 2 s tick as the plane proof above
+        {
+            double upOnUp = upAxis.X * up.X + upAxis.Y * up.Y + upAxis.Z * up.Z;
+            double upOnRight = upAxis.X * right.X + upAxis.Y * right.Y + upAxis.Z * right.Z;
+            RttLog.Line($"Orbit orientation: up.upRow={upOnUp:F2} up.rightRow={upOnRight:F2} " +
+                        $"=> roll={Math.Atan2(upOnRight, upOnUp) * 180.0 / Math.PI:F1}deg, " +
+                        (upOnUp > 0 ? "UPRIGHT" : "UPSIDE DOWN") + " before projection. " +
+                        "Expect roll ~0 and upRow=+cos(look-down); the look-down is " +
+                        $"{Math.Atan2(height + extent * 0.35, radius) * 180.0 / Math.PI:F0}deg.");
+        }
 
         // Camera world matrix: rows are the basis vectors, translation is the eye.
         var m = default(MatrixD);
