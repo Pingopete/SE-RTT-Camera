@@ -167,8 +167,19 @@ wholeSceneAAMode        = -1  # -1 = do not scope DRS.AAMode at all (see stage 1
 # first feed render. This is the FOURTH CTD behind this knob. Do not retry without a new
 # mechanism — see docs/roadmap.md goal 4.2.
 wholeSceneNativeScaling = 0
-wholeSceneExposure      = 0   # inert while skip id 25 is on; the feed follows the
-                              # player's live adaptation instead
+# FEED EXPOSURE, in EV stops. Signed: +1 doubles, -1 halves. LIVE as of 2026-08-01.
+#
+# THIS ONLY WORKS WITH 25 OFF THE SKIP LIST (see wholeSceneSkipStages below). Skipping
+# stage 25 makes ConstantExposure read-only — it returns the EXISTING exposure view, which
+# is the player's adapted value — so the feed inherited the player's eye adaptation and this
+# knob did nothing at all. That is why the feed looked over-exposed in dark scenes: its
+# brightness tracked where the PLAYER was standing, not what the camera saw, and at night
+# their adaptation is wide open. The symptom was lifted muddy blacks and colour banding.
+#
+# -2 EV was chosen in game: "much closer to main world exposure now this looks good".
+#
+# IN THE REBUILD SIGNATURE — see the CAUTION on wholeSceneSkipStages below.
+wholeSceneExposure      = -2
 
 # Ray tracing in the feed. 0 = leave RaytracingSettings completely alone.
 # rtFlags is deliberately EMPTY: scoping any RTGISettings field rebuilds the job
@@ -198,7 +209,23 @@ wholeSceneRtFlags =
 #                                     CONFIRMED device removal (DRED page fault in
 #                                     CloudShading). Costs the feed volumetric clouds
 #                                     only; planet atmospheres are unaffected.
-wholeSceneSkipStages = 0,1,2,5,7,9,16,19,20,21,25,26   # 24 REMOVED 2026-07-29 (goal 4.1)
+# 25 REMOVED 2026-08-01: keeping it made wholeSceneExposure inert and left the feed running
+# on the player's eye adaptation. See wholeSceneExposure above.
+#
+# CAUTION, PAID FOR: this key IS in the rebuild signature. Editing it live on a running feed
+# triggers a full rebuild mid-render, and that removed the device at 15:08 on 2026-08-01 —
+# DXGI_ERROR_DEVICE_REMOVED 700 ms after the second ScreenBuffers was allocated, with 1.2 GB
+# of VRAM still spare, so it was the rebuild and not the memory. "Config-only" is NOT the
+# same as "safe". To change this or any other signature key: set feedsDisabled=1, wait for
+# "FEED GATE: DORMANT" in rtt.log, edit, then clear feedsDisabled. feedsDisabled is
+# deliberately outside the signature, which is what makes it usable as the gate.
+#
+# THE FULL SIGNATURE: BuildBuffers Width Height Feeds.Count Camera ToPanel CameraRebuild
+# AAMode Exposure NativeScaling NoBloom LdrResize DisableRaytracing DisableEyeAdaptation
+# DisableProbeUpdates OwnDrawContexts OwnShadows CascadeResolution CascadeCount PlanetEnv
+# OwnFlares SkipStages RtFlags.  Free to tune live: intervalMs, farClip, farClipExtend,
+# ownProbes, flareIntensity, emissivity, the orbit knobs, feedsDisabled.
+wholeSceneSkipStages = 0,1,2,5,7,9,16,19,20,21,26   # 24 REMOVED 2026-07-29 (goal 4.1)
 
 
 # =============================================================================
@@ -302,6 +329,18 @@ fullCameraCb = 1
 # PANEL / WORLD
 # =============================================================================
 
+# EMISSIVITY IS A DEAD KNOB — measured 2026-08-01. Do not reach for it to fix brightness.
+#
+# With the orbit frozen (orbitPeriod = 6000) so the scene content stopped changing between
+# samples, mean panel luma was flat across the whole sweep:
+#
+#     emissivity 1 -> 11.20    4 -> 11.21    10 -> 11.20    1 -> 11.21
+#
+# The write DOES reach the material ("EmissivityMultiplier 10 -> 10"), but the emissive mask
+# is the base material's ExtensionsTexture GREEN channel, which we never write, so the
+# multiplier has nothing to scale. PanelBinding.cs:192 listed this exact outcome as one of
+# the two possibilities. So the panel shows our feed as ALBEDO, not as an emissive display.
+# Making the emissive path real needs our own ExtensionsTexture bound — separate work.
 emissivity  = 10         # LCD material emissive multiplier (shared definition)
 dimDistance = -1         # -1 = leave the engine's probe DimDistance alone
 
