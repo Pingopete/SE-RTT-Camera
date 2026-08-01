@@ -93,7 +93,8 @@ internal static class CameraFeed
     // CustomRender=2). Fails OPEN: if the shape ever changes and we cannot read it, treat
     // the panel as powered, because a mod that silently refuses to run is harder to
     // diagnose than one that runs when it should not.
-    private static string _powerLog;
+    private static string _powerLog
+    { get => Feeds.Cur.PowerLog; set => Feeds.Cur.PowerLog = value; }
 
     private static bool IsPanelPowered(object renderComponent)
     {
@@ -144,6 +145,7 @@ internal static class CameraFeed
         _target = null;
         _boundsGrid = null; _boundsAt = 0;
         LastRenderComponent = null;
+        _powerLog = null;
 
         // The primary election and the claim set re-form from live ticks (phase E2
         // fan-out): a destroyed primary hands the feed to the next ticking claimant, and
@@ -159,7 +161,6 @@ internal static class CameraFeed
 
         // ---- last feed out only: the shared discovery state ----
         EverFound = false;
-        _powerLog = null;
         _boundsDiag = _orbitLogged = false; _closedTryGet = null;
         _findLogs = _errLogs = 0;
         _seenNames.Clear();

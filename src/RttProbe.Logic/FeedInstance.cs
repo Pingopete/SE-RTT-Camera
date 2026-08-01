@@ -148,6 +148,17 @@ internal sealed class FeedInstance
     public int RingIndex = -1;
     public int LdrMips = 1;
 
+    // Last reported power state of THIS feed's panel, so the log line fires on a change.
+    //
+    // PER-FEED, and the SIXTH instance of the same defect shape on this route (gate poll
+    // throttle, startup flag, DC failure count, resumed-intact, delivery throttle, now this).
+    // As a process-global string it worked perfectly until two feeds were in DIFFERENT power
+    // states — which is exactly the state the whole graceful-cut contract creates. Feed 0
+    // POWERED and feed 1 PowerOff then flipped the shared latch on every tick, so a
+    // log-once-on-change line wrote ~97 lines/second into an 81 MB log, forever. Observed
+    // 2026-08-01 11:53 during the panel-off test.
+    public string PowerLog;
+
     // The panel we deliver to, and its shape.
     public object FeedTexture;
     public object FeedRes;
