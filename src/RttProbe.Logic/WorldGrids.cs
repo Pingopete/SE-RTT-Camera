@@ -216,12 +216,135 @@ internal static class WorldGrids
                 sb.AppendLine($"{d,11:F0}m  {g.Extent,7:F0}m  {pos,-34}  {g.Name}{near}");
             }
 
+            AppendManagedAreas(sb, anyEntityInScene, player);
+
             Directory.CreateDirectory(RttLog.OutDir);
             File.WriteAllText(ReportPath, sb.ToString());
             RttLog.Line($"WORLD SURVEY: {planets.Count} planet-like bodies and {all.Count} grid(s) " +
                         $"written to {ReportPath}.");
         }
         catch (Exception e) { RttLog.Error("world grid survey", e); }
+    }
+
+    // MANAGED WORLD AREAS — the content that is in the SAVE but not in the WORLD.
+    //
+    // The grid walk above can only see instantiated entities, and the user's observation
+    // that forced this section was sharp: the asteroid station 273 km out in SPACE was
+    // loaded, while the planet surface showed nothing outside the player's bubble. Surface
+    // POIs go through the managed-area system — serialized bundles behind a spatial
+    // trigger, spawned when something with the right tag walks in. So "where are the
+    // grids outside my bubble" is answered HERE, not by the entity walk:
+    // ManagedWorldAreaSessionComponent._areas holds every area with its Name, its
+    // BoundingBoxD and its LoadingState, whether or not its content currently exists.
+    //
+    // This is also the tier-2 recon for goal 10: each area carries the IEntityTrigger the
+    // player trips, and the session component exposes the ISpatialTriggerSystem those
+    // triggers register with — the exact surface a camera entity must reach to make the
+    // world materialize around it.
+    private static void AppendManagedAreas(StringBuilder sb, object anyEntityInScene, Vector3D player)
+    {
+        try
+        {
+            // The panel's entity is a BLOCK entity: it carries CubeBlockComponent, and the
+            // grid component lives on the GRID entity behind block.Grid. Asking the panel
+            // entity for CubeGridComponent directly returns null — which is how the first
+            // run of this section reported "no Session reachable" while the world was fine.
+            //
+            // And the block is NOT in the panel entity's own Components array either (second
+            // false "NULL"): TryGet<T> evidently searches beyond the array — it is the
+            // mechanism CameraFeed.WorldPositionOf uses successfully on this same entity
+            // every tick — so for THIS hop the generic dance is the proven road, not the
+            // array walk. The array walk stays right for scene-wide enumeration, where
+            // TryGet was the one that silently failed. Neither mechanism is universally
+            // correct; each has one context where it is the only one that works.
+            var tBlock = Type.GetType(
+                "Keen.Game2.Simulation.WorldObjects.CubeBlocks.CubeBlockComponent, Game2.Simulation");
+            var grid = ComponentOf(anyEntityInScene, "CubeGridComponent")
+                       ?? Prop(TryGetViaGeneric(anyEntityInScene, tBlock), "Grid");
+            var session = Prop(grid, "Session");
+            if (session == null)
+            {
+                sb.AppendLine("\n--- managed world areas: no Session reachable from the panel's grid ---");
+                sb.AppendLine($"    grid component: {(grid == null ? "NULL" : grid.GetType().Name)}");
+                return;
+            }
+
+            // Find the session component by NAME across whatever collection the Session
+            // exposes — the generic Get<T> dance is exactly what silently failed for grid
+            // components, so it is not trusted here either.
+            // Session.SessionComponents is an ENTITY, not a collection — session components
+            // are ordinary components riding a dedicated entity (IL: `Entity
+            // <SessionComponents>k__BackingField`). Two earlier attempts enumerated it as a
+            // sequence and found nothing; the right move is the same Components-array walk
+            // used for every other component in this file.
+            object mwa = null;
+            var scEntity = Prop(session, "SessionComponents");
+            if (scEntity != null && _fComponents?.GetValue(scEntity) is IEnumerable scComps)
+                foreach (var c in scComps)
+                {
+                    if (c == null) continue;
+                    var n2 = c.GetType().Name;
+                    // Exact core name preferred; any ManagedWorldArea-marked component
+                    // accepted as fallback (a game-side subclass would still carry it).
+                    if (n2 == "ManagedWorldAreaSessionComponent") { mwa = c; break; }
+                    if (mwa == null && n2.Contains("ManagedWorldArea", StringComparison.Ordinal)
+                                    && Prop(c, "_areas") != null)
+                        mwa = c;
+                }
+            if (mwa == null)
+            {
+                // One diagnostic dump instead of a guess: name the session's members so the
+                // next attempt is a lookup. The session type is stable; this fires once.
+                sb.AppendLine("\n--- managed world areas: ManagedWorldAreaSessionComponent NOT FOUND on the session ---");
+                // Name the components actually present on the session entity, so the next
+                // attempt is a lookup instead of another guess-reload — reloads are priced
+                // by the VRAM ratchet now, not free.
+                try
+                {
+                    var names = new List<string>();
+                    if (scEntity != null && _fComponents?.GetValue(scEntity) is IEnumerable cs2)
+                        foreach (var item in cs2)
+                        { if (names.Count >= 400) break; names.Add(item?.GetType().Name ?? "null"); }
+                    // 60 was the original cap and the list hit it EXACTLY, making "not in
+                    // the list" and "past the cap" indistinguishable — a truncation that
+                    // reads as an answer, the same trap as head-limited greps. 400 is
+                    // comfortably above any plausible session-component count.
+                    sb.AppendLine("    session-entity components: " + string.Join(", ", names.Distinct()));
+                }
+                catch (Exception e2) { sb.AppendLine("    session entity unreadable: " + e2.Message); }
+                return;
+            }
+
+            var areas = Prop(mwa, "_areas") as IEnumerable;
+            var loadAll = Prop(mwa, "_loadAll");
+            sb.AppendLine($"\n--- managed world areas (content in the SAVE, spawned by trigger; _loadAll={loadAll}) ---");
+            if (areas == null) { sb.AppendLine("    _areas not readable"); return; }
+
+            sb.AppendLine($"{"distance",12}  {"state",-14}  {"centre",-34}  name");
+            sb.AppendLine(new string('-', 100));
+            int n = 0;
+            foreach (var a in areas)
+            {
+                if (a == null) continue;
+                n++;
+                var name = Prop(a, "Name")?.ToString() ?? "(unnamed)";
+                var state = Prop(a, "_state")?.ToString() ?? "?";
+                var bounds = Prop(a, "Bounds");
+                var centre = bounds == null ? (Vector3D?)null
+                    : (Prop(bounds, "Center") is Vector3D c ? c
+                       : Prop(bounds, "Min") is Vector3D mn && Prop(bounds, "Max") is Vector3D mx
+                         ? (mn + mx) * 0.5 : (Vector3D?)null);
+                var pos = centre.HasValue
+                    ? $"{centre.Value.X:F0}, {centre.Value.Y:F0}, {centre.Value.Z:F0}" : "?";
+                var dist = centre.HasValue ? $"{(centre.Value - player).Length():F0}m" : "?";
+                sb.AppendLine($"{dist,12}  {state,-14}  {pos,-34}  {name}");
+            }
+            sb.AppendLine($"{n} area(s).");
+        }
+        catch (Exception e)
+        {
+            sb.AppendLine($"\n--- managed world areas: FAILED ({e.GetType().Name}: {e.Message}) ---");
+        }
     }
 
     // Planet-like bodies: entities carrying any component whose type name mentions Planet.
@@ -509,6 +632,28 @@ internal static class WorldGrids
             if (c != null && c.GetType().Name.EndsWith(typeNameSuffix, StringComparison.Ordinal))
                 return c;
         return null;
+    }
+
+    // Entity.TryGet<T> — declared TryGet<T>(StringId tag = default), so reflection sees one
+    // parameter even where C# calls it with none. Same dance as CameraFeed.WorldPositionOf.
+    private static object TryGetViaGeneric(object entity, Type componentType)
+    {
+        if (entity == null || componentType == null) return null;
+        try
+        {
+            var tryGet = entity.GetType().GetMethods(Any)
+                .FirstOrDefault(m => m.Name == "TryGet" && m.IsGenericMethodDefinition
+                                  && m.GetParameters().Length <= 1);
+            if (tryGet == null) return null;
+            var closed = tryGet.MakeGenericMethod(componentType);
+            var ps = closed.GetParameters();
+            var args = ps.Length == 0
+                ? null
+                : new[] { ps[0].ParameterType.IsValueType
+                            ? Activator.CreateInstance(ps[0].ParameterType) : null };
+            return closed.Invoke(entity, args);
+        }
+        catch { return null; }
     }
 
     private static object Prop(object o, string name)
