@@ -69,10 +69,19 @@ internal static class FeedHandover
         _diagged.Clear(); _diagCount = _skipDisabled = 0;
         _miCopy = null; _copyArgs = null;
 
-        if (File.Exists(LivePath))
+        // Against the PROCESS, not this assembly — a hot reload is not a death. Same fix and
+        // same reasoning as CameraRender's latch, which disabled a perfectly healthy camera
+        // pass on 2026-08-01 because the previous logic instance was swapped mid-pass.
+        if (File.Exists(LivePath) && !CameraRender.WrittenByThisProcess(LivePath))
         {
             _disarmed = true;
             RttLog.Line("!!! PREVIOUS SESSION DIED DURING HANDOVER — disabled. Delete " + LivePath + " to retry.");
+        }
+        else if (File.Exists(LivePath))
+        {
+            RttLog.Line("Handover: mid-copy marker present but written by THIS process — a hot " +
+                        "reload landing mid-copy, not a death. Continuing, and clearing it.");
+            try { File.Delete(LivePath); } catch { }
         }
         _armed = !_disarmed && File.Exists(ArmPath);
         RttLog.Line(_armed ? "Handover ARMED." : $"Handover not armed (observation only). Create {ArmPath} to arm.");
@@ -494,6 +503,40 @@ internal static class FeedHandover
             int levels = (FeedConfig.PanelMipRegen && RegenerateMips(args, frame, commandList))
                 ? CameraRender.LdrMips
                 : 1;
+
+            // VALIDATE BOTH RESOURCES IMMEDIATELY BEFORE THE COPY.
+            //
+            // This is the fix for the 2026-08-01 13:36:47 freeze:
+            //
+            //   Assertion Failure: 'IsValid' evaluated to false
+            //     at RWRenderTargetTexture.get_D3DResource()
+            //     at CopyCommandList.CopyTextureSubresource(...)
+            //     at FeedHandover.OnOffscreenUiDrawScoped
+            //   [Watchdog]: the application froze with RenderThreadFreeze
+            //
+            // One of the two textures had already had its D3D resource released. We park a
+            // frame on one pass and copy it on another, and in between a gate cycle, a
+            // rebuild or the LCD system's own distance eviction can free either end — the
+            // parked frame belongs to our LDR ring, the destination belongs to the panel, and
+            // neither is ours to keep alive. The engine does not return an error for this; it
+            // asserts, on the render thread, which is a freeze rather than an exception we
+            // could catch.
+            //
+            // Checked HERE rather than at park time because the gap is precisely what makes
+            // it stale: validity a few hundred lines earlier proves nothing about validity
+            // now. One property read per copy against a hard freeze is not a trade worth
+            // thinking about.
+            if (!ResourceUsable(frame) || !ResourceUsable(dest))
+            {
+                _skipInvalid++;
+                if (_skipInvalidLogs++ < 5)
+                    RttLog.Line($"Handover: SKIPPED a copy — {(ResourceUsable(frame) ? "destination" : "parked frame")} " +
+                                "has no live D3D resource. Something released it between the park and the copy (gate " +
+                                "cycle, rebuild, or the LCD system evicting the panel's target by distance). Copying " +
+                                "into it asserts inside the engine and freezes the render thread, so the frame is " +
+                                "dropped instead. The next park re-establishes both ends.");
+                return;
+            }
 
             // Level-by-level with the SAME call that has been copying mip 0 all along.
             // CopyResource would move the whole chain in one go — it is what DrawOne uses —
@@ -947,6 +990,39 @@ internal static class FeedHandover
             var v = Prop(o, n);
             if (v != null) sb.AppendLine($"      {n} = {v}");
         }
+    }
+
+    private static int _skipInvalid, _skipInvalidLogs;
+
+    // Does this texture still have a live D3D resource behind it?
+    //
+    // FAILS OPEN when no IsValid member exists, because that is the pre-2026-08-01 behaviour
+    // and a guard that silently blocks every copy would present as a permanently black panel —
+    // the failure shape this project has spent the most time on. It says so loudly once, so an
+    // inert guard cannot be mistaken for a working one.
+    private static bool _validityProbeLogged;
+
+    private static bool ResourceUsable(object tex)
+    {
+        if (tex == null) return false;
+        try
+        {
+            var p = tex.GetType().GetProperty("IsValid", Any)
+                 ?? tex.GetType().GetProperty("IsAllocated", Any);
+            if (p == null)
+            {
+                if (!_validityProbeLogged)
+                {
+                    _validityProbeLogged = true;
+                    RttLog.Line($"Handover: no IsValid on {tex.GetType().Name} — the copy guard is INERT for this " +
+                                "resource type, so a released texture can still assert inside the engine and freeze " +
+                                "the render thread. Find the right member before trusting this guard's silence.");
+                }
+                return true;                       // behave as before rather than go dark
+            }
+            return p.GetValue(tex) is not bool b || b;
+        }
+        catch { return true; }
     }
 
     private static object Prop(object o, string name)

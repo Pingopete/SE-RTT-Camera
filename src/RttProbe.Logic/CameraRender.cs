@@ -29,6 +29,26 @@ internal static class CameraRender
     private static readonly string ArmPath = Path.Combine(RttLog.OutDir, "camera-armed.marker");
     private static readonly string LivePath = Path.Combine(RttLog.OutDir, "camera-live.marker");
 
+    // Was this crash marker written during THIS process's lifetime?
+    //
+    // The whole point of a live-marker latch is "the process died holding this". A hot reload
+    // swaps our assembly inside a process that is perfectly alive, and every static in here is
+    // new afterwards — so the assembly cannot tell the two apart by looking at itself. The
+    // process start time can, and it is the only clock that survives a reload.
+    //
+    // Fails SAFE: if the time cannot be read, treat the marker as a real death, because a
+    // spurious disable is recoverable by deleting a file while re-entering a pass that killed
+    // the GPU is not.
+    internal static bool WrittenByThisProcess(string path)
+    {
+        try
+        {
+            var started = System.Diagnostics.Process.GetCurrentProcess().StartTime;
+            return File.GetLastWriteTime(path) >= started;
+        }
+        catch { return false; }
+    }
+
     private static bool _armed;
     private static bool _disarmed;
 
@@ -144,11 +164,35 @@ internal static class CameraRender
 
         // A live marker left from last session means we issued GPU work and never
         // came back. Refuse to repeat it until a human clears it.
-        if (File.Exists(LivePath))
+        //
+        // "LAST SESSION" MEANS A DEAD PROCESS, NOT A SWAPPED ASSEMBLY. This latch fired on an
+        // ordinary hot reload (2026-08-01 13:13:44) and disabled the camera pass on a game
+        // that had never crashed: the previous logic instance was mid-pass when the assembly
+        // was swapped, so its marker outlived it. The timestamps say it plainly —
+        //
+        //     marker written:  13:09:04
+        //     bootstrap:       13:09:21      the marker PREDATES this logic instance
+        //
+        // — but they equally say the game process was alive the whole time. A reload is not a
+        // death, and treating it as one is worse than useless here, because a disarmed pass
+        // never writes the marker again and so never deletes it: the recovery path below
+        // waits for a file that nothing will remove. Deadlock, and the feed goes dark with
+        // every counter healthy.
+        //
+        // So the question is asked against the PROCESS: a marker written after this process
+        // started was written by us, in this run, and means a reload landed mid-pass.
+        if (File.Exists(LivePath) && !WrittenByThisProcess(LivePath))
         {
             _disarmed = true;
             RttLog.Line("!!! PREVIOUS SESSION DIED MID-RENDER — camera pass DISABLED.");
             RttLog.Line($"!!! Delete {LivePath} to try again.");
+        }
+        else if (File.Exists(LivePath))
+        {
+            RttLog.Line("Camera pass: a mid-render marker is present but was written by THIS " +
+                        "process, so it is a hot reload landing mid-pass rather than a death. " +
+                        "Continuing, and clearing it.");
+            try { File.Delete(LivePath); } catch { }
         }
         _armed = !_disarmed && File.Exists(ArmPath);
         RttLog.Line(_armed

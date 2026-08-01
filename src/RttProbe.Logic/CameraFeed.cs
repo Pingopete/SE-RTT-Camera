@@ -33,7 +33,24 @@ internal static class CameraFeed
         public Vector3D Centre;        // what the camera orbits and looks at
         public double Extent;          // half-diagonal of the grid, 0 if unknown
         public string Name;
+
+        // LOCAL UP at the subject — the grid's own up, which on a planet is the surface
+        // normal. The orbit plane is built perpendicular to this. Zero means "unknown", and
+        // the orbit falls back to world Y (the pre-2026-08-01 behaviour).
+        public Vector3D Up;
     }
+
+    // The up the orbit is currently built around. Published with the Target rather than read
+    // from it inside OrbitCameraWorld, because that method is also called from the diagnostic
+    // paths with a bare position and no Target at all.
+    internal static Vector3D OrbitUp;
+
+    // Did OrbitUp come from the planet (exact) or from the subject's rotation (a guess)?
+    // Reported in the orbit-plane proof so the two are never confused again.
+    internal static bool OrbitUpIsPlanet;
+
+    // Rate limit for the orbit-plane proof in OrbitCameraWorld.
+    private static long _orbitPlaneDiagMs;
     // PER-FEED (phase C1a): WHAT this feed is pointed at. Once feeds are independent
     // this is the single most feed-defining value in the mod — it is the camera's
     // subject. The backing field stays volatile for the tick/render publish above.
@@ -426,13 +443,23 @@ internal static class CameraFeed
             var (centre, extent) = GridBounds(entity, pos.Value);
 
             // Built fully, then published in one reference write.
+            // PLANET RADIAL FIRST, block rotation only as a fallback. The planet's centre
+            // gives the surface normal by definition; a grid's own up is the surface normal
+            // only if it was built gravity-aligned, which is an assumption and was wrong here.
+            // In space there is no planet and the block rotation is the sensible answer.
+            var planetUp = RttProbe.WholeSceneRender.PlanetUpAt(centre);
+            var chosenUp = planetUp ?? _lastUp;
+
             _target = new Target
             {
                 Position = pos.Value,
                 Centre = centre,
                 Extent = extent,
                 Name = name,
+                Up = chosenUp,
             };
+            OrbitUp = chosenUp;
+            OrbitUpIsPlanet = planetUp.HasValue;
             EverFound = true;
 
             if (_findLogs++ < 3)
@@ -606,6 +633,133 @@ internal static class CameraFeed
     // null at the end says nothing about which link broke.
     private static bool _posDiagLogged;
 
+    // The up vector read from the last world transform we walked, and the flag saying whether
+    // it is trustworthy. Set by WorldPositionOf, consumed when the Target is published.
+    private static Vector3D _lastUp;
+
+    // Pull an up vector out of an engine WorldTransform, whatever shape it turns out to be.
+    //
+    // Tried in order of directness. Logged once with WHICH candidate answered, because the
+    // failure mode of a wrong guess here is a subtly tilted orbit rather than an exception,
+    // and this project has paid for silently-wrong reflection more than once today.
+    // The GRID's up — the base's own orientation, which on a planet is gravity-aligned and so
+    // is the surface normal. Distinct from any single block's rotation.
+    //
+    // Dumps the grid's orientation-bearing members once when it cannot find one, because
+    // three different sources have now been tried for this vector and each silently produced
+    // a plausible-but-wrong answer. A wrong up here is never an exception, only a tilted ring.
+    private static bool _gridUpDumped;
+
+    private static Vector3D GridUp(object grid, bool diag)
+    {
+        if (grid == null) return default;
+        try
+        {
+            // A world matrix, by whatever name, on the grid or on a position component.
+            foreach (var host in new[] { grid, Prop(grid, "PositionComp"), Prop(grid, "Entity") })
+            {
+                if (host == null) continue;
+                foreach (var member in new[] { "WorldMatrix", "WorldTransform", "PositionAndOrientation", "Transform" })
+                {
+                    var m = Prop(host, member);
+                    if (m == null) continue;
+
+                    // A matrix exposes Up directly; a transform exposes a rotation.
+                    if (Prop(m, "Up") is Vector3D mu && mu.LengthSquared() > 0.5)
+                    {
+                        if (diag) RttLog.Line($"  orbit up: GRID {member}.Up = {mu.X:F3},{mu.Y:F3},{mu.Z:F3} " +
+                                              "— the base's own orientation, gravity-aligned on a planet.");
+                        return Normalize(mu);
+                    }
+                    var viaRot = UpFromTransform(m, false);
+                    if (viaRot.LengthSquared() > 0.5)
+                    {
+                        if (diag) RttLog.Line($"  orbit up: GRID {member} rotation -> {viaRot.X:F3},{viaRot.Y:F3},{viaRot.Z:F3}");
+                        return viaRot;
+                    }
+                }
+            }
+
+            if (!_gridUpDumped)
+            {
+                _gridUpDumped = true;
+                var sb = new System.Text.StringBuilder();
+                sb.Append("  orbit up: NO grid orientation found. Grid type ").Append(grid.GetType().FullName)
+                  .Append(" — members that could carry one:");
+                foreach (var p in grid.GetType().GetProperties(Any))
+                    if (p.PropertyType.Name.Contains("Matrix") || p.PropertyType.Name.Contains("Transform")
+                        || p.PropertyType.Name.Contains("Quaternion") || p.Name.Contains("World")
+                        || p.Name.Contains("Orient") || p.Name.Contains("Position"))
+                        sb.Append("\n    prop  ").Append(p.PropertyType.Name).Append(' ').Append(p.Name);
+                foreach (var f in grid.GetType().GetFields(Any))
+                    if (f.FieldType.Name.Contains("Matrix") || f.FieldType.Name.Contains("Transform")
+                        || f.FieldType.Name.Contains("Quaternion") || f.Name.Contains("World")
+                        || f.Name.Contains("Orient"))
+                        sb.Append("\n    field ").Append(f.FieldType.Name).Append(' ').Append(f.Name);
+                RttLog.Line(sb.ToString());
+            }
+        }
+        catch { }
+        return default;
+    }
+
+    private static Vector3D UpFromTransform(object wt, bool diag)
+    {
+        try
+        {
+            if (Prop(wt, "Up") is Vector3D up && up.LengthSquared() > 0.5)
+            {
+                if (diag) RttLog.Line($"  orbit up: from WorldTransform.Up = {up.X:F3},{up.Y:F3},{up.Z:F3}");
+                return Normalize(up);
+            }
+
+            // Rotation quaternion: up = q * (0,1,0). Written out rather than reached for a
+            // helper, because the engine's quaternion type is not one we reference.
+            var rot = Prop(wt, "Rotation") ?? Prop(wt, "Orientation");
+            if (rot != null)
+            {
+                double x = ToD(Prop(rot, "X")), y = ToD(Prop(rot, "Y")),
+                       z = ToD(Prop(rot, "Z")), w = ToD(Prop(rot, "W"));
+                if (x * x + y * y + z * z + w * w > 0.5)
+                {
+                    // All three axes, and the raw quaternion, because "the derived up is near
+                    // world Y" has two very different causes and they need different fixes:
+                    // either the subject really is roughly world-Y-up, or the transform we are
+                    // reading carries an IDENTITY rotation and we are extracting world Y out
+                    // of nothing. A quaternion near (0,0,0,1) is the second case.
+                    var vx = new Vector3D(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y));
+                    var vy = new Vector3D(2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x));
+                    var vz = new Vector3D(2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y));
+
+                    if (diag)
+                    {
+                        bool identity = Math.Abs(w) > 0.999 && x * x + y * y + z * z < 1e-4;
+                        RttLog.Line($"  orbit up: quaternion x={x:F4} y={y:F4} z={z:F4} w={w:F4}" +
+                                    (identity ? "  <-- IDENTITY: this transform carries NO rotation, so the " +
+                                                "'up' below is just world Y and the orbit plane is not " +
+                                                "following the surface. Need a different source."
+                                              : "") +
+                                    $"\n    axisX={vx.X:F3},{vx.Y:F3},{vx.Z:F3}" +
+                                    $"  axisY(up)={vy.X:F3},{vy.Y:F3},{vy.Z:F3}" +
+                                    $"  axisZ={vz.X:F3},{vz.Y:F3},{vz.Z:F3}");
+                    }
+                    return Normalize(vy);
+                }
+            }
+
+            if (diag) RttLog.Line("  orbit up: NO up on the world transform — the orbit stays in the " +
+                                  "world XZ plane, which tips into the terrain on a planet. Members: " +
+                                  string.Join(", ", wt.GetType().GetProperties(Any).Take(12).Select(pp => pp.Name)));
+        }
+        catch { }
+        return default;   // zero = "unknown", caller falls back to world Y
+    }
+
+    private static double ToD(object o)
+    {
+        try { return o == null ? 0.0 : Convert.ToDouble(o); } catch { return 0.0; }
+    }
+
     private static Vector3D? WorldPositionOf(object entity)
     {
         bool diag = !_posDiagLogged;
@@ -655,6 +809,31 @@ internal static class CameraFeed
             var wt = gwt?.Invoke(grid, new[] { min });
             if (diag) RttLog.Line($"  pos: worldTransform={(wt == null ? "NULL" : wt.GetType().Name)}");
             if (wt == null) return null;
+
+            // THE LOCAL UP, from the same transform (2026-08-01). The orbit used to be built
+            // in the world XZ plane around world +Y, which is arbitrary-but-harmless in space
+            // and wrong on a planet: local up is radial from the planet centre, so a world-Y
+            // orbit tips into the ground and spends half its arc underneath the terrain.
+            // Reported exactly that way.
+            //
+            // The grid's own up is the right proxy and needs no planet lookup: a base built on
+            // a planet is gravity-aligned, so its up IS the surface normal, and for a ship in
+            // space "orbit in the hull's horizontal plane" is a better answer than world Y
+            // anyway. Cached on the Target so the render side does not re-walk this.
+            // THE GRID'S OWN ORIENTATION, not this block's.
+            //
+            // GetWorldTransform is being handed the BLOCK's AABB min, so what comes back is
+            // the transform AT THAT BLOCK — including the block's own rotation. For a
+            // wall-mounted LCD that is the screen's facing, which has nothing to do with
+            // which way the ground is, and it is why the orbit ring kept coming out tilted
+            // while measuring perfectly flat against the up it was given. The user spotted
+            // this before I did.
+            //
+            // A base built on a planet is gravity-aligned, so the GRID's up is the surface
+            // normal. Dumped once if it cannot be found, rather than silently falling back
+            // to the block again.
+            _lastUp = GridUp(grid, diag);
+            if (_lastUp.LengthSquared() < 0.5) _lastUp = UpFromTransform(wt, diag);
 
             var p = Prop(wt, "Position");
             if (diag) RttLog.Line($"  pos: Position={(p == null ? "NULL" : p.GetType().Name + " " + p)}");
@@ -854,17 +1033,64 @@ internal static class CameraFeed
         double radius = Math.Max(FeedConfig.OrbitRadius, extent * FeedConfig.OrbitClearance);
 
         double a = 2.0 * Math.PI * (timeSeconds % period) / period;
-        var eye = new Vector3D(
-            target.X + radius * Math.Cos(a),
-            target.Y + height + extent * 0.35,   // rise with the subject, not a flat 15 m
-            target.Z + radius * Math.Sin(a));
+
+        // THE ORBIT PLANE IS PERPENDICULAR TO LOCAL UP, not to world Y (2026-08-01).
+        //
+        // The old form added radius on world X/Z and height on world Y, so the circle always
+        // lay in the world XZ plane. In space that is arbitrary and nobody notices. On a
+        // planet local up is radial from the planet centre and is almost never world Y, so
+        // the circle tips into the ground and the camera spends half of every lap under the
+        // terrain — which is exactly what was reported.
+        //
+        // Local up comes from the subject's own world transform (see UpFromTransform): a
+        // planet-side base is gravity-aligned, so its up IS the surface normal. Zero means we
+        // could not read one, and world Y is then the same behaviour as before.
+        var upAxis = OrbitUp.LengthSquared() > 0.5 ? Normalize(OrbitUp) : new Vector3D(0, 1, 0);
+
+        // Any two axes spanning the plane. Seeded from whichever world axis is least parallel
+        // to up, so the cross product never degenerates — picking a fixed seed would collapse
+        // exactly when up happens to align with it.
+        var seed = Math.Abs(upAxis.Y) < 0.9 ? new Vector3D(0, 1, 0) : new Vector3D(1, 0, 0);
+        var axis1 = Normalize(Cross(upAxis, seed));
+        var axis2 = Cross(upAxis, axis1);
+
+        var eye = target
+                + upAxis * (height + extent * 0.35)      // rise with the subject, along LOCAL up
+                + axis1 * (radius * Math.Cos(a))
+                + axis2 * (radius * Math.Sin(a));
+
+        // ORBIT PLANE PROOF, because "it still looks perpendicular" and "the plane is now
+        // perpendicular to the normal" are the same sentence read two ways, and neither of us
+        // can settle it by looking at a screenshot.
+        //
+        // Decompose the eye's offset from the subject into its component ALONG local up and
+        // its component ACROSS it. A HORIZONTAL orbit holds "along" constant at the configured
+        // height while "across" stays at the radius. A VERTICAL one swings "along" between
+        // +radius and -radius as the angle sweeps — and the negative half is the part that was
+        // underground. One number per sample, and the answer is unambiguous.
+        long nowMs = Clock.Ms;
+        if (nowMs - _orbitPlaneDiagMs > 2000)
+        {
+            _orbitPlaneDiagMs = nowMs;
+            var d = eye - target;
+            double alongUp = d.X * upAxis.X + d.Y * upAxis.Y + d.Z * upAxis.Z;
+            double acrossUp = Math.Sqrt(Math.Max(0.0, d.LengthSquared() - alongUp * alongUp));
+            RttLog.Line($"Orbit plane: angle={a * 180.0 / Math.PI:F0}deg  along-up={alongUp:F1}m  " +
+                        $"across-up={acrossUp:F1}m  up={upAxis.X:F2},{upAxis.Y:F2},{upAxis.Z:F2}  " +
+                        $"(source={(OrbitUp.LengthSquared() > 0.5 ? "subject transform" : "WORLD Y fallback")}). " +
+                        "along-up CONSTANT across angles = orbit parallel to the surface; " +
+                        "along-up swinging +/-radius = orbit still vertical.");
+        }
 
         // Row 2 of the camera's world matrix points AWAY from the subject in this
         // engine's convention, not along the view direction. Building it as
         // (target - eye) — the intuitive "look at" vector — aimed the camera outward
         // from the orbit centre, so the feed showed everything except the ship.
         var fwd = Normalize(eye - target);
-        var worldUp = new Vector3D(0, 1, 0);
+
+        // The camera's reference up is the LOCAL up too, so the horizon sits level in the
+        // feed instead of rolling as the orbit goes round a planet.
+        var worldUp = upAxis;
         var right = Normalize(Cross(worldUp, fwd));
         if (double.IsNaN(right.X)) right = new Vector3D(1, 0, 0);   // looking straight up/down
         var up = Cross(fwd, right);

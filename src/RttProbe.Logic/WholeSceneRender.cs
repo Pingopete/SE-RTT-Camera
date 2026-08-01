@@ -1,4 +1,5 @@
 using System.Reflection;
+using Keen.VRage.Library.Mathematics;   // Vector3D, for the planet-radial orbit up
 
 namespace RttProbe;
 
@@ -1906,6 +1907,146 @@ internal static class WholeSceneRender
     private static object _planetEnvGroup;
     private static FieldInfo _fPeFrustum, _fPeSetupsData, _fPeSetupsCbs, _fPeFirst, _fPeFirstData;
     private static FieldInfo _fPeSpheres, _fPeSpheresData;
+
+    // ---- TRUE LOCAL UP, FROM THE PLANET ITSELF (2026-08-01) ----------------------
+    //
+    // The orbit needs the surface normal, and every cheaper source was wrong. The subject's
+    // own block rotation looked right — a real ~16 degree quaternion, not identity — but a
+    // base is only gravity-aligned if it was built that way, and this one was not: the orbit
+    // ring came out flat with respect to that up and still visibly tilted against the ground.
+    //
+    // The planet's centre is the only source that cannot be wrong. Up is radial, by
+    // definition, and the engine is already handing us the planet spheres for the atmosphere
+    // rebuild — so this costs one list walk and no new engine surface.
+    //
+    // Deliberately shape-agnostic: the sphere element's members are found by TYPE rather than
+    // by name (a Vector3D for the centre, a big number for the radius), because guessing field
+    // names blind is exactly what has cost time today. Radius must be kilometre-scale, which
+    // rejects anything that is not a planet.
+    private static bool _planetUpLogged;
+
+    internal static Vector3D? PlanetUpAt(Vector3D pos)
+    {
+        try
+        {
+            if (_planetEnvGroup == null || _fPeSpheresData == null)
+            {
+                if (!_planetUpLogged)
+                {
+                    _planetUpLogged = true;
+                    RttLog.Line($"Orbit up: planet spheres unreachable (group={(_planetEnvGroup == null ? "NULL" : "ok")}, " +
+                                $"spheresData field={(_fPeSpheresData == null ? "NULL" : "ok")}) — falling back to the " +
+                                "subject's block rotation, which for a WALL-MOUNTED panel is the screen's facing and " +
+                                "not the ground normal.");
+                }
+                return null;
+            }
+            if (_fPeSpheresData.GetValue(_planetEnvGroup) is not System.Collections.IList list
+                || list.Count == 0)
+            {
+                if (!_planetUpLogged)
+                {
+                    _planetUpLogged = true;
+                    RttLog.Line("Orbit up: planet spheres list is empty — no planet in the render's view data.");
+                }
+                return null;
+            }
+
+            // ONE-SHOT SHAPE DUMP. The type-based scan below guessed Vector3D + a big double,
+            // and got nothing — so the element is some other shape (float vectors for shader
+            // constants, or camera-relative positions under the floating origin, both likely).
+            // Print what is actually there rather than guess a third time.
+            if (!_planetUpLogged)
+            {
+                _planetUpLogged = true;
+                var e0 = list[0];
+                var sb = new System.Text.StringBuilder();
+                sb.Append("Orbit up: PLANET SPHERE SHAPE — count=").Append(list.Count)
+                  .Append(" element=").Append(e0?.GetType().FullName);
+                if (e0 != null)
+                {
+                    foreach (var f in e0.GetType().GetFields(Any))
+                    {
+                        object v = null; try { v = f.GetValue(e0); } catch { }
+                        sb.Append("\n    field ").Append(f.FieldType.Name).Append(' ')
+                          .Append(f.Name).Append(" = ").Append(v);
+                    }
+                    foreach (var p in e0.GetType().GetProperties(Any))
+                    {
+                        object v = null; try { v = p.GetValue(e0); } catch { }
+                        sb.Append("\n    prop  ").Append(p.PropertyType.Name).Append(' ')
+                          .Append(p.Name).Append(" = ").Append(v);
+                    }
+                }
+                sb.Append("\n    subject is at ").Append($"{pos.X:F0},{pos.Y:F0},{pos.Z:F0}")
+                  .Append(" — the centre we want is ~60 km from that for an SE2 planet.");
+                RttLog.Line(sb.ToString());
+            }
+
+            Vector3D bestCentre = default;
+            double bestRadius = 0, bestErr = double.MaxValue;
+
+            foreach (var s in list)
+            {
+                if (s == null) continue;
+                if (!SphereOf(s, out var centre, out double radius)) continue;
+                if (radius < 1000.0) continue;                    // not a planet
+
+                double dist = (pos - centre).Length();
+                double err = Math.Abs(dist - radius) / radius;     // on the surface => ~0
+                if (err < bestErr) { bestErr = err; bestCentre = centre; bestRadius = radius; }
+            }
+
+            if (bestRadius <= 0) return null;
+
+            var up = pos - bestCentre;
+            double len = up.Length();
+            if (len < 1.0) return null;
+            up = new Vector3D(up.X / len, up.Y / len, up.Z / len);
+
+            if (!_planetUpLogged)
+            {
+                _planetUpLogged = true;
+                RttLog.Line($"Orbit up: PLANET RADIAL — centre {bestCentre.X:F0},{bestCentre.Y:F0},{bestCentre.Z:F0} " +
+                            $"radius {bestRadius:F0} m, subject {len:F0} m from centre ({(len - bestRadius):F0} m " +
+                            $"above the sphere). up = {up.X:F3},{up.Y:F3},{up.Z:F3}. This is the surface normal by " +
+                            "definition and replaces the subject's block rotation, which is only the surface normal " +
+                            "if the grid happened to be built gravity-aligned.");
+            }
+            return up;
+        }
+        catch { return null; }
+    }
+
+    // A centre and a radius out of an unknown struct, found by type.
+    private static bool SphereOf(object s, out Vector3D centre, out double radius)
+    {
+        centre = default; radius = 0;
+        var t = s.GetType();
+        foreach (var f in t.GetFields(Any))
+        {
+            object v = null;
+            try { v = f.GetValue(s); } catch { }
+            if (v is Vector3D vd && centre == default) centre = vd;
+            else if (radius <= 0 && v != null && (v is double || v is float))
+            {
+                double d = Convert.ToDouble(v);
+                if (d > 1000.0) radius = d;
+            }
+        }
+        foreach (var p in t.GetProperties(Any))
+        {
+            object v = null;
+            try { v = p.GetValue(s); } catch { }
+            if (v is Vector3D vd && centre == default) centre = vd;
+            else if (radius <= 0 && v != null && (v is double || v is float))
+            {
+                double d = Convert.ToDouble(v);
+                if (d > 1000.0) radius = d;
+            }
+        }
+        return centre != default && radius > 0;
+    }
     private static MethodInfo _miPeFillSetups, _miPeFillSlim, _miPeSetMatrix, _miPeCreateCb;
     private static System.Reflection.PropertyInfo _pPeModifiersCtx;
     private static object _peBufMgr;

@@ -125,10 +125,17 @@ internal static class PanelBinding
         }
 
 
-        if (File.Exists(LivePath))
+        // Against the PROCESS, not this assembly — see CameraRender.WrittenByThisProcess.
+        if (File.Exists(LivePath) && !CameraRender.WrittenByThisProcess(LivePath))
         {
             _disarmed = true;
             RttLog.Line("!!! PREVIOUS SESSION DIED DURING BINDING — disabled. Delete " + LivePath + " to retry.");
+        }
+        else if (File.Exists(LivePath))
+        {
+            RttLog.Line("Panel binding: mid-bind marker present but written by THIS process — a " +
+                        "hot reload landing mid-bind, not a death. Continuing, and clearing it.");
+            try { File.Delete(LivePath); } catch { }
         }
     }
 
