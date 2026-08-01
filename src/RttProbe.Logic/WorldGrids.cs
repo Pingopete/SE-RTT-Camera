@@ -527,6 +527,109 @@ internal static class WorldGrids
         catch (Exception e) { RttLog.Error($"load area \"{wantName}\"", e); }
     }
 
+    // PRELOAD THE WORLD AROUND THE FEED CAMERA (goal 10, tier 1).
+    //
+    // SpaceProbeSessionComponent.PreloadAsync(BoundingBoxD, Precision) fans the volume out
+    // across every registered ISpaceProbePreloadable that overlaps it. The two registered
+    // providers in this save are exactly the two systems a remote feed is missing —
+    // VoxelStorageComponentBase (terrain data) and PlanetEnvironmentComponent (flora
+    // sectors) — so ONE call asks for both.
+    //
+    // WHY THIS IS SAFE TO CALL FROM HERE, established BEFORE the first call rather than
+    // after (the discipline four incidents bought today):
+    //   * PreloadInternalAsync continues with TaskExtensions.ContinueDirectly — NOT
+    //     ContinueOnDCS<SyncPoint>, and it never calls Scene.FinishBefore. That pair is
+    //     precisely what made ManagedWorldArea.TryLoad deadlock the sim from this thread:
+    //     FinishBefore plants a blocking task in the scene scheduler that only the sim pump
+    //     can clear.
+    //   * A reachability sweep from PreloadAreaAsync across Core.Game/Voxels/DCS/Simulation
+    //     for FinishBefore|ContinueOnDCS returned one hit, and it was a FALSE POSITIVE: the
+    //     path hops through IDisposable.Dispose(), which ilscan's virtual expansion links to
+    //     every Dispose in the loaded set, landing in an unrelated encounter spawner.
+    //     Reading VoxelStorageComponentBase's actual body settles it — box maths,
+    //     PerformPinRequest on streamable voxel resources, CollectPreloaded callbacks, and
+    //     no scheduler touch at all. The tool over-approximates BY DESIGN; a hit means
+    //     "go read this", never "this happens".
+    //
+    // It also names an explicit VOLUME rather than competing for a shared "where is the
+    // viewer" slot, so unlike the observer route it structurally cannot become the
+    // single-slot tug-of-war that causes the LOD popping.
+    //
+    // Fire-and-forget: the returned Task is deliberately not awaited or stored. Preloading
+    // is a HINT — if it never completes, the feed simply looks as it does today.
+    private static long _lastPreloadTicks;
+    private static int _preloadCount;
+    private static bool _preloadShapeLogged;
+
+    internal static void PreloadAroundCamera(object anyEntityInScene, Vector3D centre, double radius)
+    {
+        try
+        {
+            var now = Environment.TickCount64;
+            if (now - _lastPreloadTicks < Math.Max(1000, FeedConfig.PreloadIntervalMs)) return;
+            _lastPreloadTicks = now;
+
+            var probe = FindSessionComponent(anyEntityInScene, "SpaceProbeSessionComponent");
+            if (probe == null)
+            {
+                if (!_preloadShapeLogged)
+                { _preloadShapeLogged = true; RttLog.Line("PRELOAD: SpaceProbeSessionComponent not reachable — preload disabled."); }
+                return;
+            }
+
+            var tPrec = Type.GetType(
+                "Keen.VRage.Core.Game.GameSystems.SpaceProbe.Precision, VRage.Core.Game");
+            var mi = probe.GetType().GetMethods(Any).FirstOrDefault(m =>
+                m.Name == "PreloadAsync" && m.GetParameters().Length == 2 &&
+                m.GetParameters()[0].ParameterType.Name == "BoundingBoxD");
+            if (tPrec == null || mi == null)
+            {
+                if (!_preloadShapeLogged)
+                {
+                    _preloadShapeLogged = true;
+                    RttLog.Line($"PRELOAD: shape missing (Precision={(tPrec == null ? "NOT FOUND" : "ok")}, " +
+                                $"PreloadAsync(BoundingBoxD,Precision)={(mi == null ? "NOT FOUND" : "ok")}). " +
+                                "Overloads present: " + string.Join(" | ", probe.GetType().GetMethods(Any)
+                                    .Where(m => m.Name == "PreloadAsync")
+                                    .Select(m => string.Join(",", m.GetParameters().Select(p => p.ParameterType.Name)))));
+                }
+                return;
+            }
+
+            // BoundingBoxD(Vector3D min, Vector3D max) — a cube of side 2*radius on the
+            // camera's subject centre, which is the anchor when one is set.
+            var tBox = mi.GetParameters()[0].ParameterType;
+            var half = new Vector3D(radius, radius, radius);
+            var box = Activator.CreateInstance(tBox, centre - half, centre + half);
+
+            var precName = FeedConfig.PreloadPrecision;
+            object prec;
+            try { prec = Enum.Parse(tPrec, precName, true); }
+            catch { prec = Enum.Parse(tPrec, "Medium", true); }
+
+            mi.Invoke(probe, new[] { box, prec });
+            _preloadCount++;
+
+            // First call and then every 20th: enough to prove liveness without flooding.
+            if (_preloadCount == 1 || _preloadCount % 20 == 0)
+                RttLog.Line($"PRELOAD #{_preloadCount}: asked the space probe for a {radius * 2:F0} m cube at " +
+                            $"{centre.X:F0},{centre.Y:F0},{centre.Z:F0} at {prec} precision. This fans out to every " +
+                            "registered preloadable overlapping the volume — terrain data AND flora sectors. " +
+                            "Fire-and-forget: if it does nothing the feed just looks as it did.");
+        }
+        catch (Exception e)
+        {
+            // Log once and DISARM. A repeating exception from a world-mutating call is
+            // exactly the shape that turns into a crash loop while nobody is watching.
+            if (!_preloadShapeLogged)
+            {
+                _preloadShapeLogged = true;
+                RttLog.Error("preload around camera (now disarmed for this session)", e);
+            }
+            _lastPreloadTicks = long.MaxValue / 2;
+        }
+    }
+
     // THE OBSERVER REGISTRY — read-only recon for the camera-as-observer route.
     //
     // IObservers is the engine's own MULTI-viewer abstraction and the most promising route

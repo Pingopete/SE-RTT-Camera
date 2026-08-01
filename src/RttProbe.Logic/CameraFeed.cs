@@ -520,6 +520,12 @@ internal static class CameraFeed
             // entity, which is the only handle we have on the Scene. Request is consumed
             // once (TakeWorldGridSurveyRequest), so a `worldGridSurvey = 1` left in the file
             // does not re-dump on every poll.
+            // Ask the engine to make the world exist around the camera. Placed AFTER the
+            // target is published so `centre` is the anchor when one is set, and rate-limited
+            // inside PreloadAroundCamera rather than here.
+            if (FeedConfig.PreloadAroundCamera)
+                WorldGrids.PreloadAroundCamera(entity, centre, FeedConfig.PreloadRadius);
+
             if (FeedConfig.TakeWorldGridSurveyRequest()) WorldGrids.DumpGrids(entity);
             var loadReq = FeedConfig.TakeLoadAreaRequest();
             if (loadReq.Length > 0) WorldGrids.LoadAreaByName(entity, loadReq);

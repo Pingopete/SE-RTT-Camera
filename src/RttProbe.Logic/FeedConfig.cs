@@ -835,6 +835,17 @@ internal static class FeedConfig
     public static bool WorldGridSurvey { get; private set; }
     private static bool _surveyArmedLast;
 
+    // PRELOAD AROUND THE FEED CAMERA (goal 10 tier 1). Off by default: it asks the engine
+    // to make world data resident somewhere no player is, which costs memory, and the VRAM
+    // cap is already the binding constraint on this route.
+    //
+    // All three are OUTSIDE the whole-scene rebuild signature — they allocate nothing of
+    // ours and resize nothing, so they are safe to edit on a running feed.
+    public static bool PreloadAroundCamera { get; private set; }
+    public static double PreloadRadius { get; private set; } = 500.0;
+    public static int PreloadIntervalMs { get; private set; } = 5000;
+    public static string PreloadPrecision { get; private set; } = "Medium";   // Low | Medium | High
+
     // MATERIALIZE ONE MANAGED AREA BY NAME (goal 10 / tier 2 pathfinder, 2026-08-01).
     // `loadArea = Vallis Reach` calls TryLoad() on the matching ManagedWorldArea — the
     // engine's own load path, the one its spatial trigger fires — so the content spawns
@@ -942,6 +953,20 @@ internal static class FeedConfig
             // Edge-triggered, not level-triggered: only a false->true transition arms it.
             // Level-triggered would re-dump on every config poll for as long as the line
             // said 1, which is this project's house bug wearing a survey hat.
+            var preloadWas = PreloadAroundCamera;
+            PreloadAroundCamera = Bool(kv, "preloadAroundCamera", PreloadAroundCamera);
+            PreloadRadius       = Dbl(kv, "preloadRadius", PreloadRadius);
+            PreloadIntervalMs   = Int(kv, "preloadIntervalMs", PreloadIntervalMs);
+            PreloadPrecision    = Str(kv, "preloadPrecision", PreloadPrecision);
+            if (preloadWas != PreloadAroundCamera)
+                RttLog.Global($"Config: preloadAroundCamera {preloadWas} -> {PreloadAroundCamera}" +
+                    (PreloadAroundCamera
+                        ? $" ({PreloadRadius:F0} m radius, every {PreloadIntervalMs} ms, {PreloadPrecision} precision). " +
+                          "The feed camera now asks the space probe to make terrain and flora resident around it. " +
+                          "Watch for \"PRELOAD #\" in the log, and watch VRAM — residency somewhere no player " +
+                          "stands is not free."
+                        : ". The camera stops asking; anything already resident stays until the engine reclaims it."));
+
             var surveyWanted = Bool(kv, "worldGridSurvey", false);
             if (surveyWanted && !_surveyArmedLast) WorldGridSurvey = true;
             _surveyArmedLast = surveyWanted;
