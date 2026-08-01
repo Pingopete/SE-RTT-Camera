@@ -522,9 +522,16 @@ internal static class FeedGate
         RttLog.Line("Feed gate: releasing resources now. " + (last
             ? "This is the LAST live feed, so the shared engine state goes back to stock too — " +
               "the game should render exactly as it does without this mod."
-            : $"Other feed(s) are still live ({Feeds.RotationLine()}), so the shared LCD material, " +
-              "the probe settings and the panel-discovery state are left alone. Only this feed's " +
-              "own resources are released."));
+            // "still HOLDING RESOURCES", not "still live". OthersLive tests gate-or-resident,
+            // while RotationLine reports the gate alone — so when two feeds tear down in the
+            // same frame the first one printed "Other feed(s) are still live (0=dormant
+            // 1=dormant)", contradicting itself inside one sentence. The test is right (a feed
+            // that went dormant this frame still owns its buffers until its own teardown runs);
+            // it was the word that was wrong.
+            : $"Other feed(s) still hold resources ({Feeds.RotationLine()} — a feed that just went " +
+              "dormant still owns its buffers until its own teardown runs), so the shared LCD " +
+              "material, the probe settings and the panel-discovery state are left alone. Only " +
+              "this feed's own resources are released."));
 
         // 1. Stop issuing work. The whole-scene route and the probe pass both gate on
         //    Active, so they are already inert by the time this runs; these calls release
