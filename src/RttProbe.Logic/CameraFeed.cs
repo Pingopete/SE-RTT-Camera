@@ -45,6 +45,14 @@ internal static class CameraFeed
     // paths with a bare position and no Target at all.
     internal static Vector3D OrbitUp;
 
+    // PLANET RADIAL UP, published by the RENDER thread and consumed by the LCD tick.
+    //
+    // Crossing the threads deliberately: the planet-env group this is derived from is resolved
+    // lazily inside the render path and is null everywhere else, so discovery asking for it
+    // directly always got nothing. A stale value here is harmless — a planet's radial direction
+    // at a fixed base does not change — so a plain field beats any synchronisation.
+    internal static Vector3D PlanetUpCache;
+
     // Did OrbitUp come from the planet (exact) or from the subject's rotation (a guess)?
     // Reported in the orbit-plane proof so the two are never confused again.
     internal static bool OrbitUpIsPlanet;
@@ -447,7 +455,10 @@ internal static class CameraFeed
             // gives the surface normal by definition; a grid's own up is the surface normal
             // only if it was built gravity-aligned, which is an assumption and was wrong here.
             // In space there is no planet and the block rotation is the sensible answer.
-            var planetUp = RttProbe.WholeSceneRender.PlanetUpAt(centre);
+            // The render thread publishes this (see WholeSceneRender's planet-env rebuild); the
+            // planet group it needs is not reachable from this thread. Radial from the planet
+            // centre is the surface normal by definition and beats every other candidate.
+            var planetUp = PlanetUpCache.LengthSquared() > 0.5 ? PlanetUpCache : (Vector3D?)null;
             var chosenUp = planetUp ?? _lastUp;
 
             _target = new Target

@@ -2168,6 +2168,22 @@ internal static class WholeSceneRender
             if (!_planetEnvLogged)
             {
                 _planetEnvLogged = true;
+                // THE ORBIT'S UP, COMPUTED WHERE THE DATA IS LIVE.
+                //
+                // PlanetUpAt needs _planetEnvGroup, which is resolved lazily by THIS method on
+                // the render thread. Discovery runs on the LCD tick and kept finding it null,
+                // so the orbit silently fell back to the subject's block rotation — which for a
+                // wall-mounted panel is the screen's facing, not the ground normal. Same shape
+                // as the config-poll bootstrap: state read from a thread that cannot see it.
+                //
+                // Cached for discovery to pick up instead of asking across the thread boundary.
+                var feedTarget = CameraFeed.Current;
+                if (feedTarget != null)
+                {
+                    var radial = PlanetUpAt(feedTarget.Centre);
+                    if (radial.HasValue) CameraFeed.PlanetUpCache = radial.Value;
+                }
+
                 RttLog.Line("=== PLANET ENV REBUILT (narrow) for our render: the setup CBs and planet " +
                             "spheres now come from the ORBIT camera — atmosphere on the planet, not on " +
                             "the player's aim. SortEntities and the LUT/weather TABLE fills are NOT " +

@@ -58,6 +58,7 @@ Get-ChildItem "$root\output\*-live.marker" -ErrorAction SilentlyContinue | ForEa
 # launch options, no dialog, no bounce. App 1133870 = Space Engineers 2.
 Write-Output "launching via steam://rungameid/1133870 (as the desktop shortcut does)"
 $bootstrapsBefore = (Select-String -Path "$root\output\rtt.log" -Pattern 'RttProbe bootstrap' -ErrorAction SilentlyContinue | Measure-Object).Count
+$linesBefore      = @(Get-Content "$root\output\rtt.log" -ErrorAction SilentlyContinue).Count
 Start-Process "steam://rungameid/1133870"
 
 $deadline = (Get-Date).AddMinutes(5)
@@ -88,10 +89,16 @@ for ($attempt = 1; $attempt -le 12; $attempt++) {
     Write-Output "attempt ${attempt}: focused, sending Enter (Continue)"
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
 
+    # ONLY LINES WRITTEN SINCE WE LAUNCHED COUNT. The first version grepped the last 400 lines
+    # for "FEED GATE: ACTIVE" and matched a line from BEFORE the crash, so it reported
+    # "WORLD LOADED" while the game was still sitting at the menu. rtt.log carries no dates and
+    # spans every session, which has now produced this same false reading in three different
+    # tools today. Compare against a line count taken before the launch instead.
     for ($w = 0; $w -lt 10; $w++) {
         Start-Sleep -Seconds 6
-        $tail = Get-Content "$root\output\rtt.log" -Tail 400 -ErrorAction SilentlyContinue
-        if ($tail -match 'FEED GATE: ACTIVE') {
+        $lines = @(Get-Content "$root\output\rtt.log" -ErrorAction SilentlyContinue)
+        $fresh = if ($lines.Count -gt $linesBefore) { $lines[$linesBefore..($lines.Count - 1)] } else { @() }
+        if ($fresh -match 'FEED GATE: ACTIVE') {
             # Confirm the PLUGIN loaded, not merely that a world did. If Steam's launch options
             # ever lose the -plugins: argument the game comes up perfectly and the mod is simply
             # absent - which reads as "everything is fine" right up until nothing is measurable.
