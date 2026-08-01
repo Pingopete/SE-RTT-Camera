@@ -217,6 +217,8 @@ internal static class WorldGrids
             }
 
             AppendManagedAreas(sb, anyEntityInScene, player);
+            AppendObservers(sb, anyEntityInScene, player);
+            AppendSpaceProbe(sb, anyEntityInScene);
 
             Directory.CreateDirectory(RttLog.OutDir);
             File.WriteAllText(ReportPath, sb.ToString());
@@ -523,6 +525,209 @@ internal static class WorldGrids
 #pragma warning restore CS0162
         }
         catch (Exception e) { RttLog.Error($"load area \"{wantName}\"", e); }
+    }
+
+    // THE OBSERVER REGISTRY — read-only recon for the camera-as-observer route.
+    //
+    // IObservers is the engine's own MULTI-viewer abstraction and the most promising route
+    // to world materialization around a feed camera:
+    //     Observer Add(ImmutableArray<StringId> tags, ObserverData data)
+    //     ReadOnlySpan<Observer> Get(StringId tag)          <- plural BY DESIGN
+    // plus helpers that ask for the CLOSEST observer to a point, which only makes sense if
+    // several are expected. ObserverComponent is the supported way to register: an entity
+    // carrying it calls Add on OnAddedToScene with its definition's Tags + InfluenceRadius,
+    // and re-registers itself on move. ObserverComponentDefinition is just those two fields.
+    //
+    // WHAT THIS DUMP IS FOR: an observer is only useful if we register it under the tag the
+    // consumer looks for, and tags are StringIds resolved at runtime — not readable from the
+    // assemblies. So enumerate the LIVE registry: whatever the player is registered as tells
+    // us exactly what to imitate.
+    //
+    // STRICTLY READ-ONLY. No Add, no Update. Note IObservers.CreateJobContext(Session)
+    // exists, which strongly implies the registry is meant to be touched from inside DCS
+    // jobs — so when the time comes to register, the safe route is attaching an
+    // ObserverComponent to an entity and letting the ENGINE call Add from its own context,
+    // not calling Add ourselves. Today cost four incidents to learn that distinction.
+    private static void AppendObservers(StringBuilder sb, object anyEntityInScene, Vector3D player)
+    {
+        try
+        {
+            sb.AppendLine("\n--- observer registry (IObservers) ---");
+            var voxObs = FindSessionComponent(anyEntityInScene, "VoxelObserverSessionComponent");
+            var observers = Prop(voxObs, "_observers");
+            if (observers == null)
+            {
+                sb.AppendLine("    IObservers not reachable" +
+                              $" (VoxelObserverSessionComponent={(voxObs == null ? "not found" : "found")})");
+                return;
+            }
+            sb.AppendLine($"    registry: {observers.GetType().FullName}");
+
+            // The concrete registry's own fields hold the tag -> observers mapping. Dump
+            // whatever collections it carries rather than guessing a member name; one
+            // structural dump beats three reload-priced guesses.
+            foreach (var f in observers.GetType().GetFields(Any))
+            {
+                object v = null; try { v = f.GetValue(observers); } catch { }
+                if (v == null) { sb.AppendLine($"    {f.FieldType.Name,-34} {f.Name} = null"); continue; }
+                var count = (v as System.Collections.ICollection)?.Count;
+                sb.AppendLine($"    {f.FieldType.Name,-34} {f.Name}" +
+                              (count.HasValue ? $"  count={count}" : $" = {v}"));
+
+                // ENUMERATE, THEN REFLECT Key/Value. The engine's ListDictionary<K,V> is not
+                // an IDictionary — its enumerator yields KeyValuePair<K,V>, and casting each
+                // item to DictionaryEntry throws, which is exactly what killed the first run
+                // of this dump. Reading Key/Value by reflection handles both shapes.
+                if (v is System.Collections.IEnumerable pairs and not string
+                    && v.GetType().Name.Contains("Dictionary", StringComparison.Ordinal))
+                {
+                    foreach (var item in pairs)
+                    {
+                        var k = Prop(item, "Key"); var val = Prop(item, "Value");
+                        if (k == null && val == null) { sb.AppendLine("        " + item); continue; }
+                        var entries = (val as System.Collections.ICollection)?.Count;
+                        sb.AppendLine($"        tag [{k}] -> {(entries.HasValue ? entries + " observer(s)" : val?.GetType().Name)}");
+                        if (val is System.Collections.IEnumerable list and not string)
+                            foreach (var o in list) sb.AppendLine("            " + DescribeObserver(o, player));
+                        else if (val != null)
+                            sb.AppendLine("            " + DescribeObserver(val, player));
+                    }
+                }
+                else if (v is System.Collections.IEnumerable seq and not string)
+                {
+                    int n = 0;
+                    foreach (var o in seq)
+                    {
+                        if (n++ >= 20) { sb.AppendLine("        ... (truncated at 20)"); break; }
+                        sb.AppendLine("        " + DescribeObserver(o, player));
+                    }
+                }
+            }
+
+            // The voxel side specifically: which tag it watches, and whether it is currently
+            // following an observer or being force-aligned to the render camera.
+            var dbg = Prop(voxObs, "_voxelDebugConfig");
+            sb.AppendLine($"    voxel ObserverTag = {Prop(dbg, "ObserverTag") ?? "?"}" +
+                          "   (VoxelObserverSessionComponent.UpdateObserver copies the FIRST observer " +
+                          "with this tag into a single _observerEntity, and AlignToRenderCamera can " +
+                          "instead force it to RenderSettings.CameraTransform — so terrain follows ONE " +
+                          "point either way. Terrain likely needs its own clipmap, not just an observer.)");
+        }
+        catch (Exception e) { sb.AppendLine($"    observer dump FAILED ({e.GetType().Name}: {e.Message})"); }
+    }
+
+    // THE PRELOAD API — the other live route, and the only one that addresses BOTH gaps.
+    //
+    //     SpaceProbeSessionComponent.PreloadAsync(BoundingBoxD | OrientedBoundingBoxD | LineD,
+    //                                             Precision) -> Task<...>
+    //
+    // It keeps a spatial tree of registered ISpaceProbePreloadable providers and fans the
+    // request out to whichever overlap the volume. The two implementers are exactly the two
+    // systems the feed is missing: VoxelStorageComponentBase (terrain data) and
+    // PlanetEnvironmentComponent (the flora sectors). So one call over a box around the
+    // camera asks for terrain AND clutter, which no other route does in a single step.
+    //
+    // Advantages over the observer route: it names the VOLUME explicitly rather than relying
+    // on a single global "where the viewer is", so it cannot be a tug-of-war with the
+    // player; and there are three Precision-keyed caches, so repeat requests over a
+    // stationary orbit should be cheap.
+    //
+    // THREADING, given today: PreloadAsync returns a Task and the game's own admin tools and
+    // debug screen call it — encouraging, but "returns a Task" is NOT proof it can be
+    // *initiated* from any thread. TryLoad also returned a Task and still deadlocked the sim
+    // by planting a scheduler dependency. Confirm the seat before the first call; this dump
+    // is read-only reconnaissance, not a call site.
+    private static void AppendSpaceProbe(StringBuilder sb, object anyEntityInScene)
+    {
+        try
+        {
+            sb.AppendLine("\n--- space probe / preload API ---");
+            var probe = FindSessionComponent(anyEntityInScene, "SpaceProbeSessionComponent");
+            if (probe == null) { sb.AppendLine("    SpaceProbeSessionComponent not found"); return; }
+
+            var providers = Prop(probe, "_preloadableProviders") as System.Collections.IDictionary;
+            sb.AppendLine($"    registered preloadable providers: {(providers == null ? "?" : providers.Count.ToString())}");
+            if (providers != null)
+            {
+                // The dictionary is keyed by PreloadableToken; the PROVIDER is what we want
+                // named, so look through both key and value for the ISpaceProbePreloadable.
+                var kinds = new Dictionary<string, int>(StringComparer.Ordinal);
+                foreach (System.Collections.DictionaryEntry kv in providers)
+                {
+                    string n = null;
+                    foreach (var host in new[] { kv.Value, kv.Key })
+                    {
+                        if (host == null) continue;
+                        if (host.GetType().Name.Contains("Preloadable", StringComparison.Ordinal))
+                            foreach (var f2 in host.GetType().GetFields(Any))
+                            {
+                                object inner = null; try { inner = f2.GetValue(host); } catch { }
+                                var tn = inner?.GetType().Name;
+                                if (tn != null && (tn.Contains("Voxel", StringComparison.Ordinal)
+                                                || tn.Contains("Planet", StringComparison.Ordinal)
+                                                || tn.Contains("Environment", StringComparison.Ordinal)))
+                                { n = tn; break; }
+                            }
+                        n ??= host.GetType().Name;
+                        if (!n.Contains("Token", StringComparison.Ordinal)) break;
+                    }
+                    n ??= "null";
+                    kinds[n] = kinds.TryGetValue(n, out var c) ? c + 1 : 1;
+                }
+                foreach (var k in kinds.OrderByDescending(k => k.Value))
+                    sb.AppendLine($"        {k.Value,5}  {k.Key}");
+                sb.AppendLine("    (VoxelStorageComponentBase = terrain data, PlanetEnvironmentComponent " +
+                              "= flora sectors. Both present means one PreloadAsync over a box at the " +
+                              "camera asks for terrain AND clutter in a single call.)");
+            }
+            foreach (var m in probe.GetType().GetMethods(Any).Where(m => m.Name == "PreloadAsync"))
+                sb.AppendLine($"    PreloadAsync({string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name))})");
+        }
+        catch (Exception e) { sb.AppendLine($"    space probe dump FAILED ({e.GetType().Name}: {e.Message})"); }
+    }
+
+    private static string DescribeObserver(object o, Vector3D player)
+    {
+        if (o == null) return "<null>";
+        var sbo = new StringBuilder(o.GetType().Name);
+        foreach (var name in new[] { "Tags", "Tag", "InfluenceRadius", "Radius", "Data", "Transform", "WorldTransform" })
+        {
+            var v = Prop(o, name);
+            if (v == null) continue;
+            if (v is Vector3D p)
+                sbo.Append($"  {name}={p.X:F0},{p.Y:F0},{p.Z:F0} ({(p - player).Length():F0} m from subject)");
+            else if (v is System.Collections.IEnumerable en and not string)
+            {
+                var items = new List<string>();
+                foreach (var i in en) { if (items.Count >= 8) break; items.Add(i?.ToString() ?? "null"); }
+                sbo.Append($"  {name}=[{string.Join(", ", items)}]");
+            }
+            else sbo.Append($"  {name}={v}");
+        }
+        // Position often hides one level down, on the observer's data/transform struct.
+        foreach (var host in new[] { Prop(o, "Data"), Prop(o, "Transform"), Prop(o, "WorldTransform") })
+        {
+            if (host == null) continue;
+            var p2 = Prop(host, "Position") ?? Prop(host, "Translation");
+            if (p2 is Vector3D pv)
+            { sbo.Append($"  pos={pv.X:F0},{pv.Y:F0},{pv.Z:F0} ({(pv - player).Length():F0} m)"); break; }
+        }
+        return sbo.ToString();
+    }
+
+    // Any session component by type name — generalised from the managed-area hop, which
+    // needed exactly this and had it inlined.
+    private static object FindSessionComponent(object anyEntityInScene, string typeName)
+    {
+        var tBlock3 = Type.GetType(
+            "Keen.Game2.Simulation.WorldObjects.CubeBlocks.CubeBlockComponent, Game2.Simulation");
+        var grid = ComponentOf(anyEntityInScene, "CubeGridComponent")
+                   ?? Prop(TryGetViaGeneric(anyEntityInScene, tBlock3), "Grid");
+        var scEntity = Prop(Prop(grid, "Session"), "SessionComponents");
+        if (scEntity == null || _fComponents?.GetValue(scEntity) is not IEnumerable comps) return null;
+        foreach (var c in comps)
+            if (c != null && c.GetType().Name == typeName) return c;
+        return null;
     }
 
     // The session-component hop, shared by the survey section and the loader.
