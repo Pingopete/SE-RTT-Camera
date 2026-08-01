@@ -210,3 +210,146 @@ Read from the shipped assemblies, not tested in game. The short version:
 The radius test this document proposed is superseded by sharper predictions: distant BUILT
 grids should be visible TODAY (needs #17's look-at target to aim at one); distant TERRAIN
 stays coarse until per-feed clipmaps exist.
+
+---
+
+## 2026-08-01: THE POPPING BUG AND GOAL 10 ARE THE SAME PROBLEM
+
+Chasing the user-reported "objects and terrain LODs flipping back and forth, objects
+popping in and out" ended up in this document rather than a bug report, because the
+mechanism turned out to be the one this file exists to ask about: **the engine models
+exactly ONE viewer.** Today the feed deals with that by briefly *impersonating* it. That
+poisons anything reading the viewer while we hold it, and still leaves our camera with no
+standing of its own. Both halves of the symptom fall out of that single fact.
+
+### What was measured in game (not inferred)
+
+| experiment | what it moved | result |
+|---|---|---|
+| `feedsDisabled=1`, gate DORMANT | the feed, entirely | **no popping** — we cause it |
+| `wholeSceneIntervalMs` 0 -> 500 | render rate 39/s -> 2/s (verified: PERF `ours n=164` -> `n=9`) | **no change** |
+| `orbitPeriod` 30 -> 100000 (frozen) | camera POSITION only; VRAM and render rate held | **much less popping** |
+| `orbitPeriod` back to 30 (A-B-A) | camera position moving again | **popping returns** |
+
+VRAM was never exhausted at any point (12.43 GB used / 13.89 GB available at dormancy;
+966 MB headroom with the feed up). The earlier "it is VRAM eviction" claim was an overreach
+on circumstantial evidence and is retired.
+
+The variable that tracks the symptom is **camera POSITION** — not render count, not memory.
+
+Two user observations pinned it further, and both deserve recording because neither came
+from an instrument:
+
+- With the feed OFF, a platform grid sat *stably* at low-tier textures, and **pausing the
+  game resolved it to full LOD at once.** Pausing frees no memory — it stops demand from
+  CHANGING. The streaming manager is failing to CONVERGE under churn.
+- With the orbit FROZEN, stepping behind a wall made objects the camera could plainly see
+  **unload**. Player state deciding feed content, directly observed.
+
+### Mechanism A — texture tiers: we poison the distance collector
+
+`ManagedTexturePrioritizerComponent.OnCollectStandardsRoot`, read from IL:
+
+```
+if (!CoreSystems.Settings.Streaming.EnableCollectingMaterialDistances) return;
+Vector3D camPos = CoreSystems.Settings.RenderView.CameraPosition;   // <-- SHARED GLOBAL
+... CollectStandards(ref relativePosition, ...)
+```
+
+Texture tier is a min-distance reduction (`ClosestDistanceCollector`) over scene ENTITIES
+against ONE camera position, taken from the shared `CoreSystems.Settings.RenderView` —
+which `WholeSceneRender.InstallCamera` overwrites for the duration of our nested Draw.
+
+**Our own code already contains the assumption this breaks.** `CameraRender.cs`, "MODE 2 —
+THE RACE FIX": *"a view whose RESOLUTION diverges from the player's poisons whatever
+buffer-size math the unlucky reader feeds. The baseline survives because camera-position
+divergence never sizes anything."* Correct as far as it goes — position divergence sizes
+nothing. It STEERS the streaming distance collector, which nobody had looked for. Mode 2
+neutralised resolution divergence and deliberately left position divergence in place. That
+is the gap.
+
+Ruled OUT by the same read, so nobody re-treads them:
+
+- **Texel density is not ours.** `GetPixelsPerSurfaceMeterBase` reads
+  `CoreSystems.SwapChain.ResolutionF.Y` — the player's swapchain. Our 1024x1024 target is
+  invisible to it.
+- **Our draw calls contribute nothing.** Demand comes from an entity iteration, not from
+  what we draw. Submit is not a demand proxy (this file already warned it is not a
+  visibility proxy either).
+- **The voxel clipmap slot is clean.** `RenderSettings.CameraTransform` has sole writer
+  `RenderSettings.SetCameraParameters`; our `SetCameraParameters` call goes to our own
+  private RenderView copy, and `grep CameraTransform src/` returns nothing. The single-slot
+  tug-of-war this project predicted for terrain has NOT been committed.
+
+Note on the negative result: the render-rate test did **not** exonerate a race. Our
+per-render cost ROSE at low cadence (26 ms -> 46-130 ms, cold caches), so wall-clock
+exposure fell only ~85% -> ~12%, not 20x. If one poisoned collection pass demotes a large
+set and promotion is throughput-limited (`StreamingLoadingTaskDeadline`), 12% still
+saturates recovery. Rate-independence is CONSISTENT with position poisoning, not evidence
+against it.
+
+### Mechanism B — objects unloading: flora sectors ride PLAYER entities
+
+Already recorded in `remote-object-instancing-recon.md`, and the likely cause of the
+disappearances: `PlanetEnvironmentComponent` materializes surface sectors through the
+spatial-trigger system, on **volumes riding `EnvironmentLocal`-tagged entities — players**.
+Sectors spawn flora entities and GPU batches on materialize and REMOVE them on
+dematerialize. The feed camera carries no tag, so it gets no vote.
+
+This reframes "I hid behind a wall and things unloaded": hiding required MOVING, which moved
+the trigger volume. The competing reading is genuine occlusion culling. They are separable
+by a one-minute test — **move the same distance in the open, clear line of sight.** If the
+same objects unload, it is position-driven sector dematerialization.
+
+Supporting structure: `GPUModelEntity.LastVisibleFrame` and
+`GPUInstancedModelEntity.LastVisibleFrame` are per-entity and scene-wide, written by
+`ComposeModelEntity` and by `FloraSectorEntityComponent.UploadEntitiesOnGpu`, with NO
+managed readers — they are consumed GPU-side by culling shaders. Meanwhile
+`OcclusionContext`, `HiZContext`, `MainVisibilityListBuffers`, `MainViewCulling` and both
+`LODTransitionContext`s all hang off `DrawContextManager`, which we own per feed. So our
+visibility work is isolated from the player's — which is what protects the player's view,
+and is ALSO why our camera's visibility can never count toward keeping anything resident.
+The isolation cuts both ways.
+
+### Why this closes the loop with goal 10
+
+The fix for the bug and the feature are the same work, differing only in sign:
+
+- **As a bug**, we want our camera to STOP steering shared viewer state it should not own.
+- **As a feature**, we want our camera to legitimately BE a viewer, so the world
+  materializes around it.
+
+Impersonating the single slot delivers neither cleanly. Registering as a real second viewer
+delivers both. The three-tier recipe from `remote-object-instancing-recon.md`
+(`PreloadAreaAsync` warm-up / environment trigger at the feed position / per-feed
+`VoxelClipmap`) is therefore not only goal 10's plan — tier 2 is also the principled repair
+for Mechanism B.
+
+### Candidate repair for Mechanism A, with its trap stated
+
+Scope `StreamingSettings` around our render, the same pattern already used for shadow
+settings. **Do not deploy blind:** setting `EnableCollectingMaterialDistances=false` during
+our window means any collection pass landing there collects NOTHING, and `RAW_UNUSED`
+exists — an empty pass could mass-demote, i.e. worse than the disease. Establish first
+whether collection is per-frame or throttled, and whether a partial pass is reachable. A
+safer shape is holding the collector's view at the PLAYER's `CameraPosition`, if the render
+can tolerate it.
+
+Other levers on `StreamingSettings`: `SkipMipLevels`, `MinTextureStreamingBytes`,
+`TargetUnusedVRAMMult`, `AvailableStreamingSizeOverride`, `EnableCaching`.
+
+### The last no-build control, not yet run
+
+`wholeSceneCamera = 0` renders the feed from the PLAYER's camera: same second render, same
+VRAM, same buffers, only the divergence removed. If popping stops, divergence is proven. It
+is in the REBUILD SIGNATURE, so it needs the dormant-first protocol — a live edit of a
+signature knob is what removed the device at 15:08 today.
+
+### Tooling
+
+`ilscan` — a Mono.Cecil call-graph / IL scanner over the shipped assemblies, built on the
+`Mono.Cecil.dll` that ships in `Game2`. Commands: `find`, `members`, `callers`, `reach`,
+`writes`, `il`; `--mod=` keeps the graph build to seconds instead of minutes. Every
+structural claim above came from it rather than from guessing at symbol names — which is
+the direct answer to the two greps earlier today that reported "no sun symbols" when what
+was missing was the `strings` command.
