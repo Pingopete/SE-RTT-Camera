@@ -855,6 +855,10 @@ internal static class FeedConfig
     // radius is 60 km) without reaching neighbours.
     public static double ClipmapMaxFeedDistance { get; private set; } = 80000.0;
 
+    // Per-frame budget for ALL clipmap updates. The engine ships 0.5 ms. 0 = leave alone.
+    // GLOBAL: it cannot be scoped to the feed, so it spends the player's frame time too.
+    public static double ClipmapUpdateBudgetMs { get; private set; }
+
     public static bool PreloadAroundCamera { get; private set; }
     public static double PreloadRadius { get; private set; } = 500.0;
     public static int PreloadIntervalMs { get; private set; } = 5000;
@@ -970,6 +974,8 @@ internal static class FeedConfig
             var clipWas = PerBodyClipmapCamera;
             PerBodyClipmapCamera     = Bool(kv, "perBodyClipmapCamera", PerBodyClipmapCamera);
             ClipmapMinPlayerDistance = Dbl(kv, "clipmapMinPlayerDistance", ClipmapMinPlayerDistance);
+            ClipmapMaxFeedDistance   = Dbl(kv, "clipmapMaxFeedDistance", ClipmapMaxFeedDistance);
+            ClipmapUpdateBudgetMs    = Dbl(kv, "clipmapUpdateBudgetMs", ClipmapUpdateBudgetMs);
             if (clipWas != PerBodyClipmapCamera)
                 RttLog.Global($"Config: perBodyClipmapCamera {clipWas} -> {PerBodyClipmapCamera}" +
                     (PerBodyClipmapCamera

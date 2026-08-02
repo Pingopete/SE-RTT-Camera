@@ -622,6 +622,7 @@ internal static class WorldGrids
                             $"({_clipmapOverrides} override(s) of {_clipmapCalls} body-updates; this line is " +
                             "rate-limited to one per 15 s.)");
             }
+            ApplyClipmapBudget();
             ProbeLodDataSharing(renderComponent);
             return replacement;
         }
@@ -642,6 +643,46 @@ internal static class WorldGrids
     private static long _lodProbeTicks;
     private static object _lodOwner;
     private static Vector3D? _lastLodSlot0;
+
+    // THE CLIPMAP FRAME BUDGET — prime suspect for the mid-LOD plateau.
+    //
+    // VoxelRenderUpdateSessionComponent's ctor sets _updateTimeout to
+    // TimeSpan.FromMilliseconds(0.5). HALF A MILLISECOND is the entire per-frame allowance
+    // for ALL clipmap updates: UpdateClipmaps walks every voxel body and bails the moment
+    // IsTimingOut trips. Adding a second viewer's body to that budget without widening it
+    // starves the finer LOD rings, which is exactly the observed plateau — and it explains
+    // why 20 minutes changed nothing (the budget resets every frame; more time buys nothing
+    // if each frame gives up at the same point).
+    //
+    // THIS IS GLOBAL AND IT COSTS THE PLAYER. UpdateTimeout is read inside the engine's own
+    // loop, not around our render, so it cannot be scoped to the feed the way shadow settings
+    // are. Raising it hands more of every frame to terrain meshing for everyone. 0 = leave
+    // the engine's value alone, and that stays the default.
+    private static double _budgetApplied;
+    private static object _budgetProp;
+
+    private static void ApplyClipmapBudget()
+    {
+        var want = FeedConfig.ClipmapUpdateBudgetMs;
+        if (want <= 0 || Math.Abs(want - _budgetApplied) < 0.01) return;
+        try
+        {
+            _lodOwner ??= Type.GetType("RttProbe.RttBridge, RttProbe")
+                              ?.GetField("VoxelUpdateComponent")?.GetValue(null);
+            if (_lodOwner == null) return;
+            var p = _lodOwner.GetType().GetProperty("UpdateTimeout", Any);
+            if (p == null || !p.CanWrite) return;
+            var was = p.GetValue(_lodOwner);
+            p.SetValue(_lodOwner, TimeSpan.FromMilliseconds(want));
+            _budgetApplied = want; _budgetProp = p;
+            RttLog.Line($"CLIPMAP BUDGET: UpdateTimeout {was} -> {want} ms. The engine ships 0.5 ms " +
+                        "for ALL clipmap updates per frame, and UpdateClipmaps bails on IsTimingOut — " +
+                        "so a second viewer's body competes for that same half-millisecond. This is " +
+                        "GLOBAL: it buys terrain detail everywhere and spends the player's frame time " +
+                        "to do it. Watch the player's fps, not just the feed's.");
+        }
+        catch (Exception e) { RttLog.Error("clipmap budget", e); _budgetApplied = want; }
+    }
 
     private static void ProbeLodDataSharing(object renderComponent)
     {
