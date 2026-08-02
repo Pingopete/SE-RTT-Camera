@@ -407,7 +407,7 @@ else.
 
 ### The build that follows, and it is fully scoped
 
-`VoxelRenderComponent.InstantiateLowResClipmap` is the engine's own precedent for a second
+`VoxelRenderComponent.InstantiateLowResClipmap` shows a second clipmap being constructed on a
 clipmap on a body, and every constructor argument is reachable from the existing clipmap
 and component:
 
@@ -421,6 +421,14 @@ new VoxelClipmap(Session, Clipmap.Size, Clipmap.LocalToWorld,
 
 Nothing unreachable. Two things to settle before writing it:
 
+- **THE PRECEDENT IS WEAKER THAN IT FIRST LOOKED, and this correction matters before anyone
+  starts building.** `EnableLowResClipmap` is true only when environment probes AND
+  raytraced diffuse GI are enabled, so the engine's second clipmap serves **GI** — a
+  different PURPOSE at coarser quality, matching `VoxelRenderTarget.GI` — and
+  `UpdatePosition` moves it with the same body. It is NOT a second VIEWPOINT. What survives
+  is that a second `VoxelClipmap` is CONSTRUCTIBLE with reachable arguments, which is the
+  mechanically useful part. What does not survive is any claim that two clipmaps centred in
+  DIFFERENT PLACES is a configuration Keen already exercises. Our use is novel.
 - **Overlap.** `VoxelRenderTarget` is `Model | GI | Shadow | GBuffer | None` — it selects the
   rendering PURPOSE, not the viewer. A second clipmap's cells land in the shared geometry
   data and frustum culling decides who sees them, so two clipmaps covering the same ground
