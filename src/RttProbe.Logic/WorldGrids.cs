@@ -676,6 +676,545 @@ internal static class WorldGrids
         }
     }
 
+    // ── THE TRIGGER CENSUS — the instrument the marker's null result demanded ───────────
+    //
+    // 2026-08-01, late: the camera trigger entity carried ClientTriggerTag at a virgin site
+    // for four minutes and NOTHING materialized (VRAM +0M, user-confirmed low-poly). The IL
+    // then reorganized the model:
+    //
+    //   ProceduralGeneratorCLIENTSessionComponent.GetMustHaveTriggerTypeIds -> ClientTriggerTag
+    //   ProceduralGeneratorSERVERSessionComponent.GetMustHaveTriggerTypeIds -> Physics.Data.DynamicTag
+    //
+    // The SERVER — where flora actually spawns (PlanetEnvironmentClientComponent is a pure
+    // replication mirror) — triggers on DYNAMIC PHYSICS entities, not on camera markers. If
+    // that holds in the live session, the fix is a DynamicTag presence in the server scene,
+    // and every consumer of this machinery (flora sectors, encounters, managed world areas —
+    // ManagedWorldArea registers with the SAME ISpatialTriggerSystem) starts working at the
+    // camera natively, ref-counted, overlap-safe.
+    //
+    // This census reads, per scene (client via the panel's session; server via the sessions
+    // the bootstrap stashed at world load), every EntityTrigger in the spatial trigger
+    // system: debug name, bounds, tag constraints (TypeConstraints as raw TypeIds, resolved
+    // to names by asking TypeId<T> for the known candidates), and the entities currently
+    // inside. READ-ONLY: reflection over dictionaries the sim owns, so a torn enumeration is
+    // possible — every loop catches and reports partial rather than aborting the report.
+    private static readonly string TriggerCensusPath = Path.Combine(RttLog.OutDir, "trigger-census.txt");
+
+    // The tag types whose TypeIds the census resolves to names. Read via TypeId<T>.Value
+    // (already initialized in a running game — WithInitIfNeeded is the fallback for safety).
+    private static readonly (string Label, string AqName)[] KnownTags =
+    {
+        ("ClientTriggerTag",       "Keen.VRage.Core.Game.GameSystems.GamePruning.ClientTriggerTag, VRage.Core.Game"),
+        ("DynamicTag",             "Keen.VRage.Physics.Data.DynamicTag, VRage.Physics"),
+        ("ProcedurallyGeneratedTag","Keen.VRage.Core.Game.GameSystems.ProceduralGeneration.ProcedurallyGeneratedTag, VRage.Core.Game"),
+        ("ManagedByWorldAreaTag",  "Keen.VRage.Core.Game.GameSystems.ManagedWorldAreas.ManagedByWorldAreaTag, VRage.Core.Game"),
+        ("StaticTag",              "Keen.VRage.Physics.Data.StaticTag, VRage.Physics"),
+        ("CharacterTag",           "Keen.Game2.Simulation.WorldObjects.Characters.CharacterTag, Game2.Simulation"),
+    };
+
+    internal static void DumpTriggerCensus(object anyEntityInScene, Vector3D cameraPos)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("=== SPATIAL TRIGGER CENSUS ===");
+        sb.AppendLine("Written by WorldGrids.DumpTriggerCensus (triggerCensus = 1).");
+        sb.AppendLine($"Camera (orbit centre): {cameraPos.X:F0}, {cameraPos.Y:F0}, {cameraPos.Z:F0}");
+        sb.AppendLine("Every EntityTrigger in each reachable scene's SpatialTriggerSystemSessionComponent,");
+        sb.AppendLine("sorted by distance to the camera. 'inside' counts entities currently in the trigger.");
+
+        // The TypeId -> name table, rebuilt per dump into the shared map the per-session
+        // census reads. Reading TypeId<T>.Value is a static-field read; WithInitIfNeeded is
+        // the fallback and is what every engine consumer calls anyway.
+        idToNameShared.Clear();
+        sb.AppendLine("\n--- known tag TypeIds ---");
+        foreach (var (label, aq) in KnownTags)
+        {
+            try
+            {
+                var t = Type.GetType(aq);
+                if (t == null) { sb.AppendLine($"    {label,-26} TYPE NOT FOUND ({aq})"); continue; }
+                var tid = Type.GetType("Keen.VRage.DCS.Internal.TypeId`1, VRage.DCS")?.MakeGenericType(t);
+                var val = tid?.GetProperty("Value", Any)?.GetValue(null)
+                       ?? tid?.GetMethod("WithInitIfNeeded", Any)?.Invoke(null, null);
+                if (val is int i)
+                {
+                    idToNameShared[i] = label;
+                    sb.AppendLine($"    {label,-26} id {i}");
+                }
+                else sb.AppendLine($"    {label,-26} TypeId unreadable");
+            }
+            catch (Exception e) { sb.AppendLine($"    {label,-26} FAILED: {e.GetType().Name}"); }
+        }
+
+        // Scene 1: the client (the panel's own session — same road AppendManagedAreas walks).
+        var tBlock = Type.GetType(
+            "Keen.Game2.Simulation.WorldObjects.CubeBlocks.CubeBlockComponent, Game2.Simulation");
+        var grid = ComponentOf(anyEntityInScene, "CubeGridComponent")
+                   ?? Prop(TryGetViaGeneric(anyEntityInScene, tBlock), "Grid");
+        var clientSession = Prop(grid, "Session");
+        CensusOneSession(sb, clientSession, "CLIENT (panel's session)", cameraPos);
+
+        // Scene 2+: every distinct session the bootstrap captured at world load. These were
+        // stashed by the managed-area patch DURING LOAD, before the logic attached — it is
+        // how the server session was found for the TryLoad experiments. Distinct by
+        // reference; the client session is skipped if it shows up again.
+        //
+        // The captured object is the ManagedWorldArea SESSION COMPONENT, not the Session —
+        // the first census run printed "[ManagedWorldAreaSessionComponent]" as the session
+        // type and then found nothing on it. One Prop hop fixes it, and the SERVER flavour
+        // (the one without "Client" in its name) is exactly the session this census exists
+        // to reach.
+        try
+        {
+            var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
+            var regs = bridge?.GetField("ManagedAreaRegistrations")?.GetValue(null) as IEnumerable;
+            var regsLock = bridge?.GetField("ManagedAreaLock")?.GetValue(null);
+            var seen = new HashSet<object> { clientSession };
+            if (regs != null && regsLock != null)
+            {
+                // Snapshot under the SAME lock the bootstrap's postfix takes — locking any
+                // other object is synchronization theatre.
+                var sessions = new List<(object Session, string Via)>();
+                lock (regsLock)
+                {
+                    foreach (var pair in regs)
+                        if (pair is object[] { Length: >= 2 } p && p[1] != null)
+                        {
+                            var cand = p[1];
+                            // The stash holds whatever Harmony bound to `session` — on this
+                            // build that is the session COMPONENT. Resolve to its Session.
+                            var real = Prop(cand, "SessionComponents") != null ? cand : Prop(cand, "Session");
+                            if (real != null) sessions.Add((real, cand.GetType().Name));
+                        }
+                }
+                foreach (var (s, via) in sessions)
+                    if (seen.Add(s))
+                        CensusOneSession(sb, s, $"CAPTURED via {via}", cameraPos);
+            }
+            else sb.AppendLine("\n--- no captured sessions on the bridge (old bootstrap or none registered) ---");
+        }
+        catch (Exception e) { sb.AppendLine($"\n--- captured-session sweep FAILED: {e.GetType().Name}: {e.Message} ---"); }
+
+        // The legend: every raw id the tables printed, resolved through the engine's own
+        // reverse registry. This is what turns "must:3+80+519" into an archetype recipe.
+        if (_censusIdsSeen.Count > 0)
+        {
+            sb.AppendLine("\n--- TypeId legend (RuntimeDataInfo.Of) ---");
+            foreach (var id in _censusIdsSeen.OrderBy(i => i))
+                sb.AppendLine($"    {id,6}  {(idToNameShared.TryGetValue(id, out var known) ? known + "  =  " : "")}{ResolveTypeId(id)}");
+            _censusIdsSeen.Clear();
+        }
+
+        try
+        {
+            File.WriteAllText(TriggerCensusPath, sb.ToString());
+            RttLog.Line($"TRIGGER CENSUS written to {TriggerCensusPath} ({sb.Length} chars).");
+        }
+        catch (Exception e) { RttLog.Error("trigger census write", e); }
+    }
+
+    private static void CensusOneSession(StringBuilder sb, object session, string label, Vector3D cameraPos)
+    {
+        try
+        {
+            if (session == null) { sb.AppendLine($"\n=== {label}: session NULL ==="); return; }
+            sb.AppendLine($"\n=== {label}  [{session.GetType().Name}] ===");
+
+            // Which scene is this? SpawnSyncPoint in the job tables marks the one that can
+            // spawn — the discriminator the TryLoad saga established. Reached and tested the
+            // way LoadAreaByName's probe does it (Session -> Entity -> Scene, Contains with
+            // the TYPE key): the first census asked Prop(session, "Scene") and string-matched
+            // key.ToString(), and reported "no" for scenes the type-key probe says HAVE it.
+            var scene = Prop(Prop(session, "Entity"), "Scene") ?? Prop(session, "Scene");
+            var tSync = Type.GetType(
+                "Keen.VRage.Core.Game.GameSystems.ManagedWorldAreas.ManagedWorldArea+SpawnSyncPoint, VRage.Core.Game");
+            var sys = Prop(scene, "_jobSystemsIndex") as IDictionary;
+            var grp = Prop(scene, "_jobGroupToIndex") as IDictionary;
+            bool canSpawn = tSync != null && ((sys?.Contains(tSync) ?? false) || (grp?.Contains(tSync) ?? false));
+            sb.AppendLine($"    scene #{scene?.GetHashCode():x8} ({scene?.GetType().Name ?? "?"})  " +
+                          $"SpawnSyncPoint: {(sys == null && grp == null ? "tables unreadable" : canSpawn ? "YES — this scene spawns" : "no")}");
+
+            object triggerSystem = null;
+            var scEntity = Prop(session, "SessionComponents");
+            if (scEntity != null && _fComponents?.GetValue(scEntity) is IEnumerable scComps)
+                foreach (var c in scComps)
+                    if (c != null && c.GetType().Name == "SpatialTriggerSystemSessionComponent") { triggerSystem = c; break; }
+            if (triggerSystem == null)
+            {
+                sb.AppendLine("    SpatialTriggerSystemSessionComponent NOT on this session's entity.");
+                return;
+            }
+
+            // _attachedEntityIndex: entity -> its attached triggers. Enumerating the values
+            // reaches every trigger that is attached to anything, which in this engine is
+            // every trigger that matters (sector triggers ride the planet, area triggers
+            // ride their area entity). Distinct by reference — one trigger can index twice.
+            var index = Prop(triggerSystem, "_attachedEntityIndex") as IDictionary;
+            if (index == null) { sb.AppendLine("    _attachedEntityIndex unreadable."); return; }
+
+            var triggers = new List<object>();
+            var seenT = new HashSet<object>();
+            int indexEntries = 0;
+            string shapeNote = null;
+
+            // The second census run showed the real layout: entity -> HashSetDictionary ->
+            // KeyValuePair -> HashSet -> EntityTrigger. Rather than hard-code four hops,
+            // descend until something NAMED like a trigger appears. KeyValuePairs unwrap
+            // through Value; anything else enumerable enumerates. At METHOD scope because
+            // both the attached index and the occupancy map below feed through it.
+            void Collect(object node, int depth)
+            {
+                if (node == null || depth > 4) return;
+                var tn = node.GetType().Name;
+                // Contains, not EndsWith: the live types are ShapedSectoredTrigger`1 /
+                // ShapedEntityTrigger`1 — generic, so the name ends in the arity marker.
+                if (tn.Contains("Trigger", StringComparison.Ordinal) && !tn.Contains("TriggerSystem", StringComparison.Ordinal))
+                {
+                    if (seenT.Add(node)) triggers.Add(node);
+                    return;
+                }
+                if (tn.StartsWith("KeyValuePair", StringComparison.Ordinal))
+                {
+                    Collect(Prop(node, "Value"), depth + 1);
+                    return;
+                }
+                if (node is IEnumerable seq && node is not string)
+                    foreach (var child in seq) Collect(child, depth + 1);
+            }
+
+            try
+            {
+                foreach (DictionaryEntry de in index)
+                {
+                    indexEntries++;
+                    shapeNote ??= $"index value: {de.Value?.GetType().Name ?? "null"}";
+                    Collect(de.Value, 0);
+                }
+            }
+            catch (Exception e)
+            {
+                sb.AppendLine($"    (index enumeration torn after {indexEntries} entries: {e.GetType().Name} — partial list below)");
+            }
+
+            sb.AppendLine($"    _attachedEntityIndex: {indexEntries} entit(ies), {triggers.Count} trigger(s) reachable through it. [{shapeNote ?? "empty"}]");
+
+            // THE AUTHORITATIVE STORE. _triggerBroadphase maps SparseTriggerGroup -> volume
+            // tree; the tree's Count is the number of live triggers in that group. The
+            // attached index only covers triggers attached to entities, which the first two
+            // censuses proved is a sparse subset (3 entities, empty sets, while 3 entities
+            // were demonstrably INSIDE triggers).
+            try
+            {
+                var broad = Prop(triggerSystem, "_triggerBroadphase") as IDictionary;
+                if (broad == null) sb.AppendLine("    _triggerBroadphase unreadable.");
+                else
+                {
+                    int total = 0, groups = 0;
+                    foreach (DictionaryEntry de in broad)
+                    {
+                        groups++;
+                        var count = Prop(de.Value, "Count") is int c ? c : -1;
+                        if (count > 0) total += count;
+                        var sparse = Prop(Prop(de.Key, "Definition"), "SparseUpdate");
+                        sb.AppendLine($"    broadphase group #{groups}: {count} trigger(s), SparseUpdate={sparse}");
+
+                        // The trigger OBJECTS. The tree's node pool is a plain array of Node
+                        // structs; leaves carry the trigger in UserData. Internal-node slots
+                        // and freed slots hold null/non-trigger UserData and are skipped by
+                        // Collect's name test. Every hop is NAMED on failure — the last three
+                        // censuses each died silently one hop short, and a reload is priced.
+                        var pool = Prop(de.Value, "_nodes");
+                        var arr = Prop(pool, "_list") as Array;
+                        if (arr == null)
+                        {
+                            sb.AppendLine($"      harvest DEAD-ENDS: tree={de.Value.GetType().Name} " +
+                                          $"_nodes={(pool == null ? "NULL" : pool.GetType().Name)} " +
+                                          $"_list={(pool == null ? "-" : Prop(pool, "_list")?.GetType().Name ?? "NULL")}");
+                        }
+                        else
+                        {
+                            int before = triggers.Count; string firstTypes = null;
+                            foreach (var nodeObj in arr)
+                            {
+                                var ud = Prop(nodeObj, "UserData");
+                                if (ud != null && firstTypes == null) firstTypes = ud.GetType().FullName;
+                                Collect(ud, 0);
+                            }
+                            if (triggers.Count == before)
+                                sb.AppendLine($"      harvest EMPTY: array[{arr.Length}] of {arr.GetType().GetElementType()?.Name}, " +
+                                              $"first non-null UserData: {firstTypes ?? "(all null)"}");
+                        }
+                    }
+                    sb.AppendLine($"    _triggerBroadphase TOTAL: {total} trigger(s) in {groups} group(s); " +
+                                  $"{triggers.Count} trigger object(s) harvested for the table below.");
+                }
+            }
+            catch (Exception e) { sb.AppendLine($"    _triggerBroadphase unreadable: {e.GetType().Name}: {e.Message}"); }
+
+            // Who is currently inside anything — and specifically, is OUR marker? The map is
+            // entity -> containing triggers; its VALUES are live trigger objects, so they
+            // also feed the detail table below (these are exactly the triggers that are
+            // doing something right now).
+            try
+            {
+                var containing = Prop(triggerSystem, "_containingTriggers") as IDictionary;
+                if (containing != null)
+                {
+                    var markerHandle = _marker == null ? null : Prop(_marker, "Entity")?.ToString();
+                    var occupied = 0; string markerLine = null;
+                    foreach (DictionaryEntry de in containing)
+                    {
+                        occupied++;
+                        Collect(de.Value, 0);      // harvest the trigger objects themselves
+                        if (markerHandle != null && de.Key?.ToString() == markerHandle)
+                            markerLine = $"OUR MARKER ({markerHandle}) IS INSIDE {(de.Value is IEnumerable l ? CountSafe(l) : 1)} trigger(s)";
+                    }
+                    sb.AppendLine($"    _containingTriggers: {occupied} entit(ies) inside at least one trigger. " +
+                                  (markerLine ?? (markerHandle == null ? "(no marker alive)" : $"our marker ({markerHandle}) is inside NONE")));
+                }
+            }
+            catch (Exception e) { sb.AppendLine($"    _containingTriggers unreadable: {e.GetType().Name}"); }
+            sb.AppendLine($"    {"distance",12}  {"size",7}  {"inside",6}  {"kind",-9}  {"constraints",-60}  name");
+            sb.AppendLine("    " + new string('-', 130));
+
+            var rows = new List<(double Dist, string Line)>();
+            foreach (var t in triggers)
+            {
+                try
+                {
+                    var name = Prop(t, "_debugName")?.ToString() ?? "(unnamed)";
+                    var kind = t.GetType().Name.Contains("Sectored", StringComparison.Ordinal) ? "SECTORED" : "entity";
+                    var bounds = Prop(t, "ShapeBounds");
+                    Vector3D? centre = null; double half = 0;
+                    if (Prop(bounds, "Min") is Vector3D mn && Prop(bounds, "Max") is Vector3D mx)
+                    { centre = (mn + mx) * 0.5; half = (mx - mn).Length() * 0.5; }
+                    else if (Prop(bounds, "Center") is Vector3D c) centre = c;
+                    var dist = centre.HasValue ? (centre.Value - cameraPos).Length() : double.MaxValue;
+                    // CONTAINS beats distance-to-centre for reading this table: a planet-wide
+                    // sector box 61 km from the camera by centre very much covers the camera.
+                    var contains = centre.HasValue && half > 0 && dist <= half;
+                    var inside = Prop(t, "Entities") is IEnumerable ents ? CountSafe(ents) : -1;
+
+                    // LAYOUT (read from TypeConstraintBuilder.AsSpan(out mustHaveCount), not
+                    // guessed): each int[] is [count, ...count MustHave ids, ...MustNot ids].
+                    // The first census printed the count as if it were a component id, which
+                    // made ManagedByWorldAreaTag look like a MUST on the area triggers.
+                    var cons = "?";
+                    if (Prop(Prop(t, "TriggerArgs"), "TypeConstraints") is int[][] tc)
+                    {
+                        var parts = new List<string>();
+                        foreach (var layer in tc)
+                        {
+                            if (layer == null || layer.Length == 0) continue;
+                            var n2 = layer[0];
+                            var must = layer.Skip(1).Take(n2).Select(FormatTagId);
+                            var not = layer.Skip(1 + n2).Select(FormatTagId);
+                            parts.Add($"must:{string.Join("+", must)}" +
+                                      (layer.Length > 1 + n2 ? $" not:{string.Join("+", not)}" : ""));
+                        }
+                        cons = string.Join(" | ", parts);
+                    }
+
+                    var distStr = dist == double.MaxValue ? "?" : dist >= 1000 ? $"{dist / 1000:F0}km" : $"{dist:F0}m";
+                    var sizeStr = half <= 0 ? "?" : half >= 1000 ? $"{half / 1000:F0}km" : $"{half:F0}m";
+                    if (contains) distStr = "COVERS-CAM";
+                    rows.Add((contains ? 0 : dist,
+                        $"    {distStr,12}  {sizeStr,7}  {inside,6}  {kind,-9}  {Trunc(cons, 60),-60}  {Trunc(name, 60)}"));
+                }
+                catch { /* torn trigger — skip it, keep the census */ }
+            }
+
+            // Every trigger within 100 km of the camera, then the nearest tail beyond it up
+            // to a cap — a distant-but-relevant trigger (a managed area two valleys over)
+            // should still show, but a thousand-line dump of the whole solar system is the
+            // component-roster trap again.
+            rows.Sort((a, b2) => a.Dist.CompareTo(b2.Dist));
+            int printed = 0;
+            foreach (var r in rows)
+            {
+                if (printed >= 250 && r.Dist > 100000) break;
+                sb.AppendLine(r.Line);
+                printed++;
+            }
+            if (printed < rows.Count) sb.AppendLine($"    ... {rows.Count - printed} more beyond 100 km (capped).");
+
+            string FormatTagId(int id)
+            {
+                _censusIdsSeen.Add(id);
+                return idToNameShared.TryGetValue(id, out var n2) ? n2 : id.ToString();
+            }
+        }
+        catch (Exception e)
+        {
+            sb.AppendLine($"    CENSUS FAILED for this session: {e.GetType().Name}: {e.Message}");
+        }
+    }
+
+    // Shared by CensusOneSession's local function — filled by DumpTriggerCensus before use.
+    private static readonly Dictionary<int, string> idToNameShared = new();
+
+    // Every raw TypeId the census prints, resolved to a legend at the end of the report via
+    // the engine's own reverse registry: RuntimeDataInfo.Of(int) -> Info. The first censused
+    // constraints were number soup (must:3+80+519...) precisely because the id->type mapping
+    // is runtime-assigned and unknowable offline.
+    private static readonly HashSet<int> _censusIdsSeen = new();
+
+    private static string ResolveTypeId(int id)
+    {
+        try
+        {
+            var tRdi = Type.GetType("Keen.VRage.DCS.Internal.RuntimeDataInfo, VRage.DCS");
+            var of = tRdi?.GetMethods(Any).FirstOrDefault(m => m.Name == "Of" && m.GetParameters().Length == 1
+                                                            && m.GetParameters()[0].ParameterType == typeof(int));
+            var info = of?.Invoke(null, new object[] { id });
+            if (info == null) return "(unresolvable)";
+            var t = Prop(info, "Type") ?? Prop(info, "DataType") ?? Prop(info, "RuntimeType");
+            return (t as Type)?.FullName ?? t?.ToString() ?? info.ToString();
+        }
+        catch (Exception e) { return $"(resolve failed: {e.GetType().Name})"; }
+    }
+
+    private static int CountSafe(IEnumerable e)
+    {
+        try { int n = 0; foreach (var _ in e) n++; return n; }
+        catch { return -1; }
+    }
+
+    private static string Trunc(string s, int max) => s.Length <= max ? s : s.Substring(0, max - 1) + "…";
+
+    // ── THE SERVER PRESENCE ENTITY — goal 10's server half, on the engine's own seat ────
+    //
+    // The trigger census (2026-08-01, trigger-census.txt) decoded every relevant constraint:
+    //
+    //   flora sectors (server scene):   must DynamicTag+WorldTransform+BoundingBoxData
+    //   managed world areas (server):   must DynamicTag+WorldTransform+BoundingBoxData
+    //   voxel data sectors (client):    must DynamicTag+WorldTransform+BoundingBoxData
+    //
+    // One archetype makes the engine materialize EVERYTHING around a position, ref-counted
+    // and overlap-safe, because it is the same input multiplayer presence uses. But the
+    // server scene pumps on its own thread, and structural mutation from any other thread
+    // is the TryLoad freeze waiting to recur — so all server-scene work happens INSIDE
+    // OnSimPump, which the bootstrap invokes from a Harmony prefix on the trigger system's
+    // own per-frame methods: by construction, the right thread for that scene.
+    //
+    // The callback fires for BOTH scenes' trigger systems; the SpawnSyncPoint probe (the
+    // TryLoad saga's discriminator) picks the server one, cached per component instance.
+    private static readonly Dictionary<object, bool> _pumpSceneIsServer = new();
+    private static object _serverMarker;          // DEntityContext in the SERVER scene
+    private static Vector3D _serverMarkerPos;
+    private static int _serverMarkerMoves;
+    private static bool _serverDisarmed;
+    private static long _serverLogTicks;
+
+    internal static void OnSimPump(object triggerSystemComponent)
+    {
+        // Cheap early-outs first: this runs inside the engine's trigger processing.
+        if (_serverDisarmed || triggerSystemComponent == null) return;
+        var want = FeedConfig.ServerPresenceEntity;
+        if (!want && _serverMarker == null) return;
+
+        try
+        {
+            if (!_pumpSceneIsServer.TryGetValue(triggerSystemComponent, out var isServer))
+            {
+                var session = Prop(triggerSystemComponent, "Session");
+                var scene = Prop(Prop(session, "Entity"), "Scene");
+                var tSync = Type.GetType(
+                    "Keen.VRage.Core.Game.GameSystems.ManagedWorldAreas.ManagedWorldArea+SpawnSyncPoint, VRage.Core.Game");
+                var sys = Prop(scene, "_jobSystemsIndex") as IDictionary;
+                var grp = Prop(scene, "_jobGroupToIndex") as IDictionary;
+                isServer = tSync != null && ((sys?.Contains(tSync) ?? false) || (grp?.Contains(tSync) ?? false));
+                _pumpSceneIsServer[triggerSystemComponent] = isServer;
+                if (isServer)
+                    RttLog.Line("SERVER PRESENCE: sim-pump seat identified the spawning scene's trigger system — " +
+                                "server-side world materialization is now drivable from here.");
+            }
+            if (!isServer) return;
+
+            var scene2 = Prop(Prop(Prop(triggerSystemComponent, "Session"), "Entity"), "Scene");
+            if (scene2 == null) return;
+
+            if (!want)
+            {
+                // Teardown, on the same seat that created it.
+                if (_serverMarker != null)
+                {
+                    var handle = Prop(_serverMarker, "Entity");
+                    _miRemoveEntity ??= scene2.GetType().GetMethods(Any).FirstOrDefault(
+                        m => m.Name == "RemoveEntity" && m.GetParameters().Length == 1);
+                    _miRemoveEntity?.Invoke(scene2, new[] { handle });
+                    _serverMarker = null;
+                    RttLog.Line("SERVER PRESENCE: marker removed (knob off). Sectors it materialized are the " +
+                                "engine's to reclaim.");
+                }
+                return;
+            }
+
+            var pos = CameraFeed.SubjectCentreCache;
+            if (pos.LengthSquared() <= 1.0) return;                 // no feed target yet
+
+            if (_serverMarker == null)
+            {
+                _tWt ??= Type.GetType("Keen.VRage.Core.WorldTransform, VRage.Core");
+                _tBbd ??= Type.GetType("Keen.VRage.Core.Game.Data.BoundingBoxData, VRage.Core.Game");
+                var tDyn = Type.GetType("Keen.VRage.Physics.Data.DynamicTag, VRage.Physics");
+                var add = scene2.GetType().GetMethods(Any).FirstOrDefault(
+                    m => m.Name == "AddEntity" && m.IsGenericMethodDefinition
+                      && m.GetGenericArguments().Length == 3 && m.GetParameters().Length == 3);
+                if (_tWt == null || _tBbd == null || tDyn == null || add == null)
+                {
+                    _serverDisarmed = true;
+                    RttLog.Line($"SERVER PRESENCE: shape missing (WorldTransform={(_tWt == null ? "X" : "ok")} " +
+                                $"BoundingBoxData={(_tBbd == null ? "X" : "ok")} DynamicTag={(tDyn == null ? "X" : "ok")} " +
+                                $"AddEntity<3>={(add == null ? "X" : "ok")}) — server presence inactive.");
+                    return;
+                }
+
+                var bbd = Activator.CreateInstance(_tBbd);
+                _tBbd.GetField("BoundingBox", Any)?.SetValue(
+                    bbd, new BoundingBox(new Vector3(-MarkerHalfExtent), new Vector3(MarkerHalfExtent)));
+                _serverMarker = add.MakeGenericMethod(tDyn, _tWt, _tBbd).Invoke(
+                    scene2, new[] { Activator.CreateInstance(tDyn), Activator.CreateInstance(_tWt, new object[] { pos }), bbd });
+                _serverMarkerPos = pos;
+                _serverMarkerMoves = 0;
+                RttLog.Line($"SERVER PRESENCE: created DynamicTag+WorldTransform+BoundingBoxData at " +
+                            $"{pos.X:F0},{pos.Y:F0},{pos.Z:F0} IN THE SERVER SCENE, from its own pump. This is " +
+                            "the archetype every censused trigger tests. Flora sectors, managed areas and voxel " +
+                            "sectors should now see a presence at the camera. Watch the census 'inside' column, " +
+                            "the feed, and VRAM.");
+                return;
+            }
+
+            if ((pos - _serverMarkerPos).LengthSquared() >= MarkerMoveEpsilon * MarkerMoveEpsilon)
+            {
+                _miSetWt ??= Type.GetType("Keen.VRage.Core.Game.Data.EntityTransformFunctions, VRage.Core.Game")
+                    ?.GetMethods(Any).FirstOrDefault(m => m.Name == "SetWorldTransform" && m.GetParameters().Length == 2);
+                var wt = Activator.CreateInstance(_tWt, new object[] { pos });
+                if (_miSetWt != null) _miSetWt.Invoke(null, new[] { _serverMarker, wt });
+                else
+                {
+                    var set = _serverMarker.GetType().GetMethods(Any).FirstOrDefault(
+                        m => m.Name == "Set" && m.IsGenericMethodDefinition && m.GetParameters().Length == 1);
+                    set?.MakeGenericMethod(_tWt).Invoke(_serverMarker, new[] { wt });
+                }
+                _serverMarkerPos = pos;
+                _serverMarkerMoves++;
+            }
+
+            var now = Environment.TickCount64;
+            if (now - _serverLogTicks > 30000)
+            {
+                _serverLogTicks = now;
+                RttLog.Line($"SERVER PRESENCE: alive at {_serverMarkerPos.X:F0},{_serverMarkerPos.Y:F0},{_serverMarkerPos.Z:F0} " +
+                            $"({_serverMarkerMoves} move(s)).");
+            }
+        }
+        catch (Exception e)
+        {
+            _serverDisarmed = true;      // fault once, stop — this is inside engine trigger code
+            RttLog.Error("server presence", e);
+        }
+    }
+
     // TAG PROVENANCE ACROSS A HOT RELOAD.
     //
     // _tagAddedByUs lives in statics that a reload throws away, while the tag it records
@@ -844,12 +1383,31 @@ internal static class WorldGrids
         _markerPos = pos;
         _markerMoves = 0;
 
+        // DynamicTag, decoded from the census: the client scene's voxel-sector triggers
+        // (Voxel : Block / Voxel : Prediction) constrain on DynamicTag+WorldTransform+
+        // BoundingBoxData — ClientTriggerTag never moves voxel DATA. Set<T> is a
+        // structural archetype change, done once here at birth.
+        var dynAdded = false;
+        if (FeedConfig.CameraTriggerDynamicTag)
+        {
+            try
+            {
+                var tDyn = Type.GetType("Keen.VRage.Physics.Data.DynamicTag, VRage.Physics");
+                var set = _marker.GetType().GetMethods(Any).FirstOrDefault(
+                    m => m.Name == "Set" && m.IsGenericMethodDefinition && m.GetParameters().Length == 1);
+                if (tDyn != null && set != null)
+                {
+                    set.MakeGenericMethod(tDyn).Invoke(_marker, new[] { Activator.CreateInstance(tDyn) });
+                    dynAdded = true;
+                }
+            }
+            catch (Exception e) { RttLog.Error("marker DynamicTag", e); }
+        }
+
         RttLog.Line($"CAMERA TRIGGER: created the marker entity at {pos.X:F0},{pos.Y:F0},{pos.Z:F0} — " +
-                    "ClientTriggerTag + WorldTransform + a 2.75 m box, which is the engine's own voxel " +
-                    "observer construction with our camera's position instead of the player's. The planet's " +
-                    "sectored trigger tests exactly MustHave(ClientTriggerTag), so environment sectors should " +
-                    "now materialize around the CAMERA with nothing anchored and no grid mutated. Watch VRAM: " +
-                    "materialized sectors are real entities and real GPU batches.");
+                    $"ClientTriggerTag{(dynAdded ? " + DynamicTag" : "")} + WorldTransform + a 2.75 m box. " +
+                    "Per the census: ClientTriggerTag satisfies the client flora-sector triggers, DynamicTag " +
+                    "the client voxel-sector triggers. Watch the census 'inside' column and VRAM.");
     }
 
     private static void MoveMarker(Vector3D pos)

@@ -134,6 +134,53 @@ static class Program
             return 0;
         }
 
+        // OPERAND GREP — the `strings` command this tool's own header says was missing.
+        //
+        // The question it answers: "who, ANYWHERE in the loaded set, touches <name>?" — where
+        // <name> is a type, a generic instantiation (Set<ClientTriggerTag> shows the argument
+        // in the operand's FullName), a field, or a string literal such as an observer tag.
+        // `callers` cannot answer this: it seeds on method DEFINITIONS, and a generic
+        // definition's name never mentions its instantiations — which is exactly how the
+        // ClientTriggerTag consumer hunt came back empty through the callers command.
+        //
+        // Linear scan, no call graph, so it is fast enough to run over everything.
+        if (cmd == "grepil")
+        {
+            var rx = new Regex(args[2], RegexOptions.IgnoreCase);
+            var byType = new SortedDictionary<string, List<string>>();
+            foreach (var m in AllMethods)
+            {
+                if (!m.HasBody) continue;
+                MethodBody b;
+                try { b = m.Body; } catch { continue; }
+                var hits = new HashSet<string>();
+                foreach (var ins in b.Instructions)
+                {
+                    var s = ins.Operand switch
+                    {
+                        MethodReference mr => mr.FullName,
+                        FieldReference fr => fr.FullName,
+                        TypeReference tr => tr.FullName,
+                        string lit => "\"" + lit + "\"",
+                        _ => null,
+                    };
+                    if (s != null && rx.IsMatch(s)) hits.Add(s);
+                }
+                if (hits.Count == 0) continue;
+                var key = m.DeclaringType.FullName + "   [" + m.Module.Name + "]";
+                if (!byType.TryGetValue(key, out var l)) byType[key] = l = new();
+                foreach (var h in hits.OrderBy(x => x))
+                    l.Add($"  {m.Name}  ->  {(h.Length > 160 ? h.Substring(0, 160) + "…" : h)}");
+            }
+            foreach (var kv in byType)
+            {
+                Console.WriteLine($"\n=== {kv.Key}");
+                foreach (var line in kv.Value.Distinct()) Console.WriteLine(line);
+            }
+            Console.Error.WriteLine($"[ilscan] {byType.Count} type(s) touch the pattern");
+            return 0;
+        }
+
         // Raw IL. The `members` dump answers "what is the shape"; this answers "what does it
         // actually READ", which is the only way to settle questions like "does this static
         // helper sample the live back-buffer resolution or a stored one" — the difference

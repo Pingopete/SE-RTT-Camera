@@ -172,6 +172,26 @@ public static class RttBridge
     // the 16-slot LODData array whose sharing across bodies is the current prime suspect for
     // the mid-LOD plateau. Handing it over here costs nothing and saves guessing at its home.
     public static volatile object VoxelUpdateComponent;
+
+    // ---- THE SIM-PUMP SEAT (goal 10, the server half) ---------------------------------
+    //
+    // Everything the trigger census proved wants a presence entity in the SERVER scene:
+    // flora sectors, managed world areas and voxel sectors all constrain on
+    // DynamicTag + WorldTransform + BoundingBoxData (census 2026-08-01, constraints read
+    // from the live TriggerArgs). But structural scene mutation is only safe on the thread
+    // that pumps that scene — the TryLoad freeze (FinishBefore<SpawnSyncPoint> from OUR
+    // thread) is the standing proof of what happens otherwise.
+    //
+    // So the bootstrap provides a SEAT rather than an action: a Harmony prefix on a method
+    // that provably runs on every scene's own pump each frame hands the logic a callback
+    // IN that seat, and the logic decides per-invocation whether this is the scene it
+    // wants (it probes the job tables for SpawnSyncPoint, same discriminator as ever).
+    // The bootstrap stays ignorant of what the logic does there, exactly like every other
+    // hook on this bridge.
+    //
+    // (component) -> void, invoked at the top of SpatialTriggerSystemSessionComponent's
+    // per-frame pending-trigger processing, on that component's scene's pump thread.
+    public static volatile Action<object> SimPumpHook;
 }
 
 public sealed class RttPlugin : IPlugin
@@ -234,6 +254,7 @@ public sealed class RttPlugin : IPlugin
             PatchGhostProbes(harmony);
             PatchManagedAreas(harmony);
             PatchClipmapCamera(harmony);
+            PatchSimPumpSeat(harmony);
         }
         catch (Exception e) { Log("Patching FAILED: " + e); }
     }
@@ -272,6 +293,44 @@ public sealed class RttPlugin : IPlugin
             if (replacement != null) __args[1] = replacement;
         }
         catch { }
+    }
+
+    // The sim-pump seat — see RttBridge.SimPumpHook. Two candidate methods are patched
+    // with the same prefix because neither is individually guaranteed to run every frame:
+    // OnTriggerPending processes queued trigger work, UpdateStats maintains the counters.
+    // Either firing is a seat; both firing is two chances per frame, and the hook is
+    // idempotent on the logic side (it drains a queue).
+    private static void PatchSimPumpSeat(HarmonyLib.Harmony harmony)
+    {
+        try
+        {
+            var t = Type.GetType(
+                "Keen.VRage.Core.Game.GameSystems.SpatialTrigger.SpatialTriggerSystemSessionComponent, VRage.Core.Game");
+            if (t == null) { Log("SpatialTriggerSystemSessionComponent not found — sim-pump seat inactive."); return; }
+            var pre = typeof(RttPlugin).GetMethod(nameof(SimPumpPrefix), BindingFlags.Static | BindingFlags.NonPublic);
+            int patched = 0;
+            foreach (var name in new[] { "OnTriggerPending", "OnUpdateAddedOrMovedTrigger" })
+            {
+                var mi = t.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (mi == null) { Log($"SpatialTriggerSystemSessionComponent.{name} not found — skipped."); continue; }
+                harmony.Patch(mi, prefix: new HarmonyLib.HarmonyMethod(pre));
+                patched++;
+            }
+            Log(patched > 0
+                ? $"Sim-pump seat armed on {patched} SpatialTriggerSystem method(s)."
+                : "Sim-pump seat FAILED: no patchable method found.");
+        }
+        catch (Exception e) { Log("Patching sim-pump seat FAILED: " + e.Message); }
+    }
+
+    // Runs on the owning scene's pump thread, potentially every frame, for BOTH scenes'
+    // trigger systems. Must be cheap and must never throw — it sits inside the engine's
+    // trigger processing.
+    private static void SimPumpPrefix(object __instance)
+    {
+        var hook = RttBridge.SimPumpHook;
+        if (hook == null) return;
+        try { hook(__instance); } catch { }
     }
 
     // Managed-area registration capture — see RttBridge.ManagedAreaRegistrations for why

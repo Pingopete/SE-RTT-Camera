@@ -73,6 +73,22 @@ public static class LogicEntry
             bridge.GetField("ClipmapCameraHook")?.SetValue(null,
                 (Func<object, object, object>)WorldGrids.ChooseClipmapCamera);
 
+            // The sim-pump seat (server presence entity). Absent on an older bootstrap,
+            // which degrades to "no server-side materialization" — the state of the world
+            // before 2026-08-02. Say so out loud, because serverPresenceEntity = 1 with a
+            // stale bootstrap would otherwise read as a silent null result.
+            var pump = bridge.GetField("SimPumpHook");
+            if (pump != null)
+            {
+                pump.SetValue(null, (Action<object>)WorldGrids.OnSimPump);
+                RttLog.Line("Sim-pump seat hook registered — serverPresenceEntity is armable.");
+            }
+            else
+            {
+                RttLog.Line("SimPumpHook not on this bootstrap — restart the game to adopt it. " +
+                            "serverPresenceEntity will have NO EFFECT until then.");
+            }
+
             // The whole-scene route. Null on an older bootstrap, which is the expected
             // state until the game is restarted to adopt the new one — the field is
             // looked up rather than assumed so a stale bootstrap degrades to "this

@@ -835,6 +835,21 @@ internal static class FeedConfig
     public static bool WorldGridSurvey { get; private set; }
     private static bool _surveyArmedLast;
 
+    // One-shot spatial trigger census — every EntityTrigger in every reachable scene, with
+    // tag constraints and current occupants. The instrument for the client/server trigger
+    // split (ClientTriggerTag vs DynamicTag). Same edge discipline as worldGridSurvey;
+    // read-only, so an accidental re-fire costs a report, not a world. Writes
+    // output/trigger-census.txt.
+    public static bool TriggerCensus { get; private set; }
+    private static bool _censusArmedLast;
+
+    public static bool TakeTriggerCensusRequest()
+    {
+        var r = TriggerCensus;
+        TriggerCensus = false;
+        return r;
+    }
+
     // PRELOAD AROUND THE FEED CAMERA (goal 10 tier 1). Off by default: it asks the engine
     // to make world data resident somewhere no player is, which costs memory, and the VRAM
     // cap is already the binding constraint on this route.
@@ -867,6 +882,19 @@ internal static class FeedConfig
     // or the other so a result attributes to something. The A/B that grades this is:
     // clutter appeared with the tag in ~2 min, so marker ON + tag OFF must reproduce it.
     public static bool CameraTriggerEntity { get; private set; }
+
+    // Add DynamicTag to the CLIENT marker. The census decoded the client voxel-sector
+    // triggers (Voxel : Block / Voxel : Prediction) as must:DynamicTag+WorldTransform+
+    // BoundingBoxData — ClientTriggerTag does not move voxel data; DynamicTag does.
+    // Applied at marker CREATION only: toggle cameraTriggerEntity off/on to change it live.
+    public static bool CameraTriggerDynamicTag { get; private set; } = true;
+
+    // THE SERVER HALF. A DynamicTag+WorldTransform+BoundingBoxData entity in the SERVER
+    // scene, created and moved exclusively on that scene's own pump (the bootstrap's
+    // sim-pump seat) — never from our threads. This is the archetype every censused
+    // server trigger tests: flora sectors, managed world areas, encounters' spatial layer.
+    // Off by default: it is a world mutation in the scene that spawns things.
+    public static bool ServerPresenceEntity { get; private set; }
 
     public static bool PerBodyClipmapCamera { get; private set; }
     public static double ClipmapMinPlayerDistance { get; private set; } = 100000.0;
@@ -1002,6 +1030,17 @@ internal static class FeedConfig
 
             var markerWas = CameraTriggerEntity;
             CameraTriggerEntity = Bool(kv, "cameraTriggerEntity", CameraTriggerEntity);
+            CameraTriggerDynamicTag = Bool(kv, "cameraTriggerDynamicTag", CameraTriggerDynamicTag);
+
+            var presenceWas = ServerPresenceEntity;
+            ServerPresenceEntity = Bool(kv, "serverPresenceEntity", ServerPresenceEntity);
+            if (presenceWas != ServerPresenceEntity)
+                RttLog.Global($"Config: serverPresenceEntity {presenceWas} -> {ServerPresenceEntity}" +
+                    (ServerPresenceEntity
+                        ? ". A DynamicTag presence entity will be created in the SERVER scene at the camera, " +
+                          "on that scene's own pump — the archetype flora sectors, managed areas and voxel " +
+                          "sectors all trigger on. Watch for \"SERVER PRESENCE:\" in the log."
+                        : ". The server marker is removed on the next pump pass."));
             if (markerWas != CameraTriggerEntity)
                 RttLog.Global($"Config: cameraTriggerEntity {markerWas} -> {CameraTriggerEntity}" +
                     (CameraTriggerEntity
@@ -1037,6 +1076,10 @@ internal static class FeedConfig
             var surveyWanted = Bool(kv, "worldGridSurvey", false);
             if (surveyWanted && !_surveyArmedLast) WorldGridSurvey = true;
             _surveyArmedLast = surveyWanted;
+
+            var censusWanted = Bool(kv, "triggerCensus", false);
+            if (censusWanted && !_censusArmedLast) TriggerCensus = true;
+            _censusArmedLast = censusWanted;
 
             // DURABLE consume for the area loader, not the in-memory edge the survey uses.
             // The in-memory version re-fired after a game restart — fresh statics saw the
