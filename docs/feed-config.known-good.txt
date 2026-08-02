@@ -108,6 +108,61 @@ wholeSceneOwnFlares = 1
 # next render picks it up, no gate cycle.
 wholeSceneFlareIntensity = 0.2
 
+# ---- SCATTER: FLORA, CLUTTER AND GRASS (2026-08-02, proven in game) ---------
+#
+# READ THIS FIRST, because it dominates every knob below it: a remote feed gets NO
+# flora at all unless flora SECTOR ENTITIES stream in around it. Measured after a
+# restart: `FLORA CAMERA: 0 claimed` out of 8,000,000 updates, stable for ten
+# minutes, feed completely bare. preloadAroundCamera = 1 fixed it within ~2 min.
+#
+# `claimed` in the FLORA CAMERA log line is THE MASTER INSTRUMENT for scatter
+# frequency. Healthy signature: "nearest sector to the FEED is 226 m away with 31
+# model instance(s)". At claimed = 0 nothing below can move the picture, because
+# there is no flora near the feed to select LODs for. Check it before theorising.
+preloadAroundCamera = 1
+
+# FLORA DENSITY/DISTANCE for the FEED ONLY. -1 = do not scope.
+#
+# LOWER = MORE FLORA. It scales the MEASURED DISTANCE that LOD selection consumes,
+# not the LOD thresholds — so raising it makes every plant read as farther away,
+# pick a coarser LOD, and fall off the end of the chain. Measured on a frozen
+# orbit: 2.4 -> ~4 trees, off -> ~15-20, 0.25 -> more than baseline plus shrubs
+# that appeared in no earlier shot. Cost 38.5 -> 34.6 fps, VRAM flat (+4 MB):
+# geometry submitted, not residency.
+#
+# The engine's own min(1, 1080/SwapChain.Resolution.Y) term is it being GENEROUS
+# at high resolution (4K -> 0.5 -> flora reads half as far -> finer LODs), and the
+# feed already inherits that. The probe's "=> N for parity" figure is what the
+# feed's OWN height would earn, which is STINGIER — a reference point, NOT a target.
+wholeSceneFloraLodMult = 0.25
+
+# THE SPAWN RADIUS. GLOBAL — the player's world and VRAM change too, and there is
+# no automatic guard (standing choice: warn loudly, never act). -1 = engine's 10.
+#
+# Flora.RenderingDistanceMultiplier -> InstanceBatch.ComputeCullingDistance (whole
+# body: mult * base) -> InstanceBatch.CullingDistance -> ComputeBoundingBox sets
+# _maxCullingDistance = max(batch.CullingDistance) -> IsOctreeVisible returns
+# boundingBox.Distance(camera) < _maxCullingDistance. That last line IS the circle.
+#
+# PROVEN WIRED: 10 -> 3 visibly thinned scatter in an overhead view. Two things
+# that will otherwise read as "no effect":
+#   NOT RETROACTIVE — read at BATCH ALLOCATION and stored on the batch, so only
+#   batches allocated from now on change. Allow a minute or two of sector cycling.
+#   COARSE — _maxCullingDistance culls whole ~800 m SECTORS, not individual plants,
+#   so it moves in steps and shows no sharp circular edge inside a ~500 m frame.
+worldFloraRadiusMult = -1
+
+# Remaining scatter knobs, all feed-only and all defaulted off. LODSetup.Compose is
+# reached from SceneDrawSystem.MainViewCulling inside our nested Draw, which is what
+# makes per-feed LOD control possible at all. -999 = do not scope (0 and negatives
+# are meaningful: LODShift = -1 asks for one level MORE detail).
+#   wholeSceneLodShift           = -999   LOD.MainView.LODShift
+#   wholeSceneFloraMinLod        = -999   LOD.MainView.FloraMinLOD
+#   wholeSceneObjectDistanceMult = -1     LOD.ObjectDistanceMult (ALL objects)
+#   wholeSceneSmallObjectMult    = -999   LOD.SmallObjectVisibleMult
+#   wholeSceneGrassDrawDistance  = -1     Grass.DrawDistance (engine 1000)
+#   wholeSceneGrassDensity       = -1     Grass.Density      (engine 3)
+
 # OWN ENVIRONMENT PROBES (goal 4.4). The feed samples the PLAYER'S probe atlas, which is
 # centred on the player — so its reflections and ambient bounce are right for where the
 # player stands, not where the camera is. Subtle at 100 m, visibly wrong at real remote
