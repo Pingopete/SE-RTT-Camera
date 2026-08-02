@@ -2508,9 +2508,66 @@ internal static class WorldGrids
     private static double _floraNearestSeen = double.MaxValue;
     private static string _floraLastReject = "(none)";
 
-    internal static void OnFloraSectorUpdate(object component, object[] args, bool visibilityJob)
+    // CACHED REFLECTION. This path runs a quarter of a million times a second (3.8M calls
+    // in 15 s, measured); a GetField per call is not affordable. Every handle below is
+    // resolved once and reused. All are stable for the process.
+    private static FieldInfo _fOctree, _fSphere, _fSphereCentre, _fRootDataRoot, _fWtPosition, _fRelPosition;
+    private static ConstructorInfo _ctorWt;
+    private static bool _floraReflectionReady;
+
+    private static bool EnsureFloraReflection(object component, object octree, object[] args)
     {
-        if (!FeedConfig.FloraCameraOverride || component == null || args == null || args.Length < 2) return;
+        if (_floraReflectionReady) return true;
+        try
+        {
+            _tWt ??= Type.GetType("Keen.VRage.Core.WorldTransform, VRage.Core");
+            _tRelTransform ??= Type.GetType("Keen.VRage.Core.RelativeTransform, VRage.Core");
+            if (_tWt == null || _tRelTransform == null) return false;
+
+            _fWtPosition ??= _tWt.GetField("Position", Any);
+            _fRelPosition ??= _tRelTransform.GetField("Position", Any);
+            _ctorWt ??= _tWt.GetConstructor(new[] { typeof(Vector3D) });
+            _miGetRelative ??= _tWt.GetMethod("GetRelativeTransform", Any);
+            _miRelExplicit ??= _tRelTransform.GetMethods(Any).FirstOrDefault(
+                m => m.Name == "op_Explicit" && m.GetParameters().Length == 1
+                  && m.GetParameters()[0].ParameterType == _tWt);
+
+            _fSphere ??= octree.GetType().GetField("_boundingSphere", Any);
+            var sphere = _fSphere?.GetValue(octree);
+            _fSphereCentre ??= sphere?.GetType().GetField("Center", Any);
+
+            _fRootDataRoot ??= args[0]?.GetType().GetField("Root", Any);
+            _miRootItem ??= args[1]?.GetType().GetMethods(Any).FirstOrDefault(
+                m => m.Name == "get_Item" && m.GetParameters().Length == 1);
+
+            var octType = octree.GetType();
+            _miOctUpdateCam ??= octType.GetMethods(Any).FirstOrDefault(
+                m => m.Name == "UpdateCamera" && m.GetParameters().Length == 1);
+            _miOctUpdateVis ??= octType.GetMethods(Any).FirstOrDefault(
+                m => m.Name == "UpdateVisibility" && m.GetParameters().Length == 1);
+
+            _floraReflectionReady =
+                _fWtPosition != null && _fRelPosition != null && _ctorWt != null &&
+                _miGetRelative != null && _miRelExplicit != null && _fRootDataRoot != null &&
+                _miRootItem != null && _miOctUpdateCam != null && _miOctUpdateVis != null;
+
+            if (!_floraReflectionReady && !_floraShapeLogged)
+            {
+                _floraShapeLogged = true;
+                RttLog.Line("FLORA CAMERA: reflection shape incomplete — override inactive, the engine's own " +
+                            "player-centred update stands.");
+            }
+            return _floraReflectionReady;
+        }
+        catch { return false; }
+    }
+
+    // Returns TRUE when this sector was handled here and the engine's own update must be
+    // skipped. See RttBridge.FloraCameraHook: overwriting after the fact made _cameraCoords
+    // alternate between viewers every frame and the octree never settled.
+    internal static bool OnFloraSectorUpdate(object component, object[] args, bool visibilityJob)
+    {
+        if (!FeedConfig.FloraCameraOverride || component == null || args == null || args.Length < 2) return false;
         _floraCalls++;
 
         // HEARTBEAT OUTSIDE THE CLAIM PATH. The first armed run logged nothing at all,
@@ -2531,21 +2588,24 @@ internal static class WorldGrids
         try
         {
             var feedPos = CameraFeed.SubjectCentreCache;
-            if (feedPos.LengthSquared() <= 1.0) return;
+            if (feedPos.LengthSquared() <= 1.0) return false;
 
-            var octree = Prop(component, "_octree");
-            if (octree == null) return;
+            _fOctree ??= component.GetType().GetField("_octree", Any);
+            var octree = _fOctree?.GetValue(component);
+            if (octree == null) return false;
+            if (!EnsureFloraReflection(component, octree, args)) return false;
 
             // The sector's ROOT is the planet, so root position alone cannot tell sectors
             // apart. The octree's own bounding sphere is in root-relative space; its centre
-            // transformed by the root gives this sector's true world position.
-            var rootWt = RootTransformOf(args);
-            if (rootWt == null) return;
-            if (Prop(rootWt, "Position") is not Vector3D rootPos) return;
+            // offset from the root gives this sector's true world position.
+            var root = _fRootDataRoot.GetValue(args[0]);
+            if (root == null) return false;
+            var rootWt = _miRootItem.Invoke(args[1], new[] { root });
+            if (rootWt == null) return false;
+            if (_fWtPosition.GetValue(rootWt) is not Vector3D rootPos) return false;
 
             var sectorWorld = rootPos;
-            var sphere = Prop(octree, "_boundingSphere");
-            var centre = Prop(sphere, "Center");
+            var centre = _fSphereCentre == null ? null : _fSphereCentre.GetValue(_fSphere.GetValue(octree));
             if (centre != null)
             {
                 var ct = centre.GetType();
@@ -2560,56 +2620,33 @@ internal static class WorldGrids
             }
 
             var playerPos = PlayerRenderCameraPosition();
-            if (playerPos == null) return;
+            if (playerPos == null) return false;
 
             var dPlayer = (playerPos.Value - sectorWorld).Length();
             var dFeed = (feedPos - sectorWorld).Length();
             if (dFeed < _floraNearestSeen) _floraNearestSeen = dFeed;
             if (dFeed * 2.0 >= dPlayer)
-            { _floraLastReject = $"not 2x closer (feed {dFeed / 1000.0:F1} km, player {dPlayer / 1000.0:F1} km)"; return; }
+            { _floraLastReject = $"not 2x closer (feed {dFeed / 1000.0:F1} km, player {dPlayer / 1000.0:F1} km)"; return false; }
             if (dPlayer < FeedConfig.ClipmapMinPlayerDistance)
-            { _floraLastReject = $"player too close ({dPlayer / 1000.0:F1} km)"; return; }
+            { _floraLastReject = $"player too close ({dPlayer / 1000.0:F1} km)"; return false; }
 
-            // Our camera, expressed in this sector's root frame — the same two lines the
-            // engine just ran, with a different position.
-            _tWt ??= Type.GetType("Keen.VRage.Core.WorldTransform, VRage.Core");
-            _tRelTransform ??= Type.GetType("Keen.VRage.Core.RelativeTransform, VRage.Core");
-            _miGetRelative ??= _tWt?.GetMethod("GetRelativeTransform", Any);
-            _miRelExplicit ??= _tRelTransform?.GetMethods(Any).FirstOrDefault(
-                m => m.Name == "op_Explicit" && m.GetParameters().Length == 1
-                  && m.GetParameters()[0].ParameterType == _tWt);
-            if (_tWt == null || _miGetRelative == null || _miRelExplicit == null)
-            {
-                if (!_floraShapeLogged)
-                {
-                    _floraShapeLogged = true;
-                    RttLog.Line("FLORA CAMERA: transform shape missing — override inactive.");
-                }
-                return;
-            }
-
-            var ourWt = Activator.CreateInstance(_tWt, new object[] { feedPos });
+            // Our camera in this sector's root frame — the same two lines the engine would
+            // have run, with a different position. We then run the octree update ourselves
+            // and report "handled", so the engine's player-centred call is skipped and
+            // _cameraCoords stops alternating between viewers.
+            var ourWt = _ctorWt.Invoke(new object[] { feedPos });
             var rel = _miRelExplicit.Invoke(null, new[] { _miGetRelative.Invoke(null, new[] { ourWt, rootWt }) });
 
-            var octType = octree.GetType();
-            if (visibilityJob)
-            {
-                _miOctUpdateVis ??= octType.GetMethods(Any).FirstOrDefault(
-                    m => m.Name == "UpdateVisibility" && m.GetParameters().Length == 1);
-                var relPos = _tRelTransform.GetField("Position", Any)?.GetValue(rel);
-                if (_miOctUpdateVis != null && relPos != null) _miOctUpdateVis.Invoke(octree, new[] { relPos });
-            }
-            else
-            {
-                _miOctUpdateCam ??= octType.GetMethods(Any).FirstOrDefault(
-                    m => m.Name == "UpdateCamera" && m.GetParameters().Length == 1);
-                _miOctUpdateCam?.Invoke(octree, new[] { rel });
-            }
+            if (visibilityJob) _miOctUpdateVis.Invoke(octree, new[] { _fRelPosition.GetValue(rel) });
+            else _miOctUpdateCam.Invoke(octree, new[] { rel });
+
             _floraClaims++;
+            return true;
         }
         catch (Exception e)
         {
             if (!_floraShapeLogged) { _floraShapeLogged = true; RttLog.Error("flora camera (logged once)", e); }
+            return false;
         }
     }
 

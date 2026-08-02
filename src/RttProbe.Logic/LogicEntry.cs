@@ -78,7 +78,7 @@ public static class LogicEntry
             var flora = bridge.GetField("FloraCameraHook");
             if (flora != null)
             {
-                flora.SetValue(null, (Action<object, object[], bool>)WorldGrids.OnFloraSectorUpdate);
+                flora.SetValue(null, (Func<object, object[], bool, bool>)WorldGrids.OnFloraSectorUpdate);
                 RttLog.Line("Flora camera hook registered — floraCameraOverride is armable.");
             }
             else
