@@ -532,6 +532,17 @@ internal static class CameraFeed
             if (FeedConfig.ServerPreload)
                 WorldGrids.ServerPreloadAroundCamera(centre, FeedConfig.PreloadRadius);
 
+            // Renew the nearest-viewer bubble. This is a LEASE, not a latch: publishing again
+            // every camera pass is what keeps it alive, so a dormant gate, a torn-down feed or
+            // a hot reload lets it lapse on its own rather than leaving world pinned somewhere
+            // nothing is looking. See ViewerDistance.cs for why one number decides tree LOD,
+            // foliage density and whether grass exists at all.
+            if (FeedConfig.ViewerDistanceOverride)
+            {
+                ViewerDistance.Publish(centre, FeedConfig.ViewerDistanceRadius);
+                ViewerDistance.Report();
+            }
+
             // The camera trigger marker is NOT driven from here any more. The census proved
             // an entity created on this thread never enters the trigger system's candidate
             // index — the marker satisfied every constraint on paper and sat inside ZERO

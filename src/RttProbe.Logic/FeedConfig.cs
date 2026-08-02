@@ -927,6 +927,24 @@ internal static class FeedConfig
     // ClipmapMinPlayerDistance floor), so the player's flora can never regress.
     public static bool FloraCameraOverride { get; private set; }
 
+    // THE NEAREST-VIEWER DISTANCE. Every distance-driven tag in the render scene — resource
+    // streaming, the impostor swap, shadow tracking, raytracing near/far — reads ONE cached
+    // float per entity, and that float is the distance to the single global camera. This makes
+    // it the distance to the nearest of {player, feed camera} instead. See ViewerDistance.cs.
+    //
+    // Off by default because it widens what the engine holds resident. It cannot degrade the
+    // player's view under any failure: the override is a min(), so it only ever lowers a
+    // distance, and the engine's own answer stands whenever ours is not better.
+    public static bool ViewerDistanceOverride { get; private set; }
+
+    // The bubble's half-extent, metres. 200 is RootResourceStreamingComponent
+    // .RootStreamingDistance exactly — the feed camera is granted the same streaming bubble the
+    // player already carries, and no more, which is fidelity parity rather than a new budget.
+    // Raising it costs resident memory roughly with the cube; it also does nothing at all past
+    // the largest threshold in DistanceThresholdContainer.FullRefresh, since beyond that every
+    // entity is in the same last bucket whichever viewer measured it.
+    public static double ViewerDistanceRadius { get; private set; } = 200.0;
+
     public static bool PerBodyClipmapCamera { get; private set; }
     public static double ClipmapMinPlayerDistance { get; private set; } = 100000.0;
 
@@ -1071,6 +1089,24 @@ internal static class FeedConfig
                           "of the player — the octree that hides them takes one camera, and this chooses which. " +
                           "Sectors the player is near are untouched. Watch for \"FLORA CAMERA:\" in the log."
                         : ". Every flora sector goes back to culling around the player."));
+
+            var viewerWas = ViewerDistanceOverride;
+            ViewerDistanceOverride = Bool(kv, "viewerDistance", ViewerDistanceOverride);
+            ViewerDistanceRadius   = Dbl(kv, "viewerDistanceRadius", ViewerDistanceRadius);
+            // Cleared here rather than only on the transition: the bubble is a LEASE the camera
+            // pass renews, and the pass stops renewing it the moment the knob goes off — but a
+            // config poll is the earliest we can know, and leaving it to the 5 s lease would
+            // keep world pinned for five seconds after the operator asked for it to stop.
+            if (!ViewerDistanceOverride) ViewerDistance.Clear();
+            if (viewerWas != ViewerDistanceOverride)
+                RttLog.Global($"Config: viewerDistance {viewerWas} -> {ViewerDistanceOverride}" +
+                    (ViewerDistanceOverride
+                        ? $" (radius {ViewerDistanceRadius:F0} m). Entities within that of the feed camera are " +
+                          "now measured from the CAMERA rather than the player, which is the single input to " +
+                          "StreamingTag, the impostor near/far swap, shadow tracking and the raytracing tags. " +
+                          "Expect trees to resolve, foliage to thicken and grass to appear together — they are " +
+                          "one mechanism. Watch \"VIEWER DISTANCE:\" and VRAM."
+                        : ". Every entity goes back to being measured from the player alone."));
 
             var clipWas = PerBodyClipmapCamera;
             PerBodyClipmapCamera     = Bool(kv, "perBodyClipmapCamera", PerBodyClipmapCamera);

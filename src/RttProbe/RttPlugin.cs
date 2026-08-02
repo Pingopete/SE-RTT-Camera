@@ -220,6 +220,49 @@ public static class RttBridge
     // the original must be skipped. Typed as object so the bootstrap stays ignorant of
     // VRage.Render12 types.
     public static volatile Func<object, object[], bool, bool> FloraCameraHook;
+
+    // ---- THE NEAREST-VIEWER DISTANCE (2026-08-02) -------------------------------------
+    //
+    // THE ONE NUMBER BEHIND THREE SYMPTOMS. RenderUtilities.CalculateDistanceToCamera reads
+    // CoreSystems.Settings.RenderView.CameraPosition — the single global camera — and returns
+    // the distance from it to an entity's bounding box. DistanceTagManagerComponent
+    // .OnUpdateDistanceToCamera caches that ONE float per entity as DistanceRangeData, and a
+    // whole family of jobs then reads nothing but that cached number:
+    //
+    //     OnUpdateRootEntityStreamingTag  -> ResourceStreamingComponent.StreamingTag
+    //                                        (threshold RootResourceStreamingComponent
+    //                                        .RootStreamingDistance, which is 200 m)
+    //     OnUpdateImpostorTag             -> ImpostorComponent Near/FarDistanceTag
+    //                                        (threshold ImpostorSettings.SwapDistance)
+    //     OnUpdateShadowTrackingTag       -> ShadowSettings.LocalLights.DirtyAreaTracking...
+    //     OnUpdateRaytracingTag           -> RaytracingSettings.Scene Near/FarDistance
+    //     OnUpdateTag                     -> geometry-dirty tags
+    //
+    // So a remote feed camera 3,906 km from the player puts EVERY entity it looks at in the
+    // farthest distance bucket, no matter that our camera is standing on top of them. That is
+    // one mechanism producing the whole remaining fidelity gap at once: trees resolving low
+    // up close, foliage thinner than local, and grass — whose model arrives solely through
+    // the streaming path (GrassEntityComponent.UpdateModel(handle, materials, lod)) — never
+    // appearing at all.
+    //
+    // THE FIX IS THE ENGINE'S OWN SEMANTIC, not a duplicate of it. "Distance to the camera"
+    // with several viewers means distance to the NEAREST one; the engine already spells that
+    // out elsewhere (ManagedTexturePrioritizerComponent/ClosestDistanceCollector). The hook
+    // returns min(engineAnswer, ourAnswer), which is monotone: a distance can only get
+    // SMALLER, so no entity the player is near can ever be demoted by us. Overlap between
+    // the two viewers' bubbles is not a conflict — min() is idempotent.
+    //
+    // (x, y, z of the entity's world position, the engine's own answer) -> the answer to use.
+    // Primitives only: the logic assembly never sees an engine type and this stays allocation
+    // free on a path that runs over every root entity in the render scene.
+    public static volatile Func<double, double, double, float, float> ViewerDistanceHook;
+
+    // Call/override counters for the above, written by the postfix and read by the logic's
+    // reporter. Plain longs, incremented without interlock on purpose: this is a per-entity
+    // per-frame path and an occasional lost increment costs a diagnostic nothing, while a
+    // lock or an Interlocked would cost the engine real time.
+    public static long ViewerDistanceCalls;
+    public static long ViewerDistanceOverrides;
 }
 
 public sealed class RttPlugin : IPlugin
@@ -284,8 +327,65 @@ public sealed class RttPlugin : IPlugin
             PatchClipmapCamera(harmony);
             PatchSimPumpSeat(harmony);
             PatchFloraCamera(harmony);
+            PatchViewerDistance(harmony);
         }
         catch (Exception e) { Log("Patching FAILED: " + e); }
+    }
+
+    // The nearest-viewer distance — see RttBridge.ViewerDistanceHook for the mechanism.
+    //
+    // A POSTFIX, and that is the safety property: the engine computes its own answer in full
+    // first, so a null hook, a disabled feature or a throw all leave the engine's number
+    // exactly as it was. We only ever get to lower it.
+    private static void PatchViewerDistance(HarmonyLib.Harmony harmony)
+    {
+        try
+        {
+            var t = Type.GetType("Keen.VRage.Render12.Utils.RenderUtilities, VRage.Render12");
+            if (t == null) { Log("RenderUtilities not found — nearest-viewer distance inactive."); return; }
+            var mi = t.GetMethod("CalculateDistanceToCamera",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+            if (mi == null) { Log("RenderUtilities.CalculateDistanceToCamera not found — nearest-viewer distance inactive."); return; }
+            var post = typeof(RttPlugin).GetMethod(nameof(DistanceToCameraPostfix),
+                BindingFlags.Static | BindingFlags.NonPublic);
+            harmony.Patch(mi, postfix: new HarmonyLib.HarmonyMethod(post));
+            Log($"Patched RenderUtilities.CalculateDistanceToCamera({string.Join(", ", mi.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name))}) " +
+                "— nearest-viewer distance armed. This is the single input to StreamingTag, " +
+                "the impostor swap, shadow tracking and the raytracing near/far tags.");
+        }
+        catch (Exception e) { Log("Patching CalculateDistanceToCamera FAILED: " + e.Message); }
+    }
+
+    // RUNS FOR EVERY ROOT ENTITY IN THE RENDER SCENE, on the renderer's job threads. The cost
+    // budget here is a few nanoseconds, so:
+    //
+    //   * __0 rather than a named parameter — positional injection cannot be broken by a
+    //     parameter rename in a game update.
+    //   * WorldTransform TYPED, not object[] — Harmony boxes __args, and boxing a 40-byte
+    //     struct per entity per frame is exactly the allocation storm this project already
+    //     measured once. VRage.Core is referenced by the bootstrap, so the type costs nothing.
+    //   * the second argument (LocalBoundsData) is simply not requested: Harmony injects only
+    //     what the patch asks for, and that type is nested inside VRage.Render12, which the
+    //     bootstrap deliberately does not reference.
+    //
+    // Dropping boundsData means our answer is a CENTRE distance while the engine's is a
+    // bounding-BOX distance, i.e. ours over-estimates for a large entity. Under min() an
+    // over-estimate can only fail to help — it can never demote anything — so the
+    // approximation is safe by construction rather than by luck. For the entities this
+    // feature exists to fix (trees, boulders, grass cells) the box is metres wide and the
+    // difference is noise.
+    private static void DistanceToCameraPostfix(Keen.VRage.Core.WorldTransform __0, ref float __result)
+    {
+        var hook = RttBridge.ViewerDistanceHook;
+        if (hook == null) return;
+        RttBridge.ViewerDistanceCalls++;
+        try
+        {
+            var p = __0.Position;
+            var r = hook(p.X, p.Y, p.Z, __result);
+            if (r < __result) { __result = r; RttBridge.ViewerDistanceOverrides++; }
+        }
+        catch { }
     }
 
     // Per-body clipmap camera — see RttBridge.ClipmapCameraHook for the reasoning.

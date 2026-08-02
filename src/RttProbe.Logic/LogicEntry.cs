@@ -87,6 +87,23 @@ public static class LogicEntry
                             "floraCameraOverride will have NO EFFECT until then.");
             }
 
+            // The nearest-viewer distance. Absent on an older bootstrap, which degrades to
+            // "every entity is measured from the player" — the state before 2026-08-02, in
+            // which a remote feed's trees never resolve and its grass never draws at all.
+            var viewer = bridge.GetField("ViewerDistanceHook");
+            if (viewer != null)
+            {
+                viewer.SetValue(null, (Func<double, double, double, float, float>)ViewerDistance.Nearest);
+                RttLog.Line("Nearest-viewer distance hook registered — viewerDistance is armable. " +
+                            "It rewrites the ONE cached float behind StreamingTag, the impostor swap, " +
+                            "shadow tracking and the raytracing tags.");
+            }
+            else
+            {
+                RttLog.Line("ViewerDistanceHook not on this bootstrap — restart the game to adopt it. " +
+                            "viewerDistance will have NO EFFECT until then.");
+            }
+
             // The sim-pump seat (server presence entity). Absent on an older bootstrap,
             // which degrades to "no server-side materialization" — the state of the world
             // before 2026-08-02. Say so out loud, because serverPresenceEntity = 1 with a
