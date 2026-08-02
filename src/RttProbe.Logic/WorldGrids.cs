@@ -2350,8 +2350,17 @@ internal static class WorldGrids
     // cross-body case, which is the headline "camera on another world" product.
     private static int _clipmapOverrides, _clipmapCalls;
     private static long _clipmapLogTicks;
-    private static string _lastOverrideDesc = "";
-    private static readonly HashSet<string> _windowBodies = new();
+
+    // DISTINCT-BODY ACCOUNTING, split so the hot path never formats a string.
+    //
+    // This used to be a HashSet<string> fed by an interpolated "$x,y,z(d=…km)" per OVERRIDE —
+    // ~880 formatted strings a second to produce a log line that prints EIGHT of them, once
+    // per 15 s. The count and the samples are different needs, so they are now different
+    // structures: a long key for "how many distinct bodies" (no allocation at all) and a
+    // small list of formatted samples that stops growing at the number actually printed.
+    private static readonly HashSet<long> _windowBodyKeys = new();
+    private static readonly List<string> _windowBodySamples = new();
+    private const int WindowBodySampleCap = 8;
 
     // THE ARRIVAL BURST. The user's test was exact: a functioning system meshes in SECONDS,
     // because that is what happens when the PLAYER arrives anywhere — via the sync-loader's
@@ -2362,7 +2371,6 @@ internal static class WorldGrids
     // steady state. Unbounded loading phase is deliberately not offered: it is the spawn
     // path, and nothing about it is budgeted for running forever.
     private static Vector3D _lastBurstOrigin;
-    private static long _burstUntilTicks;
 
     // METERED v2, after the un-metered version removed the device inside a minute
     // (every overridden body, 20 s of solid loadingPhase -> CreateCommittedTexture flood ->
@@ -2409,10 +2417,75 @@ internal static class WorldGrids
         return true;
     }
 
+    // CACHED REFLECTION FOR THE CLIPMAP PATH — the same decision EnsureFloraReflection made,
+    // finally applied here too.
+    //
+    // MEASURED 2026-08-02: this method runs 570,419 times per 15 s window (~38,000/sec) and
+    // was doing SEVEN uncached GetField/GetProperty/GetMethod lookups per call, three of them
+    // through Prop() — which additionally calls GetIndexParameters(), and that ALLOCATES a
+    // ParameterInfo[] every time. So the steady state was roughly 114,000 throwaway arrays
+    // and 266,000 reflection name lookups PER SECOND, on renderer job threads, for a method
+    // whose actual work is six subtractions and two square roots.
+    //
+    // The flora path forty lines below already carried the comment "this path runs a quarter
+    // of a million times a second; a GetField per call is not affordable" and a full cache to
+    // match. The lesson simply never crossed over. Every handle here is resolved once and is
+    // stable for the process, exactly as there.
+    private static FieldInfo _cmTransformPos, _cmL2wPos, _cmSizeX, _cmSizeY, _cmSizeZ;
+    private static PropertyInfo _cmClipmap, _cmLocalToWorld, _cmSize;
+    private static MethodInfo _cmClone;
+    private static bool _cmReflectionReady, _cmReflectionFailed;
+
+    // Resolve the whole set in one go. All-or-nothing on purpose: a half-resolved set would
+    // silently fall back to the slow path for some members and not others, which is the
+    // hardest kind of performance bug to see later.
+    private static bool EnsureClipmapReflection(object renderComponent, object boxedTransform)
+    {
+        if (_cmReflectionReady) return true;
+        if (_cmReflectionFailed) return false;
+        try
+        {
+            var tT = boxedTransform.GetType();
+            _cmTransformPos = tT.GetField("Position", Any);
+            _cmClone = tT.GetMethod("MemberwiseClone", BindingFlags.NonPublic | BindingFlags.Instance);
+
+            _cmClipmap = renderComponent?.GetType().GetProperty("Clipmap", Any);
+            var clip = _cmClipmap?.GetValue(renderComponent);
+            if (clip == null) { _cmReflectionFailed = true; return false; }
+
+            var tC = clip.GetType();
+            _cmLocalToWorld = tC.GetProperty("LocalToWorld", Any);
+            _cmSize = tC.GetProperty("Size", Any);
+
+            var l2w = _cmLocalToWorld?.GetValue(clip);
+            if (l2w != null) _cmL2wPos = l2w.GetType().GetField("Position", Any);
+
+            var sz = _cmSize?.GetValue(clip);
+            if (sz != null)
+            {
+                var tS = sz.GetType();
+                _cmSizeX = tS.GetField("X", Any);
+                _cmSizeY = tS.GetField("Y", Any);
+                _cmSizeZ = tS.GetField("Z", Any);
+            }
+
+            if (_cmTransformPos == null || _cmClipmap == null || _cmLocalToWorld == null)
+            { _cmReflectionFailed = true; return false; }
+
+            _cmReflectionReady = true;
+            RttLog.Line("CLIPMAP CAMERA: reflection cached (position, clipmap, local-to-world, size, clone). " +
+                        "This path runs ~38,000 times a second — before caching it did seven name lookups " +
+                        "and three ParameterInfo[] allocations per call.");
+            return true;
+        }
+        catch { _cmReflectionFailed = true; return false; }
+    }
+
     internal static object ChooseClipmapCamera(object renderComponent, object boxedTransform)
     {
         if (!FeedConfig.PerBodyClipmapCamera || boxedTransform == null) return null;
         _clipmapCalls++;
+        if (!EnsureClipmapReflection(renderComponent, boxedTransform)) return null;
         try
         {
             // Where the feed camera is. SubjectCentreCache is the orbit CENTRE, published by
@@ -2421,17 +2494,15 @@ internal static class WorldGrids
             var feedPos = CameraFeed.SubjectCentreCache;
             if (feedPos.LengthSquared() <= 1.0) return null;      // no feed target yet
 
-            var fPos = boxedTransform.GetType().GetField("Position", Any);
-            if (fPos?.GetValue(boxedTransform) is not Vector3D playerPos) return null;
+            if (_cmTransformPos.GetValue(boxedTransform) is not Vector3D playerPos) return null;
 
             // The body's origin, via its clipmap's local-to-world. For a planet this is the
             // CENTRE, so both distances are measured to the same reference and the
             // comparison stays meaningful (a surface dweller sits ~radius from it).
-            var clip = Prop(renderComponent, "Clipmap");
-            var l2w = clip == null ? null : Prop(clip, "LocalToWorld");
-            if (l2w == null) return null;
-            var fBodyPos = l2w.GetType().GetField("Position", Any);
-            if (fBodyPos?.GetValue(l2w) is not Vector3D bodyPos) return null;
+            var clip = _cmClipmap.GetValue(renderComponent);
+            var l2w = clip == null ? null : _cmLocalToWorld.GetValue(clip);
+            if (l2w == null || _cmL2wPos == null) return null;
+            if (_cmL2wPos.GetValue(l2w) is not Vector3D bodyPos) return null;
 
             // CORNER, NOT CENTRE — the bug that hid the planet from this override for the
             // project's whole life. Clipmap.LocalToWorld.Position is the voxel volume's
@@ -2443,13 +2514,12 @@ internal static class WorldGrids
             double sx = 0, sy = 0, sz = 0;
             try
             {
-                var szObj0 = Prop(clip, "Size");
+                var szObj0 = _cmSize?.GetValue(clip);
                 if (szObj0 != null)
                 {
-                    var ts = szObj0.GetType();
-                    if (ts.GetField("X", Any)?.GetValue(szObj0) is int ix) sx = ix;
-                    if (ts.GetField("Y", Any)?.GetValue(szObj0) is int iy) sy = iy;
-                    if (ts.GetField("Z", Any)?.GetValue(szObj0) is int iz) sz = iz;
+                    if (_cmSizeX?.GetValue(szObj0) is int ix) sx = ix;
+                    if (_cmSizeY?.GetValue(szObj0) is int iy) sy = iy;
+                    if (_cmSizeZ?.GetValue(szObj0) is int iz) sz = iz;
                 }
             }
             catch { }
@@ -2488,10 +2558,8 @@ internal static class WorldGrids
 
             // Replace ONLY the position, on a copy, so the transform's orientation and any
             // other field the engine set survive untouched.
-            var replacement = boxedTransform.GetType()
-                .GetMethod("MemberwiseClone", BindingFlags.NonPublic | BindingFlags.Instance)
-                ?.Invoke(boxedTransform, null) ?? boxedTransform;
-            fPos.SetValue(replacement, feedPos);
+            var replacement = _cmClone?.Invoke(boxedTransform, null) ?? boxedTransform;
+            _cmTransformPos.SetValue(replacement, feedPos);
             _clipmapOverrides++;
 
             // TIME CADENCE ONLY. The first version also logged whenever the BODY changed,
@@ -2502,16 +2570,25 @@ internal static class WorldGrids
             // The window ACCUMULATES the distinct bodies overridden, because the single
             // last-body line hid the question that mattered for five minutes tonight:
             // is the PLANET among the overridden bodies, or only the small rocks?
-            _windowBodies.Add($"{bodyPos.X:F0},{bodyPos.Y:F0},{bodyPos.Z:F0}(d={dFeed / 1000.0:F1}km)");
+            // Key on the body's position quantised to a kilometre. Bodies are thousands of
+            // metres apart, so this cannot collide between distinct bodies, and it costs three
+            // casts instead of a string format plus a hash of it.
+            long bodyKey = ((long)(bodyPos.X * 0.001) * 73856093)
+                         ^ ((long)(bodyPos.Y * 0.001) * 19349663)
+                         ^ ((long)(bodyPos.Z * 0.001) * 83492791);
+            if (_windowBodyKeys.Add(bodyKey) && _windowBodySamples.Count < WindowBodySampleCap)
+                _windowBodySamples.Add($"{bodyPos.X:F0},{bodyPos.Y:F0},{bodyPos.Z:F0}(d={dFeed / 1000.0:F1}km)");
+
             var now = Environment.TickCount64;
             if (now - _clipmapLogTicks > 15000)
             {
                 _clipmapLogTicks = now;
-                RttLog.Line($"CLIPMAP CAMERA: {_windowBodies.Count} distinct bod(ies) LODing around the FEED " +
-                            $"this window: {string.Join("  ", _windowBodies.Take(8))}" +
-                            $"{(_windowBodies.Count > 8 ? " …" : "")} " +
+                RttLog.Line($"CLIPMAP CAMERA: {_windowBodyKeys.Count} distinct bod(ies) LODing around the FEED " +
+                            $"this window: {string.Join("  ", _windowBodySamples)}" +
+                            $"{(_windowBodyKeys.Count > WindowBodySampleCap ? " …" : "")} " +
                             $"({_clipmapOverrides} override(s) of {_clipmapCalls} body-updates; one line per 15 s.)");
-                _windowBodies.Clear();
+                _windowBodyKeys.Clear();
+                _windowBodySamples.Clear();
             }
             ApplyClipmapBudget();
             ProbeLodDataSharing(renderComponent);
@@ -2806,7 +2883,18 @@ internal static class WorldGrids
     private static bool _floraShapeLogged;
 
     private static double _floraNearestSeen = double.MaxValue;
-    private static string _floraLastReject = "(none)";
+    // The last rejection, stored as a code plus its two numbers rather than as prose. Written
+    // ~11,300 times a second on the hot path (three field stores, no allocation); rendered to
+    // text once per 15 s by FloraRejectText().
+    private static int _floraRejectCode;              // 0 = none, 1 = not 2x closer, 2 = player too close
+    private static double _floraRejectFeed, _floraRejectPlayer;
+
+    private static string FloraRejectText() => _floraRejectCode switch
+    {
+        1 => $"not 2x closer (feed {_floraRejectFeed / 1000.0:F1} km, player {_floraRejectPlayer / 1000.0:F1} km)",
+        2 => $"player too close ({_floraRejectPlayer / 1000.0:F1} km)",
+        _ => "(none)",
+    };
 
     // DENSITY, MEASURED RATHER THAN ARGUED. The user reports tree density unchanged after
     // the thrash fix, so the question is whether the feed's sectors CONTAIN fewer flora
@@ -2906,7 +2994,7 @@ internal static class WorldGrids
                         $"{_modelsNearFeed} model instance(s); nearest to the PLAYER is {_dNearPlayer:F0} m away " +
                         $"with {_modelsNearPlayer}. Similar counts mean the data is there and the gap is LOD or " +
                         "culling; a much lower feed count means the sectors themselves were generated thinner. " +
-                        $"Last rejection: {_floraLastReject}.");
+                        $"Last rejection: {FloraRejectText()}.");
             // Re-arm so each window reports a fresh sample rather than a session minimum.
             _dNearFeed = _dNearPlayer = double.MaxValue;
             _modelsNearFeed = _modelsNearPlayer = -1;
@@ -2955,10 +3043,17 @@ internal static class WorldGrids
             // BEFORE the rejections: player-near sectors are the control half of the
             // like-for-like and they are exactly the ones the rules reject.
             SampleDensity(octree, dFeed, dPlayer);
+
+            // REASON CODE + NUMBERS, NOT A FORMATTED STRING. These two branches reject
+            // ~11,300 times a SECOND (measured: 169,488 rejections per 15 s window), and the
+            // interpolated string they used to build was read by exactly one log line, once
+            // per 15 s. That is ~11,300 throwaway strings a second, each with two double
+            // formats, to produce four printed words. Store the raw numbers and format them
+            // at the point they are actually read — see FloraRejectText().
             if (dFeed * 2.0 >= dPlayer)
-            { _floraLastReject = $"not 2x closer (feed {dFeed / 1000.0:F1} km, player {dPlayer / 1000.0:F1} km)"; return false; }
+            { _floraRejectCode = 1; _floraRejectFeed = dFeed; _floraRejectPlayer = dPlayer; return false; }
             if (dPlayer < FeedConfig.ClipmapMinPlayerDistance)
-            { _floraLastReject = $"player too close ({dPlayer / 1000.0:F1} km)"; return false; }
+            { _floraRejectCode = 2; _floraRejectPlayer = dPlayer; return false; }
 
             // Our camera in this sector's root frame — the same two lines the engine would
             // have run, with a different position. We then run the octree update ourselves

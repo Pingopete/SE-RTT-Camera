@@ -2810,43 +2810,36 @@ internal static class WholeSceneRender
                     RttLog.Line($"Auto aperture: a direction-shaped vector exists at {sbest.Path}, " +
                                 "but sun-driven exposure is parked — see the auto-exposure note.");
 
-                if (_sunField == null)
+                // THE SETTINGS-GROUP ROUTE DOES NOT EXIST, and the scan above now only
+                // documents that. Confirmed exhaustively: the only Vector3s on any settings
+                // group are camera positions, a skybox euler, a constant world-up and
+                // hologram offsets. The sun lives with the thing that needs it —
+                // PlanetEnvironmentData.Atmosphere (AtmosphereConstants), because scattering
+                // cannot be computed without a light direction.
+                //
+                // There used to be a second branch here that read the sun from a settings
+                // field via _sunField/_sunSettings. Those were NEVER ASSIGNED by any code
+                // path, so that branch, the success log beneath it and the re-read at the
+                // bottom of this method were all unreachable — the compiler had been saying
+                // so (CS0649) for as long as they existed. Removed rather than left as
+                // plausible-looking dead scaffolding.
+                if (TrySunFromPlanetEnv(out var pdir))
                 {
-                    // NOT IN THE SETTINGS AT ALL. Confirmed exhaustively: the only Vector3s
-                    // on any group are camera positions, a skybox euler, a constant world-up
-                    // and hologram offsets. The sun lives with the thing that needs it —
-                    // PlanetEnvironmentData.Atmosphere (AtmosphereConstants), because
-                    // scattering cannot be computed without a light direction.
-                    //
-                    // Scanned RECURSIVELY and by score rather than by a guessed name, through
-                    // InlineArrays as well, because that is the shape this data is in and
-                    // guessing names blind has already cost this project a day.
-                    if (TrySunFromPlanetEnv(out var pdir))
-                    {
-                        _sunFromPlanetEnv = true;
-                        _sunState = 1;
-                        dir = pdir;
-                        return true;
-                    }
-                    RttLog.Line("Auto aperture: no sun direction in the settings groups OR the planet-env " +
-                                "setup data. Auto aperture stays OFF and the feed keeps its fixed " +
-                                "wholeSceneExposure.");
-                    _sunState = -1;
-                    return false;
+                    _sunFromPlanetEnv = true;
+                    _sunState = 1;
+                    dir = pdir;
+                    return true;
                 }
-                _sunState = 1;
-                RttLog.Line($"Auto aperture: sun direction resolved from " +
-                            $"{_sunSettings.GetType().Name}.{_sunField.Name}.");
+                RttLog.Line("Auto aperture: no sun direction in the settings groups OR the planet-env " +
+                            "setup data. Auto aperture stays OFF and the feed keeps its fixed " +
+                            "wholeSceneExposure.");
+                _sunState = -1;
+                return false;
             }
 
-            // Re-read every call: the sun moves.
-            if (_sunFromPlanetEnv) return TrySunFromPlanetEnv(out dir);
-
-            if (!AsVec3(_sunField.GetValue(_sunSettings), out var v)) return false;
-            double len = v.Length();
-            if (len < 1e-6) return false;
-            dir = new Vector3D(v.X / len, v.Y / len, v.Z / len);
-            return true;
+            // Re-read every call: the sun moves. Reaching here means _sunState == 1, and the
+            // planet-env route is now the ONLY way to reach that.
+            return TrySunFromPlanetEnv(out dir);
         }
         catch { _sunState = -1; return false; }
     }
