@@ -630,7 +630,26 @@ internal static class FeedConfig
     // TOTAL cone angle in degrees, not the half-angle. 0 or >=360 = off, the pre-cone
     // behaviour. Default OFF: this changes what the world loads, and it earns its way in on
     // measurement like everything else here.
+    // 0 = DERIVE FROM THE CAMERA'S OWN FOV, which is the default and the intended mode.
+    // A positive value forces an absolute cone and is for A/B testing only.
     public static double ResidencyConeDegrees { get; private set; }
+
+    // FORGIVENESS, in degrees, added to the feed's DIAGONAL field of view when deriving.
+    //
+    // WHY THE DIAGONAL AND NOT THE NOMINAL FOV. For a square frustum the corners sit further
+    // off-axis than the FOV number suggests: 75 degrees vertical is ~95 across the diagonal.
+    // Sizing the cone to 90 for a 75-degree camera — which reads as generous — would actually
+    // cull the frame CORNERS. The margin is therefore added to the diagonal, so the cone
+    // always contains the frustum by construction and the knob only controls the slack.
+    //
+    // 15 degrees total (7.5 a side) covers the two things the frustum itself does not:
+    // shadow casters just outside the view, and the ground a rotating orbit is about to turn
+    // onto. Raise it if flora visibly materialises at the leading edge as the camera turns.
+    //
+    // Deriving rather than configuring is the point: the cone tracks whatever sets the FOV,
+    // including on-the-fly FOV changes later. A fixed angle would be correct only until the
+    // first time the FOV moved, and would then be silently wrong.
+    public static double ResidencyConeMarginDegrees { get; private set; } = 15;
 
     // THE NEAR SHELL, exempt from the cone at any angle. Two things need world that the view
     // direction does not cover, and both are visible immediately if this is too small:
@@ -1532,6 +1551,7 @@ internal static class FeedConfig
             var coneWas = ResidencyConeDegrees;
             ResidencyConeDegrees    = Dbl(kv, "residencyConeDegrees", ResidencyConeDegrees);
             ResidencyConeNearMetres = Dbl(kv, "residencyConeNearMetres", ResidencyConeNearMetres);
+            ResidencyConeMarginDegrees = Dbl(kv, "residencyConeMarginDegrees", ResidencyConeMarginDegrees);
             if (Math.Abs(coneWas - ResidencyConeDegrees) > 1e-9)
                 RttLog.Global($"Config: residencyConeDegrees {coneWas:F0} -> {ResidencyConeDegrees:F0}. " +
                     (ResidencyConeDegrees > 0 && ResidencyConeDegrees < 360

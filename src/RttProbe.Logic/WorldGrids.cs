@@ -2912,7 +2912,7 @@ internal static class WorldGrids
     {
         1 => $"not 2x closer (feed {_floraRejectFeed / 1000.0:F1} km, player {_floraRejectPlayer / 1000.0:F1} km)",
         2 => $"player too close ({_floraRejectPlayer / 1000.0:F1} km)",
-        3 => $"outside the {FeedConfig.ResidencyConeDegrees:F0}deg residency cone",
+        3 => $"outside the {ActiveConeDegrees():F0}deg residency cone",
         _ => "(none)",
     };
 
@@ -2992,10 +2992,30 @@ internal static class WorldGrids
     private static double _coneCos = 2.0;      // 2 = impossible to satisfy => recomputed on first use
     private static double _coneCosFor = double.NaN;
 
+    // The cone angle actually in force, in degrees. 0 means "do not cull".
+    //
+    // DERIVED BY DEFAULT from the feed's own diagonal FOV plus a forgiveness margin, so it
+    // follows the camera instead of being a number someone has to remember to update. An
+    // explicit residencyConeDegrees overrides it, for A/B work only.
+    //
+    // Returns 0 while the FOV is still unknown (before the render thread has published a
+    // projection). That is the safe direction: no cone at all rather than a guessed one.
+    internal static double ActiveConeDegrees()
+    {
+        var forced = FeedConfig.ResidencyConeDegrees;
+        if (forced > 0.0) return forced >= 360.0 ? 0.0 : forced;
+
+        var diag = CameraFeed.FeedDiagonalFovDeg;
+        if (diag <= 0.0) return 0.0;                       // FOV not published yet: keep everything
+
+        var deg = diag + FeedConfig.ResidencyConeMarginDegrees;
+        return deg >= 360.0 ? 0.0 : deg;
+    }
+
     internal static bool InFeedCone(Vector3D worldPos)
     {
-        var deg = FeedConfig.ResidencyConeDegrees;
-        if (deg <= 0.0 || deg >= 360.0) return true;
+        var deg = ActiveConeDegrees();
+        if (deg <= 0.0) return true;
 
         // Recompute the cosine only when the knob moves — this runs ~19,000 times a second.
         if (_coneCosFor != deg)
@@ -3026,8 +3046,9 @@ internal static class WorldGrids
         var s = $"of {t} sector update(s): outside a 70deg cone {Pct(_cone70)}, " +
                 $"140deg {Pct(_cone140)}, 200deg {Pct(_cone200)}" +
                 (_coneNoDir > 0 ? $" [{Pct(_coneNoDir)} had no camera direction and are excluded from the case]" : "") +
-                (FeedConfig.ResidencyConeDegrees > 0 && FeedConfig.ResidencyConeDegrees < 360
-                    ? $" | LIVE at {FeedConfig.ResidencyConeDegrees:F0}deg: actually rejected {Pct(_coneRejected)} " +
+                (ActiveConeDegrees() > 0
+                    ? $" | LIVE at {ActiveConeDegrees():F0}deg (fov {CameraFeed.FeedDiagonalFovDeg:F0} diag + " +
+                      $"{FeedConfig.ResidencyConeMarginDegrees:F0} margin): actually rejected {Pct(_coneRejected)} " +
                       $"(near shell {FeedConfig.ResidencyConeNearMetres:F0} m exempt). MEASURED 2026-08-02: live " +
                       "matches the study column for the same angle EXACTLY, so the near shell is currently exempting " +
                       "nothing — sectors are ~800 m apart, so almost none sit within 300 m of the eye AND outside " +

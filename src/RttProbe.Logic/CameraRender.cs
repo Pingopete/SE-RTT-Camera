@@ -1161,9 +1161,17 @@ internal static class CameraRender
                     {
                         var pm = _rvFields.FirstOrDefault(f => f.Name.Contains("<Projection>", StringComparison.Ordinal))?.GetValue(rv);
                         var m = Prop2(pm, "Projection");
-                        return m == null ? "?" :
-                            $"M11={System.Convert.ToSingle(Prop2(m, "M11") ?? MField(m, "M11")):F4} " +
-                            $"M22={System.Convert.ToSingle(Prop2(m, "M22") ?? MField(m, "M22")):F4}";
+                        if (m == null) return "?";
+                        float m11 = System.Convert.ToSingle(Prop2(m, "M11") ?? MField(m, "M11"));
+                        float m22 = System.Convert.ToSingle(Prop2(m, "M22") ?? MField(m, "M22"));
+
+                        // Publish OUR feed's field of view for the residency cone. Only for our
+                        // view — this helper also describes the PLAYER's, and letting the
+                        // player's FOV size the feed's cone would be the single-viewer disease
+                        // arriving through a diagnostic.
+                        if (ReferenceEquals(rv, _wsRenderView)) CameraFeed.PublishFovFromProjection(m22);
+
+                        return $"M11={m11:F4} M22={m22:F4}";
                     }
                     string DescAt0(object rv)
                     {

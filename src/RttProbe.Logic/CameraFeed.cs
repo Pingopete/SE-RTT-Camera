@@ -80,6 +80,31 @@ internal static class CameraFeed
     internal static Vector3D EyeCache;
     internal static Vector3D LookDirCache;
 
+    // THE FEED'S DIAGONAL FIELD OF VIEW, in degrees, derived from its own projection matrix.
+    // 0 = not yet known, which every consumer must treat as "do not cull".
+    //
+    // DIAGONAL, NOT VERTICAL, and this is the whole reason it is computed rather than
+    // configured. For a square frustum the corners sit FURTHER off-axis than the nominal FOV:
+    // at 75 degrees vertical the diagonal is ~95. A residency cone sized to the nominal figure
+    // would quietly starve the frame CORNERS while looking generous on paper.
+    //
+    // Derived from the projection rather than from a config knob so it tracks whatever sets
+    // the FOV — including the on-the-fly FOV control planned later. A hard-coded cone angle
+    // would silently become wrong the first time the FOV moved, which is precisely the shape
+    // of bug this project keeps finding: state that can only be right while nothing changes.
+    internal static double FeedDiagonalFovDeg;
+
+    // M22 of a perspective projection is 1/tan(vFov/2). Our feed is square (the 1:1 aspect is
+    // baked in by wholeSceneCameraRebuild = 2), so the horizontal half-angle equals the
+    // vertical one and the corner is sqrt(2) further out in tangent space.
+    internal static void PublishFovFromProjection(double m22)
+    {
+        if (m22 <= 1e-6) return;
+        double halfV = Math.Atan(1.0 / m22);                       // radians
+        double halfDiag = Math.Atan(Math.Sqrt(2.0) * Math.Tan(halfV));
+        FeedDiagonalFovDeg = halfDiag * 2.0 * 180.0 / Math.PI;
+    }
+
     // Did OrbitUp come from the planet (exact) or from the subject's rotation (a guess)?
     // Reported in the orbit-plane proof so the two are never confused again.
     internal static bool OrbitUpIsPlanet;
