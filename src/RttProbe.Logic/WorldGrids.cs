@@ -1343,16 +1343,7 @@ internal static class WorldGrids
             if (!want)
             {
                 // Teardown, on the same seat that created it.
-                if (_serverMarker != null)
-                {
-                    var handle = Prop(_serverMarker, "Entity");
-                    _miRemoveEntity ??= scene2.GetType().GetMethods(Any).FirstOrDefault(
-                        m => m.Name == "RemoveEntity" && m.GetParameters().Length == 1);
-                    _miRemoveEntity?.Invoke(scene2, new[] { handle });
-                    _serverMarker = null;
-                    RttLog.Line("SERVER PRESENCE: marker removed (knob off). Sectors it materialized are the " +
-                                "engine's to reclaim.");
-                }
+                DestroyServerMarker(scene2, "knob off");
                 return;
             }
 
@@ -1384,6 +1375,7 @@ internal static class WorldGrids
                     scene2, new[] { Activator.CreateInstance(tDyn), Activator.CreateInstance(_tWt, new object[] { pos }), bbd });
                 _serverMarkerPos = pos;
                 _serverMarkerMoves = 0;
+                _serverMarkerBornExtent = FeedConfig.CameraTriggerExtent;
 
                 // Born staged, de-staged next seat tick — the transition the index listens for.
                 Stage(_serverMarker);
@@ -1394,6 +1386,15 @@ internal static class WorldGrids
                             "STAGED (de-stage follows one tick later). This is the archetype every censused " +
                             "trigger tests. Watch the census 'inside' column, the feed, and VRAM.");
                 return;
+            }
+
+            // Same rebuild-on-extent-change rule as the client marker — see DriveClientMarker.
+            if (Math.Abs(_serverMarkerBornExtent - FeedConfig.CameraTriggerExtent) > 0.001)
+            {
+                RttLog.Line($"SERVER PRESENCE: extent changed {_serverMarkerBornExtent:F2} -> " +
+                            $"{FeedConfig.CameraTriggerExtent:F2} m; rebuilding the server marker.");
+                DestroyServerMarker(scene2, "cameraTriggerExtent changed");
+                return;                                    // reborn on the next pump pass
             }
 
             if ((pos - _serverMarkerPos).LengthSquared() >= MarkerMoveEpsilon * MarkerMoveEpsilon)
@@ -1947,12 +1948,42 @@ internal static class WorldGrids
     //
     // Structural change is still structural: AddEntity moves storage, so it runs ONCE and
     // then only the transform is written. Off by default.
-    private const float MarkerHalfExtent = 1.375f;   // signature value — see SweepStaleMarkers
+    // THE BUBBLE'S RADIUS, and it is the reason scatter stops at a hard circle.
+    //
+    // 1.375 m was copied from the engine's own voxel observer, on the reasoning that
+    // matching its construction would match its behaviour. It does not, and the difference
+    // is what the user spotted from the raised orbit camera: objects spawn inside a sharp
+    // disc around the anchor and the ground beyond it is bare.
+    //
+    // The PlanetEnvironment triggers are SECTORED — they activate the sectors an entity's
+    // BOUNDING BOX overlaps. A 1.375 m box overlaps essentially one sector, so a single tiny
+    // marker buys a single tiny patch of world however long it sits there. A player is not a
+    // bigger box, but a player carries other systems that widen their materialization; our
+    // marker has only its extents.
+    //
+    // Widening is the native lever rather than a trick: same trigger, same mechanism, bigger
+    // volume. Sectors are REF-COUNTED (that is what makes them multiplayer-safe), so
+    // overlapping our bubble with a player's is not a conflict and cannot double-spawn.
+    //
+    // COSTS RESIDENT WORLD, roughly with the cube of this. Start modest and watch VRAM; the
+    // feed VRAM cap is already the binding constraint.
+    private static float MarkerHalfExtent => (float)FeedConfig.CameraTriggerExtent;
+
+    // The legacy signature, kept so SweepStaleMarkers still recognises markers left by an
+    // assembly load that ran with the old fixed extent. Without it, changing the knob would
+    // orphan every previous marker permanently — they would stop being ours to clean up.
+    private const float LegacyMarkerHalfExtent = 1.375f;
     private const double MarkerMoveEpsilon = 1.0;    // metres; below this there is nothing to do
 
     private static object _marker;            // boxed DEntityContext, or null
     private static Vector3D _markerPos;
     private static bool _markerDisarmed, _markerShapeLogged;
+
+    // The extent each marker was BORN with. BoundingBoxData is written once at creation, so
+    // this is what makes a live extent edit detectable at all — comparing the knob against
+    // itself would always agree.
+    private static double _markerBornExtent = -1.0;
+    private static double _serverMarkerBornExtent = -1.0;
     private static long _markerLogTicks;
     private static int _markerMoves;
     private static Type _tTag, _tWt, _tBbd;
@@ -1984,6 +2015,28 @@ internal static class WorldGrids
     // engine's own observer, born inside OnAddedToScene ON THE PUMP, is tracked fine. So
     // the client marker's lifecycle now runs in OnSimPump's client branch, same as the
     // server marker runs in its server branch. Called ONLY from the seat.
+    // Teardown for the server marker. Extracted from the knob-off branch so the extent
+    // rebuild uses the SAME path: two teardowns that drift apart is how one of them ends up
+    // leaving an entity behind, and this one runs in the scene that spawns things.
+    // MUST be called on the server scene's own pump — RemoveEntity consults
+    // IsCommandBufferActive() and defers, which is only correct from that seat.
+    private static void DestroyServerMarker(object scene, string why)
+    {
+        if (_serverMarker == null || scene == null) return;
+        try
+        {
+            var handle = Prop(_serverMarker, "Entity");
+            _miRemoveEntity ??= scene.GetType().GetMethods(Any).FirstOrDefault(
+                m => m.Name == "RemoveEntity" && m.GetParameters().Length == 1);
+            _miRemoveEntity?.Invoke(scene, new[] { handle });
+            _serverMarker = null;
+            _serverMarkerBornExtent = -1.0;
+            RttLog.Line($"SERVER PRESENCE: marker removed ({why}). Sectors it materialized are the " +
+                        "engine's to reclaim.");
+        }
+        catch (Exception e) { RttLog.Error("server marker teardown", e); }
+    }
+
     private static void DriveClientMarker(object scene)
     {
         if (_markerDisarmed) return;
@@ -2002,6 +2055,20 @@ internal static class WorldGrids
             cameraPos = DriftAround(cameraPos);
 
             if (_marker == null) { CreateMarker(scene, cameraPos); return; }
+
+            // The extent is baked into BoundingBoxData at birth, so a live edit means nothing
+            // until the marker is rebuilt. Doing that here rather than making the operator
+            // toggle cameraTriggerEntity off and on is not a convenience: a knob that silently
+            // does nothing until an unrelated second action is exactly how an A/B gets misread
+            // as "widening the bubble changed nothing".
+            if (Math.Abs(_markerBornExtent - FeedConfig.CameraTriggerExtent) > 0.001)
+            {
+                RttLog.Line($"CAMERA TRIGGER: extent changed {_markerBornExtent:F2} -> " +
+                            $"{FeedConfig.CameraTriggerExtent:F2} m; rebuilding the client marker so the " +
+                            "new bubble takes effect.");
+                DestroyCameraTriggerEntity("cameraTriggerExtent changed");
+                return;                                    // reborn on the next pass
+            }
 
             if ((cameraPos - _markerPos).LengthSquared() >= MarkerMoveEpsilon * MarkerMoveEpsilon)
                 MoveMarker(cameraPos);
@@ -2068,6 +2135,7 @@ internal static class WorldGrids
             scene, new[] { Activator.CreateInstance(_tTag), Activator.CreateInstance(_tWt, new object[] { pos }), bbd });
         _markerPos = pos;
         _markerMoves = 0;
+        _markerBornExtent = FeedConfig.CameraTriggerExtent;   // what the box was actually built at
 
         // DynamicTag, decoded from the census: the client scene's voxel-sector triggers
         // (Voxel : Block / Voxel : Prediction) constrain on DynamicTag+WorldTransform+
@@ -2095,7 +2163,13 @@ internal static class WorldGrids
         _pendingDestage = _marker;
 
         RttLog.Line($"CAMERA TRIGGER: created the marker entity at {pos.X:F0},{pos.Y:F0},{pos.Z:F0} — " +
-                    $"ClientTriggerTag{(dynAdded ? " + DynamicTag" : "")} + WorldTransform + a 2.75 m box, " +
+                    // The size was HARDCODED as "2.75 m box" here, and once the extent became a
+                    // knob that string was a lie: it kept reporting 2.75 while the box was
+                    // built at whatever cameraTriggerExtent said. A diagnostic that states a
+                    // constant instead of reading the value is worse than no diagnostic —
+                    // it is what made the first widened-bubble test unreadable.
+                    $"ClientTriggerTag{(dynAdded ? " + DynamicTag" : "")} + WorldTransform + a " +
+                    $"{MarkerHalfExtent * 2.0:F2} m box (half-extent {MarkerHalfExtent:F2}), " +
                     "born STAGED (de-stage follows one tick later). Per the census: ClientTriggerTag " +
                     "satisfies the client flora-sector triggers, DynamicTag the client voxel-sector " +
                     "triggers. Watch the census 'inside' column and VRAM.");
@@ -2144,7 +2218,7 @@ internal static class WorldGrids
                         "engine's to reclaim on its own schedule — they do not vanish with it.");
         }
         catch (Exception e) { RttLog.Error("camera trigger entity remove", e); }
-        finally { _marker = null; _markerMoves = 0; }
+        finally { _marker = null; _markerMoves = 0; _markerBornExtent = -1.0; }
     }
 
     // STALE MARKERS FROM A PREVIOUS ASSEMBLY LOAD.
@@ -2232,12 +2306,23 @@ internal static class WorldGrids
         catch (Exception e) { RttLog.Error("camera trigger sweep", e); }
     }
 
+    // Recognise a marker of OURS. The extent is now a knob, so the signature has to accept
+    // both the current value and the legacy 1.375 — otherwise turning the knob orphans every
+    // marker a previous assembly load left behind, and an orphan we no longer recognise is an
+    // orphan nobody will ever delete.
     private static bool IsMarkerBox(BoundingBox b)
     {
-        const float eps = 1e-4f;
-        return Math.Abs(b.Max.X - MarkerHalfExtent) < eps && Math.Abs(b.Min.X + MarkerHalfExtent) < eps
-            && Math.Abs(b.Max.Y - MarkerHalfExtent) < eps && Math.Abs(b.Min.Y + MarkerHalfExtent) < eps
-            && Math.Abs(b.Max.Z - MarkerHalfExtent) < eps && Math.Abs(b.Min.Z + MarkerHalfExtent) < eps;
+        return IsCubeOfHalfExtent(b, MarkerHalfExtent) || IsCubeOfHalfExtent(b, LegacyMarkerHalfExtent);
+    }
+
+    private static bool IsCubeOfHalfExtent(BoundingBox b, float h)
+    {
+        // Scaled tolerance: 1e-4 is right for a 1.375 m box and meaninglessly tight for a
+        // 500 m one, where float storage alone loses more than that.
+        float eps = Math.Max(1e-4f, h * 1e-5f);
+        return Math.Abs(b.Max.X - h) < eps && Math.Abs(b.Min.X + h) < eps
+            && Math.Abs(b.Max.Y - h) < eps && Math.Abs(b.Min.Y + h) < eps
+            && Math.Abs(b.Max.Z - h) < eps && Math.Abs(b.Min.Z + h) < eps;
     }
 
     // PER-BODY CLIPMAP CAMERA — the terrain fix.

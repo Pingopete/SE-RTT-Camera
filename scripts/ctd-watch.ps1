@@ -93,6 +93,23 @@ while ($true) {
                 $lived = if ($aliveSince) { [int]((Get-Date) - $aliveSince).TotalSeconds } else { -1 }
                 Note "GAME GONE (no crash dialog; was up ${lived}s) -- correlation window follows"
                 Correlate
+
+                # RELAUNCH HERE TOO, and this gap cost a session on 2026-08-02.
+                #
+                # Relaunch used to hang off the 'Crashed' branch alone - the one that fires when
+                # the crash handler puts up its message box. A VRAM exhaustion death does not do
+                # that: the process simply disappears. So the watcher dutifully wrote a perfect
+                # correlation window and then sat there while the game stayed dead, which is the
+                # exact opposite of what an unattended watcher is for.
+                #
+                # "No dialog" is not evidence of an intentional exit. The DELIBERATE kills in
+                # this project are always preceded by a note written into this same log before
+                # the process is stopped, so an operator restart is distinguishable from a death
+                # by reading upward - it does not need to be distinguishable by silence.
+                if ($Relaunch) {
+                    Note "relaunching via resume-after-crash.ps1 (silent disappearance)"
+                    & (Join-Path $PSScriptRoot 'resume-after-crash.ps1') | ForEach-Object { Note "  resume: $_" }
+                }
             } else {
                 Note "GAME GONE (from state $state)"
             }

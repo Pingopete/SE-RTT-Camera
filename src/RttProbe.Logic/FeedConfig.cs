@@ -914,6 +914,21 @@ internal static class FeedConfig
     // Applied at marker CREATION only: toggle cameraTriggerEntity off/on to change it live.
     public static bool CameraTriggerDynamicTag { get; private set; } = true;
 
+    // HALF-EXTENT of both presence markers, metres. THE RADIUS OF THE MATERIALIZATION BUBBLE.
+    //
+    // The PlanetEnvironment triggers are SECTORED: they activate the sectors an entity's
+    // bounding box overlaps. 1.375 (the engine's own voxel-observer size) overlaps about one
+    // sector, which is why scatter objects stop at a hard circle around the anchor and the
+    // ground beyond is bare — spotted from the raised orbit camera on 2026-08-02.
+    //
+    // Sectors are ref-counted, so a big bubble overlapping a player's is safe by design and
+    // cannot double-spawn. The cost is RESIDENT WORLD, roughly with the cube of this — watch
+    // VRAM, since the feed cap is already the binding constraint.
+    //
+    // Applied at marker CREATION: toggle cameraTriggerEntity/serverPresenceEntity off and on
+    // to rebuild at a new size.
+    public static double CameraTriggerExtent { get; private set; } = 1.375;
+
     // THE SERVER HALF. A DynamicTag+WorldTransform+BoundingBoxData entity in the SERVER
     // scene, created and moved exclusively on that scene's own pump (the bootstrap's
     // sim-pump seat) — never from our threads. This is the archetype every censused
@@ -1134,6 +1149,15 @@ internal static class FeedConfig
             var markerWas = CameraTriggerEntity;
             CameraTriggerEntity = Bool(kv, "cameraTriggerEntity", CameraTriggerEntity);
             CameraTriggerDynamicTag = Bool(kv, "cameraTriggerDynamicTag", CameraTriggerDynamicTag);
+            var extWas = CameraTriggerExtent;
+            CameraTriggerExtent = Dbl(kv, "cameraTriggerExtent", CameraTriggerExtent);
+            if (Math.Abs(extWas - CameraTriggerExtent) > 0.001)
+                RttLog.Global($"Config: cameraTriggerExtent {extWas:F2} -> {CameraTriggerExtent:F2} m. " +
+                    "This is the RADIUS OF THE MATERIALIZATION BUBBLE — the sectored PlanetEnvironment " +
+                    "triggers activate whatever sectors the marker's bounding box overlaps, so a small " +
+                    "box buys a small disc of world however long it sits there. Applied at marker " +
+                    "CREATION: the markers are rebuilt on the next pump pass. Resident world grows " +
+                    "roughly with the cube of this — WATCH VRAM.");
 
             var presenceWas = ServerPresenceEntity;
             ServerPresenceEntity = Bool(kv, "serverPresenceEntity", ServerPresenceEntity);
