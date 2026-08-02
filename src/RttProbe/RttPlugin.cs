@@ -165,6 +165,13 @@ public static class RttBridge
     // logic assembly (reloadable) owns every decision. The transform is a STRUCT, so it
     // arrives boxed and the logic returns a modified box.
     public static volatile Func<object, object, object> ClipmapCameraHook;
+
+    // The VoxelRenderUpdateSessionComponent that owns the clipmap update loop, captured from
+    // the patch's __instance. It is NOT reachable from the session-components entity (the
+    // logic looked and it is genuinely absent from that roster), and it owns _lodDistances —
+    // the 16-slot LODData array whose sharing across bodies is the current prime suspect for
+    // the mid-LOD plateau. Handing it over here costs nothing and saves guessing at its home.
+    public static volatile object VoxelUpdateComponent;
 }
 
 public sealed class RttPlugin : IPlugin
@@ -254,8 +261,9 @@ public sealed class RttPlugin : IPlugin
 
     // Runs for EVERY voxel body EVERY frame. It must be cheap and it must never throw:
     // an exception here is an exception in the engine's terrain update loop.
-    private static void UpdateClipmapPrefix(object[] __args)
+    private static void UpdateClipmapPrefix(object __instance, object[] __args)
     {
+        if (RttBridge.VoxelUpdateComponent == null) RttBridge.VoxelUpdateComponent = __instance;
         var hook = RttBridge.ClipmapCameraHook;
         if (hook == null || __args == null || __args.Length < 2) return;
         try

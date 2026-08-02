@@ -622,9 +622,114 @@ internal static class WorldGrids
                             $"({_clipmapOverrides} override(s) of {_clipmapCalls} body-updates; this line is " +
                             "rate-limited to one per 15 s.)");
             }
+            ProbeLodDataSharing(renderComponent);
             return replacement;
         }
         catch { return null; }
+    }
+
+    // IS THE MOVE GATE SHARED ACROSS BODIES? — settle the plateau hypothesis by measurement.
+    //
+    // IL says VoxelRenderUpdateSessionComponent._lodDistances is a 16-slot LODDataArray that
+    // Init() fills indexed by LOD LEVEL, and that CheckNeedsMove stores LastPosition into the
+    // slot UpdateClipmap picked. If that array is shared across bodies, my per-body camera
+    // override makes the feed and the player fight over the same 16 LastPositions, the gate
+    // reports "needs move" forever, and the finer rings never settle — the observed plateau.
+    //
+    // Rather than trust a reading of IL fragments, print the slots. If LastPosition values
+    // sit near BOTH viewers at once (3,907 km apart) the array is shared and the hypothesis
+    // holds; if they all cluster near one, it does not and the cap is elsewhere.
+    private static long _lodProbeTicks;
+    private static object _lodOwner;
+    private static Vector3D? _lastLodSlot0;
+
+    private static void ProbeLodDataSharing(object renderComponent)
+    {
+        var now = Environment.TickCount64;
+        if (now - _lodProbeTicks < 8000) return;
+        _lodProbeTicks = now;
+        try
+        {
+            // The session component owning the array is the one the engine calls; reach it
+            // from the component's Session rather than assuming a static.
+            // renderComponent is a COMPONENT, not an entity — FindSessionComponent expects an
+            // entity and returned null instantly, which is why the first probe reported
+            // "unreadable". VoxelRenderComponent is a GameComponent and carries Session
+            // directly; go through that to the session-components entity.
+            // From the bootstrap's captured __instance. VoxelRenderUpdateSessionComponent is
+            // genuinely NOT on the session-components entity — the logic walked that roster
+            // and it is absent — so the patch site is the only reliable handle on it.
+            _lodOwner ??= Type.GetType("RttProbe.RttBridge, RttProbe")
+                              ?.GetField("VoxelUpdateComponent")?.GetValue(null);
+            var arr = Prop(_lodOwner, "_lodDistances");
+            if (arr == null)
+            {
+                RttLog.Line("LOD PROBE: _lodDistances unreadable " +
+                            $"(owner={(_lodOwner == null ? "NOT FOUND on the session entity" : _lodOwner.GetType().Name)}, " +
+                            $"renderComponent={renderComponent?.GetType().Name}).");
+                return;
+            }
+
+            var sb = new StringBuilder("LOD PROBE: _lodDistances slots (LastPosition per slot). " +
+                "Feed camera at " +
+                $"{CameraFeed.SubjectCentreCache.X:F0},{CameraFeed.SubjectCentreCache.Y:F0}," +
+                $"{CameraFeed.SubjectCentreCache.Z:F0}.");
+            // InlineArray: invisible to plain reflection (its span cannot be boxed), reach
+            // elements through the int indexer — the lesson the planet-up scan already paid for.
+            var idx = arr.GetType().GetProperties(Any)
+                .FirstOrDefault(p => p.GetIndexParameters().Length == 1 &&
+                                     p.GetIndexParameters()[0].ParameterType == typeof(int));
+            if (idx == null)
+            {
+                // NO INDEXER: LODDataArray is an [InlineArray], and a C# inline array has no
+                // indexer at all — the compiler lowers element access to InlineArrayAsSpan,
+                // and a Span cannot be boxed for reflection. (Same trap the planet-up scan
+                // hit; there the type DID expose an int indexer, here it does not.)
+                //
+                // But an inline array's ONE field IS element 0. A single slot is enough for
+                // the question being asked: sample slot 0's LastPosition over time. If it
+                // JUMPS between positions ~3,900 km apart, the array is shared between the
+                // player's bodies and the feed's and the move gate is thrashing. If it stays
+                // put near one viewer, it is not shared and the plateau is elsewhere.
+                var f0 = arr.GetType().GetFields(Any).FirstOrDefault(f => !f.IsStatic);
+                var slot0 = f0?.GetValue(arr);
+                var lp0 = Prop(slot0, "LastPosition");
+                if (lp0 is Vector3D v0)
+                {
+                    var dFeed = (v0 - CameraFeed.SubjectCentreCache).Length();
+                    sb.Append($"\n    slot[0] (inline array, element 0 only) LastPosition=" +
+                              $"{v0.X:F0},{v0.Y:F0},{v0.Z:F0}  — {dFeed / 1000.0:F0} km from the feed camera");
+                    if (_lastLodSlot0.HasValue)
+                    {
+                        var jump = (v0 - _lastLodSlot0.Value).Length();
+                        sb.Append($"\n    moved {jump / 1000.0:F1} km since the previous sample " +
+                                  (jump > 100000
+                                    ? "— A JUMP OF THIS SIZE BETWEEN SAMPLES MEANS THE SLOT IS SHARED between the "
+                                      + "player's bodies and the feed's, so the move gate never settles. Plateau explained."
+                                    : "— stable, so this slot is NOT being fought over; the plateau is elsewhere."));
+                    }
+                    _lastLodSlot0 = v0;
+                }
+                else sb.Append($"\n    slot[0] unreadable (field={f0?.Name}, type={arr.GetType().Name})");
+            }
+            else
+                for (int i = 0; i < 16; i++)
+                {
+                    object slot = null; try { slot = idx.GetValue(arr, new object[] { i }); } catch { }
+                    if (slot == null) continue;
+                    var lp = Prop(slot, "LastPosition");
+                    var init = Prop(slot, "LastPositionInitialized");
+                    if (lp is Vector3D v && Convert.ToBoolean(init ?? false))
+                        sb.Append($"\n    [{i,2}] {v.X:F0},{v.Y:F0},{v.Z:F0}" +
+                                  $"   (feed {(v - CameraFeed.SubjectCentreCache).Length() / 1000.0:F0} km away)");
+                }
+            sb.Append("\n    READ IT THUS: slots near the FEED and slots far from it, together, " +
+                      "means the array is shared across bodies and the move gate is thrashing — " +
+                      "the plateau is explained and the fix is to scope this per body. All slots " +
+                      "clustered near one viewer means it is not shared and the cap is elsewhere.");
+            RttLog.Line(sb.ToString());
+        }
+        catch (Exception e) { RttLog.Line("LOD PROBE failed: " + e.Message); }
     }
 
     // PRELOAD THE WORLD AROUND THE FEED CAMERA (goal 10, tier 1).
