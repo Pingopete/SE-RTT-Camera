@@ -3909,10 +3909,40 @@ internal static class WholeSceneRender
                 _ourEyeJob = _eyeJobField.FieldType.IsInstanceOfType(parked) ? parked : null;
                 if (_ourEyeJob != null)
                 {
-                    // Adopted across a hot reload — already initialized, so it is usable now.
+                    // ADOPTION MUST VERIFY, NOT ASSUME — and this nearly reintroduced the exact
+                    // crash the park exists to prevent.
+                    //
+                    // The first version set _eyeReady = true here on the reasoning that a
+                    // parked job "has already been initialized". That is false for the case
+                    // that actually happened: a job whose InitializeAsync FAULTED is still
+                    // parked (deliberately, so a reload does not build a second one beside
+                    // it), and adopting it would mark it ready, install it, and dispatch
+                    // against null PSOs — a device removal, not an exception.
+                    //
+                    // EyeAdaptationJob carries the engine's own readiness flag, so ask it
+                    // rather than inferring from "the slot was non-empty".
+                    bool ready = false;
+                    try
+                    {
+                        ready = _ourEyeJob.GetType().GetField("_areAutoExposuresInitialized", Any)
+                                          ?.GetValue(_ourEyeJob) as bool? ?? false;
+                    }
+                    catch { }
+
+                    if (!ready)
+                    {
+                        _eyeState = -1;
+                        RttLog.Line($"Own eye adaptation: the parked job for feed {slot} reports " +
+                                    "_areAutoExposuresInitialized = false — it never finished initialising " +
+                                    "(its InitializeAsync faulted). NOT adopting it: dispatching an " +
+                                    "uninitialised job is a device removal. It stays parked so no second one " +
+                                    "is built beside it. A GAME RESTART is needed to get a fresh attempt.");
+                        return null;
+                    }
+
                     _eyeReady = true;
-                    RttLog.Line($"Own eye adaptation: adopted the parked job for feed {slot} — no new render " +
-                                "targets built, which is the whole point of the park.");
+                    RttLog.Line($"Own eye adaptation: adopted the parked job for feed {slot}, verified " +
+                                "initialised — no new render targets built, which is the point of the park.");
                 }
                 else
                 {
@@ -3954,8 +3984,23 @@ internal static class WholeSceneRender
                 if (!ok)
                 {
                     _eyeState = -1;
+
+                    // PRINT WHY. The first version logged only that it faulted, which is the
+                    // shape of uninformative negative this project keeps having to re-run
+                    // experiments over: "it failed" and "it failed BECAUSE" cost the same to
+                    // log and differ completely in value. Task.Exception is an
+                    // AggregateException, so the inner one is the real cause.
+                    string why = "no exception on the task";
+                    try
+                    {
+                        if (t.GetProperty("Exception", Any)?.GetValue(_eyeInitTask) is Exception agg)
+                            why = (agg as AggregateException)?.InnerException?.ToString() ?? agg.ToString();
+                    }
+                    catch { }
+
                     RttLog.Line("Own eye adaptation: InitializeAsync FAULTED — disarmed, fixed stop retained. " +
-                                "The job stays parked so a reload does not build a second one beside it.");
+                                "The job stays parked so a reload does not build a second one beside it. " +
+                                "REASON: " + why);
                     return null;
                 }
                 _eyeReady = true;
