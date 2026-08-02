@@ -257,6 +257,26 @@ public static class RttBridge
     // free on a path that runs over every root entity in the render scene.
     public static volatile Func<double, double, double, float, float> ViewerDistanceHook;
 
+    // ---- GRASS WITHOUT HiZ, FOR OUR PASS ONLY (2026-08-02) ----------------------------
+    //
+    // WHY THIS RATHER THAN THE SETTING. Clearing HZBOSettings.MainViewEnabled around our
+    // render whited out the feed AND made the PLAYER'S world flicker: six render paths read
+    // IsOcclusionCullingAllowed and expect one value for the whole frame, and SceneFinalize
+    // gates the second visible-entity update on it while RenderGBuffer still runs that pass.
+    // Scoping a field the pipeline snapshots is the documented RaytracingSettings hazard
+    // wearing a new hat.
+    //
+    // RenderGrass(DirectCommandList, bool enableHiZ) takes it as an ARGUMENT. GrassRendering
+    // then picks _triplanarSingleGenNoHiZPSO over _triplanarSingleGenPSO from that argument
+    // alone. So forcing the parameter false reaches exactly the grass generator and nothing
+    // else — per-pass by construction, no shared state touched, and it CANNOT reproduce the
+    // flicker because no other consumer sees it.
+    //
+    // The question it answers: grass instances are occlusion-tested against a depth pyramid.
+    // If that pyramid does not match our camera, every instance is rejected and the feed has
+    // no grass at all rather than thin grass — which is exactly what the feed shows.
+    public static volatile Func<bool> GrassNoHiZHook;
+
     // Call/override counters for the above, written by the postfix and read by the logic's
     // reporter. Plain longs, incremented without interlock on purpose: this is a per-entity
     // per-frame path and an occasional lost increment costs a diagnostic nothing, while a
@@ -328,8 +348,40 @@ public sealed class RttPlugin : IPlugin
             PatchSimPumpSeat(harmony);
             PatchFloraCamera(harmony);
             PatchViewerDistance(harmony);
+            PatchGrassHiZ(harmony);
         }
         catch (Exception e) { Log("Patching FAILED: " + e); }
+    }
+
+    // Grass-without-HiZ for our pass — see RttBridge.GrassNoHiZHook.
+    private static void PatchGrassHiZ(HarmonyLib.Harmony harmony)
+    {
+        try
+        {
+            var sds = Type.GetType("Keen.VRage.Render12.Core.Systems.SceneDrawSystem, VRage.Render12");
+            var mi = sds?.GetMethod("RenderGrass",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (mi == null) { Log("SceneDrawSystem.RenderGrass not found — grass HiZ override inactive."); return; }
+            var pre = typeof(RttPlugin).GetMethod(nameof(RenderGrassPrefix),
+                BindingFlags.Static | BindingFlags.NonPublic);
+            harmony.Patch(mi, prefix: new HarmonyLib.HarmonyMethod(pre));
+            Log($"Patched SceneDrawSystem.RenderGrass({string.Join(", ", mi.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name))}) " +
+                "— grass HiZ override armed (wholeSceneGrassNoHiZ).");
+        }
+        catch (Exception e) { Log("Patching RenderGrass FAILED: " + e.Message); }
+    }
+
+    // __1 is the SECOND parameter (enableHiZ); __0 is the command list. Positional injection
+    // rather than by name so a parameter rename in a game update cannot silently detach this.
+    //
+    // ref, and writable: Harmony writes a modified `ref` parameter back into the call, which
+    // is what lets the original run with our value instead of the caller's. A throw or a null
+    // hook leaves the caller's argument untouched, so the failure mode is "no change".
+    private static void RenderGrassPrefix(ref bool __1)
+    {
+        var hook = RttBridge.GrassNoHiZHook;
+        if (hook == null) return;
+        try { if (hook()) __1 = false; } catch { }
     }
 
     // The nearest-viewer distance — see RttBridge.ViewerDistanceHook for the mechanism.

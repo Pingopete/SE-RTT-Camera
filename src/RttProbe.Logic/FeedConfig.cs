@@ -127,7 +127,17 @@ internal static class FeedConfig
     // shadow still draws, and the same flag is handed to RenderGrass as enableHiZ, so it
     // would remove all grass rather than thin it. Costs feed draw calls only; scoped, so the
     // player's occlusion culling is untouched. NOT in the rebuild signature — live A/B.
+    // DANGEROUS AND KNOWN-BAD — see the note in WholeSceneRender.ScopeSharedState. Whited out
+    // the feed and made the PLAYER'S world flicker on 2026-08-02. Kept only so the failure is
+    // recorded where someone would otherwise retry it. Use WholeSceneGrassNoHiZ instead.
     public static bool WholeSceneNoHzbo { get; private set; }
+
+    // Force RenderGrass's enableHiZ ARGUMENT false inside our render. This is the safe half of
+    // the HZBO question: GrassRendering selects its NoHiZ pipeline from that argument alone, so
+    // this reaches the grass generator and nothing else — no shared setting, no other consumer,
+    // and it cannot reproduce the flicker wholeSceneNoHzbo caused. Needs the bootstrap patch on
+    // SceneDrawSystem.RenderGrass, so a game restart to adopt.
+    public static bool WholeSceneGrassNoHiZ { get; private set; }
 
     // Stop our render UPDATING the shared environment-probe atlas.
     //
@@ -1336,6 +1346,16 @@ internal static class FeedConfig
             WholeSceneOwnProbes         = Bool(kv, "wholeSceneOwnProbes", WholeSceneOwnProbes);
             WholeSceneDisableRaytracing    = Int(kv, "wholeSceneDisableRaytracing", WholeSceneDisableRaytracing);
             WholeSceneDisableEyeAdaptation = Bool(kv, "wholeSceneDisableEyeAdaptation", WholeSceneDisableEyeAdaptation);
+
+            var grassHizWas = WholeSceneGrassNoHiZ;
+            WholeSceneGrassNoHiZ = Bool(kv, "wholeSceneGrassNoHiZ", WholeSceneGrassNoHiZ);
+            if (grassHizWas != WholeSceneGrassNoHiZ)
+                RttLog.Global($"Config: wholeSceneGrassNoHiZ {grassHizWas} -> {WholeSceneGrassNoHiZ}" +
+                    (WholeSceneGrassNoHiZ
+                        ? ". Grass generation in the feed now runs the NoHiZ pipeline — instances are no " +
+                          "longer occlusion-tested against a depth pyramid. If grass appears, the pyramid " +
+                          "was rejecting every instance because it does not match our camera."
+                        : ". Grass generation goes back to occlusion-testing against HiZ."));
 
             var hzboWas = WholeSceneNoHzbo;
             WholeSceneNoHzbo = Bool(kv, "wholeSceneNoHzbo", WholeSceneNoHzbo);

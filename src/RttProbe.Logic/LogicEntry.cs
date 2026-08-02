@@ -104,6 +104,24 @@ public static class LogicEntry
                             "viewerDistance will have NO EFFECT until then.");
             }
 
+            // Grass without HiZ, for our pass only. Absent on an older bootstrap, in which case
+            // wholeSceneGrassNoHiZ is inert — worth saying, because a silently ignored flag is
+            // exactly how the HZBO A/B would get misread a second time.
+            var grassHiz = bridge.GetField("GrassNoHiZHook");
+            if (grassHiz != null)
+            {
+                grassHiz.SetValue(null, (Func<bool>)(() =>
+                    WholeSceneRender.InOurRender && FeedConfig.WholeSceneGrassNoHiZ));
+                RttLog.Line("Grass HiZ hook registered — wholeSceneGrassNoHiZ is armable. It forces " +
+                            "RenderGrass's enableHiZ ARGUMENT false inside our render only, which is the " +
+                            "per-pass version of the HZBO test that whited out the feed.");
+            }
+            else
+            {
+                RttLog.Line("GrassNoHiZHook not on this bootstrap — restart the game to adopt it. " +
+                            "wholeSceneGrassNoHiZ will have NO EFFECT until then.");
+            }
+
             // The sim-pump seat (server presence entity). Absent on an older bootstrap,
             // which degrades to "no server-side materialization" — the state of the world
             // before 2026-08-02. Say so out loud, because serverPresenceEntity = 1 with a
