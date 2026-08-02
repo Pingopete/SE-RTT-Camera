@@ -3898,10 +3898,17 @@ internal static class WholeSceneRender
     // takes. Blocking the render thread on the task instead would be a frame hitch at best
     // and a deadlock at worst, since the init tasks may want the render thread themselves.
     private static int _eyeState;                 // 0 untried, 1 armed, -1 unavailable
-    private static object _ourEyeJob;
-    private static FieldInfo _eyeJobField;
-    private static object _eyeInitTask;           // Task from InitializeAsync, polled not awaited
-    private static bool _eyeReady;
+    private static object _ourEyeJob;             // OUR job — a HISTORY CONTAINER, never dispatched
+    private static FieldInfo _eyeJobField;        // SceneDrawSystem._eyeAdaptationJob
+    private static FieldInfo _fAutoExposures;     // EyeAdaptationJob._autoExposures
+    private static FieldInfo _fAutoExpInit;       // EyeAdaptationJob._areAutoExposuresInitialized
+    private static object _ourAutoExposures;      // our ping-pong history pair
+    private static bool _ourAutoExpInit;          // our copy of the first-use flag
+
+    // Returns the ENGINE's history to put back, boxed as a small pair, or null if nothing was
+    // swapped. We swap STATE onto the engine's job rather than swapping the job itself — see
+    // the header above for why owning a job cannot work.
+    private sealed class SavedEyeState { public object AutoExposures; public bool Init; }
 
     private static object InstallEyeAdaptation(object sceneDrawSystem)
     {
@@ -3957,28 +3964,22 @@ internal static class WholeSceneRender
                     //
                     // EyeAdaptationJob carries the engine's own readiness flag, so ask it
                     // rather than inferring from "the slot was non-empty".
-                    bool ready = false;
-                    try
-                    {
-                        ready = _ourEyeJob.GetType().GetField("_areAutoExposuresInitialized", Any)
-                                          ?.GetValue(_ourEyeJob) as bool? ?? false;
-                    }
-                    catch { }
-
-                    if (!ready)
-                    {
-                        _eyeState = -1;
-                        RttLog.Line($"Own eye adaptation: the parked job for feed {slot} reports " +
-                                    "_areAutoExposuresInitialized = false — it never finished initialising " +
-                                    "(its InitializeAsync faulted). NOT adopting it: dispatching an " +
-                                    "uninitialised job is a device removal. It stays parked so no second one " +
-                                    "is built beside it. A GAME RESTART is needed to get a fresh attempt.");
-                        return null;
-                    }
-
-                    _eyeReady = true;
-                    RttLog.Line($"Own eye adaptation: adopted the parked job for feed {slot}, verified " +
-                                "initialised — no new render targets built, which is the point of the park.");
+                    // THE OLD READINESS GUARD IS GONE, and deliberately so — its premise no
+                    // longer holds. It refused to adopt a container whose
+                    // _areAutoExposuresInitialized was false, because approach 1 DISPATCHED
+                    // that job and dispatching an uninitialised one is a device removal.
+                    //
+                    // We no longer dispatch it. It is a bag of render targets: the only thing
+                    // read out of it is _autoExposures, which the CONSTRUCTOR builds (verified
+                    // in IL — the ctor is its only writer). A false flag here is not merely
+                    // tolerable, it is CORRECT: it says this history has never had its
+                    // first-use clear, which is exactly what we want DynamicExposure to do the
+                    // first time it integrates into it.
+                    //
+                    // The non-null check on _autoExposures below is what replaces this guard,
+                    // and it is the check that actually matches what we now use.
+                    RttLog.Line($"Own eye adaptation: adopted the parked history container for feed {slot} — " +
+                                "no new render targets built, which is the point of the park.");
                 }
                 else
                 {
@@ -3998,90 +3999,106 @@ internal static class WholeSceneRender
                     _ourEyeJob = ctor.Invoke(new[] { tasks });
                     park[slot] = _ourEyeJob;              // park BEFORE any await can fail
 
-                    _eyeInitTask = jobType.GetMethod("InitializeAsync", Any)?.Invoke(_ourEyeJob, null);
-                    RttLog.Line($"Own eye adaptation: built a job for feed {slot} and parked it. Initialization " +
-                                "is ASYNC — the feed holds its fixed stop until it reports complete, because a " +
-                                "job dispatched with null PSOs is a device removal rather than an exception.");
+                    // INITIALIZEASYNC IS DELIBERATELY NEVER CALLED. It is tied to the engine's
+                    // render-init cancellation token, which is already signalled by the time we
+                    // run, so it can only ever return a CANCELLED task (measured 2026-08-02:
+                    // completed, not successful, no exception). We do not need it: the CTOR is
+                    // the only writer of _autoExposures, so the history textures exist the
+                    // moment the object does. What InitializeAsync builds is PSOs and root
+                    // signatures — and this job is never dispatched, so it never needs them.
+                    RttLog.Line($"Own eye adaptation: built a history container for feed {slot} and parked it. " +
+                                "InitializeAsync is NOT called and is not needed — this object is never " +
+                                "dispatched, it only holds the ping-pong textures its constructor made.");
                 }
+                // The two state fields we substitute. Resolved once from the job's own type.
+                var jt = _eyeJobField.FieldType;
+                _fAutoExposures = jt.GetField("_autoExposures", Any);
+                _fAutoExpInit = jt.GetField("_areAutoExposuresInitialized", Any);
+                if (_fAutoExposures == null || _fAutoExpInit == null)
+                {
+                    _eyeState = -1;
+                    RttLog.Line("Own eye adaptation: EyeAdaptationJob has no _autoExposures / " +
+                                "_areAutoExposuresInitialized — the state-swap route is unavailable on this build.");
+                    return null;
+                }
+
+                // OUR history, taken from the container's constructor output. If this is null
+                // the ctor did not build the pair and there is nothing to swap in — refuse
+                // rather than install a null array under a shader.
+                _ourAutoExposures = _fAutoExposures.GetValue(_ourEyeJob);
+                if (_ourAutoExposures == null)
+                {
+                    _eyeState = -1;
+                    RttLog.Line("Own eye adaptation: the container's _autoExposures is NULL — its constructor did " +
+                                "not build the ping-pong pair, so there is no history to swap in. Disarmed.");
+                    return null;
+                }
+                _ourAutoExpInit = false;   // our history has never been cleared; let DynamicExposure do it
+
                 _eyeState = 1;
             }
 
-            if (_ourEyeJob == null) return null;
+            if (_ourEyeJob == null || _ourAutoExposures == null) return null;
 
-            // Poll, never block. IsCompletedSuccessfully distinguishes "ready" from "faulted",
-            // and a faulted init must disarm rather than be used.
-            if (!_eyeReady)
+            // THE SWAP: state, not the job.
+            //
+            // The engine's job keeps doing the dispatching — it has the PSOs and root
+            // signatures that InitializeAsync builds, and that we can never obtain for a job
+            // constructed mid-session. All we substitute is WHOSE HISTORY it integrates into.
+            //
+            // _areAutoExposuresInitialized travels WITH the history, because it is a property
+            // of that buffer pair rather than of the job: DynamicExposure uses it to decide
+            // whether this history needs its first-use clear. Leaving the engine's flag in
+            // place while swapping our (never-cleared) textures under it would have the shader
+            // integrate against uninitialised memory — a plausible-looking wrong exposure that
+            // would have been very hard to attribute.
+            //
+            // _histogram is deliberately NOT swapped. It is per-frame scratch, refilled from
+            // the source image on every call, not accumulated state — so sharing it costs
+            // nothing and avoids owning a second buffer.
+            var engineJob = _eyeJobField.GetValue(sceneDrawSystem);
+            if (engineJob == null || ReferenceEquals(engineJob, _ourEyeJob)) return null;
+
+            var saved = new SavedEyeState
             {
-                if (_eyeInitTask == null) return null;
-                var t = _eyeInitTask.GetType();
-                bool done = (bool)(t.GetProperty("IsCompleted", Any)?.GetValue(_eyeInitTask) ?? false);
-                if (!done) return null;
-                bool ok = (bool)(t.GetProperty("IsCompletedSuccessfully", Any)?.GetValue(_eyeInitTask) ?? false);
-                if (!ok)
-                {
-                    _eyeState = -1;
+                AutoExposures = _fAutoExposures.GetValue(engineJob),
+                Init          = (bool)(_fAutoExpInit.GetValue(engineJob) ?? false),
+            };
 
-                    // PRINT WHY. The first version logged only that it faulted, which is the
-                    // shape of uninformative negative this project keeps having to re-run
-                    // experiments over: "it failed" and "it failed BECAUSE" cost the same to
-                    // log and differ completely in value. Task.Exception is an
-                    // AggregateException, so the inner one is the real cause.
-                    string why = "no exception on the task";
-                    try
-                    {
-                        if (t.GetProperty("Exception", Any)?.GetValue(_eyeInitTask) is Exception agg)
-                            why = (agg as AggregateException)?.InnerException?.ToString() ?? agg.ToString();
-                    }
-                    catch { }
+            _fAutoExposures.SetValue(engineJob, _ourAutoExposures);
+            _fAutoExpInit.SetValue(engineJob, _ourAutoExpInit);
 
-                    // CANCELLED, NOT FAULTED — and the distinction is the whole diagnosis.
-                    //
-                    // MEASURED 2026-08-02: IsCompleted true, IsCompletedSuccessfully false,
-                    // Exception NULL. For a Task that combination means exactly one thing: it
-                    // was CANCELLED. The engine's InitializeAsync is tied to a cancellation
-                    // token belonging to the render-init phase, which is long finished by the
-                    // time we construct a job mid-session — so CONSTRUCTING OUR OWN
-                    // EyeAdaptationJob AFTER STARTUP CANNOT WORK through this path, no matter
-                    // how the park or the install is arranged.
-                    //
-                    // It also resolves the tension that looked like a contradiction earlier:
-                    // a job reporting _areAutoExposuresInitialized = true after its init had
-                    // "faulted". It had not faulted; it had never initialised at all.
-                    //
-                    // The alternative that avoids this entirely is to STOP CONSTRUCTING A JOB:
-                    // keep the ENGINE's fully-initialised _eyeAdaptationJob and swap only its
-                    // ADAPTATION STATE (_autoExposures and _histogram) around our render. That
-                    // needs us to own those textures rather than a whole job, and it never
-                    // touches InitializeAsync. See task #36.
-                    bool canceled = why == "no exception on the task";
-                    RttLog.Line((canceled
-                                    ? "Own eye adaptation: InitializeAsync was CANCELLED (completed, not successful, " +
-                                      "no exception) — the engine's init-phase cancellation token is already " +
-                                      "signalled, so a job constructed mid-session can never initialise. This " +
-                                      "approach is a dead end; swap the ENGINE job's state instead. "
-                                    : "Own eye adaptation: InitializeAsync FAULTED. REASON: " + why + " ") +
-                                "Disarmed, fixed stop retained. The job stays parked so a reload does not build " +
-                                "a second one beside it.");
-                    return null;
-                }
-                _eyeReady = true;
-                RttLog.Line("Own eye adaptation: initialization complete — the feed now adapts to what its own " +
-                            "camera sees. Watch the PLAYER's lighting: if it oscillates at our render cadence " +
-                            "the histories are still shared and this must come straight back off.");
-            }
-
-            var saved = _eyeJobField.GetValue(sceneDrawSystem);
-            if (ReferenceEquals(saved, _ourEyeJob)) return null;   // already ours; nothing to unwind
-            _eyeJobField.SetValue(sceneDrawSystem, _ourEyeJob);
+            if (_scopeWarned.Add("eyeStateSwapped"))
+                RttLog.Line("Own eye adaptation: SWAPPED the history onto the engine's job for our pass. " +
+                            "The engine job dispatches (it owns the PSOs); the ping-pong history it integrates " +
+                            "into is OURS, so the feed adapts to what its own camera sees and the player's " +
+                            "adaptation is untouched. _histogram stays shared — it is per-frame scratch.");
             return saved;
         }
         catch (Exception e) { RttLog.Error("install eye adaptation", e); _eyeState = -1; return null; }
     }
 
+    // Put the ENGINE's history back, and keep OURS for the next pass.
+    //
+    // Capturing our side on the way out is what makes this an adaptation rather than a
+    // one-frame measurement: DynamicExposure ping-pongs the pair and sets the first-use flag,
+    // so the values sitting on the job at the end of our render ARE our updated history. Read
+    // them back before restoring, or every frame would start from scratch and the exposure
+    // would never converge.
     private static void RestoreEyeAdaptation(object sceneDrawSystem, object saved)
     {
-        if (saved == null || _eyeJobField == null || sceneDrawSystem == null) return;
-        try { _eyeJobField.SetValue(sceneDrawSystem, saved); }
+        if (saved is not SavedEyeState s || _fAutoExposures == null || sceneDrawSystem == null) return;
+        try
+        {
+            var engineJob = _eyeJobField?.GetValue(sceneDrawSystem);
+            if (engineJob == null) return;
+
+            _ourAutoExposures = _fAutoExposures.GetValue(engineJob);
+            _ourAutoExpInit = (bool)(_fAutoExpInit?.GetValue(engineJob) ?? false);
+
+            _fAutoExposures.SetValue(engineJob, s.AutoExposures);
+            _fAutoExpInit.SetValue(engineJob, s.Init);
+        }
         catch (Exception e) { RttLog.Error("restore eye adaptation", e); }
     }
 
