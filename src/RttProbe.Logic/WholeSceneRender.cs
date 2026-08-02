@@ -2075,7 +2075,8 @@ internal static class WholeSceneRender
         if (flora.Count > 0)
             ScopeSetValues("FloraSettings",
                 $"feed flora LOD distance x{FeedConfig.WholeSceneFloraLodMult:0.###} " +
-                "(compensates LODSetup.Compose scaling flora LOD by the PLAYER'S swapchain height)",
+                "(LOWER = MORE FLORA — it scales the measured distance LOD selection reads, " +
+                "not the LOD thresholds; measured 2.4 -> ~4 trees, 0.25 -> more than baseline)",
                 flora.ToArray());
 
         // LOD, our render only. MainView is the PassLODSettings the main culling job reads,

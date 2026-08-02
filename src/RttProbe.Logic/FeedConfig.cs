@@ -517,11 +517,22 @@ internal static class FeedConfig
     //
     // LODSetup.Compose computes:
     //     GlobalFloraDistanceMult = MathF.Min(1, 1080 / SwapChain.Resolution.Y) * this
-    // and SwapChain is the PLAYER'S swapchain — so above 1080p the engine SHRINKS flora LOD
-    // distance globally, and our 1024x1024 feed inherits a multiplier computed from a
-    // resolution it does not have. That is the single-viewer disease in the LOD system, and
-    // this knob is the compensation for it: at 1440p the engine applies 0.75, so 1.33 here
-    // restores parity and anything above that is a genuine increase.
+    // and SwapChain is the PLAYER'S swapchain — the only one the engine has.
+    //
+    // LOWER = MORE FLORA, and this is the opposite of what the name suggests. MEASURED
+    // 2026-08-02, in game, on a frozen orbit: 2.4 cut visible trees from ~15-20 to ~4.
+    // The value scales the MEASURED DISTANCE that LOD selection consumes, not the LOD
+    // threshold distances — so raising it makes every plant read as farther away, pick a
+    // coarser LOD, and fall off the end of the LOD chain entirely.
+    //
+    // Which re-reads the engine's own term: at 4K, min(1, 1080/2160) = 0.5 makes flora read
+    // as HALF as far, so it picks finer LODs and more of it survives. That is the engine
+    // being GENEROUS at high resolution, not penalising it — and our feed already inherits
+    // that generous value. The first version of this comment had the sign backwards and
+    // called 2.4 a "parity fix"; the in-game A/B refuted it in one shot.
+    //
+    // The "for parity" figure the probe prints is what the feed's OWN height would earn.
+    // That is STINGIER than what it inherits, so it is a reference point, not a target.
     public static double WholeSceneFloraLodMult { get; private set; } = -1;
 
     // Per-pass LOD floors, OUR RENDER ONLY. LODSettings.MainView is a PassLODSettings, and
