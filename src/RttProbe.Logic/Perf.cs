@@ -175,6 +175,7 @@ internal static class Perf
                 if (avail <= 0)
                     vram += " OVER BUDGET — the driver is paging residency over PCIe, which is a " +
                             "hitch source no amount of per-stage tuning will fix";
+                WarnOnResidency(used, avail);
             }
             else vram = "VRAM=?";
 
@@ -225,6 +226,65 @@ internal static class Perf
 
     // For one-off before/after probes around a dispose, in MB. 0 if unavailable.
     public static long SampleVramMb() { long b = ReadVram("UsedVRAM"); return b > 0 ? b / 1048576 : 0; }
+
+    // ---- THE RESIDENCY WARNING (2026-08-02, after a VRAM CTD) -------------------------
+    //
+    // WHY THIS EXISTS AND WHY IT ONLY TALKS. On 2026-08-02 13:18 the game exited with
+    // UsedVRAM 15.41 GB against a 13.64 GB budget. Two world-residency knobs were up at
+    // once — viewerDistanceRadius still at 1000 from a diagnostic sweep hours earlier, and
+    // cameraTriggerExtent raised for a test — and NOTHING said a word. The E1 cap governs
+    // feed COUNT; neither of these is under it, and both grow resident world roughly with
+    // the cube of their value.
+    //
+    // It WARNS AND NEVER ACTS, by explicit decision: quality settings are a manual lever in
+    // this mod and the feed-count cap stays the only thing that decides anything on its own.
+    // So this buys attention, not safety — the discipline is still the operator's.
+    //
+    // IT ALSO FIXES A CHECK THAT COULD NEVER FIRE. The pre-existing over-budget test was
+    // `avail <= 0`, but AvailableVRAM is the BUDGET, not the headroom, so it is never zero
+    // and the message never printed — including through the crash it was written for.
+    // Headroom is budget MINUS used, which is the quantity that actually went negative.
+    //
+    // The knob values are NAMED rather than described, because "VRAM is high" sends you
+    // looking and "viewerDistanceRadius=1000" tells you what to put back.
+    private static long _residencyWarnTicks;
+    private static bool _residencyWasTight;
+
+    private static void WarnOnResidency(long used, long avail)
+    {
+        if (avail <= 0) return;                     // budget unreadable — nothing to compare
+        double headroomMb = (avail - used) / 1048576.0;
+
+        // 768 MB, above the 512 MB E1 reserve on purpose: VRAM swings +/-200 MB frame to
+        // frame, so a threshold at the reserve would fire on noise and be ignored, and a
+        // warning that is routinely ignored is not a warning.
+        bool tight = headroomMb < 768.0;
+        if (!tight) { _residencyWasTight = false; return; }
+
+        var now = Environment.TickCount64;
+        if (_residencyWasTight && now - _residencyWarnTicks < 15000) return;
+        _residencyWarnTicks = now;
+        _residencyWasTight = true;
+
+        RttLog.Line(
+            (headroomMb < 0
+                ? $"*** VRAM OVER BUDGET by {-headroomMb:F0} MB *** "
+                : $"VRAM TIGHT — {headroomMb:F0} MB headroom. ") +
+            "This mod does NOT throttle these automatically; they are yours to set. The knobs " +
+            "that grow RESIDENT WORLD, with their current values: " +
+            $"viewerDistance={(FeedConfig.ViewerDistanceOverride ? "1" : "0")} " +
+            $"radius={FeedConfig.ViewerDistanceRadius:F0}m, " +
+            $"cameraTriggerExtent={FeedConfig.CameraTriggerExtent:F2}m, " +
+            $"preloadAroundCamera={(FeedConfig.PreloadAroundCamera ? "1" : "0")}/" +
+            $"serverPreload={(FeedConfig.ServerPreload ? "1" : "0")} radius={FeedConfig.PreloadRadius:F0}m, " +
+            $"wholeSceneFarClip={FeedConfig.WholeSceneFarClip:F0}m, feed={FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight}. " +
+            (headroomMb < 0
+                ? "A device removal at this point is likely and a game RESTART is the only thing that " +
+                  "clears the allocator ratchet — lowering a knob stops the growth but does not give the " +
+                  "memory back. The last time this was reached the process exited with no crash dialog."
+                : "Lower one of these, or restart before going further. Raise ONE at a time and let VRAM " +
+                  "settle between steps: the crash that prompted this warning had two of them up at once."));
+    }
 
     // The BUDGET, in MB, not the free space — AvailableVRAM is what the driver is willing
     // to let this process hold, and the CTD that motivated the phase E1 cap was used
