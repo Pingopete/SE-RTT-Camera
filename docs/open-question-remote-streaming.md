@@ -449,3 +449,75 @@ Nothing unreachable. Two things to settle before writing it:
   and the same class as the LOD popping bug. Deliberately not attempted.
 - **`ManagedWorldArea.TryLoad` off-thread.** Three CTDs and a sim freeze. `FinishBefore
   <SpawnSyncPoint>` plants a scheduler dependency only the sim pump can clear.
+
+---
+
+## 2026-08-01 (night): THE TRIGGER CENSUS — every constraint decoded, one archetype rules them all
+
+The camera-marker null result (ClientTriggerTag entity at a virgin site, four minutes,
+nothing) forced the question down a level: what do the triggers actually TEST? The answer
+came from a new instrument, not from more theory.
+
+### The instrument
+
+`triggerCensus = 1` → `output/trigger-census.txt`: every `EntityTrigger` in every reachable
+scene's `SpatialTriggerSystemSessionComponent` — debug name, bounds, live occupancy, and
+`TriggerArgs.TypeConstraints` decoded to names through the engine's own reverse registry
+(`RuntimeDataInfo.Of(int)`). The SERVER scene is reached through the captured
+`ManagedWorldAreaSessionComponent.Session` (scene `#03261e87`, the one whose job tables
+carry `SpawnSyncPoint`).
+
+Constraint layout, read from `TypeConstraintBuilder.AsSpan(out mustHaveCount)` rather than
+guessed: each `int[]` is `[count, ...count MustHave ids, ...MustNot ids]`. The first
+decode treated the count as a component id and read nonsense — worth remembering, because
+"must:3+..." looks exactly like a TypeId list.
+
+### What the live constraints say
+
+| trigger (debug name) | scene | MUST have |
+|---|---|---|
+| `PlanetEnvironmentPrimary/Secondary/Blocking` (flora sectors) | server | DynamicTag + WorldTransform + BoundingBoxData |
+| `PlanetEnvironmentPrimary/Secondary` | client | ClientTriggerTag + WorldTransform + BoundingBoxData |
+| `Voxel : Block` / `Voxel : Prediction` (voxel data sectors) | client | DynamicTag + WorldTransform + BoundingBoxData |
+| `ManagedWorldArea_trigger/_blocking` (POI grids → TryLoad) | server | DynamicTag + WorldTransform + BoundingBoxData |
+| `Contract/EncounterPlanetEnvironmentTrigger` | server | InstanceBind\<CharacterComponent\> + WT + BBD |
+
+MustNot on all of them: `ProcedurallyGeneratedTag`, `ManagedByWorldAreaTag` (or
+`IgnoredByWorldAreaTag`), `StagingTag`, `ConcurrentInit` — content must not re-trigger
+content, and half-initialized entities do not count.
+
+**One archetype — `DynamicTag + WorldTransform + BoundingBoxData` — is the presence input
+for everything except encounters (which demand a real character).** Sectors are
+ref-counted (`RefCountingSectorsInfo`, per-sector entity counts in `SectoredTrigger`), so
+overlapping bubbles are the DESIGNED case: in multiplayer every dynamic physics object is
+a materialization source. That answers the overlap-safety question with the engine's own
+architecture: no duplicate spawns, whoever arrives first materializes, the count keeps it
+alive until the last leaves.
+
+It also reframes the endgame for free: a camera block on an RC ship needs NOTHING from
+this machinery — a moving ship is a DynamicTag carrier by construction, and the server
+materializes around it natively. What we are building is the same presence for a camera
+that has no ship.
+
+### The seat, and the two presence entities
+
+Server-scene structural mutation is only legal on that scene's own pump (the TryLoad
+freeze remains the standing proof). The bootstrap's `SimPumpHook` — a Harmony prefix on
+the trigger system's per-frame methods — hands the logic a callback IN each scene's pump;
+the SpawnSyncPoint probe picks the server one. On that seat:
+
+- `serverPresenceEntity = 1`: DynamicTag+WT+BBD at the camera, in the server scene —
+  flora sectors, managed areas, everything the table above lists as server-side.
+- `cameraTriggerEntity = 1` (+ `cameraTriggerDynamicTag`): the client marker now carries
+  ClientTriggerTag AND DynamicTag — client flora triggers and client voxel-data sectors.
+
+### Still open
+
+- Why the ClientTriggerTag-only marker sat inside ZERO triggers despite satisfying the
+  client flora constraint on paper (`_containingTriggers` says the trigger system tracked
+  exactly 3 entities). Candidates: the entity-index DCS signals, sector-tracking scope, or
+  trigger volumes that simply are not there until something generates the sector layout.
+  The census `inside` column with the new markers armed is the direct test.
+- Terrain MESH remains the clipmap override's job (client half, proven); voxel DATA may
+  now arrive via the marker's DynamicTag driving `Voxel : Block` sectors — if so, manual
+  preload becomes redundant. A/B: marker on, preload off, watch VRAM at a virgin site.
