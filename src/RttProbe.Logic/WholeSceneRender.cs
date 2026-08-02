@@ -2066,9 +2066,29 @@ internal static class WholeSceneRender
         double ev = FeedConfig.WholeSceneExposure;
         if (FeedConfig.FeedAutoExposure && TryAutoExposureEv(out double autoEv)) ev = autoEv;
 
-        if (ev != 0)
+        // DO NOT FORCE A STOP WHEN WE OWN THE ADAPTATION. This is stated as an ISOLATION TEST
+        // rather than a fix, because I do not yet know whether DynamicExposure even reads
+        // LuminanceExposure — the comment above establishes it for the CONSTANT path only.
+        //
+        // What is known: with our own EyeAdaptationJob installed, verified initialised and
+        // EyeAdaptation scoped on, the feed still looked identical — as washed out as it did
+        // on a fixed stop. Two readings fit that, and they need different fixes:
+        //   the fixed -2 is layered ON TOP of the adapted value and pins it, or
+        //   the dynamic path ignores this field and the washed-out image IS the adapted result
+        //   (which would point at the histogram source, not at this).
+        // Forcing nothing here separates them: if the image changes, the override was the
+        // problem; if it does not, the adaptation itself is and this line was never involved.
+        //
+        // The fixed stop remains the fallback whenever we are NOT running our own adaptation,
+        // which is the pre-existing behaviour and the safe default.
+        if (ev != 0 && !FeedConfig.WholeSceneOwnEyeAdaptation)
             ScopeSetValues("PostProcessSettings", "feed exposure (auto aperture)",
                 ("LuminanceExposure", (float)ev));
+        else if (ev != 0 && _scopeWarned.Add("evYieldsToAdaptation"))
+            RttLog.Line($"Whole-scene: NOT forcing LuminanceExposure {ev:0.###} — wholeSceneOwnEyeAdaptation is on, " +
+                        "so the feed's own DynamicExposure decides the stop. If the feed looks unchanged from the " +
+                        "fixed-stop version, the override was never what pinned it and the histogram source is the " +
+                        "next suspect.");
 
         // BLOOM. Candidate for the phantom bleed, and the only remaining shared object in
         // the composite tail.
