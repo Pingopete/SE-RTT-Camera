@@ -470,7 +470,31 @@ internal static class WholeSceneRender
                                     string.Join(", ", pt.GetProperties(Any).Select(p => p.Name).Take(20)));
                     }
                 }
-                ctx = $"GrassBufferContext={(gbc == null ? "NULL" : gbc.GetType().Name)} " +
+                // INSIDE the GrassBufferContext, not merely that one exists. RenderGrass calls
+                // Borrow() on it before anything else and the generator writes its commands and
+                // instances into these buffers. We construct the DrawContextManager ourselves,
+                // so if this context is never SIZED the whole pass runs, costs nothing
+                // measurable, and produces no grass — which fits every observation, including
+                // the flat ourDraw when the HiZ path was switched.
+                //
+                // A capacity of 0 or a null instances buffer is the answer. Reporting the type
+                // name alone (what this used to do) could never have distinguished "present"
+                // from "present and empty".
+                string gbcDetail = "NULL";
+                if (gbc != null)
+                {
+                    var gt2 = gbc.GetType();
+                    object G(string n) => gt2.GetField(n, Any)?.GetValue(gbc)
+                                       ?? gt2.GetProperty(n, Any)?.GetValue(gbc);
+                    var inst = G("GrassInstancesBuffer");
+                    var cmds = G("TriplanarGenerationCommandsSingle");
+                    gbcDetail = $"borrowed={G("_isBorrowed")} " +
+                                $"genCmdCapSingle={G("_foliageInstanceGenCommandsBufferCapacitySingle")} " +
+                                $"genCmdCapMulti={G("_foliageInstanceGenCommandsBufferCapacityMulti")} " +
+                                $"instancesBuffer={(inst == null ? "NULL" : inst.GetType().Name)} " +
+                                $"genCmdsSingle={(cmds == null ? "NULL" : cmds.GetType().Name)}";
+                }
+                ctx = $"GrassBufferContext[{gbcDetail}] " +
                       $"MainViewCulling={(cull == null ? "NULL" : "present")} EntityProxies[{pc}]";
             }
 
