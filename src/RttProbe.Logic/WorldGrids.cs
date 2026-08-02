@@ -1574,9 +1574,10 @@ internal static class WorldGrids
                           $"(size {(bodySize >= 1000 ? $"{bodySize / 1000.0:F0}k" : bodySize.ToString("F0"))} voxels" +
                           $"{(bodySize > 10000 ? " — THE PLANET" : "")}):");
                     int lod = 0;
+                    string cellTypeName = null;
                     foreach (var ring in rings)
                     {
-                        int cells = 0, withGrass = 0;
+                        int cells = 0, withGrass = 0, fieldFound = 0;
                         try
                         {
                             // SNAPSHOT, NEVER ENUMERATE LIVE. These dictionaries belong to
@@ -1595,14 +1596,36 @@ internal static class WorldGrids
                                 {
                                     if (cell == null) continue;
                                     cells++;
-                                    var ge = Prop(cell, "_grassEntity");
-                                    if (ge != null && Prop(ge, "IsValid") is bool ok && ok) withGrass++;
+                                    // VoxelClipmapRing._cells holds CellData, a POOLED
+                                    // WRAPPER; the VoxelCell that owns _grassEntity is
+                                    // behind CellData.Cell (IVoxelActorCell). Reading the
+                                    // wrapper is what produced the false "zero grass
+                                    // entities everywhere" — the instrument was blind and
+                                    // said so only once it was asked to report field
+                                    // resolution separately from field value.
+                                    var actor = Prop(cell, "Cell") ?? cell;
+                                    var ge = Prop(actor, "_grassEntity");
+                                    cellTypeName ??= actor.GetType().Name;
+                                    // FIELD-FOUND vs VALID, separately. Zero-with-grass is
+                                    // ambiguous between "no grass here" and "this reader
+                                    // cannot see the field at all", and the obvious control
+                                    // (the player's own planet) is void because he is
+                                    // standing on a rocky world that may have no grass
+                                    // either. Counting reads that RESOLVED settles it
+                                    // without needing a grassy control.
+                                    if (ge != null)
+                                    {
+                                        fieldFound++;
+                                        if (Prop(ge, "IsValid") is bool ok && ok) withGrass++;
+                                    }
                                 }
                             }
                         }
                         catch { }
                         if (cells > 0)
-                            sb.AppendLine($"        LOD {lod}: {cells} cell(s), {withGrass} with a valid grass entity");
+                            sb.AppendLine($"        LOD {lod}: {cells} cell(s) [{cellTypeName ?? "?"}], " +
+                                          $"{fieldFound} resolved a _grassEntity field, {withGrass} of those valid" +
+                                          (fieldFound == 0 ? "   <-- FIELD NOT FOUND: this reader is blind, not the world" : ""));
                         lod++;
                     }
                 }
