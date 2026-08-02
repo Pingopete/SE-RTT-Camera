@@ -93,10 +93,20 @@ public static class LogicEntry
             var viewer = bridge.GetField("ViewerDistanceHook");
             if (viewer != null)
             {
-                viewer.SetValue(null, (Func<double, double, double, float, float>)ViewerDistance.Nearest);
-                RttLog.Line("Nearest-viewer distance hook registered — viewerDistance is armable. " +
-                            "It rewrites the ONE cached float behind StreamingTag, the impostor swap, " +
-                            "shadow tracking and the raytracing tags.");
+                // INSTALLED ONLY IF THE KNOB ASKS FOR IT, unlike every other hook here.
+                //
+                // This one is postfixed onto CalculateDistanceToCamera, which the engine calls
+                // for EVERY root entity in the render scene — measured at ~107,000 calls a
+                // second. An installed-but-idle delegate is not free: the postfix still reads
+                // the hook field, increments a shared counter from a job thread and pays a
+                // dispatch, just to reach a method that returns its argument. So the delegate
+                // itself is the switch, and FeedConfig keeps it in step with the knob on every
+                // poll (SetHook is idempotent).
+                ViewerDistance.SetHook(FeedConfig.ViewerDistanceOverride);
+                RttLog.Line($"Nearest-viewer distance hook available; viewerDistance is " +
+                            $"{(FeedConfig.ViewerDistanceOverride ? "ON" : "OFF")}. When on it rewrites the ONE " +
+                            "cached float behind StreamingTag, the impostor swap, shadow tracking and the " +
+                            "raytracing tags. When off the delegate is REMOVED, not merely idle.");
             }
             else
             {

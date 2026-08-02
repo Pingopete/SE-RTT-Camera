@@ -2907,6 +2907,70 @@ internal static class WorldGrids
     private static double _dNearFeed = double.MaxValue, _dNearPlayer = double.MaxValue;
     private static int _modelsNearFeed = -1, _modelsNearPlayer = -1;
 
+    // ---- THE RESIDENCY-CONE STUDY: measure the prize before building the machine --------
+    //
+    // THE QUESTION. Every world-residency mechanism here is OMNIDIRECTIONAL — the flora claim
+    // and the clipmap override are pure distance tests, preload is a cube, the viewer bubble
+    // was a sphere — while the camera sees roughly a 70 degree frustum, about 11% of a
+    // sphere's solid angle. If that ratio holds in practice, most of what we make resident can
+    // never appear in the feed, and the VRAM wall this session hit twice is largely self-
+    // inflicted.
+    //
+    // THIS COUNTS. IT DOES NOT CULL. Nothing below changes a single claim decision — it only
+    // records what a cone WOULD have rejected, at three widths at once, so one run answers
+    // both "is there a prize?" and "how wide can the cone be and still collect it?". A
+    // measurement that changes behaviour cannot be trusted to measure the behaviour it
+    // changed, and the cost of being wrong here is a day of building the wrong thing.
+    //
+    // THREE WIDTHS, chosen for what they mean rather than for round numbers:
+    //   70 deg  — about the feed's own frustum. The theoretical ceiling on the saving, and
+    //             unusable in practice: it leaves nothing for shadow casters or orbit motion.
+    //  140 deg  — the realistic candidate. Double the frustum, so a turning orbit has a whole
+    //             frustum's worth of margin before it looks into unloaded space.
+    //  200 deg  — deliberately generous, to show how fast the prize decays with margin. If
+    //             even this rejects most sectors, the idea is strong.
+    //
+    // Reading it: if the 140 deg column rejects a large majority, the feature is worth
+    // building. If it rejects a small fraction, the omnidirectional loading was never the
+    // problem and we drop the idea rather than spend a day on 1 fps.
+    private static long _coneTotal, _cone70, _cone140, _cone200, _coneNoDir;
+
+    private static void ConeStudy(Vector3D sectorWorld)
+    {
+        var look = CameraFeed.LookDirCache;
+        var eye = CameraFeed.EyeCache;
+        _coneTotal++;
+
+        // No published direction yet (first frames, or a dormant feed). Counted separately
+        // rather than silently treated as "in cone" — a study whose denominator quietly
+        // includes unmeasurable samples is the blind instrument this project keeps meeting.
+        if (look.LengthSquared() < 0.5) { _coneNoDir++; return; }
+
+        var to = sectorWorld - eye;
+        var len = to.Length();
+        if (len < 1.0) return;                       // on top of the camera: in every cone
+
+        // cos of the angle between the view direction and the sector.
+        var c = (to.X * look.X + to.Y * look.Y + to.Z * look.Z) / len;
+
+        // Half-angles: 35, 70 and 100 degrees. Outside means c < cos(halfAngle).
+        if (c < 0.81915) _cone70++;                  // cos 35
+        if (c < 0.34202) _cone140++;                 // cos 70
+        if (c < -0.17365) _cone200++;                // cos 100
+    }
+
+    internal static string ConeStudyText()
+    {
+        var t = _coneTotal;
+        if (t == 0) return "no samples yet";
+        string Pct(long n) => $"{100.0 * n / t:F1}%";
+        var s = $"of {t} sector update(s): outside a 70deg cone {Pct(_cone70)}, " +
+                $"140deg {Pct(_cone140)}, 200deg {Pct(_cone200)}" +
+                (_coneNoDir > 0 ? $" [{Pct(_coneNoDir)} had no camera direction and are excluded from the case]" : "");
+        _coneTotal = _cone70 = _cone140 = _cone200 = _coneNoDir = 0;   // per-window, like the rest of this line
+        return s;
+    }
+
     private static void SampleDensity(object octree, double dFeed, double dPlayer)
     {
         try
@@ -2994,7 +3058,8 @@ internal static class WorldGrids
                         $"{_modelsNearFeed} model instance(s); nearest to the PLAYER is {_dNearPlayer:F0} m away " +
                         $"with {_modelsNearPlayer}. Similar counts mean the data is there and the gap is LOD or " +
                         "culling; a much lower feed count means the sectors themselves were generated thinner. " +
-                        $"Last rejection: {FloraRejectText()}.");
+                        $"Last rejection: {FloraRejectText()}. " +
+                        $"CONE STUDY (counts only, culls nothing) — {ConeStudyText()}.");
             // Re-arm so each window reports a fresh sample rather than a session minimum.
             _dNearFeed = _dNearPlayer = double.MaxValue;
             _modelsNearFeed = _modelsNearPlayer = -1;
@@ -3043,6 +3108,7 @@ internal static class WorldGrids
             // BEFORE the rejections: player-near sectors are the control half of the
             // like-for-like and they are exactly the ones the rules reject.
             SampleDensity(octree, dFeed, dPlayer);
+            ConeStudy(sectorWorld);
 
             // REASON CODE + NUMBERS, NOT A FORMATTED STRING. These two branches reject
             // ~11,300 times a SECOND (measured: 169,488 rejections per 15 s window), and the

@@ -93,6 +93,46 @@ internal static class ViewerDistance
 
     internal static void Clear() => _viewer = null;
 
+    // ---- UNINSTALLING THE HOOK, not merely emptying it -------------------------------
+    //
+    // Clear() alone is NOT a cost saving, and finding that out is the point of this comment.
+    // It nulls _viewer so Nearest() returns on its first line — but the bridge delegate is
+    // still installed, so DistanceToCameraPostfix keeps running for EVERY root entity in the
+    // render scene: ~107,000 times a second, each one reading the volatile hook field,
+    // incrementing a shared static counter from a job thread (cache-line contention, and
+    // racy on top), and paying a delegate dispatch, all to reach a method that immediately
+    // returns its argument.
+    //
+    // Turning the feature off has to REMOVE the delegate, and then the postfix's own
+    // `if (hook == null) return;` costs one static read and a predicted branch.
+    //
+    // Driven from the config poll rather than from Install(), because the knob can change at
+    // any time and a hook that could only be installed at load would be exactly the shape of
+    // bug this project keeps meeting: state that can only change while the thing it controls
+    // is already running. SetHook is idempotent and cheap, so the poll can call it every time
+    // without tracking transitions itself.
+    private static bool? _hookInstalled;
+
+    internal static void SetHook(bool wanted)
+    {
+        if (_hookInstalled == wanted) return;
+        try
+        {
+            var f = Type.GetType("RttProbe.RttBridge, RttProbe")?.GetField("ViewerDistanceHook");
+            if (f == null) return;                       // older bootstrap: nothing to install
+            f.SetValue(null, wanted ? (Func<double, double, double, float, float>)Nearest : null);
+            _hookInstalled = wanted;
+            RttLog.Line(wanted
+                ? "VIEWER DISTANCE: hook INSTALLED — CalculateDistanceToCamera is now postfixed for " +
+                  "every root entity in the render scene."
+                : "VIEWER DISTANCE: hook REMOVED — the postfix now early-outs on a null delegate. " +
+                  "That is ~107,000 calls a second on renderer job threads no longer paying a " +
+                  "delegate dispatch and a contended counter increment. Clearing the bubble alone " +
+                  "did NOT do this; the delegate had to come out.");
+        }
+        catch { }
+    }
+
     internal static bool Active => _viewer != null;
 
     // ---- THE REPORT ------------------------------------------------------------------

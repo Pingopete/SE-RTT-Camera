@@ -1232,6 +1232,12 @@ internal static class FeedConfig
             // config poll is the earliest we can know, and leaving it to the 5 s lease would
             // keep world pinned for five seconds after the operator asked for it to stop.
             if (!ViewerDistanceOverride) ViewerDistance.Clear();
+            // AND take the delegate out, which Clear() does not do. Emptying the bubble makes
+            // Nearest() return on its first line but leaves the postfix running for every root
+            // entity in the scene — ~107,000 calls a second still paying a delegate dispatch
+            // and a contended counter increment to reach a method that does nothing. Only
+            // removing the hook lets the postfix early-out. Idempotent, so it is safe here.
+            ViewerDistance.SetHook(ViewerDistanceOverride);
             if (viewerWas != ViewerDistanceOverride)
                 RttLog.Global($"Config: viewerDistance {viewerWas} -> {ViewerDistanceOverride}" +
                     (ViewerDistanceOverride

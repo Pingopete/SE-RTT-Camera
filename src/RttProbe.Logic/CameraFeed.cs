@@ -65,6 +65,21 @@ internal static class CameraFeed
     // dump now says so out loud instead of silently scanning against a wrong position.
     internal static Vector3D SubjectCentreCache;
 
+    // WHERE THE CAMERA ACTUALLY IS AND WHAT IT ACTUALLY LOOKS AT, for the residency cone.
+    //
+    // Every world-residency mechanism this project has built is OMNIDIRECTIONAL — the flora
+    // claim and the clipmap override are pure distance tests, preload is a cube, the viewer
+    // bubble is a sphere — while the camera sees roughly a 70 degree frustum, about 11% of a
+    // sphere's solid angle. So up to nine tenths of what is made resident sits behind or
+    // beside the camera and can never reach the feed. These two fields are what lets a
+    // direction test exist at all.
+    //
+    // EyeCache is the eye, NOT SubjectCentreCache: the orbit centre is metres to hundreds of
+    // metres away from the eye, and a cone apex in the wrong place cuts the wrong half of the
+    // world. LookDirCache is a UNIT vector along the true view direction.
+    internal static Vector3D EyeCache;
+    internal static Vector3D LookDirCache;
+
     // Did OrbitUp come from the planet (exact) or from the subject's rotation (a guess)?
     // Reported in the orbit-plane proof so the two are never confused again.
     internal static bool OrbitUpIsPlanet;
@@ -1184,6 +1199,13 @@ internal static class CameraFeed
         // (target - eye) — the intuitive "look at" vector — aimed the camera outward
         // from the orbit centre, so the feed showed everything except the ship.
         var fwd = Normalize(eye - target);
+
+        // Publish the eye and the TRUE view direction for the residency-cone study. `fwd` is
+        // the engine's basis convention and points BACKWARD along the view, so the direction
+        // the camera actually looks is its negation — getting that sign wrong would measure
+        // the world behind the camera and report it as the world in front.
+        EyeCache = eye;
+        LookDirCache = new Vector3D(-fwd.X, -fwd.Y, -fwd.Z);
 
         // The camera's reference up is the LOCAL up too, so the horizon sits level in the
         // feed instead of rolling as the orbit goes round a planet.
