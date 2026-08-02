@@ -1575,6 +1575,15 @@ internal static class WorldGrids
                           $"{(bodySize > 10000 ? " — THE PLANET" : "")}):");
                     int lod = 0;
                     string cellTypeName = null;
+                    // PER-CELL, NOT JUST PER-RING. "43 of 216 LOD-0 cells have a grass entity"
+                    // proves the PLANET has grass somewhere; it says nothing about the patch
+                    // the camera is actually filming, and those are different claims. Grass is
+                    // patchy by construction, so an aggregate can look healthy while every cell
+                    // in shot has none — which reads as "grass is broken" when it is really
+                    // "the camera is over bare rock". Collect (distance, hasGrass) per cell and
+                    // print the nearest handful: that is the only sample the PICTURE can be
+                    // judged against, and the picture is the thing making the claim.
+                    var cellHits = new List<(double D, bool Grass, int Lod)>();
                     foreach (var ring in rings)
                     {
                         int cells = 0, withGrass = 0, fieldFound = 0;
@@ -1613,11 +1622,25 @@ internal static class WorldGrids
                                     // standing on a rocky world that may have no grass
                                     // either. Counting reads that RESOLVED settles it
                                     // without needing a grassy control.
+                                    bool valid = false;
                                     if (ge != null)
                                     {
                                         fieldFound++;
-                                        if (Prop(ge, "IsValid") is bool ok && ok) withGrass++;
+                                        if (Prop(ge, "IsValid") is bool ok && ok) { withGrass++; valid = true; }
                                     }
+
+                                    // The cell's own world position. VoxelCell carries a
+                                    // WorldTransform; _offset alone is body-relative and would
+                                    // silently report nonsense distances, so a missing
+                                    // transform records NOTHING rather than a wrong number —
+                                    // an absent row is honest, a fabricated one is not.
+                                    try
+                                    {
+                                        var wt = Prop(actor, "_worldTransform");
+                                        if (wt != null && Prop(wt, "Position") is Vector3D cp)
+                                            cellHits.Add(((cp - feedPos).Length(), valid, lod));
+                                    }
+                                    catch { }
                                 }
                             }
                         }
@@ -1627,6 +1650,65 @@ internal static class WorldGrids
                                           $"{fieldFound} resolved a _grassEntity field, {withGrass} of those valid" +
                                           (fieldFound == 0 ? "   <-- FIELD NOT FOUND: this reader is blind, not the world" : ""));
                         lod++;
+                    }
+
+                    // THE ROW THAT SETTLES IT. The feed camera orbits at orbitRadius, so the
+                    // cells it is looking at are the ones within roughly that distance. If
+                    // those carry grass entities and the panel shows no blades, the negative
+                    // is real and downstream. If they carry none, there is simply no grass
+                    // under the camera and the whole "grass is broken" line of enquiry was
+                    // about the wrong patch of ground.
+                    if (cellHits.Count > 0)
+                    {
+                        cellHits.Sort((x, y) => x.D.CompareTo(y.D));
+                        var near = cellHits.Take(14).ToList();
+
+                        // SANITY-CHECK THIS READER BEFORE PRINTING A CONCLUSION FROM IT.
+                        //
+                        // First run (2026-08-02) reported the nearest cell 867 m away while the
+                        // camera sat 15 m above terrain rendering in full detail, with a dozen
+                        // cells sharing an IDENTICAL distance. Both are impossible for genuine
+                        // per-cell positions, so `_worldTransform` here is not what it was
+                        // assumed to be — most likely a shared root/ring transform rather than
+                        // one per cell.
+                        //
+                        // The failure mode that matters is that those numbers are PLAUSIBLE.
+                        // A zero announces itself; "867 m" just quietly gets believed, and this
+                        // project has already lost half a day to a reader whose output looked
+                        // reasonable. So the two tells are checked explicitly and the verdict
+                        // is WITHHELD rather than printed with a caveat nobody would read.
+                        int distinct = cellHits.Select(h => Math.Round(h.D)).Distinct().Count();
+                        bool degenerate = distinct * 4 < cellHits.Count;      // most share a position
+                        bool implausible = near[0].D > 300.0;                 // nothing near a camera on the ground
+
+                        sb.AppendLine("        per-cell sample: " + string.Join("  ", near.Select(h =>
+                                          $"{h.D:F0}m/L{h.Lod}{(h.Grass ? "=GRASS" : "=none")}")));
+                        sb.AppendLine($"        ({cellHits.Count} cells positioned, {distinct} distinct distances)");
+
+                        if (degenerate || implausible)
+                        {
+                            sb.AppendLine("        <-- READER UNRELIABLE, NO VERDICT. " +
+                                (degenerate ? "Most cells share one distance, so this is a shared root/ring " +
+                                              "transform, not per-cell positions. " : "") +
+                                (implausible ? "Nearest cell is >300 m from a camera that is 15 m above " +
+                                               "terrain rendering in full detail, which cannot be true. " : "") +
+                                "Do NOT read grass presence off these rows. The per-LOD counts above come " +
+                                "through a different path and are unaffected.");
+                        }
+                        else
+                        {
+                            int within = cellHits.Count(h => h.D <= 150.0);
+                            int withinGrass = cellHits.Count(h => h.D <= 150.0 && h.Grass);
+                            sb.AppendLine($"        WITHIN 150 m OF THE CAMERA: {within} cell(s), " +
+                                          $"{withinGrass} with a valid grass entity." +
+                                          (within == 0
+                                              ? "  <-- no cells that close; widen before reading anything into it"
+                                              : withinGrass == 0
+                                                  ? "  <-- NO GRASS UNDER THE CAMERA. The picture cannot show grass " +
+                                                    "here whatever the renderer does; move the anchor before calling grass broken."
+                                                  : "  <-- grass geometry IS under the camera, so a blade-free picture " +
+                                                    "is a real rendering negative."));
+                        }
                     }
                 }
             }
