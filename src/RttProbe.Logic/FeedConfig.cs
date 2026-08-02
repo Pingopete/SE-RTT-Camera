@@ -850,6 +850,19 @@ internal static class FeedConfig
         return r;
     }
 
+    // One-shot inventory of every VoxelRenderComponent in the clipmap update list — the
+    // instrument for "where does near-mode terrain exist". Same edge discipline; read-only.
+    // Writes output/voxel-bodies.txt.
+    public static bool VoxelBodySurvey { get; private set; }
+    private static bool _bodySurveyArmedLast;
+
+    public static bool TakeVoxelBodySurveyRequest()
+    {
+        var r = VoxelBodySurvey;
+        VoxelBodySurvey = false;
+        return r;
+    }
+
     // PRELOAD AROUND THE FEED CAMERA (goal 10 tier 1). Off by default: it asks the engine
     // to make world data resident somewhere no player is, which costs memory, and the VRAM
     // cap is already the binding constraint on this route.
@@ -908,6 +921,12 @@ internal static class FeedConfig
     // Per-frame budget for ALL clipmap updates. The engine ships 0.5 ms. 0 = leave alone.
     // GLOBAL: it cannot be scoped to the feed, so it spends the player's frame time too.
     public static double ClipmapUpdateBudgetMs { get; private set; }
+
+    // Metered loadingPhase pulses for planet-scale bodies after the camera jumps — the
+    // spawn-speed meshing path, fed in sips (500 ms on / 2500 ms off, 60 s window, VRAM
+    // abort). The un-metered version device-removed the GPU on 2026-08-02 00:28; see
+    // WorldGrids.ArrivalBurst before widening any of its bounds.
+    public static bool ClipmapArrivalBurst { get; private set; }
 
     public static bool PreloadAroundCamera { get; private set; }
     public static double PreloadRadius { get; private set; } = 500.0;
@@ -1026,6 +1045,15 @@ internal static class FeedConfig
             ClipmapMinPlayerDistance = Dbl(kv, "clipmapMinPlayerDistance", ClipmapMinPlayerDistance);
             ClipmapMaxFeedDistance   = Dbl(kv, "clipmapMaxFeedDistance", ClipmapMaxFeedDistance);
             ClipmapUpdateBudgetMs    = Dbl(kv, "clipmapUpdateBudgetMs", ClipmapUpdateBudgetMs);
+            var burstWas = ClipmapArrivalBurst;
+            ClipmapArrivalBurst      = Bool(kv, "clipmapArrivalBurst", ClipmapArrivalBurst);
+            if (burstWas != ClipmapArrivalBurst)
+                RttLog.Global($"Config: clipmapArrivalBurst {burstWas} -> {ClipmapArrivalBurst}" +
+                    (ClipmapArrivalBurst
+                        ? " (METERED: planet-scale bodies, 500 ms pulses, 60 s window, VRAM abort at 1.8 GB headroom). " +
+                          "Watch for \"CLIPMAP ARRIVAL BURST\" and keep an eye on VRAM — the un-metered version " +
+                          "removed the device."
+                        : ". Pulses stop; the steady-state override continues."));
             TagAnchorForClutter      = Bool(kv, "tagAnchorForClutter", TagAnchorForClutter);
 
             var markerWas = CameraTriggerEntity;
@@ -1080,6 +1108,10 @@ internal static class FeedConfig
             var censusWanted = Bool(kv, "triggerCensus", false);
             if (censusWanted && !_censusArmedLast) TriggerCensus = true;
             _censusArmedLast = censusWanted;
+
+            var bodySurveyWanted = Bool(kv, "voxelBodySurvey", false);
+            if (bodySurveyWanted && !_bodySurveyArmedLast) VoxelBodySurvey = true;
+            _bodySurveyArmedLast = bodySurveyWanted;
 
             // DURABLE consume for the area loader, not the in-memory edge the survey uses.
             // The in-memory version re-fired after a game restart — fresh statics saw the

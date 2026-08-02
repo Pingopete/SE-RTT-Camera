@@ -1284,6 +1284,85 @@ internal static class WorldGrids
         }
     }
 
+    // ── THE VOXEL BODY SURVEY — where does near-mode terrain actually EXIST? ────────────
+    //
+    // 2026-08-02 morning: the metered arrival burst never fired because NO planet-scale
+    // body ever reaches the clipmap override near the feed — everything in the stream is
+    // sub-1.5 km boulders. The planet's near-mode terrain is not a body whose camera we
+    // can swap; away from the player it apparently does not exist, and the feed renders
+    // the smooth far representation instead (the user's spectator observation: mountains
+    // "suddenly grow" crossing an atmosphere-ish threshold, flatten smoothly receding).
+    //
+    // This survey enumerates VoxelRenderUpdateSessionComponent._renderComponents — the
+    // exact list UpdateClipmaps iterates — with each body's position, voxel size and
+    // distance to the feed camera. The instantiation PATTERN (one planet body vs regional
+    // patches; clustered around the player vs everywhere) names the system that creates
+    // near-mode bodies, which is the system goal 10 must feed next.
+    internal static void DumpVoxelBodies(Vector3D feedPos)
+    {
+        try
+        {
+            var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
+            var comp = bridge?.GetField("VoxelUpdateComponent")?.GetValue(null);
+            if (comp == null)
+            {
+                RttLog.Line("VOXEL BODY SURVEY: VoxelUpdateComponent not captured yet (no clipmap update has " +
+                            "run since boot?) — nothing to enumerate.");
+                return;
+            }
+            var list = Prop(comp, "_renderComponents") as IEnumerable;
+            if (list == null) { RttLog.Line("VOXEL BODY SURVEY: _renderComponents unreadable."); return; }
+
+            var sb = new StringBuilder();
+            sb.AppendLine("=== VOXEL BODY SURVEY ===");
+            sb.AppendLine($"Feed camera: {feedPos.X:F0}, {feedPos.Y:F0}, {feedPos.Z:F0}");
+            sb.AppendLine("Every VoxelRenderComponent in the clipmap update list. 'size' is the max axis of");
+            sb.AppendLine("Clipmap.Size in voxels (~1 m each): planets read ~10^5, boulders ~10^2.");
+            sb.AppendLine($"\n{"dFeed",12}  {"size",9}  {"position",-34}  storage/entity");
+            sb.AppendLine(new string('-', 100));
+
+            var rows = new List<(double D, string Line)>();
+            int n = 0, unreadable = 0;
+            foreach (var rc in list)
+            {
+                n++;
+                try
+                {
+                    var clip = Prop(rc, "Clipmap");
+                    var l2w = Prop(clip, "LocalToWorld");
+                    if (Prop(l2w, "Position") is not Vector3D pos) { unreadable++; continue; }
+                    double size = 0;
+                    var szObj = Prop(clip, "Size");
+                    if (szObj != null)
+                    {
+                        var t2 = szObj.GetType();
+                        foreach (var ax in new[] { "X", "Y", "Z" })
+                            if (t2.GetField(ax, Any)?.GetValue(szObj) is int v && v > size) size = v;
+                    }
+                    var d = (pos - feedPos).Length();
+                    // A name, best effort: the storage tells rock from planet from debris.
+                    var name = Prop(rc, "Storage")?.GetType().Name
+                            ?? Prop(rc, "_storage")?.GetType().Name
+                            ?? rc.GetType().Name;
+                    var dStr = d >= 1000 ? $"{d / 1000:F1}km" : $"{d:F0}m";
+                    var sStr = size >= 1000 ? $"{size / 1000:F0}k" : $"{size:F0}";
+                    rows.Add((d, $"{dStr,12}  {sStr,9}  {pos.X:F0}, {pos.Y:F0}, {pos.Z:F0}".PadRight(60) + $"  {name}"));
+                }
+                catch { unreadable++; }
+            }
+
+            rows.Sort((a, b2) => a.D.CompareTo(b2.D));
+            foreach (var r in rows.Take(120)) sb.AppendLine(r.Line);
+            if (rows.Count > 120) sb.AppendLine($"... {rows.Count - 120} more, farther out.");
+            sb.AppendLine($"\n{n} component(s) in the update list, {unreadable} unreadable.");
+
+            var path = Path.Combine(RttLog.OutDir, "voxel-bodies.txt");
+            File.WriteAllText(path, sb.ToString());
+            RttLog.Line($"VOXEL BODY SURVEY written to {path} ({n} bodies).");
+        }
+        catch (Exception e) { RttLog.Error("voxel body survey", e); }
+    }
+
     // TAG PROVENANCE ACROSS A HOT RELOAD.
     //
     // _tagAddedByUs lives in statics that a reload throws away, while the tag it records
@@ -1672,30 +1751,49 @@ internal static class WorldGrids
     private static Vector3D _lastBurstOrigin;
     private static long _burstUntilTicks;
 
-    // DISARMED 2026-08-02 00:28 AFTER A DEVICE-REMOVED CTD, one minute into its first live
-    // run. The flag is real and the effect was violent — which is the point: loadingPhase
-    // is the SPAWN path, sized for a loading screen with no live swapchain and no frame
-    // budget. Twenty seconds of it across every overridden body flooded the device with
-    // committed-texture creation (CreateCommittedTexture -> DXGI_ERROR_DEVICE_REMOVED in
-    // the worker pool) and killed the GPU device. The fast path exists; it has to be fed
-    // in sips — one body at a time, bounded far tighter, or through the sync-loader's own
-    // AsyncInitClipmaps task context. Gated OFF until that version exists; the knob is
-    // deliberately absent so it cannot be re-armed by config alone.
-    private const bool ArrivalBurstEnabled = false;
+    // METERED v2, after the un-metered version removed the device inside a minute
+    // (every overridden body, 20 s of solid loadingPhase -> CreateCommittedTexture flood ->
+    // DXGI_ERROR_DEVICE_REMOVED). loadingPhase is the SPAWN path, sized for a loading
+    // screen; live, it must be fed in sips:
+    //   - PLANET-SCALE bodies only (size > 10 km of voxels) — the terrain that matters,
+    //     never the boulder swarm
+    //   - 500 ms ON / 2500 ms OFF duty cycle, inside a 60 s arrival window (~10 s total ON)
+    //   - hard abort while VRAM headroom is under 1.8 GB, checked every pulse
+    // Off by default behind clipmapArrivalBurst; the knob exists now because the metering
+    // does.
+    private static long _burstWindowStart = long.MinValue;
+    private static long _vramAbortLogTicks;
 
-    private static bool ArrivalBurst(Vector3D feedPos)
+    private static bool ArrivalBurst(Vector3D feedPos, double bodySize)
     {
-        if (!ArrivalBurstEnabled) return false;
+        if (!FeedConfig.ClipmapArrivalBurst) return false;
+        if (bodySize <= 10000) return false;
+
         var now = Environment.TickCount64;
         if ((feedPos - _lastBurstOrigin).LengthSquared() > 2000.0 * 2000.0)
         {
             _lastBurstOrigin = feedPos;
-            _burstUntilTicks = now + 20000;
-            RttLog.Line($"CLIPMAP ARRIVAL BURST: camera jumped to {feedPos.X:F0},{feedPos.Y:F0},{feedPos.Z:F0} — " +
-                        "overridden bodies run with loadingPhase=TRUE for 20 s (the sync-loader's spawn-speed " +
-                        "meshing path), then return to steady state.");
+            _burstWindowStart = now;
+            RttLog.Line($"CLIPMAP ARRIVAL BURST (metered): camera jumped to " +
+                        $"{feedPos.X:F0},{feedPos.Y:F0},{feedPos.Z:F0} — planet-scale bodies get " +
+                        "loadingPhase pulses (500 ms on / 2500 ms off) for the next 60 s, VRAM permitting.");
         }
-        return now < _burstUntilTicks;
+        if (now - _burstWindowStart > 60000) return false;
+        if ((now - _burstWindowStart) % 3000 >= 500) return false;     // duty: 1/6 on
+
+        var used = Perf.SampleVramMb();
+        var avail = Perf.SampleVramAvailMb();
+        if (used > 0 && avail > 0 && avail - used < 1800)
+        {
+            if (now - _vramAbortLogTicks > 15000)
+            {
+                _vramAbortLogTicks = now;
+                RttLog.Line($"CLIPMAP ARRIVAL BURST: paused — VRAM headroom {avail - used} MB < 1800 MB. " +
+                            "The un-metered version died exactly here; the pulse resumes when memory frees.");
+            }
+            return false;
+        }
+        return true;
     }
 
     internal static object ChooseClipmapCamera(object renderComponent, object boxedTransform)
@@ -1722,8 +1820,30 @@ internal static class WorldGrids
             var fBodyPos = l2w.GetType().GetField("Position", Any);
             if (fBodyPos?.GetValue(l2w) is not Vector3D bodyPos) return null;
 
-            var dPlayer = (playerPos - bodyPos).Length();
-            var dFeed   = (feedPos   - bodyPos).Length();
+            // CORNER, NOT CENTRE — the bug that hid the planet from this override for the
+            // project's whole life. Clipmap.LocalToWorld.Position is the voxel volume's
+            // MIN-CORNER: Verdure's 262k-voxel body reads corner = centre − 131,072 per
+            // axis, which put "the planet" 267 km from a camera standing on its surface —
+            // outside every cap ever configured. Every sharpening ever observed came from
+            // 512-voxel patches and boulders, whose corner≈centre. Distances are now taken
+            // to the true centre (corner + Size/2, one voxel ≈ 1 m).
+            double sx = 0, sy = 0, sz = 0;
+            try
+            {
+                var szObj0 = Prop(clip, "Size");
+                if (szObj0 != null)
+                {
+                    var ts = szObj0.GetType();
+                    if (ts.GetField("X", Any)?.GetValue(szObj0) is int ix) sx = ix;
+                    if (ts.GetField("Y", Any)?.GetValue(szObj0) is int iy) sy = iy;
+                    if (ts.GetField("Z", Any)?.GetValue(szObj0) is int iz) sz = iz;
+                }
+            }
+            catch { }
+            var bodyCentre = bodyPos + new Vector3D(sx * 0.5, sy * 0.5, sz * 0.5);
+
+            var dPlayer = (playerPos - bodyCentre).Length();
+            var dFeed   = (feedPos   - bodyCentre).Length();
 
             // A CLEAR MARGIN, not merely "nearer". The first version used dFeed < dPlayer and
             // immediately took over asteroids where both viewers were 150 km away and the
@@ -1743,23 +1863,13 @@ internal static class WorldGrids
             // from a few hundred metres. The floor keeps nearby scatter meshing around the
             // camera; the fixed cap survives as the outer sanity bound and the fallback
             // when the clipmap does not expose a usable size.
-            // Size is a Vector3I of VOXEL counts (~1 m each): a planet reads ~10^5 per
-            // axis, a boulder ~10^2. The first attempt Convert.ToDouble'd the struct,
-            // threw, and silently fell back to the fixed cap — 242 boulders kept feeding.
-            double bodySize = 0;
-            try
-            {
-                var szObj = Prop(clip, "Size");
-                if (szObj != null)
-                {
-                    var t2 = szObj.GetType();
-                    foreach (var ax in new[] { "X", "Y", "Z" })
-                        if (t2.GetField(ax, Any)?.GetValue(szObj) is int v && v > bodySize) bodySize = v;
-                }
-            }
-            catch { }
+            // Size was already read for the centre correction above; the max axis is the
+            // body's scale. For a planet the sensible "near" is ~its RADIUS (size/2) with
+            // margin — a surface camera sits at radius from the centre — and the fixed cap
+            // stays as the outer sanity bound for anything larger still.
+            var bodySize = Math.Max(sx, Math.Max(sy, sz));
             var nearCap = bodySize > 1.0
-                ? Math.Min(Math.Max(bodySize * 1.2, 1500.0), FeedConfig.ClipmapMaxFeedDistance)
+                ? Math.Max(bodySize * 0.75, 1500.0)
                 : FeedConfig.ClipmapMaxFeedDistance;
             if (dFeed > nearCap) return null;
 
@@ -1796,8 +1906,8 @@ internal static class WorldGrids
             // Spawn-speed meshing for a bounded window after arrival. The pair return shape
             // needs the matching bootstrap; an older one treats the array as no replacement
             // at all, so the burst degrades to "override off" rather than half-applied —
-            // which is why the pair is returned ONLY while a burst is live.
-            if (ArrivalBurst(feedPos)) return new object[] { replacement, true };
+            // which is why the pair is returned ONLY while a burst pulse is live.
+            if (ArrivalBurst(feedPos, bodySize)) return new object[] { replacement, true };
             return replacement;
         }
         catch { return null; }
