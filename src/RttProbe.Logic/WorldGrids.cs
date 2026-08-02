@@ -527,6 +527,106 @@ internal static class WorldGrids
         catch (Exception e) { RttLog.Error($"load area \"{wantName}\"", e); }
     }
 
+    // PER-BODY CLIPMAP CAMERA — the terrain fix.
+    //
+    // Called from the bootstrap's prefix on VoxelRenderUpdateSessionComponent.UpdateClipmap,
+    // once per voxel body per frame. Returns a replacement boxed WorldTransform, or null to
+    // leave the engine's choice alone.
+    //
+    // THE RULE, and it is designed so the player can NEVER lose:
+    //     take over a body only when the feed camera is closer to it than the player is,
+    //     AND the player is further away than MinPlayerDistance.
+    // Both conditions, always. A body the player is anywhere near keeps the player's camera,
+    // full stop. What we take over is terrain the player is provably not looking at.
+    //
+    // WHY THIS IS NOT THE TUG-OF-WAR. Swapping RenderSettings.CameraTransform would be: one
+    // global, two writers, both directions rebuilt every round — the same shape as the LOD
+    // popping bug. This is the opposite. Every clipmap still receives exactly ONE camera per
+    // frame; we only choose WHICH viewer that is, per body, and the choice is stable because
+    // it is a distance comparison rather than a race. Two bodies, two viewers, no contention.
+    //
+    // KNOWN LIMITATION, stated up front: when the player and the camera are near the SAME
+    // body (a camera 20 km away on the player's own planet), both distances are ~the body
+    // radius, the rule declines, and that terrain stays coarse. One clipmap cannot have two
+    // centres. Same-planet remote detail needs the per-feed clipmap build; this fixes the
+    // cross-body case, which is the headline "camera on another world" product.
+    private static int _clipmapOverrides, _clipmapCalls;
+    private static long _clipmapLogTicks;
+    private static string _lastOverrideDesc = "";
+
+    internal static object ChooseClipmapCamera(object renderComponent, object boxedTransform)
+    {
+        if (!FeedConfig.PerBodyClipmapCamera || boxedTransform == null) return null;
+        _clipmapCalls++;
+        try
+        {
+            // Where the feed camera is. SubjectCentreCache is the orbit CENTRE, published by
+            // the tick; the eye orbits within tens of metres of it, which is far below any
+            // distance this decision turns on.
+            var feedPos = CameraFeed.SubjectCentreCache;
+            if (feedPos.LengthSquared() <= 1.0) return null;      // no feed target yet
+
+            var fPos = boxedTransform.GetType().GetField("Position", Any);
+            if (fPos?.GetValue(boxedTransform) is not Vector3D playerPos) return null;
+
+            // The body's origin, via its clipmap's local-to-world. For a planet this is the
+            // CENTRE, so both distances are measured to the same reference and the
+            // comparison stays meaningful (a surface dweller sits ~radius from it).
+            var clip = Prop(renderComponent, "Clipmap");
+            var l2w = clip == null ? null : Prop(clip, "LocalToWorld");
+            if (l2w == null) return null;
+            var fBodyPos = l2w.GetType().GetField("Position", Any);
+            if (fBodyPos?.GetValue(l2w) is not Vector3D bodyPos) return null;
+
+            var dPlayer = (playerPos - bodyPos).Length();
+            var dFeed   = (feedPos   - bodyPos).Length();
+
+            // A CLEAR MARGIN, not merely "nearer". The first version used dFeed < dPlayer and
+            // immediately took over asteroids where both viewers were 150 km away and the
+            // difference was metres — a near-tie is noise, not intent, and overriding on it
+            // churns a clipmap for no benefit. Requiring the camera to be at least twice as
+            // close makes the decision stable and obviously-correct: the cross-body case
+            // clears it by orders of magnitude (61 km vs 4,000 km), a tie cannot.
+            if (dFeed * 2.0 >= dPlayer) return null;
+            if (dPlayer < FeedConfig.ClipmapMinPlayerDistance) return null;   // player too close to risk it
+
+            // AND the camera must actually be NEAR this body. "Closer than the player" is not
+            // enough on its own: with the player 3,900 km away, a rock 561 km from the camera
+            // still qualified, and the first armed run was re-centring the clipmaps of bodies
+            // NOBODY is looking at — 187,000 overrides across 25% of all body-updates, which
+            // is meshing work spent on nothing. A remote camera only needs detail on what is
+            // in front of it.
+            if (dFeed > FeedConfig.ClipmapMaxFeedDistance) return null;
+
+            // Replace ONLY the position, on a copy, so the transform's orientation and any
+            // other field the engine set survive untouched.
+            var replacement = boxedTransform.GetType()
+                .GetMethod("MemberwiseClone", BindingFlags.NonPublic | BindingFlags.Instance)
+                ?.Invoke(boxedTransform, null) ?? boxedTransform;
+            fPos.SetValue(replacement, feedPos);
+            _clipmapOverrides++;
+
+            // TIME CADENCE ONLY. The first version also logged whenever the BODY changed,
+            // which with many bodies in range meant a line per body per frame — it hit 4,200
+            // lines/sec and put 180 MB into rtt.log before the spike detector caught it. A
+            // per-frame path may only ever log on a clock, never on "something differed".
+            var now = Environment.TickCount64;
+            if (now - _clipmapLogTicks > 15000)
+            {
+                _clipmapLogTicks = now;
+                _lastOverrideDesc = $"body@{bodyPos.X:F0},{bodyPos.Y:F0},{bodyPos.Z:F0}";
+                RttLog.Line($"CLIPMAP CAMERA: {_lastOverrideDesc} is LODing around the FEED — player is " +
+                            $"{dPlayer / 1000.0:F0} km from it, the camera {dFeed / 1000.0:F0} km. Bodies the " +
+                            $"player is nearer to, or that the camera is not within " +
+                            $"{FeedConfig.ClipmapMaxFeedDistance / 1000.0:F0} km of, are untouched. " +
+                            $"({_clipmapOverrides} override(s) of {_clipmapCalls} body-updates; this line is " +
+                            "rate-limited to one per 15 s.)");
+            }
+            return replacement;
+        }
+        catch { return null; }
+    }
+
     // PRELOAD THE WORLD AROUND THE FEED CAMERA (goal 10, tier 1).
     //
     // SpaceProbeSessionComponent.PreloadAsync(BoundingBoxD, Precision) fans the volume out

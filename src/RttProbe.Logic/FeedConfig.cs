@@ -841,6 +841,20 @@ internal static class FeedConfig
     //
     // All three are OUTSIDE the whole-scene rebuild signature — they allocate nothing of
     // ours and resize nothing, so they are safe to edit on a running feed.
+    // PER-BODY CLIPMAP CAMERA — the terrain fix. Off by default until proven in game.
+    //
+    // ClipmapMinPlayerDistance is the safety floor: a body the player is closer than this to
+    // is NEVER taken over, whatever the camera is doing. 100 km comfortably exceeds a planet
+    // radius (Verdure is 60 km), so "the player is on this planet" can never satisfy it.
+    public static bool PerBodyClipmapCamera { get; private set; }
+    public static double ClipmapMinPlayerDistance { get; private set; } = 100000.0;
+
+    // And the camera must be WITHIN this of the body. "Closer than the player" alone let a
+    // rock 561 km from the camera qualify while the player was 3,900 km away — re-centring
+    // clipmaps nobody is looking at. 80 km covers a planet the camera is orbiting (Verdure's
+    // radius is 60 km) without reaching neighbours.
+    public static double ClipmapMaxFeedDistance { get; private set; } = 80000.0;
+
     public static bool PreloadAroundCamera { get; private set; }
     public static double PreloadRadius { get; private set; } = 500.0;
     public static int PreloadIntervalMs { get; private set; } = 5000;
@@ -953,6 +967,18 @@ internal static class FeedConfig
             // Edge-triggered, not level-triggered: only a false->true transition arms it.
             // Level-triggered would re-dump on every config poll for as long as the line
             // said 1, which is this project's house bug wearing a survey hat.
+            var clipWas = PerBodyClipmapCamera;
+            PerBodyClipmapCamera     = Bool(kv, "perBodyClipmapCamera", PerBodyClipmapCamera);
+            ClipmapMinPlayerDistance = Dbl(kv, "clipmapMinPlayerDistance", ClipmapMinPlayerDistance);
+            if (clipWas != PerBodyClipmapCamera)
+                RttLog.Global($"Config: perBodyClipmapCamera {clipWas} -> {PerBodyClipmapCamera}" +
+                    (PerBodyClipmapCamera
+                        ? $" (safety floor {ClipmapMinPlayerDistance / 1000.0:F0} km). Voxel bodies the " +
+                          "player is far from, and the camera is nearer to, will now LOD their terrain " +
+                          "around the CAMERA. Bodies the player is nearer to are untouched. Watch for " +
+                          "\"CLIPMAP CAMERA:\" in the log."
+                        : ". Every body goes back to LODing around the player."));
+
             var preloadWas = PreloadAroundCamera;
             PreloadAroundCamera = Bool(kv, "preloadAroundCamera", PreloadAroundCamera);
             PreloadRadius       = Dbl(kv, "preloadRadius", PreloadRadius);

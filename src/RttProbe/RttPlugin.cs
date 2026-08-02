@@ -142,6 +142,29 @@ public static class RttBridge
     // ignore stale worlds. The lock covers the racy append-during-load window.
     public static readonly List<object[]> ManagedAreaRegistrations = new();
     public static readonly object ManagedAreaLock = new();
+
+    // ---- PER-BODY CLIPMAP CAMERA (goal 10, the terrain fix) ---------------------------
+    //
+    // (voxelRenderComponent, boxedWorldTransform) -> replacement boxed WorldTransform, or
+    // null to leave the engine's choice alone.
+    //
+    // VoxelRenderUpdateSessionComponent.UpdateClipmaps() reads ONE global camera transform
+    // per frame and calls UpdateClipmap(body, camera, loading) for EVERY voxel body — so
+    // terrain meshes are built around the player and nowhere else. That is the entire
+    // reason a remote feed sees a smooth blob where the player sees boulders, proven by
+    // positive control on 2026-08-01.
+    //
+    // But the camera is a PER-CALL ARGUMENT, not a global the callee re-reads. When the
+    // player and the feed camera are near DIFFERENT bodies (player on Kemik, camera on
+    // Verdure), each body can be driven by whichever viewer is actually near it with no
+    // contention at all — this is emphatically NOT the single-slot tug-of-war that swapping
+    // RenderSettings.CameraTransform would be, because each clipmap still gets exactly one
+    // camera; we only change WHICH one, per body.
+    //
+    // Typed as object on purpose: the bootstrap stays ignorant of engine types and the
+    // logic assembly (reloadable) owns every decision. The transform is a STRUCT, so it
+    // arrives boxed and the logic returns a modified box.
+    public static volatile Func<object, object, object> ClipmapCameraHook;
 }
 
 public sealed class RttPlugin : IPlugin
@@ -203,8 +226,44 @@ public sealed class RttPlugin : IPlugin
             PatchOffscreenUi(harmony);
             PatchGhostProbes(harmony);
             PatchManagedAreas(harmony);
+            PatchClipmapCamera(harmony);
         }
         catch (Exception e) { Log("Patching FAILED: " + e); }
+    }
+
+    // Per-body clipmap camera — see RttBridge.ClipmapCameraHook for the reasoning.
+    //
+    // __args rather than typed parameters: it keeps the bootstrap free of VRage.Voxels
+    // types, and Harmony writes __args back for prefixes, which is what lets a boxed struct
+    // argument be replaced. A prefix returning void never suppresses the original.
+    private static void PatchClipmapCamera(HarmonyLib.Harmony harmony)
+    {
+        try
+        {
+            var t = Type.GetType("Keen.VRage.Voxels.Client.Components.VoxelRenderUpdateSessionComponent, VRage.Voxels.Client");
+            var mi = t?.GetMethod("UpdateClipmap",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (mi == null) { Log("VoxelRenderUpdateSessionComponent.UpdateClipmap not found — per-body clipmap camera inactive."); return; }
+            var pre = typeof(RttPlugin).GetMethod(nameof(UpdateClipmapPrefix),
+                BindingFlags.Static | BindingFlags.NonPublic);
+            harmony.Patch(mi, prefix: new HarmonyLib.HarmonyMethod(pre));
+            Log($"Patched VoxelRenderUpdateSessionComponent.UpdateClipmap({string.Join(", ", mi.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name))}) — per-body clipmap camera armed.");
+        }
+        catch (Exception e) { Log("Patching UpdateClipmap FAILED: " + e.Message); }
+    }
+
+    // Runs for EVERY voxel body EVERY frame. It must be cheap and it must never throw:
+    // an exception here is an exception in the engine's terrain update loop.
+    private static void UpdateClipmapPrefix(object[] __args)
+    {
+        var hook = RttBridge.ClipmapCameraHook;
+        if (hook == null || __args == null || __args.Length < 2) return;
+        try
+        {
+            var replacement = hook(__args[0], __args[1]);
+            if (replacement != null) __args[1] = replacement;
+        }
+        catch { }
     }
 
     // Managed-area registration capture — see RttBridge.ManagedAreaRegistrations for why

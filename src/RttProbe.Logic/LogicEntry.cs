@@ -68,6 +68,11 @@ public static class LogicEntry
             // nested Draw. Null-safe on an older bootstrap.
             bridge.GetField("InOurRenderHook")?.SetValue(null, (Func<bool>)(() => WholeSceneRender.InOurRender));
 
+            // Per-body clipmap camera. Absent on an older bootstrap, which degrades to
+            // "terrain always follows the player" — the behaviour before this existed.
+            bridge.GetField("ClipmapCameraHook")?.SetValue(null,
+                (Func<object, object, object>)WorldGrids.ChooseClipmapCamera);
+
             // The whole-scene route. Null on an older bootstrap, which is the expected
             // state until the game is restarted to adopt the new one — the field is
             // looked up rather than assumed so a stale bootstrap degrades to "this
