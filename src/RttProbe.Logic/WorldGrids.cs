@@ -1329,7 +1329,14 @@ internal static class WorldGrids
 
             // The CLIENT scene's seat drives the client marker — the same "born on the
             // pump" requirement the census exposed, applied to both scenes symmetrically.
-            if (!isServer) { DriveClientMarker(scene2); return; }
+            // ONLY the panel's own client scene: several client scenes tick through this
+            // seat, and a marker in the wrong one is a marker no trigger will ever see.
+            if (!isServer)
+            {
+                if (PanelScene != null && !ReferenceEquals(scene2, PanelScene)) return;
+                DriveClientMarker(scene2);
+                return;
+            }
             if (_serverFloraSurveyPending) { _serverFloraSurveyPending = false; DumpServerFlora(scene2); }
             if (_serverDisarmed) return;
 
@@ -1735,6 +1742,25 @@ internal static class WorldGrids
     private static int _markerMoves;
     private static Type _tTag, _tWt, _tBbd;
     private static MethodInfo _miAddEntity, _miSetWt, _miRemoveEntity;
+
+    // WHICH client scene is the PANEL's? The seat sees several — two client scenes ticked
+    // through it on 2026-08-02 — and the client marker is a single static, so it lands in
+    // whichever client scene ticks first. If that is not the scene whose trigger system
+    // owns the flora triggers, the marker is invisible to them no matter how correct its
+    // archetype is, which is precisely what the census reported: the SERVER marker tracked
+    // by its triggers, the CLIENT marker tracked by nothing at all.
+    internal static object PanelScene;
+
+    internal static void PublishPanelScene(object anyEntityInScene)
+    {
+        if (PanelScene == null && anyEntityInScene != null)
+        {
+            PanelScene = SceneOf(anyEntityInScene);
+            if (PanelScene != null)
+                RttLog.Line($"PANEL SCENE: #{PanelScene.GetHashCode():x8} — the client marker will only be " +
+                            "created in THIS scene, the one whose trigger system owns the flora triggers.");
+        }
+    }
 
     // SEAT-DRIVEN, since the census verdict. An entity created from the tick thread exists
     // but never enters the trigger system's candidate index: the marker satisfied
@@ -2445,6 +2471,186 @@ internal static class WorldGrids
             }
             _lastPreloadTicks = long.MaxValue / 2;
         }
+    }
+
+    // ── PER-SECTOR FLORA CAMERA — the client-visibility half of goal 10 ────────────────
+    //
+    // Diagnosed 2026-08-02 after serverPreload filled the server scene with flora nobody
+    // could see. FloraSectorEntityComponent's two jobs both do:
+    //
+    //     var rootWT = rootTransforms[root.Root];
+    //     var camWT  = new WorldTransform(CoreSystems.Settings.RenderView.CameraPosition);
+    //     var rel    = (RelativeTransform)WorldTransform.GetRelativeTransform(camWT, rootWT);
+    //     _octree.UpdateCamera(rel);          // or UpdateVisibility(rel.Position)
+    //
+    // ONE global camera, and the octree culls by distance from it (_maxCullingDistance,
+    // _minDistanceToOctree, _isVisible). With the player 3,912 km away, every flora sector
+    // near the feed is marked invisible — the content is there and the renderer is told to
+    // hide it. Identical in shape to the clipmap corner bug, and it gets the identical
+    // remedy: choose the viewer PER SECTOR.
+    //
+    // THE RULE IS THE CLIPMAP'S, deliberately — it has been correct in game for a day:
+    //     claim a sector only when the feed camera is at least twice as close as the
+    //     player AND the player is beyond ClipmapMinPlayerDistance.
+    // A sector the player is anywhere near keeps his camera, so his flora cannot regress.
+    //
+    // We run as a POSTFIX: the engine's update completes first, then we re-point the
+    // octrees we claim. Nothing is suppressed; a fault here leaves the engine's own result
+    // in place. Instances we make visible are drawn in the player's view too, but they are
+    // thousands of km outside his frustum — the same deal the clipmap override already
+    // makes, and the same reason it costs nothing visible to him.
+    private static int _floraClaims, _floraCalls;
+    private static long _floraLogTicks;
+    private static Type _tRelTransform;
+    private static MethodInfo _miGetRelative, _miRelExplicit, _miOctUpdateCam, _miOctUpdateVis;
+    private static bool _floraShapeLogged;
+
+    private static double _floraNearestSeen = double.MaxValue;
+    private static string _floraLastReject = "(none)";
+
+    internal static void OnFloraSectorUpdate(object component, object[] args, bool visibilityJob)
+    {
+        if (!FeedConfig.FloraCameraOverride || component == null || args == null || args.Length < 2) return;
+        _floraCalls++;
+
+        // HEARTBEAT OUTSIDE THE CLAIM PATH. The first armed run logged nothing at all,
+        // which is ambiguous between "the postfix never fires" (no flora sector entities
+        // exist client-side near the feed — the interesting answer) and "it fires and the
+        // rule rejects". This line distinguishes them on a clock.
+        var now0 = Environment.TickCount64;
+        if (now0 - _floraLogTicks > 15000)
+        {
+            _floraLogTicks = now0;
+            RttLog.Line($"FLORA CAMERA: {_floraCalls} sector-update(s) seen, {_floraClaims} claimed. " +
+                        $"Nearest sector to the feed camera so far: " +
+                        $"{(_floraNearestSeen == double.MaxValue ? "none measured" : $"{_floraNearestSeen / 1000.0:F1} km")}. " +
+                        $"Last rejection: {_floraLastReject}. If updates are seen but none are near, the CLIENT " +
+                        "has no flora sector entities at the camera and the gap is upstream of rendering.");
+        }
+
+        try
+        {
+            var feedPos = CameraFeed.SubjectCentreCache;
+            if (feedPos.LengthSquared() <= 1.0) return;
+
+            var octree = Prop(component, "_octree");
+            if (octree == null) return;
+
+            // The sector's ROOT is the planet, so root position alone cannot tell sectors
+            // apart. The octree's own bounding sphere is in root-relative space; its centre
+            // transformed by the root gives this sector's true world position.
+            var rootWt = RootTransformOf(args);
+            if (rootWt == null) return;
+            if (Prop(rootWt, "Position") is not Vector3D rootPos) return;
+
+            var sectorWorld = rootPos;
+            var sphere = Prop(octree, "_boundingSphere");
+            var centre = Prop(sphere, "Center");
+            if (centre != null)
+            {
+                var ct = centre.GetType();
+                double cx = 0, cy = 0, cz = 0;
+                if (ct.GetField("X", Any)?.GetValue(centre) is float fx) cx = fx;
+                if (ct.GetField("Y", Any)?.GetValue(centre) is float fy) cy = fy;
+                if (ct.GetField("Z", Any)?.GetValue(centre) is float fz) cz = fz;
+                // Rotation of a planet root is identity in practice and the offset is at
+                // most a sector's extent; translation alone is accurate enough for a
+                // distance comparison whose threshold is a factor of two.
+                sectorWorld = rootPos + new Vector3D(cx, cy, cz);
+            }
+
+            var playerPos = PlayerRenderCameraPosition();
+            if (playerPos == null) return;
+
+            var dPlayer = (playerPos.Value - sectorWorld).Length();
+            var dFeed = (feedPos - sectorWorld).Length();
+            if (dFeed < _floraNearestSeen) _floraNearestSeen = dFeed;
+            if (dFeed * 2.0 >= dPlayer)
+            { _floraLastReject = $"not 2x closer (feed {dFeed / 1000.0:F1} km, player {dPlayer / 1000.0:F1} km)"; return; }
+            if (dPlayer < FeedConfig.ClipmapMinPlayerDistance)
+            { _floraLastReject = $"player too close ({dPlayer / 1000.0:F1} km)"; return; }
+
+            // Our camera, expressed in this sector's root frame — the same two lines the
+            // engine just ran, with a different position.
+            _tWt ??= Type.GetType("Keen.VRage.Core.WorldTransform, VRage.Core");
+            _tRelTransform ??= Type.GetType("Keen.VRage.Core.RelativeTransform, VRage.Core");
+            _miGetRelative ??= _tWt?.GetMethod("GetRelativeTransform", Any);
+            _miRelExplicit ??= _tRelTransform?.GetMethods(Any).FirstOrDefault(
+                m => m.Name == "op_Explicit" && m.GetParameters().Length == 1
+                  && m.GetParameters()[0].ParameterType == _tWt);
+            if (_tWt == null || _miGetRelative == null || _miRelExplicit == null)
+            {
+                if (!_floraShapeLogged)
+                {
+                    _floraShapeLogged = true;
+                    RttLog.Line("FLORA CAMERA: transform shape missing — override inactive.");
+                }
+                return;
+            }
+
+            var ourWt = Activator.CreateInstance(_tWt, new object[] { feedPos });
+            var rel = _miRelExplicit.Invoke(null, new[] { _miGetRelative.Invoke(null, new[] { ourWt, rootWt }) });
+
+            var octType = octree.GetType();
+            if (visibilityJob)
+            {
+                _miOctUpdateVis ??= octType.GetMethods(Any).FirstOrDefault(
+                    m => m.Name == "UpdateVisibility" && m.GetParameters().Length == 1);
+                var relPos = _tRelTransform.GetField("Position", Any)?.GetValue(rel);
+                if (_miOctUpdateVis != null && relPos != null) _miOctUpdateVis.Invoke(octree, new[] { relPos });
+            }
+            else
+            {
+                _miOctUpdateCam ??= octType.GetMethods(Any).FirstOrDefault(
+                    m => m.Name == "UpdateCamera" && m.GetParameters().Length == 1);
+                _miOctUpdateCam?.Invoke(octree, new[] { rel });
+            }
+            _floraClaims++;
+        }
+        catch (Exception e)
+        {
+            if (!_floraShapeLogged) { _floraShapeLogged = true; RttLog.Error("flora camera (logged once)", e); }
+        }
+    }
+
+    // args[0] is the boxed RootData (DEntity Root); args[1] the ReadOnlyEntityData<WorldTransform>
+    // indexer the job itself uses. Boxed by Harmony, read back the same way the job reads them.
+    private static MethodInfo _miRootItem;
+
+    private static object RootTransformOf(object[] args)
+    {
+        try
+        {
+            var root = Prop(args[0], "Root");
+            if (root == null) return null;
+            _miRootItem ??= args[1].GetType().GetMethods(Any).FirstOrDefault(
+                m => m.Name == "get_Item" && m.GetParameters().Length == 1);
+            return _miRootItem?.Invoke(args[1], new[] { root });
+        }
+        catch { return null; }
+    }
+
+    // The global the flora jobs read: CoreSystems.Settings.RenderView.CameraPosition.
+    private static MethodInfo _miRenderView, _miCamPos;
+    private static object _settingsManager;
+
+    private static Vector3D? PlayerRenderCameraPosition()
+    {
+        try
+        {
+            if (_settingsManager == null)
+            {
+                var tCore = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+                _settingsManager = tCore?.GetField("Settings", Any)?.GetValue(null);
+                if (_settingsManager == null) return null;
+            }
+            _miRenderView ??= _settingsManager.GetType().GetMethod("get_RenderView", Any);
+            var view = _miRenderView?.Invoke(_settingsManager, null);
+            if (view == null) return null;
+            _miCamPos ??= view.GetType().GetMethod("get_CameraPosition", Any);
+            return _miCamPos?.Invoke(view, null) as Vector3D?;
+        }
+        catch { return null; }
     }
 
     // SERVER-SIDE PRELOAD — the flora pipeline's suspected missing feedstock.

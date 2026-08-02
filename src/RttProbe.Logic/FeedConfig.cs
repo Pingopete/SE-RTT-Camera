@@ -921,6 +921,12 @@ internal static class FeedConfig
     // Off by default: it is a world mutation in the scene that spawns things.
     public static bool ServerPresenceEntity { get; private set; }
 
+    // PER-SECTOR FLORA CAMERA — the client-visibility half. Flora sectors are culled by
+    // distance from ONE global render camera, so a remote feed sees none of the flora the
+    // server generates around it. Same rule as the clipmap override (2x margin + the
+    // ClipmapMinPlayerDistance floor), so the player's flora can never regress.
+    public static bool FloraCameraOverride { get; private set; }
+
     public static bool PerBodyClipmapCamera { get; private set; }
     public static double ClipmapMinPlayerDistance { get; private set; } = 100000.0;
 
@@ -1056,6 +1062,16 @@ internal static class FeedConfig
             // Edge-triggered, not level-triggered: only a false->true transition arms it.
             // Level-triggered would re-dump on every config poll for as long as the line
             // said 1, which is this project's house bug wearing a survey hat.
+            var floraWas = FloraCameraOverride;
+            FloraCameraOverride = Bool(kv, "floraCameraOverride", FloraCameraOverride);
+            if (floraWas != FloraCameraOverride)
+                RttLog.Global($"Config: floraCameraOverride {floraWas} -> {FloraCameraOverride}" +
+                    (FloraCameraOverride
+                        ? ". Flora sectors the feed camera is near now LOD and cull around the CAMERA instead " +
+                          "of the player — the octree that hides them takes one camera, and this chooses which. " +
+                          "Sectors the player is near are untouched. Watch for \"FLORA CAMERA:\" in the log."
+                        : ". Every flora sector goes back to culling around the player."));
+
             var clipWas = PerBodyClipmapCamera;
             PerBodyClipmapCamera     = Bool(kv, "perBodyClipmapCamera", PerBodyClipmapCamera);
             ClipmapMinPlayerDistance = Dbl(kv, "clipmapMinPlayerDistance", ClipmapMinPlayerDistance);

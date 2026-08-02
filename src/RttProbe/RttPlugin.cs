@@ -192,6 +192,25 @@ public static class RttBridge
     // (component) -> void, invoked at the top of SpatialTriggerSystemSessionComponent's
     // per-frame pending-trigger processing, on that component's scene's pump thread.
     public static volatile Action<object> SimPumpHook;
+
+    // ---- FLORA SECTOR CAMERA (goal 10, the client-visibility half) --------------------
+    //
+    // FloraSectorEntityComponent.UpdateCameraPosition and .UpdateVisibility both read
+    // CoreSystems.Settings.RenderView.CameraPosition — ONE global camera — express it in
+    // the sector root's frame, and hand it to InstanceSparseOctree.UpdateCamera /
+    // .UpdateVisibility. The octree culls by distance (_maxCullingDistance,
+    // _minDistanceToOctree, _isVisible), so with the player 3,912 km away every flora
+    // sector near a remote feed camera is marked INVISIBLE. The content exists; the
+    // renderer is told to hide it. Same single-viewer disease as the clipmap.
+    //
+    // The hook fires as a POSTFIX, deliberately: the engine's own update runs first and
+    // completely (the player can never lose flora), then the logic re-points the octree of
+    // sectors it claims at the feed camera. Last write wins, nothing is suppressed, and a
+    // fault in our half leaves the engine's result standing.
+    //
+    // (component, boxedArgs, isVisibilityJob) -> void. Typed as object so the bootstrap
+    // stays ignorant of VRage.Render12 types.
+    public static volatile Action<object, object[], bool> FloraCameraHook;
 }
 
 public sealed class RttPlugin : IPlugin
@@ -255,6 +274,7 @@ public sealed class RttPlugin : IPlugin
             PatchManagedAreas(harmony);
             PatchClipmapCamera(harmony);
             PatchSimPumpSeat(harmony);
+            PatchFloraCamera(harmony);
         }
         catch (Exception e) { Log("Patching FAILED: " + e); }
     }
@@ -304,6 +324,55 @@ public sealed class RttPlugin : IPlugin
             else __args[1] = replacement;
         }
         catch { }
+    }
+
+    // Flora sector camera — see RttBridge.FloraCameraHook for the reasoning.
+    //
+    // Both jobs take (ref RootData, ReadOnlyEntityData<WorldTransform>) whose types are
+    // nested/private to VRage.Render12, so the postfixes take __args (Harmony boxes them)
+    // rather than typed parameters — the same trick the clipmap prefix uses to stay free
+    // of engine types.
+    private static void PatchFloraCamera(HarmonyLib.Harmony harmony)
+    {
+        try
+        {
+            var t = Type.GetType(
+                "Keen.VRage.Render12.SceneSystem.Components.FloraSectorEntityComponent, VRage.Render12");
+            if (t == null) { Log("FloraSectorEntityComponent not found — flora camera inactive."); return; }
+            int n = 0;
+            foreach (var (name, post) in new[]
+            {
+                ("UpdateCameraPosition", nameof(FloraCameraPostfix)),
+                ("UpdateVisibility",     nameof(FloraVisibilityPostfix)),
+            })
+            {
+                var mi = t.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (mi == null) { Log($"FloraSectorEntityComponent.{name} not found — skipped."); continue; }
+                var pm = typeof(RttPlugin).GetMethod(post, BindingFlags.Static | BindingFlags.NonPublic);
+                harmony.Patch(mi, postfix: new HarmonyLib.HarmonyMethod(pm));
+                n++;
+            }
+            Log(n > 0
+                ? $"Patched {n} FloraSectorEntityComponent job(s) — per-sector flora camera armed."
+                : "Flora camera FAILED: no patchable job found.");
+        }
+        catch (Exception e) { Log("Patching flora camera FAILED: " + e.Message); }
+    }
+
+    // Per flora sector, per throttled frame. Cheap and never throwing: this sits inside the
+    // renderer's scene update.
+    private static void FloraCameraPostfix(object __instance, object[] __args)
+    {
+        var hook = RttBridge.FloraCameraHook;
+        if (hook == null) return;
+        try { hook(__instance, __args, false); } catch { }
+    }
+
+    private static void FloraVisibilityPostfix(object __instance, object[] __args)
+    {
+        var hook = RttBridge.FloraCameraHook;
+        if (hook == null) return;
+        try { hook(__instance, __args, true); } catch { }
     }
 
     // The sim-pump seat — see RttBridge.SimPumpHook.

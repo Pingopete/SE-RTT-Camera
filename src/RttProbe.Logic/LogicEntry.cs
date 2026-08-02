@@ -73,6 +73,20 @@ public static class LogicEntry
             bridge.GetField("ClipmapCameraHook")?.SetValue(null,
                 (Func<object, object, object>)WorldGrids.ChooseClipmapCamera);
 
+            // Per-sector flora camera. Absent on an older bootstrap, which degrades to
+            // "remote feeds never see flora" — the state before 2026-08-02.
+            var flora = bridge.GetField("FloraCameraHook");
+            if (flora != null)
+            {
+                flora.SetValue(null, (Action<object, object[], bool>)WorldGrids.OnFloraSectorUpdate);
+                RttLog.Line("Flora camera hook registered — floraCameraOverride is armable.");
+            }
+            else
+            {
+                RttLog.Line("FloraCameraHook not on this bootstrap — restart the game to adopt it. " +
+                            "floraCameraOverride will have NO EFFECT until then.");
+            }
+
             // The sim-pump seat (server presence entity). Absent on an older bootstrap,
             // which degrades to "no server-side materialization" — the state of the world
             // before 2026-08-02. Say so out loud, because serverPresenceEntity = 1 with a

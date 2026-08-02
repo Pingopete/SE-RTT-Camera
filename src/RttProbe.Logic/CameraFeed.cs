@@ -523,6 +523,10 @@ internal static class CameraFeed
             // Ask the engine to make the world exist around the camera. Placed AFTER the
             // target is published so `centre` is the anchor when one is set, and rate-limited
             // inside PreloadAroundCamera rather than here.
+            // Which client scene owns the panel — the seat needs it to put the client
+            // marker in the scene whose triggers actually matter. Publishes once.
+            WorldGrids.PublishPanelScene(entity);
+
             if (FeedConfig.PreloadAroundCamera)
                 WorldGrids.PreloadAroundCamera(entity, centre, FeedConfig.PreloadRadius);
             if (FeedConfig.ServerPreload)
