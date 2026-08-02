@@ -648,3 +648,38 @@ point: a zero announces itself, but 867 m is plausible enough to be believed, an
 plausible wrong number costs more than an obvious one. Three blind readers in two days —
 the `CellData` wrapper, the desert-vs-alpine "like-for-like" density line, and this — and
 **all three produced output that looked reasonable.**
+
+### 2026-08-02, later: the marker's bounding box does NOT set the materialization radius
+
+User observation from a raised orbit camera: scatter objects stop at a hard circle around
+the anchor, bare ground beyond. That looked like the presence marker's extents, because the
+PlanetEnvironment triggers are `SECTORED` and `SectoredTrigger.UpdateEntity` takes the
+entity's OBB.
+
+**Tested and refuted.** `cameraTriggerExtent` 1.375 → 25 → 100 m, live, orbit frozen,
+markers verifiably rebuilt at each step (the creation log now prints the real half-extent —
+it previously hardcoded "2.75 m box" and so could not have shown this either way). User:
+"foliage is still limited to the previous range, I don't see any additional foliage spawning
+further away." VRAM stayed flat at 12.4 GB throughout, so it is not a residency limit either.
+
+The knob stays (it is correct that the extent be settable, and the default is back to 1.375),
+but it is **not** the radius lever.
+
+Candidates left, in order:
+1. **Sector size vs box size.** `SectorArgs` carries the sector size; if a sector is much
+   larger than our box, every extent below one sector activates exactly one sector and the
+   knob can do nothing. Primary reports `occupiedSectors=68800` over a 61 km-radius planet,
+   which is order-800 m per sector — bigger than every extent tested. Read `SectorArgs` live
+   before testing an extent above it.
+2. **`SectoredTrigger.TrackSectorPerEntity`.** If false, an entity is assigned to the single
+   sector containing it regardless of its box.
+3. **A per-layer view distance** in the environment component, which is the shape that
+   produces a hard circle most naturally.
+
+Also still unexplained and parked at the user's request: **shadows of trees and foliage with
+no object present.** That proves the object exists and is in the shadow pass's set while the
+main view drops it, which points at main-view culling — and the HZBO second pass
+(`SceneFinalize` runs the visible-entity update again for `MainViewCulling.SecondPass` gated
+on `HZBO.MainViewEnabled`) is the obvious suspect, since `RenderGrass` takes the same
+`enableHiZ` flag and has explicit NoHiZ PSO variants. One mechanism would explain both the
+missing foliage and the missing grass.
