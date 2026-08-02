@@ -713,3 +713,165 @@ test needs a lever that is per-pass by construction, not a global toggled inside
 `GrassRendering` chooses `_triplanarSingleGenNoHiZPSO` vs `_triplanarSingleGenPSO` from the
 `enableHiZ` ARGUMENT, so patching `SceneDrawSystem.RenderGrass`'s second parameter inside our
 render reaches the grass half without touching any shared setting. That is the next attempt.
+
+---
+
+## 2026-08-02 (afternoon): THE SCATTER CONTROL SURFACE
+
+The goal was reframed by the user: not "why is grass missing" but **our own control over
+scatter spawn radius and density, for grass and all foliage alike**. That reframe is what
+found the answer, because it moved the search from one symptom to the settings that govern
+the whole system.
+
+Found by reading CONSUMERS rather than guessing at names — the method that has worked every
+time here, and the one whose absence produced the "no sun symbols" embarrassment.
+
+### The surface
+
+| knob | consumer | when it is read |
+|---|---|---|
+| `Flora.RenderingDistanceMultiplier` | `InstanceBatch.ComputeCullingDistance` | **batch allocation** |
+| `Flora.LODDistanceMultiplier` | `LODSetup.Compose` -> `GlobalFloraDistanceMult` | **per pass** |
+| `Flora.FadeDistancePercentage` | `InstanceBatch.UpdateRenderData` | per batch |
+| `LOD.MainView.{LODShift,LODShiftVisible,MinLOD,FloraMinLOD}` | `CullingJob.DoWork` | **per pass** |
+| `LOD.{ObjectDistanceMult,ObjectDistanceAdd,SmallObjectVisibleMult}` | culling | per pass |
+| `Grass.{DrawDistance,Density,...}` | `RenderGrass` | **per pass** |
+
+`ComputeCullingDistance` is the entire mechanism behind the user's reported "strict circular
+radius around the camera where objects spawn". Its whole body:
+
+    IL_0000 ldsfld    CoreSystems::Settings
+    IL_0005 callvirt  SettingsManager::get_Flora()
+    IL_000a ldfld     FloraSettings::RenderingDistanceMultiplier
+    IL_000f ldarg.0
+    IL_0010 mul
+    IL_0011 ret
+
+### The timing split is the design
+
+`LODSetup.Compose` is reached from `SceneDrawSystem.MainViewCulling`, which our own probe
+already reports present inside our nested Draw. So flora LOD, object LOD and grass are
+**per-pass** and can be given to the FEED ALONE with the existing `ScopeSetValues`
+machinery — the player's frame is untouched. Those are the `wholeScene*` knobs.
+
+The radius cannot be. `ComputeCullingDistance` is called from `InstanceBatch.Initialize` <-
+`InstanceSparseOctree.AllocateInstanceBatch` <- `AddInstanceInInstanceBatches`: the value is
+read ONCE, when a flora batch is allocated during the SECTOR UPDATE, and stored on the batch.
+Our nested Draw never sees that call. So the radius knob is global and is named `world*`
+rather than `wholeScene*` to carry the distinction in the name. It is also **not
+retroactive** — already-allocated batches keep the radius they were born with, so a verdict
+taken seconds after the edit grades nothing.
+
+### The measured feed-specific deficit
+
+A read-back was added to the probe rather than echoing our own config, because a silent
+reflection bind failure and a real change look identical from the config side:
+
+    Flora[radiusMult=10 lodMult=1.2 fadePct=80 frozen=False
+          playerSwapchainY=2160 engineFloraTerm=0.5 (effective floraLodDist x0.6)
+          feedWouldWant x1.2 => wholeSceneFloraLodMult 2.4 for parity]
+
+Two things fell out of it immediately.
+
+**`RenderingDistanceMultiplier` is already 10, not 1.** It is global, so it applies equally to
+the player and the feed and therefore *cannot by itself explain the gap between them*. That
+kills the tempting reading of the radius knob as "the" answer.
+
+**The LOD term CAN explain a gap, and it is quantified.** `Compose` computes
+
+    GlobalFloraDistanceMult = MathF.Min(1, 1080 / SwapChain.Resolution.Y) * Flora.LODDistanceMultiplier
+
+and `SwapChain` is the PLAYER'S — the only one the engine has. Measured
+`playerSwapchainY=2160`, so the engine applies 0.5. Our feed renders 1024 tall and earns the
+full 1.0 term, but inherits the 4K penalty anyway: **the feed runs at exactly half the flora
+LOD distance its own resolution warrants.** This is the single-viewer disease in the LOD
+system, and unlike previous instances it comes with a number and a computed compensation.
+
+### Two corrections
+
+`GrassBufferContext` capacity-of-1 (commit a7dcb79) is **WITHDRAWN**. It was a FIRST-FRAME
+artifact: every sample after the first reads `genCmdCapSingle=2048 genCmdCapMulti=1024`, and
+the 14:14 hot reload reproduced the 1 on frame one exactly as predicted. One sample was read
+and generalised.
+
+The residency warning was reported here as never having fired. Wrong — the grep string was
+wrong (`RESIDENCY` vs the message's `RESIDENT WORLD`). It has fired 39 times. **Check the
+instrument before believing a negative** continues to earn its place.
+
+### The VRAM confound, and why a restart came first
+
+At the time of the first A/B the session was **1415 MB over budget** after 8 hot reloads,
+with the warning firing continuously. That is not merely a crash risk: over budget the
+texture and mesh streamer is evicting continuously, so *residency pressure is a confound for
+this entire investigation* and a sparse feed could partly BE that. A restart took VRAM from
+15.44 GB to 12.04 GB and is a precondition for any valid scatter reading, not just a safety
+step.
+
+**And the first clean-baseline shot proved the point about patience**: one minute after load
+the feed showed ZERO trees where the over-budget session had shown many. Flora streams in
+over minutes. Any before/after taken inside that window measures load progress, not the knob.
+
+### The circular radius, decoded end to end
+
+The user's "strict circular radius around the camera where objects spawn" now has a complete,
+IL-verified chain from a settings float to the visible circle:
+
+    Flora.RenderingDistanceMultiplier
+      -> InstanceBatch.ComputeCullingDistance(base) = mult * base   [AT BATCH ALLOCATION]
+      -> InstanceBatch.CullingDistance
+      -> InstanceSparseOctree.ComputeBoundingBox():
+             _maxCullingDistance = MathF.Max(_maxCullingDistance, batch.CullingDistance)
+             _boundingSphere     = BoundingSphere.CreateFromBoundingBox(_boundingBox)
+      -> InstanceSparseOctree.IsOctreeVisible(cameraPosition, out distance):
+             distance = _boundingBox.Distance(cameraPosition)
+             return distance < _maxCullingDistance
+      -> THE CIRCLE
+
+`ComputeBoundingBox` is the ONLY writer of `_maxCullingDistance`, which is why the chain has
+no branches in it.
+
+### Radius and density are two SEPARATE controls
+
+    RADIUS   Flora.RenderingDistanceMultiplier -> _maxCullingDistance -> IsOctreeVisible
+    DENSITY  _cameraCoords -> GetOctreeLevel -> subdivision depth
+
+`GetOctreeLevel` decodes to:
+
+    int d = (cellCoords - _cameraCoords).AbsMax() / 2;
+    for (int level = 0; level < 7; level++) { d /= 2; if (d < 2) return level; }
+    return 7;
+
+Chebyshev distance from the CAMERA CELL, halved repeatedly: level 0 nearest and finest,
+level 7 farthest and coarsest. `_cameraCoords` is precisely the field our flora claim
+overwrites — so an UNCLAIMED sector keeps the PLAYER'S camera cell, and every cell near the
+feed evaluates to level 7. That is the mechanism by which a remote feed gets the coarsest
+possible scatter no matter what the radius is set to.
+
+Note the shapes differ and both are observable: the DENSITY falloff is square (AbsMax is a
+Chebyshev metric), the RADIUS cut is spherical (a distance against `_maxCullingDistance`).
+The reported symptom was a circle, which points at the radius half.
+
+### THE BLOCKER, and the instrument that found it
+
+`claimed` in the FLORA CAMERA line is the master instrument for scatter frequency, and after
+the restart it reads:
+
+    FLORA CAMERA: 7995337 update(s) seen, 0 claimed
+    Last rejection: not 2x closer (feed 3906.2 km, player 0.6 km)
+
+**Zero claimed out of eight million**, stable over ten minutes — against 3,054,492 claimed in
+the pre-restart session where the feed DID show trees. The claim rule
+(`if (dFeed * 2.0 >= dPlayer) reject`) is behaving correctly: every sector in the update
+stream is beside the player, 3,900 km away on another planet. The problem is upstream of the
+rule — no flora sector ENTITY near the feed has streamed in, so there is nothing to claim,
+and the whole control surface below it is unreachable.
+
+The camera trigger marker is alive at the feed (1905 moves), so the trigger half works. Next
+lever tried: `preloadAroundCamera = 1`, the previously-measured PreloadAsync path, to force
+world data residency around the feed and give the flora sector entities something to
+instantiate from.
+
+**This reorders the whole problem.** The radius and LOD knobs are real and now wired, but
+they are downstream of sector residency: with `claimed = 0` none of them can move the
+picture. Scatter frequency work has to start at "get sectors to stream around the feed", and
+`claimed` is how that is measured.
