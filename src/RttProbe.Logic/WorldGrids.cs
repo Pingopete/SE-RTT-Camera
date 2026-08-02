@@ -1106,6 +1106,38 @@ internal static class WorldGrids
                         foreach (var c in cs) names.Add(c?.GetType().Name ?? "null");
                     sb.AppendLine($"        {body.Name} (r={body.Extent:F0} m): " +
                                   string.Join(", ", names.Distinct()));
+
+                    // THE DECOY SPECIFICATION, read from the live definition.
+                    //
+                    // PlanetEnvironmentComponent.OnAddedToSceneCore builds the trigger's type
+                    // constraints as, for each tag type in the environment definition's
+                    // ProceduralTriggerTagTypes:
+                    //     MustHave(tagType)
+                    //     MustNotHave<ProcedurallyGeneratedTag>()
+                    //     MustNotHave<ManagedByWorldAreaTag>()
+                    // So an entity trips the sector trigger exactly when it carries one of
+                    // those tag types and neither exclusion. Printing the list turns "build a
+                    // decoy" from a guess into a component checklist.
+                    var envClient = ComponentOf(body.Entity, "PlanetEnvironmentClientComponent");
+                    var def = envClient?.GetType()
+                        .GetMethod("GetEnvironmentDefinition", Any)?.Invoke(envClient, null);
+                    var tagTypes = Prop(def, "ProceduralTriggerTagTypes") as IEnumerable;
+                    if (tagTypes == null)
+                        sb.AppendLine($"        ProceduralTriggerTagTypes unreadable " +
+                                      $"(client component={(envClient == null ? "absent" : "ok")}, " +
+                                      $"definition={(def == null ? "null" : def.GetType().Name)})");
+                    else
+                    {
+                        sb.AppendLine("        DECOY SPEC — an entity trips the environment sector " +
+                                      "trigger iff it HAS one of these tag types and has NEITHER " +
+                                      "ProcedurallyGeneratedTag NOR ManagedByWorldAreaTag:");
+                        foreach (var t in tagTypes)
+                        {
+                            // SubclassOf<T> wraps a Type; print whichever member carries it.
+                            var inner = Prop(t, "Type") ?? Prop(t, "Value") ?? t;
+                            sb.AppendLine($"            {inner}");
+                        }
+                    }
                     break;                                      // one is enough
                 }
             }
