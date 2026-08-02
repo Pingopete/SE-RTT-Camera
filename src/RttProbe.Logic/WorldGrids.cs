@@ -219,6 +219,7 @@ internal static class WorldGrids
             AppendManagedAreas(sb, anyEntityInScene, player);
             AppendObservers(sb, anyEntityInScene, player);
             AppendSpaceProbe(sb, anyEntityInScene);
+            AppendEnvironmentSectors(sb, anyEntityInScene, player);
 
             Directory.CreateDirectory(RttLog.OutDir);
             File.WriteAllText(ReportPath, sb.ToString());
@@ -1033,6 +1034,87 @@ internal static class WorldGrids
                 sb.AppendLine($"    PreloadAsync({string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name))})");
         }
         catch (Exception e) { sb.AppendLine($"    space probe dump FAILED ({e.GetType().Name}: {e.Message})"); }
+    }
+
+    // ENVIRONMENT SECTORS — quantify the clutter gap instead of arguing about it.
+    //
+    // PlanetEnvironmentComponent materializes surface sectors (trees, boulders, surface ore)
+    // and keeps the live state in _sectors / _pendingSectors / _entityIdsPerSector. Reading
+    // those turns "the feed has no trees" from a screenshot impression into a count, and
+    // shows WHERE the materialized sectors actually are — around the player, presumably,
+    // and not around the camera.
+    //
+    // It also prints LOCAL_TAG, the static string the module uses to decide which entities
+    // count as environment observers. That is the exact tag any decoy would have to carry,
+    // so it is worth knowing before anyone designs one.
+    //
+    // STRICTLY READ-ONLY. The trigger interfaces are query-only by design (IEntityTrigger
+    // exposes just a HashSetReader, ISectoredTrigger only GetSectorKey/IsValid), so there is
+    // no supported way to force a sector from here and this makes no attempt to find one.
+    private static void AppendEnvironmentSectors(StringBuilder sb, object anyEntityInScene, Vector3D player)
+    {
+        try
+        {
+            sb.AppendLine("\n--- planet environment sectors (trees / boulders / surface ore) ---");
+
+            var tEnv = Type.GetType("Keen.VRage.Voxels.Components.PlanetEnvironmentComponent, VRage.Voxels");
+            if (tEnv == null) { sb.AppendLine("    PlanetEnvironmentComponent type not found"); return; }
+            var tagField = tEnv.GetField("LOCAL_TAG", Any);
+            sb.AppendLine($"    LOCAL_TAG = \"{tagField?.GetValue(null) ?? "?"}\"   " +
+                          "(the tag an entity must carry for this module to treat it as an " +
+                          "environment observer — what any decoy would need)");
+
+            // The component lives on the PLANET entity, so walk to it the same way the planet
+            // survey does rather than hunting the session.
+            int found = 0;
+            foreach (var body in EnumeratePlanets(anyEntityInScene))
+            {
+                var env = ComponentOf(body.Entity, "PlanetEnvironmentComponent");
+                if (env == null) continue;
+                found++;
+
+                var sectors  = Prop(env, "_sectors")        as System.Collections.ICollection;
+                var pending  = Prop(env, "_pendingSectors")  as System.Collections.ICollection;
+                var byId     = Prop(env, "_entitiesById")    as System.Collections.ICollection;
+                sb.AppendLine($"    {body.Name}:  _sectors={sectors?.Count.ToString() ?? "?"}" +
+                              $"  _pendingSectors={pending?.Count.ToString() ?? "?"}" +
+                              $"  _entitiesById={byId?.Count.ToString() ?? "?"}" +
+                              $"   (planet centre {(body.Position - player).Length() / 1000.0:F0} km from subject)");
+
+                // Sector KEYS are integer grid coords; printing a few tells us whether the
+                // live set clusters anywhere at all, without needing to decode the grid.
+                if (Prop(env, "_sectors") is IEnumerable secs)
+                {
+                    int n = 0;
+                    foreach (var s in secs)
+                    {
+                        if (n++ >= 6) break;
+                        sb.AppendLine($"        sector key: {Prop(s, "Key") ?? s}");
+                    }
+                }
+            }
+            if (found == 0)
+            {
+                sb.AppendLine("    no PlanetEnvironmentComponent on any enumerated body — " +
+                              "listing what a real planet entity DOES carry, so the next attempt is a " +
+                              "lookup rather than a guess:");
+                foreach (var body in EnumeratePlanets(anyEntityInScene))
+                {
+                    if (body.Extent < 1000) continue;          // skip boulders; want an actual planet
+                    var names = new List<string>();
+                    if (_fComponents?.GetValue(body.Entity) is IEnumerable cs)
+                        foreach (var c in cs) names.Add(c?.GetType().Name ?? "null");
+                    sb.AppendLine($"        {body.Name} (r={body.Extent:F0} m): " +
+                                  string.Join(", ", names.Distinct()));
+                    break;                                      // one is enough
+                }
+            }
+            sb.AppendLine("    READ IT THUS: a non-zero _sectors with entities means clutter IS " +
+                          "materialized SOMEWHERE. The question the feed cares about is whether any " +
+                          "of it is near the CAMERA, and the trigger design says it will not be — " +
+                          "sectors follow tagged entities, and the camera is not one.");
+        }
+        catch (Exception e) { sb.AppendLine($"    environment sector dump FAILED ({e.GetType().Name}: {e.Message})"); }
     }
 
     private static string DescribeObserver(object o, Vector3D player)
