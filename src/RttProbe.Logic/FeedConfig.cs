@@ -846,6 +846,11 @@ internal static class FeedConfig
     // ClipmapMinPlayerDistance is the safety floor: a body the player is closer than this to
     // is NEVER taken over, whatever the camera is doing. 100 km comfortably exceeds a planet
     // radius (Verdure is 60 km), so "the player is on this planet" can never satisfy it.
+    // Add ClientTriggerTag to the anchor GRID so the planet materializes environment sectors
+    // around it. Requires orbitAnchor to name a grid (coordinates have no entity to tag).
+    // Off by default: it mutates a world entity.
+    public static bool TagAnchorForClutter { get; private set; }
+
     public static bool PerBodyClipmapCamera { get; private set; }
     public static double ClipmapMinPlayerDistance { get; private set; } = 100000.0;
 
@@ -976,6 +981,7 @@ internal static class FeedConfig
             ClipmapMinPlayerDistance = Dbl(kv, "clipmapMinPlayerDistance", ClipmapMinPlayerDistance);
             ClipmapMaxFeedDistance   = Dbl(kv, "clipmapMaxFeedDistance", ClipmapMaxFeedDistance);
             ClipmapUpdateBudgetMs    = Dbl(kv, "clipmapUpdateBudgetMs", ClipmapUpdateBudgetMs);
+            TagAnchorForClutter      = Bool(kv, "tagAnchorForClutter", TagAnchorForClutter);
             if (clipWas != PerBodyClipmapCamera)
                 RttLog.Global($"Config: perBodyClipmapCamera {clipWas} -> {PerBodyClipmapCamera}" +
                     (PerBodyClipmapCamera

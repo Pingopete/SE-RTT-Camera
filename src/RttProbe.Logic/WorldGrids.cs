@@ -93,7 +93,10 @@ internal static class WorldGrids
             try
             {
                 var fresh = Describe(_cached.Value.Entity);
-                if (fresh.HasValue) { _cached = fresh; return fresh; }
+                // Re-attempt on every refresh, not only on first resolve: the knob can be
+                // switched on while an anchor is already cached, and _taggedGrids makes the
+                // repeat free.
+                if (fresh.HasValue) { TagAnchorGridForEnvironment(fresh.Value.Entity); _cached = fresh; return fresh; }
             }
             catch { }
             RttLog.Line($"ORBIT ANCHOR: \"{_cached.Value.Name}\" no longer yields a position — the grid " +
@@ -131,6 +134,7 @@ internal static class WorldGrids
                 return null;
             }
 
+            TagAnchorGridForEnvironment(hit.Value.Entity);
             RttLog.Line($"ORBIT ANCHOR: \"{want}\" -> \"{hit.Value.Name}\" at " +
                         $"{hit.Value.Position.X:F0},{hit.Value.Position.Y:F0},{hit.Value.Position.Z:F0} " +
                         $"(extent {hit.Value.Extent:F0} m). Resolved ONCE — the position now tracks the " +
@@ -526,6 +530,99 @@ internal static class WorldGrids
 #pragma warning restore CS0162
         }
         catch (Exception e) { RttLog.Error($"load area \"{wantName}\"", e); }
+    }
+
+    // CLUTTER: TAG THE ANCHOR GRID, DO NOT SPAWN A DECOY.
+    //
+    // Environment sectors (trees, boulders, surface ore) materialize when an entity trips the
+    // planet's sectored trigger, and the constraint read from the LIVE definition is exactly:
+    //     MustHave(ClientTriggerTag)  +  MustNotHave(ProcedurallyGeneratedTag)
+    //                                 +  MustNotHave(ManagedByWorldAreaTag)
+    // One empty marker component. No player-ness, no identity, no special entity.
+    //
+    // THE SHORTCUT THAT AVOIDS SPAWNING ANYTHING: when the orbit is anchored to a GRID, that
+    // grid is a real entity already sitting at the orbit centre — exactly where we want
+    // clutter. Tagging it is enough. That is why this is not the "decoy entity" build: it
+    // creates nothing, it adds one marker to something that already exists, and TryRemove
+    // puts it back. A camera watching a remote base makes that base's surroundings
+    // materialize, which is also the behaviour a player would expect.
+    //
+    // SEAT ESTABLISHED FIRST, as everything since the TryLoad freeze has been:
+    // DEntityContext.Set<T> compiles to Scene.GetDataPointer<T>(entity, flags) and a store —
+    // no Scene.FinishBefore, no ContinueOnDCS<SyncPoint>, so it plants nothing in the
+    // scheduler's dependency graph. It IS a structural change if the archetype lacks the
+    // component, which is why this runs ONCE per grid and checks Has<T> first rather than
+    // writing every tick.
+    //
+    // Off by default. It mutates a world entity, and that class of work has been expensive.
+    private static readonly HashSet<object> _taggedGrids = new();
+    private static bool _tagShapeLogged;
+
+    internal static void TagAnchorGridForEnvironment(object anchorEntity)
+    {
+        if (!FeedConfig.TagAnchorForClutter || anchorEntity == null) return;
+        if (_taggedGrids.Contains(anchorEntity)) return;
+        try
+        {
+            var tTag = Type.GetType(
+                "Keen.VRage.Core.Game.GameSystems.GamePruning.ClientTriggerTag, VRage.Core.Game");
+            var data = Prop(anchorEntity, "Data");     // DEntityContext
+            if (tTag == null || data == null)
+            {
+                if (!_tagShapeLogged)
+                {
+                    _tagShapeLogged = true;
+                    RttLog.Line($"CLUTTER TAG: shape missing (ClientTriggerTag={(tTag == null ? "NOT FOUND" : "ok")}, " +
+                                $"entity.Data={(data == null ? "NOT FOUND" : "ok")}) — clutter tagging inactive.");
+                }
+                _taggedGrids.Add(anchorEntity);
+                return;
+            }
+
+            var ctxType = data.GetType();
+            var has = ctxType.GetMethods(Any).FirstOrDefault(m => m.Name == "Has" && m.IsGenericMethodDefinition
+                                                              && m.GetParameters().Length == 0);
+            var set = ctxType.GetMethods(Any).FirstOrDefault(m => m.Name == "Set" && m.IsGenericMethodDefinition
+                                                              && m.GetParameters().Length == 1);
+            if (has == null || set == null)
+            {
+                if (!_tagShapeLogged)
+                {
+                    _tagShapeLogged = true;
+                    RttLog.Line("CLUTTER TAG: DEntityContext.Has<T>/Set<T> not found — clutter tagging inactive. " +
+                                "Members: " + string.Join(", ", ctxType.GetMethods(Any)
+                                    .Where(m => m.IsGenericMethodDefinition).Select(m => m.Name).Distinct()));
+                }
+                _taggedGrids.Add(anchorEntity);
+                return;
+            }
+
+            // Already tagged? Then the grid was born with it (a player-adjacent entity may
+            // well be) and there is nothing to do — importantly, nothing to UNDO either.
+            var already = (bool)has.MakeGenericMethod(tTag).Invoke(data, null);
+            _taggedGrids.Add(anchorEntity);
+            if (already)
+            {
+                RttLog.Line("CLUTTER TAG: the anchor grid ALREADY carries ClientTriggerTag, so the " +
+                            "environment trigger should already accept it. If clutter is still absent " +
+                            "around the camera, the tag is not the missing piece and the sector state " +
+                            "in the survey is the next thing to read.");
+                return;
+            }
+
+            set.MakeGenericMethod(tTag).Invoke(data, new[] { Activator.CreateInstance(tTag) });
+            RttLog.Line("CLUTTER TAG: added ClientTriggerTag to the anchor grid. The planet's sectored " +
+                        "trigger tests exactly this (MustHave ClientTriggerTag, MustNotHave " +
+                        "ProcedurallyGenerated/ManagedByWorldArea), so sectors should now materialize " +
+                        "around the grid — which is the orbit centre, i.e. where the camera is looking. " +
+                        "Watch the feed for trees and boulders; watch VRAM, because materialized sectors " +
+                        "are real entities and GPU batches.");
+        }
+        catch (Exception e)
+        {
+            _taggedGrids.Add(anchorEntity);          // never retry a throwing path every tick
+            RttLog.Error("clutter tag", e);
+        }
     }
 
     // PER-BODY CLIPMAP CAMERA — the terrain fix.
