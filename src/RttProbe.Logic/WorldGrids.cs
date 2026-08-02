@@ -1499,6 +1499,116 @@ internal static class WorldGrids
             if (rows.Count > 120) sb.AppendLine($"... {rows.Count - 120} more, farther out.");
             sb.AppendLine($"\n{n} component(s) in the update list, {unreadable} unreadable.");
 
+            // GRASS, PER LOD RING. Grass is not part of the flora octree at all: it hangs
+            // off individual clipmap cells (VoxelCell._grassEntity, attached when the cell
+            // has a grass material) and is drawn inside SceneDrawSystem.RenderGrass. So
+            // "no grass in the feed" has two very different causes and this separates them:
+            // cells near the camera WITH valid grass entities means the geometry exists and
+            // the gap is in generation/rendering; cells with none means the cells the
+            // override built never got grass attached.
+            sb.AppendLine("\n--- grass entities on clipmap cells nearest the feed camera ---");
+            try
+            {
+                var nearest = new List<(double D, double Size, object Rc)>();
+                foreach (var rc in list)
+                {
+                    try
+                    {
+                        var clip0 = Prop(rc, "Clipmap");
+                        var l2w0 = Prop(clip0, "LocalToWorld");
+                        if (Prop(l2w0, "Position") is not Vector3D p0) continue;
+                        double sx = 0, sy = 0, sz = 0;
+                        var sz0 = Prop(clip0, "Size");
+                        if (sz0 != null)
+                        {
+                            var ts = sz0.GetType();
+                            if (ts.GetField("X", Any)?.GetValue(sz0) is int ix) sx = ix;
+                            if (ts.GetField("Y", Any)?.GetValue(sz0) is int iy) sy = iy;
+                            if (ts.GetField("Z", Any)?.GetValue(sz0) is int iz) sz = iz;
+                        }
+                        var c0 = p0 + new Vector3D(sx * 0.5, sy * 0.5, sz * 0.5);
+                        nearest.Add(((c0 - feedPos).Length(), Math.Max(sx, Math.Max(sy, sz)), rc));
+                    }
+                    catch { }
+                }
+                nearest.Sort((a, b2) => a.D.CompareTo(b2.D));
+
+                // The nearest bodies are BOULDERS (the first sweep returned only LOD 2-5
+                // rings on 64-voxel rocks). Grass grows on the PLANET, so the biggest body
+                // in range is the one that answers the question — include it explicitly.
+                var sample = nearest.Take(2).ToList();
+                var planet = nearest.Where(x => x.Size > 10000).OrderBy(x => x.D).FirstOrDefault();
+                if (planet.Rc != null) sample.Add(planet);
+
+                // CHECK THE INSTRUMENT BEFORE BELIEVING THE NEGATIVE. "Zero grass entities"
+                // is only meaningful if this reader can see a grass entity when one exists,
+                // so the PLAYER'S nearest planet goes in as the control: the engine is
+                // certainly rendering grass around him if his world has any.
+                var playerPos0 = PlayerRenderCameraPosition();
+                if (playerPos0 != null)
+                {
+                    object bestRc = null; double bestD = double.MaxValue;
+                    foreach (var (_, size, rc) in nearest)
+                    {
+                        if (size <= 10000) continue;
+                        try
+                        {
+                            var l2w1 = Prop(Prop(rc, "Clipmap"), "LocalToWorld");
+                            if (Prop(l2w1, "Position") is not Vector3D p1) continue;
+                            var d1 = (p1 + new Vector3D(size * 0.5, size * 0.5, size * 0.5) - playerPos0.Value).Length();
+                            if (d1 < bestD) { bestD = d1; bestRc = rc; }
+                        }
+                        catch { }
+                    }
+                    if (bestRc != null && !sample.Any(s => ReferenceEquals(s.Rc, bestRc)))
+                        sample.Add((bestD, 999999, bestRc));    // marked as the player's planet below
+                }
+
+                foreach (var (d0, bodySize, rc) in sample)
+                {
+                    var clip = Prop(rc, "Clipmap");
+                    if (Prop(clip, "Rings") is not IEnumerable rings) { sb.AppendLine("    Rings unreadable"); continue; }
+                    sb.AppendLine(bodySize > 999998
+                        ? $"    CONTROL — the PLAYER'S nearest planet, {d0 / 1000.0:F1} km from him:"
+                        : $"    body at {d0 / 1000.0:F1} km from the feed camera " +
+                          $"(size {(bodySize >= 1000 ? $"{bodySize / 1000.0:F0}k" : bodySize.ToString("F0"))} voxels" +
+                          $"{(bodySize > 10000 ? " — THE PLANET" : "")}):");
+                    int lod = 0;
+                    foreach (var ring in rings)
+                    {
+                        int cells = 0, withGrass = 0;
+                        try
+                        {
+                            // SNAPSHOT, NEVER ENUMERATE LIVE. These dictionaries belong to
+                            // the render thread and are rebuilt as the clipmap streams. A
+                            // live foreach over them crashed a world load on 2026-08-02
+                            // (voxelBodySurvey was left = 1 in the config and edge-triggers
+                            // re-fire on a fresh boot — the same trap loadArea sprang on
+                            // 2026-08-01). Copying the values first bounds the exposure to
+                            // one array copy, and a torn copy just reports fewer cells.
+                            if (Prop(ring, "_cells") is IDictionary cellMap)
+                            {
+                                object[] vals;
+                                try { vals = new object[cellMap.Count]; cellMap.Values.CopyTo(vals, 0); }
+                                catch { lod++; continue; }
+                                foreach (var cell in vals)
+                                {
+                                    if (cell == null) continue;
+                                    cells++;
+                                    var ge = Prop(cell, "_grassEntity");
+                                    if (ge != null && Prop(ge, "IsValid") is bool ok && ok) withGrass++;
+                                }
+                            }
+                        }
+                        catch { }
+                        if (cells > 0)
+                            sb.AppendLine($"        LOD {lod}: {cells} cell(s), {withGrass} with a valid grass entity");
+                        lod++;
+                    }
+                }
+            }
+            catch (Exception e) { sb.AppendLine($"    grass sweep failed: {e.GetType().Name}: {e.Message}"); }
+
             var path = Path.Combine(RttLog.OutDir, "voxel-bodies.txt");
             File.WriteAllText(path, sb.ToString());
             RttLog.Line($"VOXEL BODY SURVEY written to {path} ({n} bodies).");
@@ -2508,6 +2618,29 @@ internal static class WorldGrids
     private static double _floraNearestSeen = double.MaxValue;
     private static string _floraLastReject = "(none)";
 
+    // DENSITY, MEASURED RATHER THAN ARGUED. The user reports tree density unchanged after
+    // the thrash fix, so the question is whether the feed's sectors CONTAIN fewer flora
+    // instances (a generation/materialization gap, server-side) or contain the same and
+    // render fewer (a LOD/culling gap, client-side). The octree knows: _numModelsInSector
+    // is the instance count it was built with. Sampling the nearest sector to each viewer
+    // answers it in one line — the same like-for-like discipline that reframed the
+    // "boulders" control on 2026-08-01.
+    private static FieldInfo _fNumModels;
+    private static double _dNearFeed = double.MaxValue, _dNearPlayer = double.MaxValue;
+    private static int _modelsNearFeed = -1, _modelsNearPlayer = -1;
+
+    private static void SampleDensity(object octree, double dFeed, double dPlayer)
+    {
+        try
+        {
+            _fNumModels ??= octree.GetType().GetField("_numModelsInSector", Any);
+            if (_fNumModels?.GetValue(octree) is not int n) return;
+            if (dFeed < _dNearFeed) { _dNearFeed = dFeed; _modelsNearFeed = n; }
+            if (dPlayer < _dNearPlayer) { _dNearPlayer = dPlayer; _modelsNearPlayer = n; }
+        }
+        catch { }
+    }
+
     // CACHED REFLECTION. This path runs a quarter of a million times a second (3.8M calls
     // in 15 s, measured); a GetField per call is not affordable. Every handle below is
     // resolved once and reused. All are stable for the process.
@@ -2578,11 +2711,15 @@ internal static class WorldGrids
         if (now0 - _floraLogTicks > 15000)
         {
             _floraLogTicks = now0;
-            RttLog.Line($"FLORA CAMERA: {_floraCalls} sector-update(s) seen, {_floraClaims} claimed. " +
-                        $"Nearest sector to the feed camera so far: " +
-                        $"{(_floraNearestSeen == double.MaxValue ? "none measured" : $"{_floraNearestSeen / 1000.0:F1} km")}. " +
-                        $"Last rejection: {_floraLastReject}. If updates are seen but none are near, the CLIENT " +
-                        "has no flora sector entities at the camera and the gap is upstream of rendering.");
+            RttLog.Line($"FLORA CAMERA: {_floraCalls} update(s) seen, {_floraClaims} claimed. " +
+                        $"DENSITY like-for-like — nearest sector to the FEED is {_dNearFeed:F0} m away with " +
+                        $"{_modelsNearFeed} model instance(s); nearest to the PLAYER is {_dNearPlayer:F0} m away " +
+                        $"with {_modelsNearPlayer}. Similar counts mean the data is there and the gap is LOD or " +
+                        "culling; a much lower feed count means the sectors themselves were generated thinner. " +
+                        $"Last rejection: {_floraLastReject}.");
+            // Re-arm so each window reports a fresh sample rather than a session minimum.
+            _dNearFeed = _dNearPlayer = double.MaxValue;
+            _modelsNearFeed = _modelsNearPlayer = -1;
         }
 
         try
@@ -2625,6 +2762,9 @@ internal static class WorldGrids
             var dPlayer = (playerPos.Value - sectorWorld).Length();
             var dFeed = (feedPos - sectorWorld).Length();
             if (dFeed < _floraNearestSeen) _floraNearestSeen = dFeed;
+            // BEFORE the rejections: player-near sectors are the control half of the
+            // like-for-like and they are exactly the ones the rules reject.
+            SampleDensity(octree, dFeed, dPlayer);
             if (dFeed * 2.0 >= dPlayer)
             { _floraLastReject = $"not 2x closer (feed {dFeed / 1000.0:F1} km, player {dPlayer / 1000.0:F1} km)"; return false; }
             if (dPlayer < FeedConfig.ClipmapMinPlayerDistance)

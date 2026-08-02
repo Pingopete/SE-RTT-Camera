@@ -1142,19 +1142,25 @@ internal static class FeedConfig
                         : ". The camera stops asking; anything already resident stays until the engine reclaims it."));
 
             var surveyWanted = Bool(kv, "worldGridSurvey", false);
-            if (surveyWanted && !_surveyArmedLast) WorldGridSurvey = true;
+            if (surveyWanted && !_surveyArmedLast && !_firstPoll) WorldGridSurvey = true;
             _surveyArmedLast = surveyWanted;
 
             var censusWanted = Bool(kv, "triggerCensus", false);
-            if (censusWanted && !_censusArmedLast) TriggerCensus = true;
+            if (censusWanted && !_censusArmedLast && !_firstPoll) TriggerCensus = true;
             _censusArmedLast = censusWanted;
 
+            // FIRST POLL ARMS NOTHING. An edge-triggered flag left = 1 in the file re-fires
+            // on a FRESH BOOT, because the "last" state starts false — that is how loadArea
+            // CTD'd a world load on 2026-08-01 and how voxelBodySurvey did it again on
+            // 2026-08-02, walking clipmap dictionaries while the clipmap was still building.
+            // Seeding every edge from the first poll makes a stale 1 inert until a human
+            // actually toggles it.
             var bodySurveyWanted = Bool(kv, "voxelBodySurvey", false);
-            if (bodySurveyWanted && !_bodySurveyArmedLast) VoxelBodySurvey = true;
+            if (bodySurveyWanted && !_bodySurveyArmedLast && !_firstPoll) VoxelBodySurvey = true;
             _bodySurveyArmedLast = bodySurveyWanted;
 
             var floraSurveyWanted = Bool(kv, "serverFloraSurvey", false);
-            if (floraSurveyWanted && !_floraSurveyArmedLast) ServerFloraSurvey = true;
+            if (floraSurveyWanted && !_floraSurveyArmedLast && !_firstPoll) ServerFloraSurvey = true;
             _floraSurveyArmedLast = floraSurveyWanted;
 
             // DURABLE consume for the area loader, not the in-memory edge the survey uses.
@@ -1342,6 +1348,12 @@ internal static class FeedConfig
                         $"rtFlags=[{string.Join(",", WholeSceneRtFlags)}]");
         }
         catch { /* keep the last good values */ }
+        finally
+        {
+            // AFTER the body, and in a finally so a throw mid-poll cannot leave the process
+            // permanently "first" and silently disable every one-shot for the session.
+            _firstPoll = false;
+        }
     }
 
     // Everything the second ScreenBuffers / DrawContexts build depends on.
