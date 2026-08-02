@@ -960,16 +960,21 @@ internal static class WorldGrids
                 if (containing != null)
                 {
                     var markerHandle = _marker == null ? null : Prop(_marker, "Entity")?.ToString();
-                    var occupied = 0; string markerLine = null;
+                    var serverHandle = _serverMarker == null ? null : Prop(_serverMarker, "Entity")?.ToString();
+                    var occupied = 0; string markerLine = null, serverLine = null;
                     foreach (DictionaryEntry de in containing)
                     {
                         occupied++;
                         Collect(de.Value, 0);      // harvest the trigger objects themselves
-                        if (markerHandle != null && de.Key?.ToString() == markerHandle)
-                            markerLine = $"OUR MARKER ({markerHandle}) IS INSIDE {(de.Value is IEnumerable l ? CountSafe(l) : 1)} trigger(s)";
+                        var k = de.Key?.ToString();
+                        if (markerHandle != null && k == markerHandle)
+                            markerLine = $"CLIENT MARKER ({markerHandle}) IS INSIDE {(de.Value is IEnumerable l ? CountSafe(l) : 1)} trigger(s)";
+                        if (serverHandle != null && k == serverHandle)
+                            serverLine = $"SERVER MARKER ({serverHandle}) IS INSIDE {(de.Value is IEnumerable l2 ? CountSafe(l2) : 1)} trigger(s)";
                     }
                     sb.AppendLine($"    _containingTriggers: {occupied} entit(ies) inside at least one trigger. " +
-                                  (markerLine ?? (markerHandle == null ? "(no marker alive)" : $"our marker ({markerHandle}) is inside NONE")));
+                                  (markerLine ?? (markerHandle == null ? "(no client marker)" : $"client marker ({markerHandle}) inside NONE")) + "; " +
+                                  (serverLine ?? (serverHandle == null ? "(no server marker)" : $"server marker ({serverHandle}) inside NONE")));
                 }
             }
             catch (Exception e) { sb.AppendLine($"    _containingTriggers unreadable: {e.GetType().Name}"); }
@@ -993,6 +998,10 @@ internal static class WorldGrids
                     // sector box 61 km from the camera by centre very much covers the camera.
                     var contains = centre.HasValue && half > 0 && dist <= half;
                     var inside = Prop(t, "Entities") is IEnumerable ents ? CountSafe(ents) : -1;
+                    // Sectored triggers track per-sector membership in a SEPARATE set;
+                    // an entity can be tracked without being in the flat Entities set.
+                    var tracked = Prop(t, "TrackedEntities") is IEnumerable trk ? CountSafe(trk) : -1;
+                    if (tracked > inside) inside = tracked;
 
                     // LAYOUT (read from TypeConstraintBuilder.AsSpan(out mustHaveCount), not
                     // guessed): each int[] is [count, ...count MustHave ids, ...MustNot ids].
@@ -1105,33 +1114,88 @@ internal static class WorldGrids
     private static bool _serverDisarmed;
     private static long _serverLogTicks;
 
-    internal static void OnSimPump(object triggerSystemComponent)
+    // THE STAGED BIRTH. Markers created with the final archetype never enter the trigger
+    // system's candidate index (proven twice: constraints satisfied, volumes COVERS-CAM,
+    // inside NONE — from the tick thread AND from the scene's own pump). The engine's own
+    // mid-session spawns are born STAGED — StagingTag + ConcurrentInit, the exact tags in
+    // every trigger's MustNot list — and de-staged once initialized; the archetype
+    // TRANSITION is what the index's signals key on, not existence. So each marker is born
+    // wearing StagingTag and has it removed one seat-tick later: the same edge the
+    // engine's entities present, produced with the engine's own component.
+    private static object _pendingDestage;        // marker ctx awaiting its de-stage edge
+    private static object _pendingDestageServer;
+
+    // MOTION IS PART OF THE ARCHETYPE, in practice if not in the constraint. Sector
+    // membership is evaluated on movement events (AttachedEntityTransformChanged) — every
+    // real DynamicTag entity moves, and a marker that holds perfectly still after birth
+    // presents no events for the sectored triggers to chew on. The census after the staged
+    // birth showed exactly that: tracked (12 -> 14) but never inside a sector. A slow 10 m
+    // drift circle keeps a steady trickle of genuine transform-change events flowing
+    // without meaningfully moving the presence.
+    private static Vector3D DriftAround(Vector3D centre)
     {
-        // Cheap early-outs first: this runs inside the engine's trigger processing.
-        if (_serverDisarmed || triggerSystemComponent == null) return;
+        var t = Environment.TickCount64 * 0.0002;        // one lap ~31 s
+        return centre + new Vector3D(Math.Sin(t) * 10.0, 0, Math.Cos(t) * 10.0);
+    }
+
+    private static void Destage(object markerCtx)
+    {
+        var tStaging = Type.GetType("Keen.VRage.DCS.CoreData.StagingTag, VRage.DCS");
+        if (tStaging == null || markerCtx == null) return;
+        var rm = markerCtx.GetType().GetMethods(Any).FirstOrDefault(
+            m => m.Name == "TryRemove" && m.IsGenericMethodDefinition && m.GetParameters().Length == 0);
+        var removed = rm == null ? (object)"no TryRemove" : rm.MakeGenericMethod(tStaging).Invoke(markerCtx, null);
+        RttLog.Line($"MARKER DE-STAGE: StagingTag removed -> {removed}. If the staged-birth theory is right, " +
+                    "THIS is the moment the trigger index first sees the marker.");
+    }
+
+    private static void Stage(object markerCtx)
+    {
+        var tStaging = Type.GetType("Keen.VRage.DCS.CoreData.StagingTag, VRage.DCS");
+        if (tStaging == null || markerCtx == null) return;
+        var set = markerCtx.GetType().GetMethods(Any).FirstOrDefault(
+            m => m.Name == "Set" && m.IsGenericMethodDefinition && m.GetParameters().Length == 1);
+        set?.MakeGenericMethod(tStaging).Invoke(markerCtx, new[] { Activator.CreateInstance(tStaging) });
+    }
+
+    internal static void OnSimPump(object sceneObj)
+    {
+        // Cheap early-outs first: this runs at the top of EVERY scene's Tick. The seat
+        // serves BOTH markers, so the gate is "any marker work at all" — the per-branch
+        // disarms are checked inside their branches. Since the third seat host, the
+        // bootstrap hands us the SCENE itself (Scene.Tick prefix): the trigger-system
+        // methods it patched first are all conditional jobs a quiet session never runs,
+        // and two boots produced a seat that provably never fired.
+        if (sceneObj == null) return;
         var want = FeedConfig.ServerPresenceEntity;
-        if (!want && _serverMarker == null) return;
+        if (!want && _serverMarker == null
+            && !FeedConfig.CameraTriggerEntity && _marker == null) return;
 
         try
         {
-            if (!_pumpSceneIsServer.TryGetValue(triggerSystemComponent, out var isServer))
+            if (!_pumpSceneIsServer.TryGetValue(sceneObj, out var isServer))
             {
-                var session = Prop(triggerSystemComponent, "Session");
-                var scene = Prop(Prop(session, "Entity"), "Scene");
                 var tSync = Type.GetType(
                     "Keen.VRage.Core.Game.GameSystems.ManagedWorldAreas.ManagedWorldArea+SpawnSyncPoint, VRage.Core.Game");
-                var sys = Prop(scene, "_jobSystemsIndex") as IDictionary;
-                var grp = Prop(scene, "_jobGroupToIndex") as IDictionary;
+                var sys = Prop(sceneObj, "_jobSystemsIndex") as IDictionary;
+                var grp = Prop(sceneObj, "_jobGroupToIndex") as IDictionary;
                 isServer = tSync != null && ((sys?.Contains(tSync) ?? false) || (grp?.Contains(tSync) ?? false));
-                _pumpSceneIsServer[triggerSystemComponent] = isServer;
-                if (isServer)
-                    RttLog.Line("SERVER PRESENCE: sim-pump seat identified the spawning scene's trigger system — " +
-                                "server-side world materialization is now drivable from here.");
+                _pumpSceneIsServer[sceneObj] = isServer;
+                RttLog.Line($"SIM PUMP SEAT: scene #{sceneObj.GetHashCode():x8} ticks through this seat — " +
+                            (isServer ? "the SPAWNING scene; server presence is drivable."
+                                      : "a client scene; the client marker is drivable."));
             }
-            if (!isServer) return;
+            var scene2 = sceneObj;
 
-            var scene2 = Prop(Prop(Prop(triggerSystemComponent, "Session"), "Entity"), "Scene");
-            if (scene2 == null) return;
+            // Pending de-stage edges fire FIRST, one tick after their marker's birth —
+            // this is the archetype transition the trigger index listens for.
+            if (!isServer && _pendingDestage != null) { var m = _pendingDestage; _pendingDestage = null; Destage(m); }
+            if (isServer && _pendingDestageServer != null) { var m = _pendingDestageServer; _pendingDestageServer = null; Destage(m); }
+
+            // The CLIENT scene's seat drives the client marker — the same "born on the
+            // pump" requirement the census exposed, applied to both scenes symmetrically.
+            if (!isServer) { DriveClientMarker(scene2); return; }
+            if (_serverDisarmed) return;
 
             if (!want)
             {
@@ -1151,6 +1215,7 @@ internal static class WorldGrids
 
             var pos = CameraFeed.SubjectCentreCache;
             if (pos.LengthSquared() <= 1.0) return;                 // no feed target yet
+            pos = DriftAround(pos);
 
             if (_serverMarker == null)
             {
@@ -1176,11 +1241,15 @@ internal static class WorldGrids
                     scene2, new[] { Activator.CreateInstance(tDyn), Activator.CreateInstance(_tWt, new object[] { pos }), bbd });
                 _serverMarkerPos = pos;
                 _serverMarkerMoves = 0;
+
+                // Born staged, de-staged next seat tick — the transition the index listens for.
+                Stage(_serverMarker);
+                _pendingDestageServer = _serverMarker;
+
                 RttLog.Line($"SERVER PRESENCE: created DynamicTag+WorldTransform+BoundingBoxData at " +
-                            $"{pos.X:F0},{pos.Y:F0},{pos.Z:F0} IN THE SERVER SCENE, from its own pump. This is " +
-                            "the archetype every censused trigger tests. Flora sectors, managed areas and voxel " +
-                            "sectors should now see a presence at the camera. Watch the census 'inside' column, " +
-                            "the feed, and VRAM.");
+                            $"{pos.X:F0},{pos.Y:F0},{pos.Z:F0} IN THE SERVER SCENE, from its own pump, born " +
+                            "STAGED (de-stage follows one tick later). This is the archetype every censused " +
+                            "trigger tests. Watch the census 'inside' column, the feed, and VRAM.");
                 return;
             }
 
@@ -1301,7 +1370,14 @@ internal static class WorldGrids
     private static Type _tTag, _tWt, _tBbd;
     private static MethodInfo _miAddEntity, _miSetWt, _miRemoveEntity;
 
-    internal static void UpdateCameraTriggerEntity(object anyEntityInScene, Vector3D cameraPos)
+    // SEAT-DRIVEN, since the census verdict. An entity created from the tick thread exists
+    // but never enters the trigger system's candidate index: the marker satisfied
+    // must:ClientTriggerTag+WorldTransform+BoundingBoxData exactly, the sector volumes
+    // demonstrably covered it (COVERS-CAM), and it sat inside ZERO triggers — while the
+    // engine's own observer, born inside OnAddedToScene ON THE PUMP, is tracked fine. So
+    // the client marker's lifecycle now runs in OnSimPump's client branch, same as the
+    // server marker runs in its server branch. Called ONLY from the seat.
+    private static void DriveClientMarker(object scene)
     {
         if (_markerDisarmed) return;
         if (!FeedConfig.CameraTriggerEntity)
@@ -1314,7 +1390,11 @@ internal static class WorldGrids
 
         try
         {
-            if (_marker == null) { CreateMarker(anyEntityInScene, cameraPos); return; }
+            var cameraPos = CameraFeed.SubjectCentreCache;
+            if (cameraPos.LengthSquared() <= 1.0) return;          // no feed target yet
+            cameraPos = DriftAround(cameraPos);
+
+            if (_marker == null) { CreateMarker(scene, cameraPos); return; }
 
             if ((cameraPos - _markerPos).LengthSquared() >= MarkerMoveEpsilon * MarkerMoveEpsilon)
                 MoveMarker(cameraPos);
@@ -1340,9 +1420,8 @@ internal static class WorldGrids
         }
     }
 
-    private static void CreateMarker(object anyEntityInScene, Vector3D pos)
+    private static void CreateMarker(object scene, Vector3D pos)
     {
-        var scene = SceneOf(anyEntityInScene);
         _tTag ??= Type.GetType("Keen.VRage.Core.Game.GameSystems.GamePruning.ClientTriggerTag, VRage.Core.Game");
         _tWt  ??= Type.GetType("Keen.VRage.Core.WorldTransform, VRage.Core");
         _tBbd ??= Type.GetType("Keen.VRage.Core.Game.Data.BoundingBoxData, VRage.Core.Game");
@@ -1404,10 +1483,15 @@ internal static class WorldGrids
             catch (Exception e) { RttLog.Error("marker DynamicTag", e); }
         }
 
+        // Born staged, de-staged next seat tick — the transition the index listens for.
+        Stage(_marker);
+        _pendingDestage = _marker;
+
         RttLog.Line($"CAMERA TRIGGER: created the marker entity at {pos.X:F0},{pos.Y:F0},{pos.Z:F0} — " +
-                    $"ClientTriggerTag{(dynAdded ? " + DynamicTag" : "")} + WorldTransform + a 2.75 m box. " +
-                    "Per the census: ClientTriggerTag satisfies the client flora-sector triggers, DynamicTag " +
-                    "the client voxel-sector triggers. Watch the census 'inside' column and VRAM.");
+                    $"ClientTriggerTag{(dynAdded ? " + DynamicTag" : "")} + WorldTransform + a 2.75 m box, " +
+                    "born STAGED (de-stage follows one tick later). Per the census: ClientTriggerTag " +
+                    "satisfies the client flora-sector triggers, DynamicTag the client voxel-sector " +
+                    "triggers. Watch the census 'inside' column and VRAM.");
     }
 
     private static void MoveMarker(Vector3D pos)
@@ -1575,6 +1659,44 @@ internal static class WorldGrids
     private static int _clipmapOverrides, _clipmapCalls;
     private static long _clipmapLogTicks;
     private static string _lastOverrideDesc = "";
+    private static readonly HashSet<string> _windowBodies = new();
+
+    // THE ARRIVAL BURST. The user's test was exact: a functioning system meshes in SECONDS,
+    // because that is what happens when the PLAYER arrives anywhere — via the sync-loader's
+    // loadingPhase=true sweep, not the steady-state path amortized to fractions of a
+    // millisecond per frame. UpdateClipmap's third argument IS that flag, and the bootstrap
+    // prefix can set it. For a bounded window after the feed camera jumps to a new site,
+    // overridden bodies run in loading phase — spawn-speed meshing — then drop back to
+    // steady state. Unbounded loading phase is deliberately not offered: it is the spawn
+    // path, and nothing about it is budgeted for running forever.
+    private static Vector3D _lastBurstOrigin;
+    private static long _burstUntilTicks;
+
+    // DISARMED 2026-08-02 00:28 AFTER A DEVICE-REMOVED CTD, one minute into its first live
+    // run. The flag is real and the effect was violent — which is the point: loadingPhase
+    // is the SPAWN path, sized for a loading screen with no live swapchain and no frame
+    // budget. Twenty seconds of it across every overridden body flooded the device with
+    // committed-texture creation (CreateCommittedTexture -> DXGI_ERROR_DEVICE_REMOVED in
+    // the worker pool) and killed the GPU device. The fast path exists; it has to be fed
+    // in sips — one body at a time, bounded far tighter, or through the sync-loader's own
+    // AsyncInitClipmaps task context. Gated OFF until that version exists; the knob is
+    // deliberately absent so it cannot be re-armed by config alone.
+    private const bool ArrivalBurstEnabled = false;
+
+    private static bool ArrivalBurst(Vector3D feedPos)
+    {
+        if (!ArrivalBurstEnabled) return false;
+        var now = Environment.TickCount64;
+        if ((feedPos - _lastBurstOrigin).LengthSquared() > 2000.0 * 2000.0)
+        {
+            _lastBurstOrigin = feedPos;
+            _burstUntilTicks = now + 20000;
+            RttLog.Line($"CLIPMAP ARRIVAL BURST: camera jumped to {feedPos.X:F0},{feedPos.Y:F0},{feedPos.Z:F0} — " +
+                        "overridden bodies run with loadingPhase=TRUE for 20 s (the sync-loader's spawn-speed " +
+                        "meshing path), then return to steady state.");
+        }
+        return now < _burstUntilTicks;
+    }
 
     internal static object ChooseClipmapCamera(object renderComponent, object boxedTransform)
     {
@@ -1612,13 +1734,34 @@ internal static class WorldGrids
             if (dFeed * 2.0 >= dPlayer) return null;
             if (dPlayer < FeedConfig.ClipmapMinPlayerDistance) return null;   // player too close to risk it
 
-            // AND the camera must actually be NEAR this body. "Closer than the player" is not
-            // enough on its own: with the player 3,900 km away, a rock 561 km from the camera
-            // still qualified, and the first armed run was re-centring the clipmaps of bodies
-            // NOBODY is looking at — 187,000 overrides across 25% of all body-updates, which
-            // is meshing work spent on nothing. A remote camera only needs detail on what is
-            // in front of it.
-            if (dFeed > FeedConfig.ClipmapMaxFeedDistance) return null;
+            // AND the camera must actually be NEAR this body — where "near" is measured in
+            // the body's OWN SCALE, not a fixed radius. The fixed 80 km cap admitted a
+            // 242-boulder field 25 km away (the debris of the virgin-site materialization
+            // test) and the frame budget split 242 ways starved the one body that mattered,
+            // the planet. A body qualifies when the camera stands within ~its own size:
+            // a planet (tens of km) qualifies from anywhere near it, a 64 m boulder only
+            // from a few hundred metres. The floor keeps nearby scatter meshing around the
+            // camera; the fixed cap survives as the outer sanity bound and the fallback
+            // when the clipmap does not expose a usable size.
+            // Size is a Vector3I of VOXEL counts (~1 m each): a planet reads ~10^5 per
+            // axis, a boulder ~10^2. The first attempt Convert.ToDouble'd the struct,
+            // threw, and silently fell back to the fixed cap — 242 boulders kept feeding.
+            double bodySize = 0;
+            try
+            {
+                var szObj = Prop(clip, "Size");
+                if (szObj != null)
+                {
+                    var t2 = szObj.GetType();
+                    foreach (var ax in new[] { "X", "Y", "Z" })
+                        if (t2.GetField(ax, Any)?.GetValue(szObj) is int v && v > bodySize) bodySize = v;
+                }
+            }
+            catch { }
+            var nearCap = bodySize > 1.0
+                ? Math.Min(Math.Max(bodySize * 1.2, 1500.0), FeedConfig.ClipmapMaxFeedDistance)
+                : FeedConfig.ClipmapMaxFeedDistance;
+            if (dFeed > nearCap) return null;
 
             // Replace ONLY the position, on a copy, so the transform's orientation and any
             // other field the engine set survive untouched.
@@ -1632,20 +1775,29 @@ internal static class WorldGrids
             // which with many bodies in range meant a line per body per frame — it hit 4,200
             // lines/sec and put 180 MB into rtt.log before the spike detector caught it. A
             // per-frame path may only ever log on a clock, never on "something differed".
+            //
+            // The window ACCUMULATES the distinct bodies overridden, because the single
+            // last-body line hid the question that mattered for five minutes tonight:
+            // is the PLANET among the overridden bodies, or only the small rocks?
+            _windowBodies.Add($"{bodyPos.X:F0},{bodyPos.Y:F0},{bodyPos.Z:F0}(d={dFeed / 1000.0:F1}km)");
             var now = Environment.TickCount64;
             if (now - _clipmapLogTicks > 15000)
             {
                 _clipmapLogTicks = now;
-                _lastOverrideDesc = $"body@{bodyPos.X:F0},{bodyPos.Y:F0},{bodyPos.Z:F0}";
-                RttLog.Line($"CLIPMAP CAMERA: {_lastOverrideDesc} is LODing around the FEED — player is " +
-                            $"{dPlayer / 1000.0:F0} km from it, the camera {dFeed / 1000.0:F0} km. Bodies the " +
-                            $"player is nearer to, or that the camera is not within " +
-                            $"{FeedConfig.ClipmapMaxFeedDistance / 1000.0:F0} km of, are untouched. " +
-                            $"({_clipmapOverrides} override(s) of {_clipmapCalls} body-updates; this line is " +
-                            "rate-limited to one per 15 s.)");
+                RttLog.Line($"CLIPMAP CAMERA: {_windowBodies.Count} distinct bod(ies) LODing around the FEED " +
+                            $"this window: {string.Join("  ", _windowBodies.Take(8))}" +
+                            $"{(_windowBodies.Count > 8 ? " …" : "")} " +
+                            $"({_clipmapOverrides} override(s) of {_clipmapCalls} body-updates; one line per 15 s.)");
+                _windowBodies.Clear();
             }
             ApplyClipmapBudget();
             ProbeLodDataSharing(renderComponent);
+
+            // Spawn-speed meshing for a bounded window after arrival. The pair return shape
+            // needs the matching bootstrap; an older one treats the array as no replacement
+            // at all, so the burst degrades to "override off" rather than half-applied —
+            // which is why the pair is returned ONLY while a burst is live.
+            if (ArrivalBurst(feedPos)) return new object[] { replacement, true };
             return replacement;
         }
         catch { return null; }

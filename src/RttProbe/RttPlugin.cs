@@ -290,42 +290,46 @@ public sealed class RttPlugin : IPlugin
         try
         {
             var replacement = hook(__args[0], __args[1]);
-            if (replacement != null) __args[1] = replacement;
+            if (replacement == null) return;
+            // Two return shapes, so an old logic DLL keeps working against this bootstrap:
+            //   boxed WorldTransform            -> replace the camera only
+            //   object[]{ transform, bool }     -> replace the camera AND the loadingPhase
+            //                                      flag (__args[2]) — the spawn-speed
+            //                                      meshing path the sync-loader uses.
+            if (replacement is object[] { Length: >= 2 } pair)
+            {
+                if (pair[0] != null) __args[1] = pair[0];
+                if (__args.Length >= 3 && pair[1] is bool loading) __args[2] = loading;
+            }
+            else __args[1] = replacement;
         }
         catch { }
     }
 
-    // The sim-pump seat — see RttBridge.SimPumpHook. Two candidate methods are patched
-    // with the same prefix because neither is individually guaranteed to run every frame:
-    // OnTriggerPending processes queued trigger work, UpdateStats maintains the counters.
-    // Either firing is a seat; both firing is two chances per frame, and the hook is
-    // idempotent on the logic side (it drains a queue).
+    // The sim-pump seat — see RttBridge.SimPumpHook.
+    //
+    // THIRD HOST, and the lesson is worth its line: the trigger system's methods
+    // (OnTriggerPending, OnUpdateAddedOrMovedTrigger, even UpdateStats) are all
+    // conditional — jobs that a quiet, unprofiled session never schedules — and two boots
+    // produced a hook that provably never fired. Scene.Tick is the pump's HEARTBEAT: the
+    // one method a live scene cannot avoid calling, once per frame, on its own thread.
+    // The prefix costs one volatile read when the hook is unset.
     private static void PatchSimPumpSeat(HarmonyLib.Harmony harmony)
     {
         try
         {
-            var t = Type.GetType(
-                "Keen.VRage.Core.Game.GameSystems.SpatialTrigger.SpatialTriggerSystemSessionComponent, VRage.Core.Game");
-            if (t == null) { Log("SpatialTriggerSystemSessionComponent not found — sim-pump seat inactive."); return; }
+            var t = Type.GetType("Keen.VRage.DCS.Scenes.Scene, VRage.DCS");
+            var mi = t?.GetMethod("Tick", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (mi == null) { Log("Scene.Tick not found — sim-pump seat inactive."); return; }
             var pre = typeof(RttPlugin).GetMethod(nameof(SimPumpPrefix), BindingFlags.Static | BindingFlags.NonPublic);
-            int patched = 0;
-            foreach (var name in new[] { "OnTriggerPending", "OnUpdateAddedOrMovedTrigger" })
-            {
-                var mi = t.GetMethod(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (mi == null) { Log($"SpatialTriggerSystemSessionComponent.{name} not found — skipped."); continue; }
-                harmony.Patch(mi, prefix: new HarmonyLib.HarmonyMethod(pre));
-                patched++;
-            }
-            Log(patched > 0
-                ? $"Sim-pump seat armed on {patched} SpatialTriggerSystem method(s)."
-                : "Sim-pump seat FAILED: no patchable method found.");
+            harmony.Patch(mi, prefix: new HarmonyLib.HarmonyMethod(pre));
+            Log("Sim-pump seat armed on Scene.Tick — fires every frame for every scene, on that scene's own thread.");
         }
         catch (Exception e) { Log("Patching sim-pump seat FAILED: " + e.Message); }
     }
 
-    // Runs on the owning scene's pump thread, potentially every frame, for BOTH scenes'
-    // trigger systems. Must be cheap and must never throw — it sits inside the engine's
-    // trigger processing.
+    // Runs at the top of EVERY scene's frame tick, on that scene's pump thread. Must be
+    // near-free and must never throw — this is the hottest seat in the engine.
     private static void SimPumpPrefix(object __instance)
     {
         var hook = RttBridge.SimPumpHook;

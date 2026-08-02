@@ -526,13 +526,13 @@ internal static class CameraFeed
             if (FeedConfig.PreloadAroundCamera)
                 WorldGrids.PreloadAroundCamera(entity, centre, FeedConfig.PreloadRadius);
 
-            // The marker entity that makes the world materialize around the camera. Called
-            // unconditionally rather than behind the knob, because the OFF path is what
-            // deletes a marker that is already out there — gating the call would leave an
-            // orphan riding a camera nothing is steering. This project's house bug is state
-            // that can only change while the thing it controls is already running, and a
-            // teardown reachable only when the feature is enabled is exactly that shape.
-            WorldGrids.UpdateCameraTriggerEntity(entity, centre);
+            // The camera trigger marker is NOT driven from here any more. The census proved
+            // an entity created on this thread never enters the trigger system's candidate
+            // index — the marker satisfied every constraint on paper and sat inside ZERO
+            // triggers while the volumes demonstrably covered it. Lifecycle now lives in
+            // WorldGrids.OnSimPump, on each scene's own pump via the bootstrap seat, which
+            // is where the engine births its own observer. This tick only publishes
+            // SubjectCentreCache (above), which the seat reads.
 
             if (FeedConfig.TakeWorldGridSurveyRequest()) WorldGrids.DumpGrids(entity);
             if (FeedConfig.TakeTriggerCensusRequest()) WorldGrids.DumpTriggerCensus(entity, centre);
