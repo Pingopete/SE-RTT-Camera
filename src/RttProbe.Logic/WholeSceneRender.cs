@@ -4034,9 +4034,34 @@ internal static class WholeSceneRender
                     }
                     catch { }
 
-                    RttLog.Line("Own eye adaptation: InitializeAsync FAULTED — disarmed, fixed stop retained. " +
-                                "The job stays parked so a reload does not build a second one beside it. " +
-                                "REASON: " + why);
+                    // CANCELLED, NOT FAULTED — and the distinction is the whole diagnosis.
+                    //
+                    // MEASURED 2026-08-02: IsCompleted true, IsCompletedSuccessfully false,
+                    // Exception NULL. For a Task that combination means exactly one thing: it
+                    // was CANCELLED. The engine's InitializeAsync is tied to a cancellation
+                    // token belonging to the render-init phase, which is long finished by the
+                    // time we construct a job mid-session — so CONSTRUCTING OUR OWN
+                    // EyeAdaptationJob AFTER STARTUP CANNOT WORK through this path, no matter
+                    // how the park or the install is arranged.
+                    //
+                    // It also resolves the tension that looked like a contradiction earlier:
+                    // a job reporting _areAutoExposuresInitialized = true after its init had
+                    // "faulted". It had not faulted; it had never initialised at all.
+                    //
+                    // The alternative that avoids this entirely is to STOP CONSTRUCTING A JOB:
+                    // keep the ENGINE's fully-initialised _eyeAdaptationJob and swap only its
+                    // ADAPTATION STATE (_autoExposures and _histogram) around our render. That
+                    // needs us to own those textures rather than a whole job, and it never
+                    // touches InitializeAsync. See task #36.
+                    bool canceled = why == "no exception on the task";
+                    RttLog.Line((canceled
+                                    ? "Own eye adaptation: InitializeAsync was CANCELLED (completed, not successful, " +
+                                      "no exception) — the engine's init-phase cancellation token is already " +
+                                      "signalled, so a job constructed mid-session can never initialise. This " +
+                                      "approach is a dead end; swap the ENGINE job's state instead. "
+                                    : "Own eye adaptation: InitializeAsync FAULTED. REASON: " + why + " ") +
+                                "Disarmed, fixed stop retained. The job stays parked so a reload does not build " +
+                                "a second one beside it.");
                     return null;
                 }
                 _eyeReady = true;
