@@ -941,6 +941,10 @@ internal static class FeedConfig
     public static bool ClipmapArrivalBurst { get; private set; }
 
     public static bool PreloadAroundCamera { get; private set; }
+
+    // Preload through the SERVER session's space probe — the side that generates flora
+    // sectors. Shares preloadRadius/IntervalMs/Precision with the client knob.
+    public static bool ServerPreload { get; private set; }
     public static double PreloadRadius { get; private set; } = 500.0;
     public static int PreloadIntervalMs { get; private set; } = 5000;
     public static string PreloadPrecision { get; private set; } = "Medium";   // Low | Medium | High
@@ -1101,6 +1105,14 @@ internal static class FeedConfig
 
             var preloadWas = PreloadAroundCamera;
             PreloadAroundCamera = Bool(kv, "preloadAroundCamera", PreloadAroundCamera);
+            var srvPreloadWas = ServerPreload;
+            ServerPreload = Bool(kv, "serverPreload", ServerPreload);
+            if (srvPreloadWas != ServerPreload)
+                RttLog.Global($"Config: serverPreload {srvPreloadWas} -> {ServerPreload}" +
+                    (ServerPreload
+                        ? ". Preload requests now ALSO go through the SPAWNING session's space probe — " +
+                          "the data the flora pipeline's tasks await. Watch \"SERVER PRELOAD\" and VRAM."
+                        : ". Server-side requests stop; pinned data stays until the engine reclaims it."));
             PreloadRadius       = Dbl(kv, "preloadRadius", PreloadRadius);
             PreloadIntervalMs   = Int(kv, "preloadIntervalMs", PreloadIntervalMs);
             PreloadPrecision    = Str(kv, "preloadPrecision", PreloadPrecision);

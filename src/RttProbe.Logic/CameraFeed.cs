@@ -525,6 +525,8 @@ internal static class CameraFeed
             // inside PreloadAroundCamera rather than here.
             if (FeedConfig.PreloadAroundCamera)
                 WorldGrids.PreloadAroundCamera(entity, centre, FeedConfig.PreloadRadius);
+            if (FeedConfig.ServerPreload)
+                WorldGrids.ServerPreloadAroundCamera(centre, FeedConfig.PreloadRadius);
 
             // The camera trigger marker is NOT driven from here any more. The census proved
             // an entity created on this thread never enters the trigger system's candidate

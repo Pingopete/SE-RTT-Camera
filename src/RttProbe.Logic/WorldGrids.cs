@@ -2447,6 +2447,104 @@ internal static class WorldGrids
         }
     }
 
+    // SERVER-SIDE PRELOAD — the flora pipeline's suspected missing feedstock.
+    //
+    // The flora chain walked 2026-08-02 morning: marker tracked, sector entries firing,
+    // TriggerLayer counters moving, DebugEnableUpdates true — and zero flora entities in
+    // the server scene. PlanetEnvironmentServerComponent's pipeline is task-shaped
+    // (GetSectorData: Task, WaitForSector, GetDependencyDataForModule): it AWAITS sector
+    // data, and nothing streams that data server-side at a site no player occupies. Every
+    // preload so far went through the CLIENT session's space probe; this one goes through
+    // the SERVER session's — same PreloadAsync (already IL-cleared as scheduler-free:
+    // ContinueDirectly, no FinishBefore), same fire-and-forget hint semantics, different
+    // session's providers.
+    //
+    // The server session comes from the bridge's managed-area capture, resolved exactly the
+    // way the census resolves it (the stashed object is the session COMPONENT; one Prop hop
+    // reaches the Session, and the SpawnSyncPoint probe picks the server one).
+    private static object _serverProbe;
+    private static long _lastServerPreloadTicks;
+    private static int _serverPreloadCount;
+    private static bool _serverPreloadLogged;
+
+    internal static void ServerPreloadAroundCamera(Vector3D centre, double radius)
+    {
+        try
+        {
+            var now = Environment.TickCount64;
+            if (now - _lastServerPreloadTicks < Math.Max(1000, FeedConfig.PreloadIntervalMs)) return;
+            _lastServerPreloadTicks = now;
+
+            if (_serverProbe == null)
+            {
+                var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
+                var regs = bridge?.GetField("ManagedAreaRegistrations")?.GetValue(null) as IEnumerable;
+                var regsLock = bridge?.GetField("ManagedAreaLock")?.GetValue(null);
+                var tSync = Type.GetType(
+                    "Keen.VRage.Core.Game.GameSystems.ManagedWorldAreas.ManagedWorldArea+SpawnSyncPoint, VRage.Core.Game");
+                if (regs == null || regsLock == null || tSync == null) return;
+                var sessions = new List<object>();
+                lock (regsLock)
+                {
+                    foreach (var pair in regs)
+                        if (pair is object[] { Length: >= 2 } p && p[1] != null)
+                        {
+                            var cand = p[1];
+                            var real = Prop(cand, "SessionComponents") != null ? cand : Prop(cand, "Session");
+                            if (real != null) sessions.Add(real);
+                        }
+                }
+                foreach (var s in sessions)
+                {
+                    var scene = Prop(Prop(s, "Entity"), "Scene") ?? Prop(s, "Scene");
+                    var sys = Prop(scene, "_jobSystemsIndex") as IDictionary;
+                    var grp = Prop(scene, "_jobGroupToIndex") as IDictionary;
+                    if (!((sys?.Contains(tSync) ?? false) || (grp?.Contains(tSync) ?? false))) continue;
+                    var scEntity = Prop(s, "SessionComponents");
+                    if (scEntity != null && _fComponents?.GetValue(scEntity) is IEnumerable comps)
+                        foreach (var c in comps)
+                            if (c != null && c.GetType().Name == "SpaceProbeSessionComponent") { _serverProbe = c; break; }
+                    if (_serverProbe != null) break;
+                }
+                if (_serverProbe == null)
+                {
+                    if (!_serverPreloadLogged)
+                    { _serverPreloadLogged = true; RttLog.Line("SERVER PRELOAD: no SpaceProbeSessionComponent on the spawning session — disabled."); }
+                    _lastServerPreloadTicks = long.MaxValue / 2;
+                    return;
+                }
+                RttLog.Line("SERVER PRELOAD: found the SPAWNING session's space probe — flora/terrain data " +
+                            "requests now go to the side that actually generates sectors.");
+            }
+
+            var tPrec = Type.GetType("Keen.VRage.Core.Game.GameSystems.SpaceProbe.Precision, VRage.Core.Game");
+            var mi = _serverProbe.GetType().GetMethods(Any).FirstOrDefault(m =>
+                m.Name == "PreloadAsync" && m.GetParameters().Length == 2 &&
+                m.GetParameters()[0].ParameterType.Name == "BoundingBoxD");
+            if (tPrec == null || mi == null) { _lastServerPreloadTicks = long.MaxValue / 2; return; }
+
+            var tBox = mi.GetParameters()[0].ParameterType;
+            var half = new Vector3D(radius, radius, radius);
+            var box = Activator.CreateInstance(tBox, centre - half, centre + half);
+            object prec;
+            try { prec = Enum.Parse(tPrec, FeedConfig.PreloadPrecision, true); }
+            catch { prec = Enum.Parse(tPrec, "Medium", true); }
+
+            mi.Invoke(_serverProbe, new[] { box, prec });
+            _serverPreloadCount++;
+            if (_serverPreloadCount == 1 || _serverPreloadCount % 20 == 0)
+                RttLog.Line($"SERVER PRELOAD #{_serverPreloadCount}: {radius * 2:F0} m cube at " +
+                            $"{centre.X:F0},{centre.Y:F0},{centre.Z:F0}, {prec} precision, via the spawning " +
+                            "session's probe. If flora was starving on sector data, watch the patrol ring.");
+        }
+        catch (Exception e)
+        {
+            if (!_serverPreloadLogged)
+            { _serverPreloadLogged = true; RttLog.Error("server preload (disarmed for this session)", e); }
+            _lastServerPreloadTicks = long.MaxValue / 2;
+        }
+    }
+
     // THE OBSERVER REGISTRY — read-only recon for the camera-as-observer route.
     //
     // IObservers is the engine's own MULTI-viewer abstraction and the most promising route
