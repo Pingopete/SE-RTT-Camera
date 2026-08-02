@@ -578,6 +578,41 @@ internal static class FeedConfig
     // warning at the apply site is the whole safety mechanism; there is no cap.
     public static double WorldFloraRadiusMult { get; private set; } = -1;
 
+    // ---- THE RESIDENCY CONE (2026-08-02) ----------------------------------------------
+    //
+    // Stop making world resident BEHIND the camera. Every other residency mechanism here is
+    // omnidirectional — the flora claim and clipmap override are distance tests, preload is a
+    // cube — while the camera sees roughly a 70 degree frustum, about 11% of a sphere.
+    //
+    // MEASURED FIRST, by a counting-only study that culled nothing (commit c54d9bd), so the
+    // decision rests on numbers rather than on the argument above being persuasive:
+    //
+    //     outside a  70 deg cone   98.8%   <- the frustum itself; no margin, unusable
+    //     outside a 140 deg cone   77.4%   <- the candidate: a 4.4x reduction
+    //     outside a 200 deg cone    8.6%   <- the prize collapses past ~150
+    //
+    // That collapse between 140 and 200 is the important shape: the sectors sit in a BAND
+    // just outside the frustum (a 45 degree downward look wraps the surface around the
+    // camera), so this is a sharp knob. 140-150 is the sweet spot; 180+ buys nothing.
+    //
+    // TOTAL cone angle in degrees, not the half-angle. 0 or >=360 = off, the pre-cone
+    // behaviour. Default OFF: this changes what the world loads, and it earns its way in on
+    // measurement like everything else here.
+    public static double ResidencyConeDegrees { get; private set; }
+
+    // THE NEAR SHELL, exempt from the cone at any angle. Two things need world that the view
+    // direction does not cover, and both are visible immediately if this is too small:
+    //
+    //   SHADOW CASTERS. The sun cascade pass samples geometry outside the view frustum; a
+    //   tree behind the camera can legitimately cast into frame.
+    //   ORBIT MOTION. A turning camera sweeps into space that was outside the cone a moment
+    //   ago. The 140 degree width already leaves a frustum of margin, and this covers the
+    //   rest at close range where pop-in is most obvious.
+    //
+    // 300 m by default, comfortably outside the 200 m RootStreamingDistance the engine uses
+    // for the player's own bubble.
+    public static double ResidencyConeNearMetres { get; private set; } = 300;
+
     // THE STATS PANEL (goal 9 / plan phase A1). Tag a panel [RTS] to get perf numbers on
     // it in world. Draws into the panel's OWN batch — no target, no binding, no handover —
     // so it is independent of the feed and cannot interfere with it.
@@ -1450,6 +1485,20 @@ internal static class FeedConfig
             // they are pure ScopeSetValues calls read fresh on every render, so a sweep is
             // live rather than a series of gate cycles.
             WholeSceneFloraLodMult      = Dbl(kv, "wholeSceneFloraLodMult", WholeSceneFloraLodMult);
+
+            var coneWas = ResidencyConeDegrees;
+            ResidencyConeDegrees    = Dbl(kv, "residencyConeDegrees", ResidencyConeDegrees);
+            ResidencyConeNearMetres = Dbl(kv, "residencyConeNearMetres", ResidencyConeNearMetres);
+            if (Math.Abs(coneWas - ResidencyConeDegrees) > 1e-9)
+                RttLog.Global($"Config: residencyConeDegrees {coneWas:F0} -> {ResidencyConeDegrees:F0}. " +
+                    (ResidencyConeDegrees > 0 && ResidencyConeDegrees < 360
+                        ? $"Flora sectors and voxel bodies more than {ResidencyConeDegrees / 2:F0} degrees off the " +
+                          $"camera's view axis are no longer claimed for the feed, except within " +
+                          $"{ResidencyConeNearMetres:F0} m. The study measured 77.4% of sector updates outside 140 " +
+                          "degrees. WATCH FOR: shadows disappearing from objects that should cast into frame, and " +
+                          "pop-in as the orbit turns — those are the two failure modes, and both are visible in the " +
+                          "feed rather than only in a counter."
+                        : "OFF — residency is omnidirectional again, as it was before the cone."));
             WholeSceneLodShift          = Int(kv, "wholeSceneLodShift", WholeSceneLodShift);
             WholeSceneFloraMinLod       = Int(kv, "wholeSceneFloraMinLod", WholeSceneFloraMinLod);
             WholeSceneObjectDistanceMult= Dbl(kv, "wholeSceneObjectDistanceMult", WholeSceneObjectDistanceMult);

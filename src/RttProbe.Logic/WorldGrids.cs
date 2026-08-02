@@ -2537,6 +2537,25 @@ internal static class WorldGrids
             if (dFeed * 2.0 >= dPlayer) return null;
             if (dPlayer < FeedConfig.ClipmapMinPlayerDistance) return null;   // player too close to risk it
 
+            // THE RESIDENCY CONE IS DELIBERATELY *NOT* APPLIED HERE. Two reasons, and the
+            // first is a bug I nearly shipped.
+            //
+            // A body's cone position has to be tested against its centre, and a planet's
+            // centre is its CORE — Verdure's is ~131 km from a camera standing on its surface,
+            // so the 300 m near-shell exemption does not protect it at all. The angle from the
+            // view axis to the core is fine for a downward look (~45 deg) but exceeds 70 deg
+            // the moment the camera looks up, at which point the cone would reject THE PLANET
+            // and the feed would lose its terrain. The near-shell reasoning that makes this
+            // safe for flora sectors (metres across, hundreds of metres away) does not
+            // transfer to bodies that are tens of kilometres across.
+            //
+            // Second, and sufficient on its own: the 77.4% prize was measured on FLORA SECTOR
+            // updates. Extending the cone to voxel bodies extrapolates past the evidence, and
+            // this path is ~880 calls/sec against flora's ~19,000 — the prize is not here.
+            //
+            // A body-aware version (test the nearest point on the bounding sphere, not the
+            // centre) is a real option later, but it needs its own measurement first.
+
             // AND the camera must actually be NEAR this body — where "near" is measured in
             // the body's OWN SCALE, not a fixed radius. The fixed 80 km cap admitted a
             // 242-boulder field 25 km away (the debris of the virgin-site materialization
@@ -2893,6 +2912,7 @@ internal static class WorldGrids
     {
         1 => $"not 2x closer (feed {_floraRejectFeed / 1000.0:F1} km, player {_floraRejectPlayer / 1000.0:F1} km)",
         2 => $"player too close ({_floraRejectPlayer / 1000.0:F1} km)",
+        3 => $"outside the {FeedConfig.ResidencyConeDegrees:F0}deg residency cone",
         _ => "(none)",
     };
 
@@ -2959,6 +2979,45 @@ internal static class WorldGrids
         if (c < -0.17365) _cone200++;                // cos 100
     }
 
+    // THE CONE TEST ITSELF — the same arithmetic ConeStudy measures with, now deciding.
+    //
+    // Returns true when a world position should still be made resident for the feed. Every
+    // uncertain case returns TRUE: no cone configured, no camera direction published yet, or
+    // a position on top of the camera. A residency filter that fails CLOSED would strip the
+    // world on a first frame or a dormant feed, and "the feature is off" must never look like
+    // "the world is gone".
+    //
+    // Costs one subtract, one dot and one square root, against a claim path that already does
+    // two Length() calls. It is not on the critical path for anything it does not reject.
+    private static double _coneCos = 2.0;      // 2 = impossible to satisfy => recomputed on first use
+    private static double _coneCosFor = double.NaN;
+
+    internal static bool InFeedCone(Vector3D worldPos)
+    {
+        var deg = FeedConfig.ResidencyConeDegrees;
+        if (deg <= 0.0 || deg >= 360.0) return true;
+
+        // Recompute the cosine only when the knob moves — this runs ~19,000 times a second.
+        if (_coneCosFor != deg)
+        {
+            _coneCosFor = deg;
+            _coneCos = Math.Cos(deg * 0.5 * Math.PI / 180.0);
+        }
+
+        var look = CameraFeed.LookDirCache;
+        if (look.LengthSquared() < 0.5) return true;          // no direction yet: keep everything
+
+        var to = worldPos - CameraFeed.EyeCache;
+        var len = to.Length();
+        if (len <= FeedConfig.ResidencyConeNearMetres) return true;   // the near shell, exempt
+
+        return (to.X * look.X + to.Y * look.Y + to.Z * look.Z) / len >= _coneCos;
+    }
+
+    // How many claims the cone actually rejected, so the live effect is visible next to the
+    // study that predicted it. Predicted and actual disagreeing is the interesting case.
+    private static long _coneRejected;
+
     internal static string ConeStudyText()
     {
         var t = _coneTotal;
@@ -2966,8 +3025,15 @@ internal static class WorldGrids
         string Pct(long n) => $"{100.0 * n / t:F1}%";
         var s = $"of {t} sector update(s): outside a 70deg cone {Pct(_cone70)}, " +
                 $"140deg {Pct(_cone140)}, 200deg {Pct(_cone200)}" +
-                (_coneNoDir > 0 ? $" [{Pct(_coneNoDir)} had no camera direction and are excluded from the case]" : "");
-        _coneTotal = _cone70 = _cone140 = _cone200 = _coneNoDir = 0;   // per-window, like the rest of this line
+                (_coneNoDir > 0 ? $" [{Pct(_coneNoDir)} had no camera direction and are excluded from the case]" : "") +
+                (FeedConfig.ResidencyConeDegrees > 0 && FeedConfig.ResidencyConeDegrees < 360
+                    ? $" | LIVE at {FeedConfig.ResidencyConeDegrees:F0}deg: actually rejected {Pct(_coneRejected)} " +
+                      $"(near shell {FeedConfig.ResidencyConeNearMetres:F0} m exempt). MEASURED 2026-08-02: live " +
+                      "matches the study column for the same angle EXACTLY, so the near shell is currently exempting " +
+                      "nothing — sectors are ~800 m apart, so almost none sit within 300 m of the eye AND outside " +
+                      "the cone. If these two ever diverge, the shell has started doing work and is worth tuning"
+                    : " | cone OFF, so nothing was rejected");
+        _coneTotal = _cone70 = _cone140 = _cone200 = _coneNoDir = _coneRejected = 0;   // per-window
         return s;
     }
 
@@ -3116,6 +3182,12 @@ internal static class WorldGrids
             // per 15 s. That is ~11,300 throwaway strings a second, each with two double
             // formats, to produce four printed words. Store the raw numbers and format them
             // at the point they are actually read — see FloraRejectText().
+            // THE CONE, after the study has counted this sample so the study keeps measuring
+            // the FULL population rather than only what survives the cone — otherwise turning
+            // the cone on would make its own prediction look like zero.
+            if (!InFeedCone(sectorWorld))
+            { _coneRejected++; _floraRejectCode = 3; return false; }
+
             if (dFeed * 2.0 >= dPlayer)
             { _floraRejectCode = 1; _floraRejectFeed = dFeed; _floraRejectPlayer = dPlayer; return false; }
             if (dPlayer < FeedConfig.ClipmapMinPlayerDistance)
