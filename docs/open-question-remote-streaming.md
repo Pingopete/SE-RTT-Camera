@@ -353,3 +353,91 @@ signature knob is what removed the device at 15:08 today.
 structural claim above came from it rather than from guessing at symbol names — which is
 the direct answer to the two greps earlier today that reported "no sun symbols" when what
 was missing was the `strings` command.
+
+---
+
+## 2026-08-01 (evening): THE TERRAIN GAP IS THE CLIPMAP, PROVEN BY POSITIVE CONTROL
+
+Three measurements, run with the player standing on KEMIK while the feed camera looked
+at Verdure 4,000 km away — the first time this project has had the player and the camera
+on different planets, which is what made the controls clean.
+
+### 1. Data residency: PreloadAsync WORKS, and our camera can drive it
+
+`SpaceProbeSessionComponent.PreloadAsync(BoundingBoxD, Precision)` is wired to the feed
+camera (`preloadAroundCamera` / `preloadRadius` / `preloadIntervalMs` / `preloadPrecision`,
+all outside the rebuild signature). Attribution was measured, not assumed:
+
+| state | VRAM |
+|---|---|
+| preload OFF at the Verdure base, 90 s | 13.49 GB -> 13.49 GB (flat) |
+| anchor moved to the antipode (never visited), still OFF | 13.49 GB |
+| **preload ON**, High precision, 2 km cube, 90 s | **13.76 GB (+270 MB)** |
+
+Flat for 90 s and across the anchor move, then +270 MB within 90 s of enabling it at a
+site no player has ever been. **A remote camera can pull world data into residency
+anywhere in the solar system, on demand.** That capability is real and banked.
+
+### 2. It produces NO visible change, and the IL says why
+
+40 preload calls at High/1000 m over the Verdure base changed nothing in the feed: same
+smooth mottled surface, zero discrete relief. The voxel provider's `PreloadAreaAsync` body
+is box maths plus `PerformPinRequest` on streamable voxel RESOURCES — it pins **data**.
+Nothing in it generates geometry. Residency and meshing are different systems, and only
+the first one is ours to drive.
+
+### 3. THE POSITIVE CONTROL — the same renderer, both ways
+
+Clearing `orbitAnchor` puts the camera back on the panel's own grid, i.e. exactly where the
+player is standing. Same feed, same 1024x1024 target, same settings, same everything —
+only proximity to the player differs:
+
+| camera AT the player | camera REMOTE |
+|---|---|
+| individual boulders, crevices, sharp ridgelines | smooth mottled gradient |
+| shadowed surface relief, readable rock texture | zero discrete features |
+| layered mountains receding into haze | featureless horizon band |
+
+**So the render path is not the limitation.** Culling, contexts, shadows, atmosphere and
+delivery all display fully detailed terrain the moment the terrain EXISTS. Remote views are
+coarse for exactly one reason: `VoxelRenderUpdateSessionComponent.UpdateClipmaps()` reads
+`RenderContracts.GetSettings().CameraTransform` ONCE per frame and drives EVERY voxel
+body's clipmap from that single transform. Meshes are built around the player and nowhere
+else.
+
+### The build that follows, and it is fully scoped
+
+`VoxelRenderComponent.InstantiateLowResClipmap` is the engine's own precedent for a second
+clipmap on a body, and every constructor argument is reachable from the existing clipmap
+and component:
+
+```
+new VoxelClipmap(Session, Clipmap.Size, Clipmap.LocalToWorld,
+                 renderComponent,                    // the mesher
+                 CreateRenderDataBuilder(target),    // component method
+                 CreateVoxelRenderSetup(),           // component method
+                 Clipmap.SettingsDefinition, quality)
+```
+
+Nothing unreachable. Two things to settle before writing it:
+
+- **Overlap.** `VoxelRenderTarget` is `Model | GI | Shadow | GBuffer | None` — it selects the
+  rendering PURPOSE, not the viewer. A second clipmap's cells land in the shared geometry
+  data and frustum culling decides who sees them, so two clipmaps covering the same ground
+  at different LODs is a double-geometry risk. The engine's own low-res clipmap sets
+  `FreezeClipmap`, which is probably how it avoids exactly this.
+- **Budget.** Clipmaps allocate GPU resources, and the feed VRAM cap is already the binding
+  constraint (13.7 of 14.2 GB with one feed). Per-feed clipmaps add a term to E1's
+  arithmetic, and the cap gets more load-bearing, not less.
+
+### What is ruled OUT, so nobody re-treads it
+
+- **Observers.** `IObservers` is a genuine multi-viewer registry (5 slots, 14 tags, three
+  observers coexisting on `Planet` right now) and registration via `ObserverComponent` is
+  thread-safe by construction. But terrain's tag `VoxelObserver` is consumed by
+  `TryGetFirstTransform` into ONE `_observerEntity` — registering a second one races the
+  player for his terrain rather than earning our own. Right mechanism, wrong consumer.
+- **Swapping the global `CameraTransform`.** The single-slot tug-of-war the recon predicted,
+  and the same class as the LOD popping bug. Deliberately not attempted.
+- **`ManagedWorldArea.TryLoad` off-thread.** Three CTDs and a sim freeze. `FinishBefore
+  <SpawnSyncPoint>` plants a scheduler dependency only the sim pump can clear.
