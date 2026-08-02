@@ -1651,17 +1651,51 @@ internal static class WholeSceneRender
     // disturb the restore order of one added earlier.
     private static readonly List<(FieldInfo Field, object Saved)> _scoped = new();
 
+    // THE SETTINGS-GROUP LOOKUP, resolved once per group name instead of once per scope per
+    // render.
+    //
+    // ScopeOff and ScopeSetValues are called about TEN TIMES PER RENDER, at ~40 renders a
+    // second, and each call used to do: an assembly-qualified Type.GetType, a GetField for
+    // "Settings", then settings.GetType().GetFields(Any) — which ALLOCATES an array of every
+    // field on SettingsManager — and a LINQ FirstOrDefault over it with a capturing closure.
+    // That is roughly 400 throwaway arrays and 400 closures a second, on the RENDER THREAD,
+    // to answer a question whose answer is fixed for the process.
+    //
+    // Nothing here can change at runtime: CoreSystems.Settings is a static, and the field
+    // that holds a given settings STRUCT TYPE on SettingsManager is fixed by the assembly.
+    // So both are cached — the settings object once, and the group field per type name.
+    private static readonly Dictionary<string, FieldInfo> _settingsFieldCache = new();
+
+    private static FieldInfo ResolveSettingsField(string settingsTypeName, out object settings)
+    {
+        settings = null;
+        if (_settingsObj == null)
+        {
+            _coreType ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            _settingsObj = _coreType?.GetField("Settings", BindingFlags.Public | BindingFlags.Static)
+                                    ?.GetValue(null);
+            if (_settingsObj == null) return null;
+        }
+        settings = _settingsObj;
+
+        // A null ENTRY is cached too, deliberately: a group this build does not have must not
+        // re-scan every field of SettingsManager forty times a second forever just to fail
+        // again. TryGetValue distinguishes "cached miss" from "not looked up yet".
+        if (_settingsFieldCache.TryGetValue(settingsTypeName, out var cached)) return cached;
+
+        FieldInfo found = null;
+        foreach (var f in settings.GetType().GetFields(Any))
+            if (f.FieldType.Name == settingsTypeName) { found = f; break; }
+        _settingsFieldCache[settingsTypeName] = found;
+        return found;
+    }
+
     private static void ScopeOff(string settingsTypeName, string label, params string[] flags)
     {
         try
         {
-            var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
-            var settings = core?.GetField("Settings", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var field = ResolveSettingsField(settingsTypeName, out var settings);
             if (settings == null) return;
-
-            _settingsObj ??= settings;
-            var field = settings.GetType().GetFields(Any)
-                .FirstOrDefault(f => f.FieldType.Name == settingsTypeName);
             if (field == null)
             {
                 if (_scopeWarned.Add(settingsTypeName))
@@ -1772,13 +1806,8 @@ internal static class WholeSceneRender
     {
         try
         {
-            var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
-            var settings = core?.GetField("Settings", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var field = ResolveSettingsField(settingsTypeName, out var settings);
             if (settings == null) return;
-
-            _settingsObj ??= settings;
-            var field = settings.GetType().GetFields(Any)
-                .FirstOrDefault(f => f.FieldType.Name == settingsTypeName);
             if (field == null)
             {
                 if (_scopeWarned.Add(settingsTypeName + label))
@@ -2756,8 +2785,6 @@ internal static class WholeSceneRender
     // blind has cost this project a day already. Cached once resolved. The one-shot dump on
     // failure is the same move that cracked the planet spheres: print what is actually there
     // rather than guess again.
-    private static FieldInfo _sunField;
-    private static object _sunSettings;
     private static int _sunState;               // 0 untried, 1 ok, -1 unavailable
 
     private static bool TrySunDirection(out Vector3D dir)
@@ -2825,7 +2852,6 @@ internal static class WholeSceneRender
                 // plausible-looking dead scaffolding.
                 if (TrySunFromPlanetEnv(out var pdir))
                 {
-                    _sunFromPlanetEnv = true;
                     _sunState = 1;
                     dir = pdir;
                     return true;
@@ -2845,7 +2871,6 @@ internal static class WholeSceneRender
     }
 
     // ---- the sun, out of the planet's atmosphere constants -------------------------
-    private static bool _sunFromPlanetEnv;
     private static string _sunPath;             // where it was found, for the log
     private static bool _sunPathLogged;
 
