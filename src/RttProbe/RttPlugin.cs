@@ -936,6 +936,49 @@ public sealed class RttPlugin : IPlugin
         // is how that one removed the device.
         ("Keen.VRage.Render12.PostProcessStage.ScreenSpaceReflection.ScreenSpaceReflections, VRage.Render12",
          "DoWork"),                                                                         // 29
+
+        // 30 — SPLITTING STAGE 1, and this one gives the feed back three things at once.
+        //
+        // Stage 1 is ExecuteRaytracingPrepareAndSceneFinalize, and its NAME is the whole bug:
+        // it is TWO unrelated bodies behind one entry point.
+        //
+        //     RaytracingPrepare(cl)    world-space shared RT state — the reason 1 was skipped
+        //     SceneFinalize(cl)        nothing to do with raytracing at all
+        //
+        // SceneFinalize, read in full, runs on OUR DrawContexts:
+        //
+        //     CascadeStatsJob                                        cascade shadow stats
+        //     LODStateUpdateJob(DrawContexts.LODTransitions)         LOD state
+        //     LODStateUpdateJob(DrawContexts.InstancedLODTransitions) INSTANCED LOD state
+        //     VisibleEntitiesUpdateJob(MainViewCulling.FirstPass, MainOutputGeometryBuffers)
+        //     VisibleInstancedEntitiesUpdateJob(MainViewCulling.FirstPass, ...)
+        //     ...and the same two again for SecondPass when HZBO.MainViewEnabled
+        //
+        // So skipping stage 1 for a RAYTRACING reason silently cost the feed its LOD state
+        // updates, its INSTANCED LOD state updates, and its visible-entity sets. That is a
+        // one-to-one match with the three fidelity gaps that were being chased as separate
+        // bugs after goal 10:
+        //
+        //     LOD state never updates            trees resolve to low-detail up close
+        //     instanced LOD never updates        foliage thinner than the same biome locally
+        //     visible-entity set never updates   RenderGrass generates from
+        //                                        DrawContexts.MainViewCulling.EntityProxies,
+        //                                        so grass generates for nothing and no grass
+        //                                        appears AT ALL
+        //
+        // The grass probe is what closed it: inside our own pass Grass.Enabled=True,
+        // DrawDistance=1000, Density=3, Is3DMapEnabled=False, our GrassBufferContext present
+        // and MainViewCulling present. Every gate open, no grass — so the failure had to be
+        // the SET being generated from, and the only thing that fills that set is the job we
+        // were skipping.
+        //
+        // Both halves have exactly ONE caller each (checked), so patching RaytracingPrepare
+        // as its own stage separates them cleanly with nothing else to consider. Put 30 in
+        // wholeSceneSkipStages and take 1 OUT: the RT half stays suppressed exactly as before
+        // — this is strictly LESS suppression than skipping all of stage 1 — while
+        // SceneFinalize runs for our camera.
+        ("Keen.VRage.Render12.Core.Systems.SceneDrawSystem, VRage.Render12",
+         "RaytracingPrepare"),                                                              // 30
     };
 
     // Stage 20 is NOT a skip — it is a return-value override, so it lives outside the
@@ -1211,6 +1254,7 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage27() => Skip(27);
     private static bool SkipStage28() => Skip(28);
     private static bool SkipStage29() => Skip(29);
+    private static bool SkipStage30() => Skip(30);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the

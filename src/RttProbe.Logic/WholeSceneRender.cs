@@ -383,6 +383,102 @@ internal static class WholeSceneRender
         catch { return "?"; }
     }
 
+    // ---- THE GRASS PROBE -------------------------------------------------------------
+    //
+    // WHY A PROBE RATHER THAN MORE IL. The grass chain has now been read end to end and
+    // every link looks correct on paper:
+    //
+    //   RenderMainView -> RenderGBuffer -> RenderGrass, and stage 11 is not on our skip list
+    //   the gate is  firstPass && !Is3DMapEnabled && Grass.Enabled
+    //                && Grass.DrawDistance > 0 && Grass.Density > 0
+    //   DrawDistance defaults to 1000 m, so our 22 m orbit is nowhere near a distance cull
+    //   every resource RenderGrass touches comes from CoreSystems.DrawContexts and
+    //     CoreSystems.ScreenBuffers -- the two globals we already swap for our pass
+    //   the generator's camera is JitteredCameraSettings, which CameraCbSwap points at ours
+    //
+    // Reading correct code and seeing no grass means one of those reads is wrong about the
+    // LIVE values, and IL cannot say which. So: print them, from inside our own pass, once
+    // every 15 s.
+    //
+    // The three questions it can distinguish, which is the point of printing all of them
+    // together rather than the first one that looks suspicious:
+    //
+    //   Grass.Enabled false / Density 0    the gate never opens; nothing downstream matters
+    //   EntityProxies count 0              the gate opens onto an EMPTY culled set, so grass
+    //                                      generates for no entity -- a culling problem, not
+    //                                      a grass problem
+    //   both fine                          the gate opens, proxies exist, and the failure is
+    //                                      in generation or in the draw -- GrassBufferContext
+    //                                      sizing is then the next suspect
+    private static long _grassProbeTicks;
+    private static bool _grassProbeShapeLogged;
+
+    private static void GrassProbe(object sceneDrawSystem)
+    {
+        var now = Environment.TickCount64;
+        if (now - _grassProbeTicks < 15000) return;
+        _grassProbeTicks = now;
+
+        try
+        {
+            var core = _coreType ?? Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            if (core == null) { RttLog.Line("GRASS PROBE: CoreSystems not resolvable."); return; }
+
+            var settings = core.GetField("Settings", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var grass = settings?.GetType().GetProperty("Grass", Any)?.GetValue(settings);
+            string gs = "Grass settings UNREADABLE";
+            if (grass != null)
+            {
+                var gt = grass.GetType();
+                object F(string n) => gt.GetField(n, Any)?.GetValue(grass);
+                gs = $"Enabled={F("Enabled")} DrawDistance={F("DrawDistance")} Density={F("Density")} " +
+                     $"MaxInclination={F("MaxInclination")} AngleCull={F("AngleCullingThreshold")}";
+            }
+
+            // Is3DMapEnabled is an INSTANCE property on the shared SceneDrawSystem, so it is
+            // the player's map state, not ours — and it hard-gates grass for both passes.
+            object map = null;
+            try { map = sceneDrawSystem?.GetType().GetProperty("Is3DMapEnabled", Any)?.GetValue(sceneDrawSystem); }
+            catch { }
+
+            var dc = core.GetField("DrawContexts", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            string ctx = "DrawContexts NULL";
+            if (dc != null)
+            {
+                var dct = dc.GetType();
+                var gbc = dct.GetProperty("GrassBufferContext", Any)?.GetValue(dc);
+                var cull = dct.GetProperty("MainViewCulling", Any)?.GetValue(dc);
+                var proxies = cull?.GetType().GetProperty("EntityProxies", Any)?.GetValue(cull);
+
+                // Count is not a guaranteed member name across versions, so try the usual
+                // suspects and SAY which one answered rather than silently reporting 0 —
+                // a blind reader printing zero is the exact failure this project hit
+                // yesterday with the grass census.
+                string pc = "no count member found (reader is blind, not the set)";
+                if (proxies != null)
+                {
+                    var pt = proxies.GetType();
+                    foreach (var n in new[] { "Count", "ProxyCount", "Length", "Size", "_count" })
+                    {
+                        var v = pt.GetProperty(n, Any)?.GetValue(proxies) ?? pt.GetField(n, Any)?.GetValue(proxies);
+                        if (v != null) { pc = $"{n}={v}"; break; }
+                    }
+                    if (!_grassProbeShapeLogged)
+                    {
+                        _grassProbeShapeLogged = true;
+                        RttLog.Line($"GRASS PROBE shape: EntityProxies is {pt.FullName}; members = " +
+                                    string.Join(", ", pt.GetProperties(Any).Select(p => p.Name).Take(20)));
+                    }
+                }
+                ctx = $"GrassBufferContext={(gbc == null ? "NULL" : gbc.GetType().Name)} " +
+                      $"MainViewCulling={(cull == null ? "NULL" : "present")} EntityProxies[{pc}]";
+            }
+
+            RttLog.Line($"GRASS PROBE (inside our pass): {gs} | Is3DMapEnabled={map} | {ctx}");
+        }
+        catch (Exception e) { RttLog.Line("GRASS PROBE failed: " + e.Message); }
+    }
+
     // PER-FEED (phase C1a): 0 untried, 1 observed, -1 unavailable. This is the route's
     // health, and per-feed is the graceful-cut contract (goal 7): one feed faulting
     // must mark ITSELF unavailable and leave the others rendering.
@@ -1412,6 +1508,13 @@ internal static class WholeSceneRender
                 Perf.NoteOurDraw((System.Diagnostics.Stopwatch.GetTimestamp() - t0)
                                  * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
                 _renderCount++;
+
+                // GRASS PROBE — read the gate FROM INSIDE OUR PASS, while our contexts are
+                // still installed. Placed here rather than anywhere cheaper because every
+                // value it reads is a GLOBAL that means something different depending on
+                // whose render is running: after the finally below, CoreSystems.DrawContexts
+                // is the player's again and the answer would be about their frame, not ours.
+                if (FeedConfig.GrassProbe) GrassProbe(sceneDrawSystem);
 
                 string after = LdrRes(ourLdr);
                 if (before != after || (_lastLdrRes != null && _lastLdrRes != before))

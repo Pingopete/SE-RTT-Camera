@@ -945,6 +945,11 @@ internal static class FeedConfig
     // entity is in the same last bucket whichever viewer measured it.
     public static double ViewerDistanceRadius { get; private set; } = 200.0;
 
+    // Print the live grass gate from INSIDE our nested pass, every 15 s. Level-triggered, not
+    // edge-triggered, because unlike the survey dumps this is a read of volatile state that is
+    // only meaningful while our contexts are installed — there is nothing to consume once.
+    public static bool GrassProbe { get; private set; }
+
     public static bool PerBodyClipmapCamera { get; private set; }
     public static double ClipmapMinPlayerDistance { get; private set; } = 100000.0;
 
@@ -1107,6 +1112,8 @@ internal static class FeedConfig
                           "Expect trees to resolve, foliage to thicken and grass to appear together — they are " +
                           "one mechanism. Watch \"VIEWER DISTANCE:\" and VRAM."
                         : ". Every entity goes back to being measured from the player alone."));
+
+            GrassProbe = Bool(kv, "grassProbe", GrassProbe);
 
             var clipWas = PerBodyClipmapCamera;
             PerBodyClipmapCamera     = Bool(kv, "perBodyClipmapCamera", PerBodyClipmapCamera);
