@@ -482,6 +482,91 @@ internal static class FeedConfig
     // finding the right value a live sweep instead of a series of gate cycles.
     public static double WholeSceneFlareIntensity { get; private set; } = -1;
 
+    // ---- THE SCATTER CONTROL SURFACE (2026-08-02) -------------------------------------
+    //
+    // Everything that decides how much flora, clutter and grass the feed sees, and how far
+    // out. Found by reading the CONSUMERS rather than by guessing at settings names, which
+    // is what finally separated the live knobs from the dead ones:
+    //
+    //   Flora.RenderingDistanceMultiplier -> InstanceBatch.ComputeCullingDistance, whose
+    //                                        entire body is `Settings.Flora.RenderingDistance
+    //                                        Multiplier * arg`. THE SPAWN RADIUS.
+    //   Flora.LODDistanceMultiplier       -> LODSetup.Compose -> GlobalFloraDistanceMult
+    //   Flora.FadeDistancePercentage      -> InstanceBatch.UpdateRenderData
+    //   LOD.MainView.{LODShift,MinLOD,FloraMinLOD} -> CullingJob.DoWork
+    //   Grass.{DrawDistance,Density}      -> RenderGrass
+    //
+    // THE SPLIT THAT MATTERS IS *WHEN* EACH IS READ, and it decides which of these can be
+    // feed-only and which cannot:
+    //
+    //   PER PASS — read inside our nested Draw, so ScopeSetValues gives the FEED its own
+    //   value and the player's frame is untouched. LODSetup.Compose is reached from
+    //   SceneDrawSystem.MainViewCulling, which our probe already reports as present in our
+    //   pass. These are the `wholeSceneFlora*` / `wholeSceneGrass*` / `wholeSceneLod*` knobs.
+    //
+    //   AT BATCH ALLOCATION — ComputeCullingDistance is called from InstanceBatch.Initialize
+    //   <- AllocateInstanceBatch <- AddInstanceInInstanceBatches. The radius is BAKED INTO
+    //   THE BATCH when flora is first added to the octree, which happens during the sector
+    //   update, NOT during our Draw. A per-pass scope would miss it entirely. So the radius
+    //   knob is GLOBAL and is named `world...` rather than `wholeScene...` to say so.
+    //
+    // Naming is the documentation here: `wholeScene*` = our render only; `world*` = the
+    // player's view changes too, and so does VRAM.
+
+    // Flora LOD distance multiplier, OUR RENDER ONLY. -1 = do not scope.
+    //
+    // LODSetup.Compose computes:
+    //     GlobalFloraDistanceMult = MathF.Min(1, 1080 / SwapChain.Resolution.Y) * this
+    // and SwapChain is the PLAYER'S swapchain — so above 1080p the engine SHRINKS flora LOD
+    // distance globally, and our 1024x1024 feed inherits a multiplier computed from a
+    // resolution it does not have. That is the single-viewer disease in the LOD system, and
+    // this knob is the compensation for it: at 1440p the engine applies 0.75, so 1.33 here
+    // restores parity and anything above that is a genuine increase.
+    public static double WholeSceneFloraLodMult { get; private set; } = -1;
+
+    // Per-pass LOD floors, OUR RENDER ONLY. LODSettings.MainView is a PassLODSettings, and
+    // the engine already treats LOD as a per-pass concept — these are its own fields, not
+    // something we invented. -999 = do not scope (0 and negatives are meaningful values:
+    // LODShift = -1 asks for one level MORE detail than the distance would pick).
+    public static int WholeSceneLodShift    { get; private set; } = -999;
+    public static int WholeSceneFloraMinLod { get; private set; } = -999;
+
+    // General object LOD distance, OUR RENDER ONLY. -1 = do not scope. These reach every
+    // entity in the culling pass, not just flora, so they are the lever for "the feed's
+    // distant grids and rocks are one LOD too coarse" as distinct from the flora-specific
+    // knobs above.
+    public static double WholeSceneObjectDistanceMult { get; private set; } = -1;
+    public static int    WholeSceneSmallObjectMult    { get; private set; } = -999;
+
+    // Grass, OUR RENDER ONLY. -1 = do not scope. Measured engine defaults are DrawDistance
+    // 1000 and Density 3; MAX_GRASS_RENDERING_DISTANCE is a static clamp, so asking for more
+    // than it will simply be ignored by the engine rather than misbehave.
+    public static double WholeSceneGrassDrawDistance { get; private set; } = -1;
+    public static double WholeSceneGrassDensity      { get; private set; } = -1;
+
+    // ---- GLOBAL. THE PLAYER'S VIEW AND VRAM CHANGE TOO. -------------------------------
+    //
+    // Flora.RenderingDistanceMultiplier — the scatter SPAWN RADIUS, the thing behind the
+    // reported "strict circular radius around the camera where objects spawn". -1 = leave
+    // the engine's value alone.
+    //
+    // WHY THIS CANNOT BE FEED-ONLY: the value is read in ComputeCullingDistance at BATCH
+    // ALLOCATION time and stored on the batch. Batches are allocated as sectors stream in,
+    // outside our Draw. So this has to be set globally and left set.
+    //
+    // TWO CONSEQUENCES WORTH KNOWING BEFORE TURNING IT UP:
+    //   1. It is retroactive only for NEW batches. Flora already allocated keeps the radius
+    //      it was born with, so raising this changes the world gradually as sectors cycle,
+    //      not instantly. Judging it after five seconds will read as "no effect".
+    //   2. It multiplies a per-definition base distance, so it scales EVERY flora layer at
+    //      once — the dense near ground cover and the sparse far trees together.
+    //
+    // VRAM: more resident flora is more VRAM, and the world-residency knobs sit outside
+    // every automatic guard by the user's explicit choice ("warn loudly, never act"). A CTD
+    // on 2026-08-02 came from exactly this class of knob left high after a sweep. The
+    // warning at the apply site is the whole safety mechanism; there is no cap.
+    public static double WorldFloraRadiusMult { get; private set; } = -1;
+
     // THE STATS PANEL (goal 9 / plan phase A1). Tag a panel [RTS] to get perf numbers on
     // it in world. Draws into the panel's OWN batch — no target, no binding, no handover —
     // so it is independent of the feed and cannot interfere with it.
@@ -1343,6 +1428,30 @@ internal static class FeedConfig
             StatsPanelMs                = Int(kv, "statsPanelMs", StatsPanelMs);
             RttBudgetMs                 = Dbl(kv, "rttBudgetMs", RttBudgetMs);
             WholeSceneFlareIntensity    = Dbl(kv, "wholeSceneFlareIntensity", WholeSceneFlareIntensity);
+
+            // The scatter control surface. All per-pass, all outside the rebuild signature:
+            // they are pure ScopeSetValues calls read fresh on every render, so a sweep is
+            // live rather than a series of gate cycles.
+            WholeSceneFloraLodMult      = Dbl(kv, "wholeSceneFloraLodMult", WholeSceneFloraLodMult);
+            WholeSceneLodShift          = Int(kv, "wholeSceneLodShift", WholeSceneLodShift);
+            WholeSceneFloraMinLod       = Int(kv, "wholeSceneFloraMinLod", WholeSceneFloraMinLod);
+            WholeSceneObjectDistanceMult= Dbl(kv, "wholeSceneObjectDistanceMult", WholeSceneObjectDistanceMult);
+            WholeSceneSmallObjectMult   = Int(kv, "wholeSceneSmallObjectMult", WholeSceneSmallObjectMult);
+            WholeSceneGrassDrawDistance = Dbl(kv, "wholeSceneGrassDrawDistance", WholeSceneGrassDrawDistance);
+            WholeSceneGrassDensity      = Dbl(kv, "wholeSceneGrassDensity", WholeSceneGrassDensity);
+
+            // GLOBAL — announced on every change, because unlike everything above this one
+            // changes the PLAYER'S world and its VRAM. Logged here as well as at the apply
+            // site so the transition is in the log even if the apply is what fails.
+            var floraRadiusWas = WorldFloraRadiusMult;
+            WorldFloraRadiusMult = Dbl(kv, "worldFloraRadiusMult", WorldFloraRadiusMult);
+            if (Math.Abs(floraRadiusWas - WorldFloraRadiusMult) > 1e-9)
+                RttLog.Global($"Config: worldFloraRadiusMult {floraRadiusWas:0.###} -> {WorldFloraRadiusMult:0.###}. " +
+                    "GLOBAL, not feed-only: Flora.RenderingDistanceMultiplier is baked into each flora " +
+                    "instance batch at ALLOCATION time, so this changes the player's view too and only " +
+                    "affects batches allocated from now on — existing flora keeps the radius it was born " +
+                    "with. Expect the world to change over the next minute or two as sectors cycle, NOT " +
+                    "instantly. More resident flora is more VRAM and this knob has no automatic guard.");
             WholeSceneOwnProbes         = Bool(kv, "wholeSceneOwnProbes", WholeSceneOwnProbes);
             WholeSceneDisableRaytracing    = Int(kv, "wholeSceneDisableRaytracing", WholeSceneDisableRaytracing);
             WholeSceneDisableEyeAdaptation = Bool(kv, "wholeSceneDisableEyeAdaptation", WholeSceneDisableEyeAdaptation);

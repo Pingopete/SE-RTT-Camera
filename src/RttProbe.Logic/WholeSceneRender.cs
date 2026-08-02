@@ -498,7 +498,13 @@ internal static class WholeSceneRender
                       $"MainViewCulling={(cull == null ? "NULL" : "present")} EntityProxies[{pc}]";
             }
 
-            RttLog.Line($"GRASS PROBE (inside our pass): {gs} | Is3DMapEnabled={map} | {ctx}");
+            // Flora read BACK from the engine, not echoed from our config. The scatter knobs
+            // are set through reflection into a boxed struct, where a silent bind failure and
+            // a real change look identical from the config side — only a read-back tells them
+            // apart. Printed next to grass because they are one control surface with one
+            // question behind it: how much is out there, and how far out.
+            RttLog.Line($"GRASS PROBE (inside our pass): {gs} | Is3DMapEnabled={map} | {ctx} " +
+                        $"| Flora[{ScatterControl.Describe()}]");
         }
         catch (Exception e) { RttLog.Line("GRASS PROBE failed: " + e.Message); }
     }
@@ -1432,6 +1438,13 @@ internal static class WholeSceneRender
                 // unless wholeSceneOwnProbes is on.
                 savedProbes = InstallProbes();
 
+                // BEFORE ScopeSharedState, and deliberately so. This writes the GLOBAL flora
+                // radius; ScopeSharedState then saves whatever is current as the value to
+                // restore at the end of our pass. In this order the global change survives
+                // the pass unwind. Reversed, the unwind would quietly undo it every frame —
+                // a knob that binds, logs success, and still does nothing.
+                ScatterControl.Apply();
+
                 ScopeSharedState();
                 if (FeedConfig.WholeSceneCamera) camSwapped = InstallCamera(out savedCam);
 
@@ -2032,6 +2045,73 @@ internal static class WholeSceneRender
                 $"feed flare intensity {FeedConfig.WholeSceneFlareIntensity:0.###} " +
                 "(fixed feed exposure cannot pull a blown flare back, and the panel multiplies by emissivity)",
                 ("FlaresIntensity", (float)FeedConfig.WholeSceneFlareIntensity));
+
+        ScopeScatter();
+    }
+
+    // ---- THE SCATTER CONTROL SURFACE, per-pass half -----------------------------------
+    //
+    // Flora LOD, general object LOD and grass, given to the FEED alone. Every value here is
+    // read by a consumer that runs inside our nested Draw, which is what makes per-feed
+    // control possible at all — see FeedConfig's scatter section for the consumer-by-consumer
+    // evidence and for why the SPAWN RADIUS is not in this list.
+    //
+    // WHY THIS IS SAFE WHERE THE RAYTRACING SCOPES WERE NOT. Scoping RaytracingSettings was
+    // dangerous because RaytraceGIJob builds SHADER DEFINES from those flags, so toggling
+    // them ten times a second forced async pipeline rebuilds. LODSettings and GrassSettings
+    // instead implement Convert(IGPUDataConvertor) with a GPUImprintSize — they are uploaded
+    // as CONSTANT BUFFER data, which is per-frame by design and carries no PSO cost.
+    //
+    // Everything defaults to "do not scope". A knob that is off must cost nothing and must
+    // not appear in the log, or the log stops being readable.
+    private static void ScopeScatter()
+    {
+        // FLORA, our render only. Two independent knobs on the same settings group, so they
+        // are gathered into one scope — ScopeSetValues boxes the struct once per call, and
+        // two calls would box, modify and restore it twice for no reason.
+        var flora = new List<(string, object)>();
+        if (FeedConfig.WholeSceneFloraLodMult > 0)
+            flora.Add(("LODDistanceMultiplier", (float)FeedConfig.WholeSceneFloraLodMult));
+        if (flora.Count > 0)
+            ScopeSetValues("FloraSettings",
+                $"feed flora LOD distance x{FeedConfig.WholeSceneFloraLodMult:0.###} " +
+                "(compensates LODSetup.Compose scaling flora LOD by the PLAYER'S swapchain height)",
+                flora.ToArray());
+
+        // LOD, our render only. MainView is the PassLODSettings the main culling job reads,
+        // so the dotted paths are the engine's own per-pass structure rather than a reach.
+        var lod = new List<(string, object)>();
+        if (FeedConfig.WholeSceneLodShift != -999)
+            lod.Add(("MainView.LODShift", FeedConfig.WholeSceneLodShift));
+        if (FeedConfig.WholeSceneFloraMinLod != -999)
+            lod.Add(("MainView.FloraMinLOD", FeedConfig.WholeSceneFloraMinLod));
+        if (FeedConfig.WholeSceneObjectDistanceMult > 0)
+            lod.Add(("ObjectDistanceMult", (float)FeedConfig.WholeSceneObjectDistanceMult));
+        if (FeedConfig.WholeSceneSmallObjectMult != -999)
+            lod.Add(("SmallObjectVisibleMult", FeedConfig.WholeSceneSmallObjectMult));
+        if (lod.Count > 0)
+            ScopeSetValues("LODSettings",
+                "feed LOD [" +
+                (FeedConfig.WholeSceneLodShift != -999 ? $"shift={FeedConfig.WholeSceneLodShift} " : "") +
+                (FeedConfig.WholeSceneFloraMinLod != -999 ? $"floraMinLod={FeedConfig.WholeSceneFloraMinLod} " : "") +
+                (FeedConfig.WholeSceneObjectDistanceMult > 0 ? $"objDistX{FeedConfig.WholeSceneObjectDistanceMult:0.###} " : "") +
+                (FeedConfig.WholeSceneSmallObjectMult != -999 ? $"smallObjX{FeedConfig.WholeSceneSmallObjectMult} " : "") +
+                "]", lod.ToArray());
+
+        // GRASS, our render only. Engine defaults measured in-game are DrawDistance 1000 and
+        // Density 3. DrawDistance is clamped by the static MAX_GRASS_RENDERING_DISTANCE, so
+        // an over-large value is ignored rather than harmful.
+        var grass = new List<(string, object)>();
+        if (FeedConfig.WholeSceneGrassDrawDistance > 0)
+            grass.Add(("DrawDistance", (float)FeedConfig.WholeSceneGrassDrawDistance));
+        if (FeedConfig.WholeSceneGrassDensity > 0)
+            grass.Add(("Density", (float)FeedConfig.WholeSceneGrassDensity));
+        if (grass.Count > 0)
+            ScopeSetValues("GrassSettings",
+                "feed grass [" +
+                (FeedConfig.WholeSceneGrassDrawDistance > 0 ? $"drawDist={FeedConfig.WholeSceneGrassDrawDistance:0.#} " : "") +
+                (FeedConfig.WholeSceneGrassDensity > 0 ? $"density={FeedConfig.WholeSceneGrassDensity:0.###} " : "") +
+                "]", grass.ToArray());
     }
 
 
