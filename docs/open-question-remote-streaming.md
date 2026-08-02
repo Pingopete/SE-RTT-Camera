@@ -683,3 +683,33 @@ main view drops it, which points at main-view culling — and the HZBO second pa
 on `HZBO.MainViewEnabled`) is the obvious suspect, since `RenderGrass` takes the same
 `enableHiZ` flag and has explicit NoHiZ PSO variants. One mechanism would explain both the
 missing foliage and the missing grass.
+
+### HZBO CANNOT BE SCOPED PER-PASS — tested, reverted, and the failure is informative
+
+`wholeSceneNoHzbo = 1` (clear `HZBOSettings.MainViewEnabled` for our render only) produced,
+within seconds: **the feed went completely white and the PLAYER'S world flickered rapidly.**
+Reverted live; feed recovered immediately at 46.9 fps.
+
+The player's world flickering is the important half — it proves the change did not stay
+inside our pass. Why it cannot:
+
+* `SceneFinalize` gates the SECOND visible-entity update on `HZBO.MainViewEnabled`. With it
+  off, `MainViewCulling.SecondPass` is never refreshed — but `RenderGBuffer` is still
+  *called* for the second pass, so it draws against a stale or empty geometry context.
+* `CullingSetup.IsOcclusionCullingAllowed` is consulted by `RenderMainView`,
+  `RenderTransparent`, `RenderHolograms`, `DrawUnlit`, `DrawUI` and
+  `RenderHighlightsAndTransparentUnlit`. Toggling it ~20x/sec flips a value the frame
+  expects to hold constant across all of them.
+
+This is the same class as the standing `RaytracingSettings` warning already in the config —
+scoping a field that a pipeline *snapshots* rather than re-reads per call. The knob stays in
+the tree defaulted OFF with this note attached, because "we tried it and it broke" is worth
+more than an empty gap where someone tries it again.
+
+**The underlying hypothesis is NOT refuted** — occlusion culling remains the only mechanism
+that can drop an object from the main view while its shadow still draws, and it still shares
+a flag with grass generation. What is refuted is testing it by scoping the setting. A valid
+test needs a lever that is per-pass by construction, not a global toggled inside one:
+`GrassRendering` chooses `_triplanarSingleGenNoHiZPSO` vs `_triplanarSingleGenPSO` from the
+`enableHiZ` ARGUMENT, so patching `SceneDrawSystem.RenderGrass`'s second parameter inside our
+render reaches the grass half without touching any shared setting. That is the next attempt.

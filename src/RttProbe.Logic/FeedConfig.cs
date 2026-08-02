@@ -121,6 +121,14 @@ internal static class FeedConfig
     // adaptation is cut, which for a fixed-purpose camera feed is arguably correct.
     public static bool WholeSceneDisableEyeAdaptation { get; private set; } = true;
 
+    // Clear HZBOSettings.MainViewEnabled for OUR render only — hierarchical-Z occlusion
+    // culling off in the feed. The test for "shadows of trees with no tree": occlusion
+    // culling is the one mechanism that can drop an object from the main view while its
+    // shadow still draws, and the same flag is handed to RenderGrass as enableHiZ, so it
+    // would remove all grass rather than thin it. Costs feed draw calls only; scoped, so the
+    // player's occlusion culling is untouched. NOT in the rebuild signature — live A/B.
+    public static bool WholeSceneNoHzbo { get; private set; }
+
     // Stop our render UPDATING the shared environment-probe atlas.
     //
     // The engine refreshes probe faces round-robin across frames into a shared atlas,
@@ -1328,6 +1336,17 @@ internal static class FeedConfig
             WholeSceneOwnProbes         = Bool(kv, "wholeSceneOwnProbes", WholeSceneOwnProbes);
             WholeSceneDisableRaytracing    = Int(kv, "wholeSceneDisableRaytracing", WholeSceneDisableRaytracing);
             WholeSceneDisableEyeAdaptation = Bool(kv, "wholeSceneDisableEyeAdaptation", WholeSceneDisableEyeAdaptation);
+
+            var hzboWas = WholeSceneNoHzbo;
+            WholeSceneNoHzbo = Bool(kv, "wholeSceneNoHzbo", WholeSceneNoHzbo);
+            if (hzboWas != WholeSceneNoHzbo)
+                RttLog.Global($"Config: wholeSceneNoHzbo {hzboWas} -> {WholeSceneNoHzbo}" +
+                    (WholeSceneNoHzbo
+                        ? ". Hierarchical-Z occlusion culling is OFF for the feed's pass only. If the " +
+                          "shadows-without-objects and the missing grass BOTH resolve, the depth pyramid " +
+                          "was culling against the wrong camera and that was one bug, not two. Costs feed " +
+                          "draw calls; watch ourDraw in the PERF line."
+                        : ". Occlusion culling restored in the feed."));
             WholeSceneDisableProbeUpdates  = Bool(kv, "wholeSceneDisableProbeUpdates", WholeSceneDisableProbeUpdates);
             WholeSceneSkipStages    = Ints(kv, "wholeSceneSkipStages", WholeSceneSkipStages);
             WholeSceneRtFlags       = Strs(kv, "wholeSceneRtFlags", WholeSceneRtFlags);

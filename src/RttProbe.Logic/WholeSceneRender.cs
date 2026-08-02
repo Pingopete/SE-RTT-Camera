@@ -1846,6 +1846,33 @@ internal static class WholeSceneRender
         if (FeedConfig.WholeSceneDisableEyeAdaptation)
             ScopeOff("PostProcessSettings", "eye adaptation", "EyeAdaptation");
 
+        // HZBO — HIERARCHICAL-Z OCCLUSION CULLING, for our pass only.
+        //
+        // THE SYMPTOM THIS EXISTS TO TEST, reported by the user 2026-08-02: shadows of trees
+        // and foliage visible in the feed with NO OBJECT PRESENT. That is not a missing
+        // object — something has to cast a shadow. It means the entity is in the shadow
+        // pass's set and the MAIN VIEW is dropping it, and occlusion culling is the one
+        // mechanism that can disagree between those two passes.
+        //
+        // HZBO tests objects against a depth pyramid built from the CURRENT depth buffer. If
+        // that pyramid does not correspond to our camera, geometry is rejected as "behind
+        // something" and vanishes from the main view while its shadow, drawn in the cascade
+        // pass which does not consult main-view HZBO, survives. Exactly the reported picture.
+        //
+        // AND IT WOULD EXPLAIN THE GRASS TOO, which is why this is worth a knob rather than a
+        // guess. RenderGBuffer passes hzboMainViewEnabled straight into RenderGrass as its
+        // enableHiZ argument, and GrassRendering ships explicit NoHiZ PSO variants — so a bad
+        // pyramid does not thin grass, it removes all of it. One mechanism, both symptoms.
+        //
+        // COSTS DRAW CALLS in the feed and nothing else: no occlusion culling means more
+        // geometry submitted. Our CPU submit sits around 2.8 ms, so there is room. Scoped, so
+        // the player's own frame keeps its occlusion culling untouched.
+        //
+        // Only MainViewEnabled is cleared, not Enabled: the cascade half (CascadesEnabled)
+        // is a different consumer and there is no reason to disturb it while testing this.
+        if (FeedConfig.WholeSceneNoHzbo)
+            ScopeOff("HZBOSettings", "HZBO main-view occlusion culling", "MainViewEnabled");
+
         // ENVIRONMENT PROBES. Reported as "reflections or ambient lighting from light
         // sources, but not the lights themselves" — which is indirect lighting exactly,
         // and that is what probes supply.
