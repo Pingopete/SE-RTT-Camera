@@ -1929,6 +1929,22 @@ internal static class WholeSceneRender
         if (FeedConfig.WholeSceneDisableEyeAdaptation && !FeedConfig.WholeSceneOwnEyeAdaptation)
             ScopeOff("PostProcessSettings", "eye adaptation", "EyeAdaptation");
 
+        // AND WHEN WE DO OWN IT, TURN IT ON — not merely stop turning it off.
+        //
+        // The first version only removed the ScopeOff above and assumed that was enough. It
+        // is not: ComputeExposure chooses between EyeAdaptationJob.DynamicExposure and
+        // .ConstantExposure on this flag, and the PLAYER's setting is whatever the player's
+        // graphics options say. If it is false globally then our own job is installed,
+        // verified initialised, and never called — the feature would be perfectly plumbed and
+        // completely inert, which is the hardest kind of failure to see because every log line
+        // says success.
+        //
+        // Scoped, so the player's own frame keeps their setting untouched.
+        if (FeedConfig.WholeSceneOwnEyeAdaptation)
+            ScopeSetValues("PostProcessSettings",
+                "feed eye adaptation ON (we own the history, so DynamicExposure is safe to run)",
+                ("EyeAdaptation", true));
+
         // HZBO — HIERARCHICAL-Z OCCLUSION CULLING, for our pass only.
         //
         // THE SYMPTOM THIS EXISTS TO TEST, reported by the user 2026-08-02: shadows of trees
