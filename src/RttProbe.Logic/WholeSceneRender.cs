@@ -1400,7 +1400,7 @@ internal static class WholeSceneRender
             }
 
             var savedSb = _sbField.GetValue(null);
-            object savedCam = null, savedDc = null, savedProbes = null;
+            object savedCam = null, savedDc = null, savedProbes = null, savedEyeJob = null;
             object[] savedCb = null;
             bool camSwapped = false, ownShadows = false, planetEnvSwapped = false;
 
@@ -1437,6 +1437,10 @@ internal static class WholeSceneRender
                 // EnvProbesToUpdate and reads _ourDrawContexts to find the field. No-op
                 // unless wholeSceneOwnProbes is on.
                 savedProbes = InstallProbes();
+
+                // OUR OWN AUTO-EXPOSURE HISTORY, installed before ScopeSharedState so the
+                // scope below can see that we own it and leave EyeAdaptation alone.
+                savedEyeJob = InstallEyeAdaptation(sceneDrawSystem);
 
                 // BEFORE ScopeSharedState, and deliberately so. This writes the GLOBAL flora
                 // radius; ScopeSharedState then saves whatever is current as the value to
@@ -1603,6 +1607,12 @@ internal static class WholeSceneRender
                     }
                     catch (Exception e) { RttLog.Error("restore probe manager", e); }
                 }
+                // The eye-adaptation job goes back BEFORE the draw contexts, mirroring install
+                // in reverse. Its failure mode is the worst one available here — our histogram
+                // left installed in the player's frame would adapt the PLAYER's exposure to
+                // OUR camera — so it restores unconditionally and swallows nothing silently.
+                RestoreEyeAdaptation(sceneDrawSystem, savedEyeJob);
+
                 if (savedDc != null) _dcField.SetValue(null, savedDc);
                 _sbField.SetValue(null, savedSb);
                 _inOurRender = false;
@@ -1909,7 +1919,14 @@ internal static class WholeSceneRender
         // Exposure itself is left ON so our image is still exposed; only the TEMPORAL
         // adaptation is cut, which for a fixed-purpose camera feed is arguably correct
         // anyway.
-        if (FeedConfig.WholeSceneDisableEyeAdaptation)
+        // NOT WHEN WE OWN THE HISTORY. Scoping EyeAdaptation off exists solely to stop our
+        // render advancing the SHARED adaptation state — with our own job installed there is
+        // no shared state to protect, and clearing the flag would make our own DynamicExposure
+        // never run, so the feature would silently be a no-op with no error to explain it.
+        // Same coupling, and the same reasoning, as own-probes vs ProbeSettings.Enable: the
+        // two settings are coupled, so the coupling is enforced here rather than left to the
+        // config file where the pair could be set inconsistently.
+        if (FeedConfig.WholeSceneDisableEyeAdaptation && !FeedConfig.WholeSceneOwnEyeAdaptation)
             ScopeOff("PostProcessSettings", "eye adaptation", "EyeAdaptation");
 
         // HZBO — HIERARCHICAL-Z OCCLUSION CULLING, for our pass only.
@@ -3830,6 +3847,138 @@ internal static class WholeSceneRender
     //
     // Fails SOFT and permanently on the first problem: a half-installed probe manager is
     // worse than none, and this runs on the render thread with the player's frame in flight.
+    // ---- PER-FEED EYE ADAPTATION -------------------------------------------------------
+    //
+    // Swap SceneDrawSystem._eyeAdaptationJob for OUR instance around our render, so
+    // ComputeExposure -> DynamicExposure integrates our own histogram and history instead of
+    // the player's. Returns the saved instance for the unwind, or null if nothing was swapped.
+    //
+    // THE ASYNC CONSTRUCTION IS THE ONLY AWKWARD PART, and it is why this is not simply the
+    // probe pattern copied. EyeAdaptationJob's ctor takes a List of initialization tasks and
+    // its real setup happens in InitializeAsync — PSOs, root signatures, the histogram buffer.
+    // A job used before that completes has null PSOs, and dispatching against those is a
+    // device removal, not an exception. So construction KICKS OFF and this returns null until
+    // the task reports completion; the feed keeps its fixed stop for the second or two that
+    // takes. Blocking the render thread on the task instead would be a frame hitch at best
+    // and a deadlock at worst, since the init tasks may want the render thread themselves.
+    private static int _eyeState;                 // 0 untried, 1 armed, -1 unavailable
+    private static object _ourEyeJob;
+    private static FieldInfo _eyeJobField;
+    private static object _eyeInitTask;           // Task from InitializeAsync, polled not awaited
+    private static bool _eyeReady;
+
+    private static object InstallEyeAdaptation(object sceneDrawSystem)
+    {
+        if (_eyeState < 0 || !FeedConfig.WholeSceneOwnEyeAdaptation || sceneDrawSystem == null) return null;
+        try
+        {
+            if (_eyeState == 0)
+            {
+                _eyeJobField = sceneDrawSystem.GetType().GetField("_eyeAdaptationJob", Any);
+                if (_eyeJobField == null)
+                {
+                    _eyeState = -1;
+                    RttLog.Line("Own eye adaptation: SceneDrawSystem._eyeAdaptationJob not found — " +
+                                "feature unavailable, the feed keeps its fixed stop.");
+                    return null;
+                }
+
+                // THE PARK IS A HARD REQUIREMENT, not a nicety. Without it every hot reload
+                // builds a fresh job and orphans the previous one's render target views, and
+                // RTV descriptors come from a small fixed pool — own-probes died exactly that
+                // way with VRAM flat. Refusing to arm is the correct failure.
+                var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
+                var park = bridge?.GetField("ParkedEyeAdaptation")?.GetValue(null) as object[];
+                if (park == null)
+                {
+                    _eyeState = -1;
+                    RttLog.Line("Own eye adaptation: this bootstrap has NO ParkedEyeAdaptation array — RESTART " +
+                                "THE GAME to adopt the new bootstrap. Refusing to arm: without the park each hot " +
+                                "reload would orphan a job and leak its RTV descriptors, which is the crash " +
+                                "own-probes already paid for (Out of the descriptor heap at BorrowRTV).");
+                    return null;
+                }
+
+                int slot = Feeds.Cur.Id;
+                if (slot < 0 || slot >= park.Length) { _eyeState = -1; return null; }
+
+                // TYPE-CHECK THE ADOPTION. The park is untyped object[] because the bootstrap
+                // must not touch engine types, so a slot filled by an older or incompatible
+                // build would otherwise be trusted and cast blindly at first use.
+                var parked = park[slot];
+                _ourEyeJob = _eyeJobField.FieldType.IsInstanceOfType(parked) ? parked : null;
+                if (_ourEyeJob != null)
+                {
+                    // Adopted across a hot reload — already initialized, so it is usable now.
+                    _eyeReady = true;
+                    RttLog.Line($"Own eye adaptation: adopted the parked job for feed {slot} — no new render " +
+                                "targets built, which is the whole point of the park.");
+                }
+                else
+                {
+                    var jobType = _eyeJobField.FieldType;
+                    var ctor = jobType.GetConstructors(Any).FirstOrDefault(c => c.GetParameters().Length == 1);
+                    if (ctor == null)
+                    {
+                        _eyeState = -1;
+                        RttLog.Line("Own eye adaptation: no single-argument EyeAdaptationJob ctor — unavailable.");
+                        return null;
+                    }
+
+                    // The ctor wants a List<Task> to append its initialization work to. Build
+                    // the exact generic list its parameter names, so we do not guess at Task.
+                    var listType = ctor.GetParameters()[0].ParameterType;
+                    var tasks = Activator.CreateInstance(listType);
+                    _ourEyeJob = ctor.Invoke(new[] { tasks });
+                    park[slot] = _ourEyeJob;              // park BEFORE any await can fail
+
+                    _eyeInitTask = jobType.GetMethod("InitializeAsync", Any)?.Invoke(_ourEyeJob, null);
+                    RttLog.Line($"Own eye adaptation: built a job for feed {slot} and parked it. Initialization " +
+                                "is ASYNC — the feed holds its fixed stop until it reports complete, because a " +
+                                "job dispatched with null PSOs is a device removal rather than an exception.");
+                }
+                _eyeState = 1;
+            }
+
+            if (_ourEyeJob == null) return null;
+
+            // Poll, never block. IsCompletedSuccessfully distinguishes "ready" from "faulted",
+            // and a faulted init must disarm rather than be used.
+            if (!_eyeReady)
+            {
+                if (_eyeInitTask == null) return null;
+                var t = _eyeInitTask.GetType();
+                bool done = (bool)(t.GetProperty("IsCompleted", Any)?.GetValue(_eyeInitTask) ?? false);
+                if (!done) return null;
+                bool ok = (bool)(t.GetProperty("IsCompletedSuccessfully", Any)?.GetValue(_eyeInitTask) ?? false);
+                if (!ok)
+                {
+                    _eyeState = -1;
+                    RttLog.Line("Own eye adaptation: InitializeAsync FAULTED — disarmed, fixed stop retained. " +
+                                "The job stays parked so a reload does not build a second one beside it.");
+                    return null;
+                }
+                _eyeReady = true;
+                RttLog.Line("Own eye adaptation: initialization complete — the feed now adapts to what its own " +
+                            "camera sees. Watch the PLAYER's lighting: if it oscillates at our render cadence " +
+                            "the histories are still shared and this must come straight back off.");
+            }
+
+            var saved = _eyeJobField.GetValue(sceneDrawSystem);
+            if (ReferenceEquals(saved, _ourEyeJob)) return null;   // already ours; nothing to unwind
+            _eyeJobField.SetValue(sceneDrawSystem, _ourEyeJob);
+            return saved;
+        }
+        catch (Exception e) { RttLog.Error("install eye adaptation", e); _eyeState = -1; return null; }
+    }
+
+    private static void RestoreEyeAdaptation(object sceneDrawSystem, object saved)
+    {
+        if (saved == null || _eyeJobField == null || sceneDrawSystem == null) return;
+        try { _eyeJobField.SetValue(sceneDrawSystem, saved); }
+        catch (Exception e) { RttLog.Error("restore eye adaptation", e); }
+    }
+
     private static object InstallProbes()
     {
         if (_probeState < 0 || !FeedConfig.WholeSceneOwnProbes) return null;

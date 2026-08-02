@@ -45,6 +45,27 @@ public static class RttBridge
     // but it would silently stop parking the feeds past the end, so keep them in step.
     public static readonly object[] ParkedProbeManagers = new object[4];
 
+    // PER-FEED EYE ADAPTATION, parked for exactly the reason above.
+    //
+    // EyeAdaptationJob holds the auto-exposure history as INSTANCE state — a
+    // RenderTargetTexture[] ping-pong pair plus a histogram RWBuffer — which is what makes
+    // per-feed adaptation possible at all: give our render its own instance and its history
+    // stops fighting the player's. That is the same shape as the probe manager, the cascade
+    // shadows and the draw contexts.
+    //
+    // AND IT CARRIES THE SAME HAZARD, which is why this array exists before the feature does.
+    // Logic statics die on every hot reload, so a logic-owned instance is rebuilt each time
+    // and the previous one becomes unreachable from any code that could dispose it. Its
+    // RENDER TARGET VIEWS leak — and RTV descriptors come from a small fixed pool that
+    // exhausts long before VRAM does. That is not a prediction: own-probes CTD'd on
+    // 2026-07-30 with "Assertion Failure: Out of the descriptor heap at
+    // DescriptorHeapPool.BorrowRTV()" after four reloads, while VRAM sat flat at 12.2 GB.
+    // Parking the instance here is the fix that made own-probes safe, and it is a
+    // prerequisite for this feature rather than a hardening pass to do afterwards.
+    //
+    // Typed object and sized to Feeds.MaxFeeds, both for the reasons given above.
+    public static readonly object[] ParkedEyeAdaptation = new object[4];
+
     // (renderer, batch, surfaceContext) — the renderer is needed to rebuild a panel's
     // screen material, which is how Phase 2 points a panel at our own render target.
     public static volatile Action<object, object, object> PanelRenderHook;

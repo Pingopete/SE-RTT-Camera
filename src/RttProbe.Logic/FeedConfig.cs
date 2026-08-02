@@ -578,6 +578,38 @@ internal static class FeedConfig
     // warning at the apply site is the whole safety mechanism; there is no cap.
     public static double WorldFloraRadiusMult { get; private set; } = -1;
 
+    // ---- PER-FEED EYE ADAPTATION (2026-08-02) -----------------------------------------
+    //
+    // CAMERA-LOCAL AUTO EXPOSURE, closed loop. The feed has been on a FIXED stop for its whole
+    // life, which is why remote daylight washes out: a fixed stop cannot be right twice, and
+    // the feed's camera sees a different average luminance from the player's.
+    //
+    // There is already a sun-elevation model here (feedAutoExposure / TryAutoExposureEv) but
+    // it is OPEN LOOP — it predicts exposure from time of day and cannot react to the camera
+    // sitting in shadow or pointing at bright desert versus dark forest. It also never
+    // engages on this build: "Auto aperture: no sun direction ... stays OFF". This replaces
+    // the idea rather than tuning it.
+    //
+    // THE MECHANISM. ExecuteForwardAndPostProcess -> ExecutePostPasses ->
+    // SceneDrawSystem.ComputeExposure -> EyeAdaptationJob.DynamicExposure, all INSIDE our
+    // nested Draw. EyeAdaptationJob keeps the adaptation history as instance state
+    // (RenderTargetTexture[] _autoExposures, RWBuffer _histogram), so a second instance
+    // installed for our pass adapts to OUR image and leaves the player's alone. Same shape as
+    // the probe manager, the cascade shadows and the draw contexts.
+    //
+    // WHY THE SHARED ONE COULD NEVER JUST BE ENABLED: it ping-pongs one history. Running it
+    // twice a frame against two different average luminances made the PLAYER's lighting
+    // oscillate at our render cadence, which is why wholeSceneDisableEyeAdaptation exists.
+    // Owning the state is what removes that objection.
+    //
+    // REQUIRES A BOOTSTRAP RESTART. The instance is parked in RttBridge.ParkedEyeAdaptation
+    // because it owns RenderTargetTextures: a logic-owned instance is rebuilt on every hot
+    // reload and the orphan's RTV descriptors leak from a small fixed pool. Own-probes CTD'd
+    // that exact way ("Out of the descriptor heap at DescriptorHeapPool.BorrowRTV") after
+    // four reloads with VRAM flat. If the park is missing the feature refuses to arm and says
+    // so, rather than running and leaking.
+    public static bool WholeSceneOwnEyeAdaptation { get; private set; }
+
     // ---- THE RESIDENCY CONE (2026-08-02) ----------------------------------------------
     //
     // Stop making world resident BEHIND the camera. Every other residency mechanism here is
@@ -1485,6 +1517,17 @@ internal static class FeedConfig
             // they are pure ScopeSetValues calls read fresh on every render, so a sweep is
             // live rather than a series of gate cycles.
             WholeSceneFloraLodMult      = Dbl(kv, "wholeSceneFloraLodMult", WholeSceneFloraLodMult);
+
+            var eyeWas = WholeSceneOwnEyeAdaptation;
+            WholeSceneOwnEyeAdaptation = Bool(kv, "wholeSceneOwnEyeAdaptation", WholeSceneOwnEyeAdaptation);
+            if (eyeWas != WholeSceneOwnEyeAdaptation)
+                RttLog.Global($"Config: wholeSceneOwnEyeAdaptation {eyeWas} -> {WholeSceneOwnEyeAdaptation}. " +
+                    (WholeSceneOwnEyeAdaptation
+                        ? "The feed gets its OWN auto-exposure history, so it adapts to what the CAMERA sees " +
+                          "instead of holding a fixed stop. Needs the parked instance from the bootstrap — if the " +
+                          "log says the park is missing, restart the game; it will refuse to arm rather than leak " +
+                          "RTV descriptors. Also implies dropping the EyeAdaptation scope for our pass."
+                        : "Back to a fixed stop (wholeSceneExposure)."));
 
             var coneWas = ResidencyConeDegrees;
             ResidencyConeDegrees    = Dbl(kv, "residencyConeDegrees", ResidencyConeDegrees);
