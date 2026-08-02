@@ -521,3 +521,98 @@ the SpawnSyncPoint probe picks the server one. On that seat:
 - Terrain MESH remains the clipmap override's job (client half, proven); voxel DATA may
   now arrive via the marker's DynamicTag driving `Voxel : Block` sectors — if so, manual
   preload becomes redundant. A/B: marker on, preload off, watch VRAM at a virgin site.
+
+---
+
+## 2026-08-02 — THE STAGE WE SKIPPED WAS THE BUG (stage 1 split)
+
+Three fidelity gaps were left after goal 10 and were being chased as three separate bugs:
+trees resolving low up close, foliage thinner than local, and no grass at all. They share
+one cause, and the cause was **ours**, not the engine's.
+
+`wholeSceneSkipStages` contained id 1 = `ExecuteRaytracingPrepareAndSceneFinalize`. The
+name is the whole bug: **two unrelated bodies behind one entry point.**
+
+    RaytracingPrepare(cl)   world-space shared RT state — the reason 1 was skipped
+    SceneFinalize(cl)       nothing to do with raytracing whatsoever
+
+`SceneFinalize`, read in full, runs on **our** DrawContexts:
+
+    CascadeStatsJob
+    LODStateUpdateJob(DrawContexts.LODTransitions)             <- LOD state
+    LODStateUpdateJob(DrawContexts.InstancedLODTransitions)    <- INSTANCED LOD state
+    VisibleEntitiesUpdateJob(MainViewCulling.FirstPass, MainOutputGeometryBuffers)
+    VisibleInstancedEntitiesUpdateJob(MainViewCulling.FirstPass, ...)
+    ...and both again for SecondPass when HZBO.MainViewEnabled
+
+Mapping onto the symptoms:
+
+| skipped job | symptom |
+|---|---|
+| LOD state never updates | trees stay low-detail however close the camera gets |
+| instanced LOD never updates | foliage thinner than the same biome is locally |
+| visible-entity set never updates | `RenderGrass` generates from `DrawContexts.MainViewCulling.EntityProxies`, so grass generates for nothing |
+
+**Fix**: `RaytracingPrepare` becomes skippable stage **30**; config swaps `1` for `30`.
+Both halves have exactly one caller each, so they separate cleanly. This is strictly
+*less* suppression than before — the RT half stays off exactly as it was.
+
+### How it was found, and the lesson
+
+Every link in the grass chain looked correct on paper. What closed it was printing the
+live gate **from inside our own pass** (`grassProbe = 1`) instead of reasoning about it:
+
+    Grass.Enabled=True DrawDistance=1000 Density=3 MaxInclination=35 AngleCull=42
+    Is3DMapEnabled=False
+    GrassBufferContext=GrassBufferContext MainViewCulling=present
+
+Every gate open, still no grass — which leaves only the *set* being generated from, and
+the one job that fills it was the one we were skipping. **Reading code says what should
+happen; the probe said what did.**
+
+### The control that invalidates the grass claim
+
+Pointing the feed at the player's own grid (`orbitAnchor` empty) put the feed and the
+player's own view of the same ground in one screenshot. **The player is standing in bare
+sandstone desert — no grass, no flora of any kind.**
+
+So this save has *no local grass to compare against*, and every "grass is missing from
+the feed" conclusion here has rested on an untested premise: that the filmed site has
+blade grass at all. The remote alpine anchor has moss, lichen, boulders and trees.
+**The grass gap is UNPROVEN, not confirmed.** Do not re-litigate it without a site
+verified grassy on foot.
+
+The same invalidity infects the density instrument: `FLORA CAMERA`'s "DENSITY
+like-for-like" line compares the nearest sector to the FEED (31 instances, alpine) with
+the nearest to the PLAYER (16, desert). Different biomes. It has been printing all day
+and reads as like-for-like when it is nothing of the sort — the same class of error as
+the blind grass reader, only quieter, because a plausible number attracts less suspicion
+than a zero.
+
+### Measured while hunting (keep — these were all guessed at before)
+
+- `RootResourceStreamingComponent.RootStreamingDistance` = **200 m**
+- `ImpostorSettings.SwapDistance` = 500 m, with `EnableImpostorSwitching` **false** by default
+- `GrassSettings.DrawDistance` = **1000 m** — distance was never what culled our grass
+- `GrassSettings.MaxInclination` = 35, `AngleCullingThreshold` = 42
+- `VoxelCell.MAX_LOD_WITH_GRASS` gates which clipmap LODs get a grass entity at all
+- Grass does **not** arrive via resource streaming: `VoxelCell.CreateModelEntity(model,
+  materials, hasGrassMaterial, ...)` builds it alongside the cell's model
+
+### The nearest-viewer distance (commit 0c5c53a) — real, firing, not the headline
+
+`RenderUtilities.CalculateDistanceToCamera` reads the single global
+`Settings.RenderView.CameraPosition`; `DistanceTagManagerComponent` caches that one float
+per entity and the whole tag family (`StreamingTag`, impostor near/far, shadow tracking,
+RT near/far, geometry-dirty) reads nothing else. A postfix returns
+`min(engineAnswer, ourAnswer)` — monotone downward, so the player can never be demoted,
+and idempotent, so overlapping viewer bubbles are not a conflict.
+
+Firing and measured: 673 overrides/window at r=200, ~11,500 at r=1000 (so render-scene
+roots are dense enough for the bubble to bite), fps flat, VRAM +121 MB. But it is **not**
+what was holding the three symptoms back, and no visual difference could honestly be
+called from its A/B. It stays because tag-family parity is still the right thing.
+
+**Not covered by it**: `ManagedTexturePrioritizerComponent.OnCollectStandardsRoot` reads
+`Settings.RenderView.CameraPosition` *directly* for texture mip priority — a second,
+independent single-camera decision. Open.
