@@ -721,6 +721,19 @@ internal static class WorldGrids
         sb.AppendLine("Every EntityTrigger in each reachable scene's SpatialTriggerSystemSessionComponent,");
         sb.AppendLine("sorted by distance to the camera. 'inside' counts entities currently in the trigger.");
 
+        // THE DEBUG KILL-SWITCH. PlanetEnvironmentComponent.MaterializeSectors's only gate
+        // before the sector storage is `if (!DebugEnableUpdates) return;` — a STATIC debug
+        // bool. This save boots through a "altered with Debug Menu" warning every load; if
+        // that menu left this off, every flora sector-entry callback in the world silently
+        // returns, which is exactly the observed symptom.
+        try
+        {
+            var tPec = Type.GetType("Keen.VRage.Voxels.Components.PlanetEnvironmentComponent, VRage.Voxels");
+            var fDbg = tPec?.GetField("DebugEnableUpdates", Any);
+            sb.AppendLine($"\nPlanetEnvironmentComponent.DebugEnableUpdates = {fDbg?.GetValue(null) ?? "(unreadable)"}" );
+        }
+        catch (Exception e) { sb.AppendLine($"\nDebugEnableUpdates read failed: {e.GetType().Name}"); }
+
         // The TypeId -> name table, rebuilt per dump into the shared map the per-session
         // census reads. Reading TypeId<T>.Value is a static-field read; WithInitIfNeeded is
         // the fallback and is what every engine consumer calls anyway.
@@ -1032,6 +1045,113 @@ internal static class WorldGrids
                 catch { /* torn trigger — skip it, keep the census */ }
             }
 
+            // THE FLORA CHAIN, link by link (2026-08-02: terrain landed, scatters did not).
+            // For every environment/generation sectored trigger: is it tracking our
+            // markers, and do any of its SECTORS currently hold an entity? A tracked
+            // marker with zero occupied sectors means sector-entry never fired; occupied
+            // sectors with no content means the generation/spawn side is the dead link.
+            try
+            {
+                var mh = _marker == null ? null : Prop(_marker, "Entity")?.ToString();
+                var sh = _serverMarker == null ? null : Prop(_serverMarker, "Entity")?.ToString();
+                sb.AppendLine("    --- flora-chain detail (PlanetEnvironment* / Procedural Generation triggers) ---");
+                foreach (var t in triggers)
+                {
+                    string nm;
+                    try { nm = Prop(t, "_debugName")?.ToString() ?? ""; } catch { continue; }
+                    if (!nm.Contains("PlanetEnvironment", StringComparison.Ordinal) &&
+                        !nm.Contains("Procedural Generation", StringComparison.Ordinal)) continue;
+                    try
+                    {
+                        var tracked = Prop(t, "TrackedEntities") as IEnumerable;
+                        int tn = 0; bool hasM = false, hasS = false;
+                        if (tracked != null)
+                            foreach (var e2 in tracked)
+                            {
+                                tn++;
+                                var k = e2?.ToString();
+                                if (mh != null && k == mh) hasM = true;
+                                if (sh != null && k == sh) hasS = true;
+                            }
+                        var counts = Prop(t, "SectorEntityCounts") as IDictionary;
+                        var occupied = counts?.Count ?? -1;
+                        sb.AppendLine($"      {Trunc(nm, 44),-44} tracked={tn}{(hasM ? " +CLIENT-MARKER" : "")}" +
+                                      $"{(hasS ? " +SERVER-MARKER" : "")}  occupiedSectors={occupied}");
+
+                        // THE STORAGE, through the callback's own target. The server planet
+                        // entity's Components array does not carry PlanetEnvironmentComponent
+                        // (a scene walk found none), but every sector callback is a delegate
+                        // whose Target IS that component — the trigger hands us the exact
+                        // instance its entries would notify. Its sector-storage collection
+                        // counts are the pending-vs-materialized verdict.
+                        if (nm.StartsWith("PlanetEnvironment", StringComparison.Ordinal))
+                        {
+                            // The trigger's callback target is a TriggerLayer wrapper; the
+                            // component sits one hop further, behind the LAYER's Args
+                            // delegates. Both tiers report: the layer's own counters, then
+                            // the component's sector storage.
+                            var cb = Prop(Prop(t, "SectorArgs") ?? Prop(t, "_args"), "OnFirstEntityEntered") as Delegate;
+                            var layer = cb?.Target;
+                            if (layer != null && layer.GetType().Name == "TriggerLayer")
+                            {
+                                var sc = Prop(layer, "SectorCounter") as IDictionary;
+                                var cc = Prop(layer, "ChunkCounter") as IDictionary;
+                                sb.AppendLine($"          layer: SectorCounter={sc?.Count ?? -1} ChunkCounter={cc?.Count ?? -1}");
+
+                                object component = null;
+                                var args = Prop(layer, "Args");
+                                if (args != null)
+                                    foreach (var f3 in args.GetType().GetFields(Any))
+                                        if (f3.GetValue(args) is Delegate d3 && d3.Target != null
+                                            && Prop(d3.Target, "EnvironmentSectorStorage") != null)
+                                        { component = d3.Target; break; }
+                                var storage = component == null ? null : Prop(component, "EnvironmentSectorStorage");
+                                if (storage != null)
+                                {
+                                    var parts = new List<string>();
+                                    for (var ty = storage.GetType(); ty != null && ty != typeof(object); ty = ty.BaseType)
+                                        foreach (var f2 in ty.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                                        {
+                                            object v2;
+                                            try { v2 = f2.GetValue(storage); } catch { continue; }
+                                            if (v2 is IDictionary dct) parts.Add($"{f2.Name}={dct.Count}");
+                                            else if (v2 is ICollection col) parts.Add($"{f2.Name}={col.Count}");
+                                        }
+                                    sb.AppendLine($"          storage[{component.GetType().Name}]: {Trunc(string.Join(" ", parts), 110)}");
+                                }
+                                else sb.AppendLine("          (no Args delegate reaches an EnvironmentSectorStorage)");
+                            }
+                            else if (cb != null)
+                                sb.AppendLine($"          callback target: {layer?.GetType().Name ?? "static"}");
+                        }
+                    }
+                    catch (Exception e2) { sb.AppendLine($"      {Trunc(nm, 44),-44} unreadable: {e2.GetType().Name}"); }
+                }
+            }
+            catch { }
+
+            // The generator itself: is it running, is it blocked, is anything queued?
+            try
+            {
+                object gen = null;
+                var scEntity2 = Prop(session, "SessionComponents");
+                if (scEntity2 != null && _fComponents?.GetValue(scEntity2) is IEnumerable comps2)
+                    foreach (var c in comps2)
+                        if (c != null && c.GetType().Name.StartsWith("ProceduralGenerator", StringComparison.Ordinal))
+                        { gen = c; break; }
+                if (gen != null)
+                {
+                    var q = Prop(gen, "MaterializationQueue");
+                    sb.AppendLine($"    generator: {gen.GetType().Name}  IsActive={Prop(gen, "IsActive")}  " +
+                                  $"_blocked={Prop(gen, "_blocked")}  blockedTasks={CountSafe(Prop(gen, "_blockedTasks") as IEnumerable)}  " +
+                                  $"queue={(q == null ? "?" : Prop(q, "Count")?.ToString() ?? q.GetType().Name)}  " +
+                                  $"volumeSectors={Prop(Prop(gen, "_volumeSectors"), "Count") ?? "?"}  " +
+                                  $"entitySectors={Prop(Prop(gen, "_entitySectors"), "Count") ?? "?"}");
+                }
+                else sb.AppendLine("    generator: no ProceduralGenerator*SessionComponent on this session's entity.");
+            }
+            catch (Exception e) { sb.AppendLine($"    generator: unreadable ({e.GetType().Name})"); }
+
             // Every trigger within 100 km of the camera, then the nearest tail beyond it up
             // to a cap — a distant-but-relevant trigger (a managed area two valleys over)
             // should still show, but a thousand-line dump of the whole solar system is the
@@ -1125,17 +1245,31 @@ internal static class WorldGrids
     private static object _pendingDestage;        // marker ctx awaiting its de-stage edge
     private static object _pendingDestageServer;
 
-    // MOTION IS PART OF THE ARCHETYPE, in practice if not in the constraint. Sector
-    // membership is evaluated on movement events (AttachedEntityTransformChanged) — every
-    // real DynamicTag entity moves, and a marker that holds perfectly still after birth
-    // presents no events for the sectored triggers to chew on. The census after the staged
-    // birth showed exactly that: tracked (12 -> 14) but never inside a sector. A slow 10 m
-    // drift circle keeps a steady trickle of genuine transform-change events flowing
-    // without meaningfully moving the presence.
+    // MOTION IS PART OF THE ARCHETYPE — and the RIGHT motion is a PATROL, not a shuffle.
+    // The 10 m drift version proved tracking (census: +SERVER-MARKER on the flora
+    // triggers) and proved insufficiency: zero flora entities in the server scene after
+    // minutes of presence. Sector-entry callbacks (SectorArgs.OnFirstEntityEntered — the
+    // hook that enqueues generation) fire on sector BOUNDARY CROSSINGS, and a 10 m circle
+    // lives inside one sector: one entry at birth, then silence. Players trip these
+    // constantly because they travel. So the marker now patrols a 250 m ring at ~12 m/s —
+    // a brisk vehicle pace, crossing flora-scale sectors every few seconds, the same
+    // stimulus a driving player presents.
+    // IN THE PLANET-TANGENT PLANE, not world X/Z — the user's "did the voxel-mesh fix
+    // teach us anything" question caught this before it shipped wrong: at the Verdure base
+    // the radial up is ~(0.97, 0.19, -0.14), mostly world-X, so a world-horizontal ring is
+    // nearly VERTICAL there — a patrol into the sky and the bedrock, where no flora sector
+    // lives. Same disease as corner-vs-centre: right numbers, wrong frame. The feed
+    // publishes planet-radial up; the ring lives in the plane perpendicular to it.
     private static Vector3D DriftAround(Vector3D centre)
     {
-        var t = Environment.TickCount64 * 0.0002;        // one lap ~31 s
-        return centre + new Vector3D(Math.Sin(t) * 10.0, 0, Math.Cos(t) * 10.0);
+        var t = Environment.TickCount64 * 0.00005;       // 0.05 rad/s -> one lap ~126 s
+        var up = CameraFeed.OrbitUp;
+        if (up.LengthSquared() < 0.5) up = new Vector3D(0, 1, 0);
+        up.Normalize();
+        var seed = Math.Abs(up.Y) < 0.9 ? new Vector3D(0, 1, 0) : new Vector3D(1, 0, 0);
+        var t1 = Vector3D.Cross(up, seed); t1.Normalize();
+        var t2 = Vector3D.Cross(up, t1);
+        return centre + t1 * (Math.Sin(t) * 250.0) + t2 * (Math.Cos(t) * 250.0);
     }
 
     private static void Destage(object markerCtx)
@@ -1169,7 +1303,8 @@ internal static class WorldGrids
         if (sceneObj == null) return;
         var want = FeedConfig.ServerPresenceEntity;
         if (!want && _serverMarker == null
-            && !FeedConfig.CameraTriggerEntity && _marker == null) return;
+            && !FeedConfig.CameraTriggerEntity && _marker == null
+            && !_serverFloraSurveyPending) return;
 
         try
         {
@@ -1195,6 +1330,7 @@ internal static class WorldGrids
             // The CLIENT scene's seat drives the client marker — the same "born on the
             // pump" requirement the census exposed, applied to both scenes symmetrically.
             if (!isServer) { DriveClientMarker(scene2); return; }
+            if (_serverFloraSurveyPending) { _serverFloraSurveyPending = false; DumpServerFlora(scene2); }
             if (_serverDisarmed) return;
 
             if (!want)
@@ -1361,6 +1497,157 @@ internal static class WorldGrids
             RttLog.Line($"VOXEL BODY SURVEY written to {path} ({n} bodies).");
         }
         catch (Exception e) { RttLog.Error("voxel body survey", e); }
+    }
+
+    // ── THE SERVER FLORA CENSUS — spawned-but-not-replicated vs never-spawned ───────────
+    //
+    // 2026-08-02: terrain landed; scatters did not. The trigger census left a fork: the
+    // server's Verdure flora triggers show 448 OCCUPIED sectors with an ACTIVE, EMPTY-queue
+    // generator. Either sector content already exists server-side (gap = replication /
+    // client rendering) or entry never queued generation (gap = the callback chain).
+    // Counting the server scene's entities near the camera splits it: hundreds of flora
+    // entities -> replication-side gap; none -> generation-side gap.
+    //
+    // The walk runs ON the sim-pump seat's server callback — the only thread where reading
+    // the server scene's archetypes mid-session is legitimate. One shot per request; a
+    // 30k-entity walk costs the server pump tens of milliseconds, once.
+    private static volatile bool _serverFloraSurveyPending;
+
+    internal static void RequestServerFloraSurvey() => _serverFloraSurveyPending = true;
+
+    private static void DumpServerFlora(object scene)
+    {
+        try
+        {
+            var centre = CameraFeed.SubjectCentreCache;
+            const double Radius = 3000.0;
+
+            _miEnumerate ??= scene.GetType().GetMethod("EnumerateEntities", Any, null, Type.EmptyTypes, null);
+            _tCtx ??= Type.GetType("Keen.VRage.DCS.Accessors.DEntityContext, VRage.DCS");
+            _tEntity ??= Type.GetType("Keen.VRage.DCS.Components.Entity, VRage.DCS");
+            _miFromData ??= _tEntity?.GetMethod("TryGetFromDataEntity", Any);
+            var tBbd = Type.GetType("Keen.VRage.Core.Game.Data.BoundingBoxData, VRage.Core.Game");
+            var miAabb = tBbd?.GetMethods(Any).FirstOrDefault(m =>
+                m.Name == "GetWorldAABB" && m.GetParameters().Length == 1
+                && m.GetParameters()[0].ParameterType.Name == "DEntityContext");
+            if (_miEnumerate == null || _tCtx == null || _miFromData == null || miAabb == null)
+            {
+                RttLog.Line("SERVER FLORA: shape missing (enumerate/ctx/entity/GetWorldAABB) — survey skipped.");
+                return;
+            }
+            if (_miEnumerate.Invoke(scene, null) is not IEnumerable handles)
+            { RttLog.Line("SERVER FLORA: enumeration returned nothing."); return; }
+
+            var byComponent = new Dictionary<string, int>();
+            var samples = new List<string>();
+            int seen = 0, near = 0, positioned = 0;
+            foreach (var handle in handles)
+            {
+                seen++;
+                try
+                {
+                    var ctx = Activator.CreateInstance(_tCtx, scene, handle);
+                    // Distance first, via the AABB helper — most entities carry bounds, and
+                    // the ones that do not are infrastructure the question is not about.
+                    object aabb;
+                    try { aabb = miAabb.Invoke(null, new[] { ctx }); } catch { continue; }
+                    Vector3D pos;
+                    if (Prop(aabb, "Center") is Vector3D c) pos = c;
+                    else if (Prop(aabb, "Min") is Vector3D mn && Prop(aabb, "Max") is Vector3D mx) pos = (mn + mx) * 0.5;
+                    else continue;
+                    positioned++;
+                    var d = (pos - centre).Length();
+                    if (d > Radius) continue;
+                    near++;
+
+                    var entity = _miFromData.Invoke(null, new[] { ctx });
+                    string label;
+                    if (entity != null && _fComponents == null)
+                        _fComponents = entity.GetType().GetField("Components", Any);
+                    if (entity != null && _fComponents?.GetValue(entity) is IEnumerable comps)
+                    {
+                        var names = new List<string>();
+                        foreach (var comp in comps) if (comp != null) names.Add(comp.GetType().Name);
+                        foreach (var n2 in names)
+                            byComponent[n2] = byComponent.TryGetValue(n2, out var v) ? v + 1 : 1;
+                        label = string.Join("+", names.Take(4));
+                    }
+                    else
+                    {
+                        // Data-only entity (no managed wrapper): histogram the archetype id
+                        // so pure-ECS content (which flora may well be) still shows up.
+                        label = "(data-only) " + (Prop(ctx, "Archetype")?.ToString() ?? "?");
+                        byComponent[label] = byComponent.TryGetValue(label, out var v) ? v + 1 : 1;
+                    }
+                    if (samples.Count < 30)
+                        samples.Add($"    {d,6:F0}m  {pos.X:F0},{pos.Y:F0},{pos.Z:F0}  {Trunc(label, 90)}");
+                }
+                catch { }
+            }
+
+            // THE SECTOR STORAGE, generically. PlanetEnvironmentSectorStorage is the state
+            // machine between "sector-entry callback fired" and "content spawned"; every
+            // collection-typed field's count is dumped without knowing its name, so pending
+            // vs materialized vs nothing reads straight off. All-zeros = the callbacks never
+            // fire; growing pendings = the callbacks fire and the downstream stalls.
+            var storageReport = new StringBuilder();
+            try
+            {
+                if (_miEnumerate.Invoke(scene, null) is IEnumerable handles2)
+                {
+                    int planetsFound = 0;
+                    foreach (var handle in handles2)
+                    {
+                        if (planetsFound >= 6) break;
+                        try
+                        {
+                            var ctx = Activator.CreateInstance(_tCtx, scene, handle);
+                            var entity = _miFromData.Invoke(null, new[] { ctx });
+                            if (entity == null || _fComponents?.GetValue(entity) is not IEnumerable comps) continue;
+                            object pec = null;
+                            foreach (var comp in comps)
+                                if (comp != null && comp.GetType().Name == "PlanetEnvironmentComponent") { pec = comp; break; }
+                            if (pec == null) continue;
+                            planetsFound++;
+                            var storage = Prop(pec, "EnvironmentSectorStorage");
+                            storageReport.AppendLine($"    planet entity {handle}: storage = {(storage == null ? "NULL" : storage.GetType().Name)}");
+                            if (storage == null) continue;
+                            for (var ty = storage.GetType(); ty != null && ty != typeof(object); ty = ty.BaseType)
+                                foreach (var f2 in ty.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                                {
+                                    object v2;
+                                    try { v2 = f2.GetValue(storage); } catch { continue; }
+                                    if (v2 is IDictionary dct) storageReport.AppendLine($"        {f2.Name}: {dct.Count} entries");
+                                    else if (v2 is ICollection col) storageReport.AppendLine($"        {f2.Name}: {col.Count} items");
+                                }
+                        }
+                        catch { }
+                    }
+                    if (planetsFound == 0) storageReport.AppendLine("    (no entity with PlanetEnvironmentComponent found in this scene)");
+                }
+            }
+            catch (Exception e) { storageReport.AppendLine($"    storage sweep failed: {e.GetType().Name}"); }
+
+            var sb = new StringBuilder();
+            sb.AppendLine("=== SERVER FLORA CENSUS ===");
+            sb.AppendLine($"Server scene walked on its own pump. Camera: {centre.X:F0}, {centre.Y:F0}, {centre.Z:F0}; radius {Radius:F0} m.");
+            sb.AppendLine($"{seen} entit(ies) seen, {positioned} with world bounds, {near} within radius.");
+            sb.AppendLine("\n--- planet EnvironmentSectorStorage state ---");
+            sb.Append(storageReport);
+            sb.AppendLine("\n--- component histogram within radius ---");
+            foreach (var kv in byComponent.OrderByDescending(k => k.Value).Take(40))
+                sb.AppendLine($"    {kv.Value,6}  {kv.Key}");
+            sb.AppendLine("\n--- nearest samples ---");
+            foreach (var s in samples) sb.AppendLine(s);
+
+            var path = Path.Combine(RttLog.OutDir, "server-flora.txt");
+            File.WriteAllText(path, sb.ToString());
+            RttLog.Line($"SERVER FLORA CENSUS written to {path}: {near} entit(ies) within {Radius:F0} m " +
+                        $"of the camera ({seen} in the scene). ZERO here with 448 occupied sectors means the " +
+                        "generation side never ran; hundreds means the content exists and the gap is " +
+                        "replication or client rendering.");
+        }
+        catch (Exception e) { RttLog.Error("server flora census", e); }
     }
 
     // TAG PROVENANCE ACROSS A HOT RELOAD.

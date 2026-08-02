@@ -856,6 +856,18 @@ internal static class FeedConfig
     public static bool VoxelBodySurvey { get; private set; }
     private static bool _bodySurveyArmedLast;
 
+    // One-shot SERVER-scene entity census near the camera, walked on the sim-pump seat —
+    // the spawned-vs-never-spawned fork for the flora chain. Writes output/server-flora.txt.
+    public static bool ServerFloraSurvey { get; private set; }
+    private static bool _floraSurveyArmedLast;
+
+    public static bool TakeServerFloraSurveyRequest()
+    {
+        var r = ServerFloraSurvey;
+        ServerFloraSurvey = false;
+        return r;
+    }
+
     public static bool TakeVoxelBodySurveyRequest()
     {
         var r = VoxelBodySurvey;
@@ -1112,6 +1124,10 @@ internal static class FeedConfig
             var bodySurveyWanted = Bool(kv, "voxelBodySurvey", false);
             if (bodySurveyWanted && !_bodySurveyArmedLast) VoxelBodySurvey = true;
             _bodySurveyArmedLast = bodySurveyWanted;
+
+            var floraSurveyWanted = Bool(kv, "serverFloraSurvey", false);
+            if (floraSurveyWanted && !_floraSurveyArmedLast) ServerFloraSurvey = true;
+            _floraSurveyArmedLast = floraSurveyWanted;
 
             // DURABLE consume for the area loader, not the in-memory edge the survey uses.
             // The in-memory version re-fired after a game restart — fresh statics saw the

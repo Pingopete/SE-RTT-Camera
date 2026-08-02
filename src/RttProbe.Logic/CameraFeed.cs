@@ -537,6 +537,7 @@ internal static class CameraFeed
             if (FeedConfig.TakeWorldGridSurveyRequest()) WorldGrids.DumpGrids(entity);
             if (FeedConfig.TakeTriggerCensusRequest()) WorldGrids.DumpTriggerCensus(entity, centre);
             if (FeedConfig.TakeVoxelBodySurveyRequest()) WorldGrids.DumpVoxelBodies(centre);
+            if (FeedConfig.TakeServerFloraSurveyRequest()) WorldGrids.RequestServerFloraSurvey();
             var loadReq = FeedConfig.TakeLoadAreaRequest();
             if (loadReq.Length > 0) WorldGrids.LoadAreaByName(entity, loadReq);
 
