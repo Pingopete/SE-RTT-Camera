@@ -526,6 +526,14 @@ internal static class CameraFeed
             if (FeedConfig.PreloadAroundCamera)
                 WorldGrids.PreloadAroundCamera(entity, centre, FeedConfig.PreloadRadius);
 
+            // The marker entity that makes the world materialize around the camera. Called
+            // unconditionally rather than behind the knob, because the OFF path is what
+            // deletes a marker that is already out there — gating the call would leave an
+            // orphan riding a camera nothing is steering. This project's house bug is state
+            // that can only change while the thing it controls is already running, and a
+            // teardown reachable only when the feature is enabled is exactly that shape.
+            WorldGrids.UpdateCameraTriggerEntity(entity, centre);
+
             if (FeedConfig.TakeWorldGridSurveyRequest()) WorldGrids.DumpGrids(entity);
             var loadReq = FeedConfig.TakeLoadAreaRequest();
             if (loadReq.Length > 0) WorldGrids.LoadAreaByName(entity, loadReq);

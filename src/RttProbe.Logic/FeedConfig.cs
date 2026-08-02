@@ -851,6 +851,23 @@ internal static class FeedConfig
     // Off by default: it mutates a world entity.
     public static bool TagAnchorForClutter { get; private set; }
 
+    // THE CAMERA TRIGGER ENTITY — the same job as tagAnchorForClutter, done the way the
+    // ENGINE does it rather than by mutating one of the player's grids.
+    //
+    // VoxelObserverSessionComponent.OnAddedToScene spawns exactly this and nothing more:
+    //     Scene.AddEntity<ClientTriggerTag, WorldTransform, BoundingBoxData>(
+    //         default, RenderSettings.CameraTransform, BoundingBox(-1, 1))
+    // an invisible 2 m marker that IS the engine's voxel streaming observer, moved every
+    // tick to wherever the viewer is. We build the same thing and move it to the feed
+    // camera. Strictly better than tagging a grid: it touches nothing the player owns, it
+    // works at bare coordinates where there is no entity to tag, it will work unchanged
+    // when the camera is a block on a moving ship, and it deletes cleanly.
+    //
+    // Off by default, and mutually exclusive in practice with tagAnchorForClutter — run one
+    // or the other so a result attributes to something. The A/B that grades this is:
+    // clutter appeared with the tag in ~2 min, so marker ON + tag OFF must reproduce it.
+    public static bool CameraTriggerEntity { get; private set; }
+
     public static bool PerBodyClipmapCamera { get; private set; }
     public static double ClipmapMinPlayerDistance { get; private set; } = 100000.0;
 
@@ -982,6 +999,18 @@ internal static class FeedConfig
             ClipmapMaxFeedDistance   = Dbl(kv, "clipmapMaxFeedDistance", ClipmapMaxFeedDistance);
             ClipmapUpdateBudgetMs    = Dbl(kv, "clipmapUpdateBudgetMs", ClipmapUpdateBudgetMs);
             TagAnchorForClutter      = Bool(kv, "tagAnchorForClutter", TagAnchorForClutter);
+
+            var markerWas = CameraTriggerEntity;
+            CameraTriggerEntity = Bool(kv, "cameraTriggerEntity", CameraTriggerEntity);
+            if (markerWas != CameraTriggerEntity)
+                RttLog.Global($"Config: cameraTriggerEntity {markerWas} -> {CameraTriggerEntity}" +
+                    (CameraTriggerEntity
+                        ? ". A ClientTriggerTag marker entity now rides the feed camera — the same "
+                          + "construction the engine's own voxel observer uses. Environment sectors should "
+                          + "materialize around the camera whether or not anything is anchored to a grid. "
+                          + "Watch for \"CAMERA TRIGGER:\" in the log; for a clean A/B set tagAnchorForClutter = 0."
+                        : ". The marker is deleted on the next tick and the camera stops triggering sectors."));
+
             if (clipWas != PerBodyClipmapCamera)
                 RttLog.Global($"Config: perBodyClipmapCamera {clipWas} -> {PerBodyClipmapCamera}" +
                     (PerBodyClipmapCamera

@@ -556,11 +556,45 @@ internal static class WorldGrids
     //
     // Off by default. It mutates a world entity, and that class of work has been expensive.
     private static readonly HashSet<object> _taggedGrids = new();
+    // WHICH GRIDS WE ACTUALLY WROTE TO, kept separate from _taggedGrids on purpose.
+    // _taggedGrids means "considered, do not consider again" and includes grids that were
+    // BORN with the tag; untagging one of those would delete a property of the player's
+    // world that we never granted. Only what is in here may ever be removed.
+    private static readonly HashSet<object> _tagAddedByUs = new();
     private static bool _tagShapeLogged;
 
     internal static void TagAnchorGridForEnvironment(object anchorEntity)
     {
-        if (!FeedConfig.TagAnchorForClutter || anchorEntity == null) return;
+        if (anchorEntity == null) return;
+
+        // THE 1->0 EDGE. Turning the knob off has to actually undo the mutation, or the
+        // "off" state is a lie and every A/B run after the first one is confounded by a tag
+        // nobody can see. This is also the house bug's exact shape — a teardown reachable
+        // only while the feature is enabled — so it lives BEFORE the enabled check.
+        if (!FeedConfig.TagAnchorForClutter)
+        {
+            if (!_tagAddedByUs.Contains(anchorEntity)) { _taggedGrids.Remove(anchorEntity); return; }
+            try
+            {
+                var t = Type.GetType(
+                    "Keen.VRage.Core.Game.GameSystems.GamePruning.ClientTriggerTag, VRage.Core.Game");
+                var d = Prop(anchorEntity, "Data");
+                var rm = d?.GetType().GetMethods(Any).FirstOrDefault(
+                    m => m.Name == "TryRemove" && m.IsGenericMethodDefinition && m.GetParameters().Length == 0);
+                if (t != null && rm != null)
+                {
+                    var removed = (bool)rm.MakeGenericMethod(t).Invoke(d, null);
+                    RttLog.Line($"CLUTTER TAG: removed ClientTriggerTag from the anchor grid (TryRemove -> {removed}). " +
+                                "The grid stops being an environment trigger. Sectors it already materialized are " +
+                                "the engine's to reclaim on its own schedule — if they persist, materialization is " +
+                                "one-way and the tag is an arming switch rather than a sustaining one.");
+                }
+            }
+            catch (Exception e) { RttLog.Error("clutter untag", e); }
+            finally { _tagAddedByUs.Remove(anchorEntity); _taggedGrids.Remove(anchorEntity); ClearTagMarker(); }
+            return;
+        }
+
         if (_taggedGrids.Contains(anchorEntity)) return;
         try
         {
@@ -597,20 +631,37 @@ internal static class WorldGrids
                 return;
             }
 
-            // Already tagged? Then the grid was born with it (a player-adjacent entity may
-            // well be) and there is nothing to do — importantly, nothing to UNDO either.
+            // Already tagged? Either the grid was BORN with it — in which case there is
+            // nothing to do and, importantly, nothing to UNDO — or WE tagged it before a hot
+            // reload dropped the statics that remembered so. The marker file is what tells
+            // those two apart; without it, every reload silently converts one of our
+            // mutations into a permanent one nobody is tracking.
             var already = (bool)has.MakeGenericMethod(tTag).Invoke(data, null);
             _taggedGrids.Add(anchorEntity);
             if (already)
             {
-                RttLog.Line("CLUTTER TAG: the anchor grid ALREADY carries ClientTriggerTag, so the " +
-                            "environment trigger should already accept it. If clutter is still absent " +
-                            "around the camera, the tag is not the missing piece and the sector state " +
-                            "in the survey is the next thing to read.");
+                // "*" is a deliberate human claim: I know this tag is mine, adopt it whatever
+                // the handle says. It exists because the feature that WRITES the marker is
+                // newer than the first tag it ever applied, so the very first grid this
+                // project tagged can never match a key — and refusing to untag it would mean
+                // restarting the game to get a clean control.
+                var claim = ReadTagMarker();
+                var ours = claim != null && (claim == "*" || claim == TagKey(anchorEntity, data));
+                if (ours) _tagAddedByUs.Add(anchorEntity);
+                RttLog.Line("CLUTTER TAG: the anchor grid ALREADY carries ClientTriggerTag" +
+                            (ours
+                                ? " — and the marker file says WE added it, before a reload. Adopted, so " +
+                                  "tagAnchorForClutter = 0 can still take it back off."
+                                : ", and no marker file claims it, so it was born with it. Left alone: " +
+                                  "this code never removes a tag it did not add.") +
+                            " If clutter is still absent around the camera, the tag is not the missing " +
+                            "piece and the sector state in the survey is the next thing to read.");
                 return;
             }
 
             set.MakeGenericMethod(tTag).Invoke(data, new[] { Activator.CreateInstance(tTag) });
+            _tagAddedByUs.Add(anchorEntity);
+            WriteTagMarker(TagKey(anchorEntity, data));
             RttLog.Line("CLUTTER TAG: added ClientTriggerTag to the anchor grid. The planet's sectored " +
                         "trigger tests exactly this (MustHave ClientTriggerTag, MustNotHave " +
                         "ProcedurallyGenerated/ManagedByWorldArea), so sectors should now materialize " +
@@ -623,6 +674,321 @@ internal static class WorldGrids
             _taggedGrids.Add(anchorEntity);          // never retry a throwing path every tick
             RttLog.Error("clutter tag", e);
         }
+    }
+
+    // TAG PROVENANCE ACROSS A HOT RELOAD.
+    //
+    // _tagAddedByUs lives in statics that a reload throws away, while the tag it records
+    // lives in the world and does not. Without something durable, the sequence "tag a grid,
+    // reload, set the knob to 0" leaves the tag on forever and the next A/B silently runs
+    // against a world that is still armed — which is exactly the confound this file exists
+    // to avoid. Same durable-consume discipline as loadarea-consumed.marker, for the same
+    // reason: an in-memory edge is not a record.
+    //
+    // The key is the ECS handle, which is stable for the life of the SESSION and meaningless
+    // after a restart. That is the correct lifetime: ClientTriggerTag is client-side state
+    // and does not survive a restart either, so a stale file simply fails to match.
+    private static readonly string TagMarkerPath = Path.Combine(RttLog.OutDir, "clutter-tagged.marker");
+
+    private static string TagKey(object anchorEntity, object data)
+    {
+        var handle = Prop(data, "Entity");
+        var name = Describe(anchorEntity)?.Name ?? "?";
+        return $"{handle}|{name}";
+    }
+
+    private static string ReadTagMarker()
+    {
+        try { return File.Exists(TagMarkerPath) ? File.ReadAllText(TagMarkerPath).Trim() : null; }
+        catch { return null; }
+    }
+
+    private static void WriteTagMarker(string key)
+    {
+        try { File.WriteAllText(TagMarkerPath, key); } catch { }
+    }
+
+    private static void ClearTagMarker()
+    {
+        try { if (File.Exists(TagMarkerPath)) File.Delete(TagMarkerPath); } catch { }
+    }
+
+    // ── THE CAMERA TRIGGER ENTITY ───────────────────────────────────────────────────────
+    //
+    // The same job as TagAnchorGridForEnvironment above, done the way the ENGINE does it.
+    //
+    // VoxelObserverSessionComponent.OnAddedToScene is, in full:
+    //
+    //     _observerEntity = Scene.AddEntity<ClientTriggerTag, WorldTransform, BoundingBoxData>(
+    //         default(ClientTriggerTag),
+    //         _render.GetSettings().CameraTransform,
+    //         new BoundingBoxData { BoundingBox = new BoundingBox(-1f, 1f) });
+    //
+    // and UpdateObserver then moves that entity to wherever the viewer is, every tick. So
+    // the engine's own voxel streaming observer IS an invisible 2 m marker carrying one
+    // empty tag. This builds the same thing at the feed camera.
+    //
+    // WHY THIS BEATS TAGGING THE ANCHOR GRID, which it is meant to replace:
+    //   - it mutates nothing the player owns; the grid tag edits a real base
+    //   - it works at bare coordinates, where there is no entity to tag at all
+    //   - it will work unchanged when the camera is a block on a moving ship: the block
+    //     supplies a POSITION, and the marker follows it
+    //   - teardown is RemoveEntity, not a TryRemove on someone else's grid
+    //
+    // SEAT ESTABLISHED FIRST, as everything since the TryLoad freeze has been. Read from the
+    // IL, not assumed:
+    //   AddEntity<T1,T2,T3>  -> TypeId<T>.Value, GetArchetype, AllocateEntity,
+    //                           TryGetDataPointer. A profiler scope and an assert. No
+    //                           Scene.FinishBefore, no ContinueOnDCS<SyncPoint>, nothing
+    //                           planted in the scheduler's dependency graph.
+    //   RemoveEntity         -> consults IsCommandBufferActive() and defers through the
+    //                           command buffer when one is open. The engine built the
+    //                           re-entrancy guard itself.
+    //   SetWorldTransform    -> two EntityData.TryWriteTo stores plus parent maths.
+    // That is the same shape as DEntityContext.Set<T>, which has run all session. It is the
+    // OPPOSITE of ManagedWorldArea.TryLoad, whose FinishBefore<SpawnSyncPoint> cost three
+    // CTDs and a sim freeze.
+    //
+    // Structural change is still structural: AddEntity moves storage, so it runs ONCE and
+    // then only the transform is written. Off by default.
+    private const float MarkerHalfExtent = 1.375f;   // signature value — see SweepStaleMarkers
+    private const double MarkerMoveEpsilon = 1.0;    // metres; below this there is nothing to do
+
+    private static object _marker;            // boxed DEntityContext, or null
+    private static Vector3D _markerPos;
+    private static bool _markerDisarmed, _markerShapeLogged;
+    private static long _markerLogTicks;
+    private static int _markerMoves;
+    private static Type _tTag, _tWt, _tBbd;
+    private static MethodInfo _miAddEntity, _miSetWt, _miRemoveEntity;
+
+    internal static void UpdateCameraTriggerEntity(object anyEntityInScene, Vector3D cameraPos)
+    {
+        if (_markerDisarmed) return;
+        if (!FeedConfig.CameraTriggerEntity)
+        {
+            // Turning the knob off deletes it live, rather than leaving a marker in the world
+            // that nothing is steering any more.
+            if (_marker != null) DestroyCameraTriggerEntity("cameraTriggerEntity was set to 0");
+            return;
+        }
+
+        try
+        {
+            if (_marker == null) { CreateMarker(anyEntityInScene, cameraPos); return; }
+
+            if ((cameraPos - _markerPos).LengthSquared() >= MarkerMoveEpsilon * MarkerMoveEpsilon)
+                MoveMarker(cameraPos);
+
+            // TIME CADENCE ONLY, the rule this project learned at 4,200 lines/sec: a path
+            // that runs every tick may log on a clock and never on "something changed".
+            var now = Environment.TickCount64;
+            if (now - _markerLogTicks > 30000)
+            {
+                _markerLogTicks = now;
+                RttLog.Line($"CAMERA TRIGGER: marker alive at {_markerPos.X:F0},{_markerPos.Y:F0},{_markerPos.Z:F0} " +
+                            $"({_markerMoves} move(s) so far). If sectors are materializing, trees and boulders " +
+                            "arrive within a couple of minutes and BEFORE the terrain under them meshes — the " +
+                            "\"floating rocks\" stage is expected, not a fault.");
+            }
+        }
+        catch (Exception e)
+        {
+            // Disarm rather than throw every tick. A world mutation that faults once will
+            // fault again, and the log flood is worse than the missing feature.
+            _markerDisarmed = true;
+            RttLog.Error("camera trigger entity", e);
+        }
+    }
+
+    private static void CreateMarker(object anyEntityInScene, Vector3D pos)
+    {
+        var scene = SceneOf(anyEntityInScene);
+        _tTag ??= Type.GetType("Keen.VRage.Core.Game.GameSystems.GamePruning.ClientTriggerTag, VRage.Core.Game");
+        _tWt  ??= Type.GetType("Keen.VRage.Core.WorldTransform, VRage.Core");
+        _tBbd ??= Type.GetType("Keen.VRage.Core.Game.Data.BoundingBoxData, VRage.Core.Game");
+
+        // AddEntity<T1,T2,T3>(T1,T2,T3). Matched on arity rather than by signature so a
+        // parameter type rename does not silently select the wrong overload.
+        if (scene != null && _miAddEntity == null)
+            _miAddEntity = scene.GetType().GetMethods(Any).FirstOrDefault(
+                m => m.Name == "AddEntity" && m.IsGenericMethodDefinition
+                  && m.GetGenericArguments().Length == 3 && m.GetParameters().Length == 3);
+
+        if (scene == null || _tTag == null || _tWt == null || _tBbd == null || _miAddEntity == null)
+        {
+            if (!_markerShapeLogged)
+            {
+                _markerShapeLogged = true;
+                RttLog.Line("CAMERA TRIGGER: shape missing — " +
+                            $"scene={(scene == null ? "NOT FOUND" : "ok")} " +
+                            $"ClientTriggerTag={(_tTag == null ? "NOT FOUND" : "ok")} " +
+                            $"WorldTransform={(_tWt == null ? "NOT FOUND" : "ok")} " +
+                            $"BoundingBoxData={(_tBbd == null ? "NOT FOUND" : "ok")} " +
+                            $"AddEntity<3>={(_miAddEntity == null ? "NOT FOUND" : "ok")}. " +
+                            "The marker cannot be built on this game build; the feed is unaffected.");
+            }
+            _markerDisarmed = true;
+            return;
+        }
+
+        // Before creating one, remove any WE left behind. See SweepStaleMarkers.
+        SweepStaleMarkers(scene);
+
+        var bbd = Activator.CreateInstance(_tBbd);
+        _tBbd.GetField("BoundingBox", Any)?.SetValue(
+            bbd, new BoundingBox(new Vector3(-MarkerHalfExtent), new Vector3(MarkerHalfExtent)));
+
+        _marker = _miAddEntity.MakeGenericMethod(_tTag, _tWt, _tBbd).Invoke(
+            scene, new[] { Activator.CreateInstance(_tTag), Activator.CreateInstance(_tWt, new object[] { pos }), bbd });
+        _markerPos = pos;
+        _markerMoves = 0;
+
+        RttLog.Line($"CAMERA TRIGGER: created the marker entity at {pos.X:F0},{pos.Y:F0},{pos.Z:F0} — " +
+                    "ClientTriggerTag + WorldTransform + a 2.75 m box, which is the engine's own voxel " +
+                    "observer construction with our camera's position instead of the player's. The planet's " +
+                    "sectored trigger tests exactly MustHave(ClientTriggerTag), so environment sectors should " +
+                    "now materialize around the CAMERA with nothing anchored and no grid mutated. Watch VRAM: " +
+                    "materialized sectors are real entities and real GPU batches.");
+    }
+
+    private static void MoveMarker(Vector3D pos)
+    {
+        var wt = Activator.CreateInstance(_tWt, new object[] { pos });
+
+        // EntityTransformFunctions.SetWorldTransform(DEntityContext, ref WorldTransform) is
+        // what the engine's own AlignToRenderCamera calls from OUTSIDE a job — the same seat
+        // we are in. It also maintains RelativeTransform for parented entities, which a raw
+        // Set<WorldTransform> does not; ours has no parent, but matching the engine costs
+        // nothing and stops being a guess the day the marker gets attached to a block.
+        _miSetWt ??= Type.GetType("Keen.VRage.Core.Game.Data.EntityTransformFunctions, VRage.Core.Game")
+            ?.GetMethods(Any).FirstOrDefault(m => m.Name == "SetWorldTransform" && m.GetParameters().Length == 2);
+
+        if (_miSetWt != null)
+        {
+            _miSetWt.Invoke(null, new[] { _marker, wt });
+        }
+        else
+        {
+            // Fallback: the raw store, which is what the engine's per-tick UpdateObserver job
+            // uses. Enough to move a parentless entity.
+            var set = _marker.GetType().GetMethods(Any).FirstOrDefault(
+                m => m.Name == "Set" && m.IsGenericMethodDefinition && m.GetParameters().Length == 1);
+            set?.MakeGenericMethod(_tWt).Invoke(_marker, new[] { wt });
+        }
+
+        _markerPos = pos;
+        _markerMoves++;
+    }
+
+    internal static void DestroyCameraTriggerEntity(string why)
+    {
+        if (_marker == null) return;
+        try
+        {
+            var scene = Prop(_marker, "Scene");
+            var handle = Prop(_marker, "Entity");            // DEntity
+            _miRemoveEntity ??= scene?.GetType().GetMethods(Any).FirstOrDefault(
+                m => m.Name == "RemoveEntity" && m.GetParameters().Length == 1);
+            _miRemoveEntity?.Invoke(scene, new[] { handle });
+            RttLog.Line($"CAMERA TRIGGER: marker removed ({why}). Sectors it materialized are the " +
+                        "engine's to reclaim on its own schedule — they do not vanish with it.");
+        }
+        catch (Exception e) { RttLog.Error("camera trigger entity remove", e); }
+        finally { _marker = null; _markerMoves = 0; }
+    }
+
+    // STALE MARKERS FROM A PREVIOUS ASSEMBLY LOAD.
+    //
+    // A hot reload drops our statics but NOT the entity they pointed at, so every reload with
+    // the knob on would otherwise leave one orphan marker behind, each still triggering
+    // sectors at wherever the camera happened to be. That compounds, and this project already
+    // has a VRAM ratchet it cannot explain — leaking world entities on top of it would make
+    // that measurement worse and harder to read.
+    //
+    // IDENTIFICATION IS THE WHOLE RISK HERE. The engine's own voxel observer has the SAME
+    // three components, so an archetype match would delete the player's terrain streaming
+    // observer — a catastrophic false positive. What distinguishes ours is the box: the
+    // engine's is exactly (-1, 1) and ours is (-1.375, 1.375), a value chosen for no reason
+    // other than that nothing else will have it. All six components of the AABB must match,
+    // every removal is logged with its position so a mistake is visible rather than silent,
+    // and finding more than a couple of candidates aborts the sweep entirely on the grounds
+    // that the identification must then be wrong.
+    private static void SweepStaleMarkers(object scene)
+    {
+        try
+        {
+            _miEnumerate ??= scene.GetType().GetMethod("EnumerateEntities", Any, null, Type.EmptyTypes, null);
+            _tCtx ??= Type.GetType("Keen.VRage.DCS.Accessors.DEntityContext, VRage.DCS");
+            if (_miEnumerate == null || _tCtx == null) return;
+            if (_miEnumerate.Invoke(scene, null) is not IEnumerable handles) return;
+
+            var hasT = _tCtx.GetMethods(Any).FirstOrDefault(
+                m => m.Name == "Has" && m.IsGenericMethodDefinition && m.GetParameters().Length == 0);
+            var getT = _tCtx.GetMethods(Any).FirstOrDefault(
+                m => m.Name == "Get" && m.IsGenericMethodDefinition && m.GetParameters().Length == 0);
+            if (hasT == null || getT == null) return;
+
+            // Closed ONCE. MakeGenericMethod per entity over 34k entities is the difference
+            // between a one-shot pause and a visible hitch.
+            var hasTag = hasT.MakeGenericMethod(_tTag);
+            var hasBox = hasT.MakeGenericMethod(_tBbd);
+            var getBox = getT.MakeGenericMethod(_tBbd);
+            var fBox = _tBbd.GetField("BoundingBox", Any);
+            if (fBox == null) return;
+
+            // COLLECT, THEN REMOVE. Removing inside the walk is a structural change during
+            // iteration, which is the one thing an archetype-backed enumeration cannot survive.
+            var doomed = new List<object>();
+            var scanned = 0;
+            foreach (var handle in handles)
+            {
+                scanned++;
+                try
+                {
+                    var ctx = Activator.CreateInstance(_tCtx, scene, handle);
+                    if (!(bool)hasTag.Invoke(ctx, null)) continue;
+                    if (!(bool)hasBox.Invoke(ctx, null)) continue;
+                    if (fBox.GetValue(getBox.Invoke(ctx, null)) is not BoundingBox box) continue;
+                    if (!IsMarkerBox(box)) continue;
+                    doomed.Add(ctx);
+                }
+                catch { }
+            }
+
+            if (doomed.Count == 0)
+            {
+                RttLog.Line($"CAMERA TRIGGER: swept {scanned} entities, no orphan markers — clean start.");
+                return;
+            }
+            if (doomed.Count > 4)
+            {
+                RttLog.Line($"CAMERA TRIGGER: sweep found {doomed.Count} candidate markers among {scanned} " +
+                            "entities, which is more than this feature can ever have created. The box signature " +
+                            "must be matching something it should not, so NOTHING was removed. Investigate " +
+                            "before turning this knob on again.");
+                return;
+            }
+
+            foreach (var ctx in doomed)
+            {
+                var handle = Prop(ctx, "Entity");
+                _miRemoveEntity ??= scene.GetType().GetMethods(Any).FirstOrDefault(
+                    m => m.Name == "RemoveEntity" && m.GetParameters().Length == 1);
+                _miRemoveEntity?.Invoke(scene, new[] { handle });
+                RttLog.Line($"CAMERA TRIGGER: removed an orphan marker left by a previous assembly load " +
+                            $"(entity {handle}). This is expected after a hot reload with the knob on.");
+            }
+        }
+        catch (Exception e) { RttLog.Error("camera trigger sweep", e); }
+    }
+
+    private static bool IsMarkerBox(BoundingBox b)
+    {
+        const float eps = 1e-4f;
+        return Math.Abs(b.Max.X - MarkerHalfExtent) < eps && Math.Abs(b.Min.X + MarkerHalfExtent) < eps
+            && Math.Abs(b.Max.Y - MarkerHalfExtent) < eps && Math.Abs(b.Min.Y + MarkerHalfExtent) < eps
+            && Math.Abs(b.Max.Z - MarkerHalfExtent) < eps && Math.Abs(b.Min.Z + MarkerHalfExtent) < eps;
     }
 
     // PER-BODY CLIPMAP CAMERA — the terrain fix.
