@@ -616,3 +616,35 @@ called from its A/B. It stays because tag-family parity is still the right thing
 **Not covered by it**: `ManagedTexturePrioritizerComponent.OnCollectStandardsRoot` reads
 `Settings.RenderView.CameraPosition` *directly* for texture mip priority — a second,
 independent single-camera decision. Open.
+
+### CORRECTION (same day): the remote site DOES have grass — the negative stands
+
+The control above proved there is no *local* grass in this save to compare against. That
+is true and worth keeping, but I used it to walk the grass claim back further than the
+evidence supports. Correcting:
+
+`VoxelCell.CreateModelEntity(model, materials, **hasGrassMaterial**, immediateUpdate)`
+branches on that flag — `IL_00b6 ldarg.3 / brfalse.s IL_0114` jumps the whole grass block.
+So `_grassEntity` exists **only** when the cell's materials include a grass material.
+
+The census reading **43–85 valid `_grassEntity` per LOD 0–4 around the remote camera** is
+therefore positive proof those cells carry grass material. The site has grass geometry and
+the feed draws no blades. **The remote grass negative is real.**
+
+What the desert control actually establishes is narrower: there is no local A/B available,
+so the *comparison* has to be made against the remote site's own geometry counts rather
+than against the player's view.
+
+### And a third blind reader, caught before it was believed
+
+A per-cell distance readout added to the grass sweep reported the nearest clipmap cell
+**867 m** from a camera sitting 15 m above terrain rendering in full detail, with a dozen
+cells at an *identical* distance. Both impossible: `VoxelCell._worldTransform` is a shared
+root/ring transform, not per-cell.
+
+The sweep now checks both tells (most cells sharing one distance; nearest cell implausibly
+far) and **withholds the verdict** rather than printing it with a caveat. That is the
+point: a zero announces itself, but 867 m is plausible enough to be believed, and a
+plausible wrong number costs more than an obvious one. Three blind readers in two days —
+the `CellData` wrapper, the desert-vs-alpine "like-for-like" density line, and this — and
+**all three produced output that looked reasonable.**
