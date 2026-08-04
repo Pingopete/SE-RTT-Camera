@@ -102,7 +102,7 @@ public static class LogicEntry
                 // dispatch, just to reach a method that returns its argument. So the delegate
                 // itself is the switch, and FeedConfig keeps it in step with the knob on every
                 // poll (SetHook is idempotent).
-                ViewerDistance.SetHook(FeedConfig.ViewerDistanceOverride);
+                ViewerDistance.SetHook(FeedConfig.ViewerDistanceOverride || FeedConfig.FixLodCycling);
                 RttLog.Line($"Nearest-viewer distance hook available; viewerDistance is " +
                             $"{(FeedConfig.ViewerDistanceOverride ? "ON" : "OFF")}. When on it rewrites the ONE " +
                             "cached float behind StreamingTag, the impostor swap, shadow tracking and the " +
@@ -114,14 +114,56 @@ public static class LogicEntry
                             "viewerDistance will have NO EFFECT until then.");
             }
 
+            // The frame-end constant-buffer drain. Freed one render late by the render bracket
+            // itself, which fixed the LEAK; this hook is what takes the residual ~5 to zero so
+            // 'AliveConstantBufferCount == 0' stops asserting every frame — and with it the
+            // exit-to-menu CTD that assertion is promoted into.
+            //
+            // On an older bootstrap this field is absent and the leak stays FIXED but the
+            // assert stays LIVE. Said out loud, because "the leak is gone" and "the crash is
+            // gone" are different claims and I have already conflated them once.
+            var frameEnd = bridge.GetField("FrameEndHook");
+            if (frameEnd != null)
+            {
+                frameEnd.SetValue(null, new Action(WholeSceneRender.DrainAllStagedCbs));
+                RttLog.Line("FrameEndHook armed — transient constant buffers we displace are now freed " +
+                            "inside IRender_Present, immediately before the engine's own OnFrameEndDisposal " +
+                            "counts them. Acceptance test: the exit log should no longer carry " +
+                            "'AliveConstantBufferCount == 0'.");
+            }
+            else
+            {
+                RttLog.Line("FrameEndHook not on this bootstrap — restart the game to adopt it. The " +
+                            "constant-buffer LEAK is still fixed (one-render-late reclaim), but ~5 stay " +
+                            "alive at frame end, so the per-frame assertion and the exit CTD REMAIN.");
+            }
+
             // Grass without HiZ, for our pass only. Absent on an older bootstrap, in which case
             // wholeSceneGrassNoHiZ is inert — worth saying, because a silently ignored flag is
             // exactly how the HZBO A/B would get misread a second time.
             var grassHiz = bridge.GetField("GrassNoHiZHook");
             if (grassHiz != null)
             {
+                // THE CENSUS RIDES THE HOOK THAT ALREADY EXISTS.
+                //
+                // This delegate is called from the bootstrap's RenderGrass PREFIX, so it fires
+                // once per RenderGrass invocation whether or not wholeSceneGrassNoHiZ is armed.
+                // That makes it a free call counter for the one question no instrument has ever
+                // answered: does the grass draw RUN during our nested Draw, or not at all?
+                //
+                // Everything measured so far is STATE (settings readable, buffers present,
+                // 51/51 cells under the camera carrying valid grass entities). State cannot
+                // distinguish "the draw ran and produced nothing" from "the draw never ran".
+                // Those have completely different fixes, so guessing between them is how this
+                // question has burned three sessions.
+                //
+                // Counting here needs no bootstrap change and therefore NO GAME RESTART.
                 grassHiz.SetValue(null, (Func<bool>)(() =>
-                    WholeSceneRender.InOurRender && FeedConfig.WholeSceneGrassNoHiZ));
+                {
+                    var ours = WholeSceneRender.InOurRender;
+                    GrassCallCensus.Note(ours);
+                    return ours && FeedConfig.WholeSceneGrassNoHiZ;
+                }));
                 RttLog.Line("Grass HiZ hook registered — wholeSceneGrassNoHiZ is armable. It forces " +
                             "RenderGrass's enableHiZ ARGUMENT false inside our render only, which is the " +
                             "per-pass version of the HZBO test that whited out the feed.");
@@ -176,6 +218,20 @@ public static class LogicEntry
                                 "wholeSceneSubmitEarly will have NO EFFECT until then.");
                 }
 
+                // The culling-view classifier (occlusion scope v2). Absent on an older
+                // bootstrap -> wholeSceneNoOcclusion is inert, said out loud.
+                var cullView = bridge.GetField("CullingViewIsOursHook");
+                if (cullView != null)
+                {
+                    cullView.SetValue(null, (Func<object, bool>)WholeSceneRender.CullingViewIsOurs);
+                    RttLog.Line("Culling-view hook registered — wholeSceneNoOcclusion is armable.");
+                }
+                else
+                {
+                    RttLog.Line("CullingViewIsOursHook not on this bootstrap — restart to adopt it. " +
+                                "wholeSceneNoOcclusion will have NO EFFECT until then.");
+                }
+
                 var skip = bridge.GetField("SkipStageHook");
                 if (skip != null)
                 {
@@ -194,5 +250,56 @@ public static class LogicEntry
             RttLog.Line("Tag a panel [RTT] for blit stages 1-3, [RTT!] to also arm the blit.");
         }
         catch (Exception e) { RttLog.Error("bridge hookup", e); }
+    }
+}
+
+// THE GRASS CALL CENSUS — does RenderGrass run inside our pass, or not at all?
+//
+// Fed from the bootstrap's RenderGrass prefix (see the GrassNoHiZHook registration above),
+// so it counts every invocation the engine makes, split by whose render it happened in.
+//
+// WHY THIS IS THE QUESTION. Grass geometry is confirmed present — 51 of 51 clipmap cells
+// within 150 m of the feed camera carry a VALID GrassEntity, nearest at 22 m, all at LOD 0
+// (the engine refuses grass above LOD 4; verified in IL and reproduced in live memory). The
+// settings are confirmed readable inside our pass. So the failure is downstream of state,
+// and splits exactly two ways:
+//
+//   ours == 0     the draw never runs for us. The fix is upstream, in whatever decides the
+//                 stage list for our pass — NOT in any grass setting, and no amount of
+//                 density or draw distance would ever have helped.
+//   ours  > 0     the draw runs and emits nothing, so the generator's input set is empty.
+//                 That points at MainViewCulling.EntityProxies, which the bootstrap already
+//                 names as the thing RenderGrass generates from.
+//
+// Both numbers are reported, because "ours = 0" only means something next to a healthy
+// player count: if BOTH are zero the hook itself is detached and the reader is blind again,
+// which is a different result and must not be read as a negative.
+internal static class GrassCallCensus
+{
+    private static long _ours, _theirs;
+    private static long _lastTicks;
+
+    internal static void Note(bool ours)
+    {
+        if (ours) _ours++; else _theirs++;
+
+        // Rate-limited: this is on the render thread, once per RenderGrass call.
+        var now = Environment.TickCount64;
+        if (now - _lastTicks < 15000) return;
+        _lastTicks = now;
+
+        // The census answers "does the draw run"; the probe answers "over what". Paired here
+        // because reading either alone is what made this look like a mystery for two days.
+        WholeSceneRender.GrassProbe();
+
+        RttLog.Line($"GRASS CALL CENSUS: RenderGrass ran {_ours} time(s) in OUR pass, " +
+                    $"{_theirs} time(s) in the player's (cumulative). " +
+                    (_ours == 0 && _theirs == 0
+                        ? "BOTH ZERO — the hook is detached, so this is a BLIND READER, not a negative."
+                        : _ours == 0
+                            ? "OURS IS ZERO while the player's render calls it: the grass draw is NOT " +
+                              "RUNNING for the feed. No grass setting can matter until that changes."
+                            : "The grass draw DOES run for the feed, so a blade-free picture means it is " +
+                              "generating from an empty set — look at MainViewCulling.EntityProxies."));
     }
 }

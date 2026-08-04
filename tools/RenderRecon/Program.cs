@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 
@@ -12,7 +12,7 @@ namespace RttCamera.Recon;
 // shipped assemblies, before a line of mod code is written.
 internal static class Program
 {
-    public static string GameDir = @"D:\SteamLibrary\steamapps\common\SpaceEngineers2\Game2";
+    public static string GameDir = @"E:\SteamLibrary\steamapps\common\SpaceEngineers2\Game2";
     private static string _outDir;
 
     private static int Main(string[] args)
@@ -198,7 +198,7 @@ internal static class Probes
         r.AppendLine();
         foreach (var (where, kind, calls) in hits.OrderBy(h => h.Where, StringComparer.Ordinal))
         {
-            r.AppendLine($"### `{where}` — {kind}");
+            r.AppendLine($"### `{where}` â€” {kind}");
             r.AppendLine();
             r.AppendLine("```");
             foreach (var c in calls.Take(45)) r.AppendLine("  " + c);
@@ -266,7 +266,7 @@ internal static class Probes
         foreach (var want in new[] { "CameraComponent", "RenderCameraComponent", "CameraSystemComponent", "MainRenderTarget", "RenderSettings" })
         {
             var t = w.AllTypes().Select(x => x.Type).FirstOrDefault(x => x.Name == want);
-            if (t == null) { r.AppendLine($"### `{want}` — not found"); r.AppendLine(); continue; }
+            if (t == null) { r.AppendLine($"### `{want}` â€” not found"); r.AppendLine(); continue; }
             r.AppendLine($"### `{t.FullName}`");
             r.AppendLine();
             r.AppendLine("```");
@@ -282,7 +282,7 @@ internal static class Probes
     }
 
     // ---------------------------------------------------------------- probe 4
-    // The full RenderSystem / RenderContracts surface — looking for any
+    // The full RenderSystem / RenderContracts surface â€” looking for any
     // "render this view" entry point that is not the main camera.
     public static void RenderSystemApi(CecilWorld w, StringBuilder r)
     {
@@ -296,7 +296,7 @@ internal static class Probes
             if (t == null)
             {
                 t = w.AllTypes().Select(x => x.Type).FirstOrDefault(x => x.Name == want);
-                if (t == null) { r.AppendLine($"### `{want}` — not found"); r.AppendLine(); continue; }
+                if (t == null) { r.AppendLine($"### `{want}` â€” not found"); r.AppendLine(); continue; }
             }
             r.AppendLine($"### `{t.FullName}`");
             r.AppendLine();
@@ -319,7 +319,7 @@ internal static class Probes
         r.AppendLine();
         r.AppendLine("IL of the UI recorder's texture-handle classification. A generated");
         r.AppendLine("(render-target) handle must not fall into the file-backed content-cache");
-        r.AppendLine("path — that throws inside the render thread's replay, which crashes.");
+        r.AppendLine("path â€” that throws inside the render thread's replay, which crashes.");
         r.AppendLine();
 
         var names = new[] { "TryExtractGraphicsType", "DrawImage", "DrawImageExt", "ResolveTexture", "GetTexture" };
@@ -348,7 +348,7 @@ internal static class Probes
     {
         r.AppendLine("## 6. View / viewport / pass / frame-graph types");
         r.AppendLine();
-        r.AppendLine("Candidates for a second scene view. Names only — the shortlist gets a");
+        r.AppendLine("Candidates for a second scene view. Names only â€” the shortlist gets a");
         r.AppendLine("full dump on the next pass once we know which are real.");
         r.AppendLine();
 
@@ -367,7 +367,7 @@ internal static class Probes
         r.AppendLine("```");
         r.AppendLine();
 
-        // Methods whose name says they render a scene/view — the real prize.
+        // Methods whose name says they render a scene/view â€” the real prize.
         r.AppendLine("### Methods named like a scene/view render entry point");
         r.AppendLine();
         r.AppendLine("```");
@@ -387,6 +387,6 @@ internal static class Probes
     private static string Trim(string s)
     {
         if (string.IsNullOrEmpty(s)) return "";
-        return s.Length > 150 ? s[..150] + "…" : s;
+        return s.Length > 150 ? s[..150] + "â€¦" : s;
     }
 }

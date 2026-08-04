@@ -93,6 +93,55 @@ internal static class ViewerDistance
 
     internal static void Clear() => _viewer = null;
 
+    // Corrections made by the swap guard. Reported so "the fix is installed" and "the fix is
+    // actually catching poisoned reads" stay separate claims — this project has confused those
+    // before, and a zero here with the guard armed would mean the discriminator is wrong.
+    private static long _swapCorrections, _lastSwapCorrections;
+    private static long _inWindowCalls, _lastInWindowCalls;
+    private static long _inWindowOurThread, _lastInWindowOurThread;
+
+    // The instrument must confess when it is not installed. On 2026-08-03 this text reported
+    // "0 calls landed inside our swap window -> the theory is WRONG" for a session where
+    // viewerDistance=0 AND fixLodCycling=0 at boot — the postfix was never PATCHED, the
+    // counters were reading an uninstalled instrument, and the confident refutation was a
+    // lie. A zero is only evidence when the patch demonstrably ran. (The same lesson as the
+    // POOL CENSUS FieldInfo bug: check the instrument before believing a negative.)
+    private static System.Reflection.FieldInfo _fCallsForGuard;
+    private static bool _guardBridgeLooked;
+
+    internal static string SwapGuardText()
+    {
+        var n = _swapCorrections - _lastSwapCorrections;
+        _lastSwapCorrections = _swapCorrections;
+        var inWin = _inWindowCalls - _lastInWindowCalls;
+        _lastInWindowCalls = _inWindowCalls;
+        var ours = _inWindowOurThread - _lastInWindowOurThread;
+        _lastInWindowOurThread = _inWindowOurThread;
+
+        if (!_guardBridgeLooked)
+        {
+            _guardBridgeLooked = true;
+            _fCallsForGuard = Type.GetType("RttProbe.RttBridge, RttProbe")?.GetField("ViewerDistanceCalls");
+        }
+        var totalCalls = _fCallsForGuard != null && _fCallsForGuard.GetValue(null) is long tc ? tc : -1;
+        if (totalCalls == 0)
+            return "swap guard: INERT — the CalculateDistanceToCamera postfix has made ZERO calls this " +
+                   "session, meaning the patch was never applied (viewerDistance and fixLodCycling were " +
+                   "both 0 at boot). Every zero here is the uninstalled instrument, NOT evidence of no " +
+                   "overlap. Set either knob and RESTART to make this instrument mean something.";
+
+        return $"swap guard: {n} corrected, {inWin} distance call(s) landed INSIDE our swap window " +
+               $"({ours} of them on our own render thread; postfix alive, {totalCalls} calls total)" +
+               (inWin == 0
+                   ? "   <-- NO OVERLAP: the engine never queries entity distance while our camera is " +
+                     "installed, so CalculateDistanceToCamera is not the vector on this path."
+                   : ours == inWin
+                       ? "   <-- ALL OURS: every query inside the window came from our own draw, which " +
+                         "SHOULD see our camera. No race here either."
+                       : "   <-- RACE CONFIRMED: queries from other threads are reading our camera for " +
+                         "player-side entities, and the guard is rewriting them.");
+    }
+
     // ---- UNINSTALLING THE HOOK, not merely emptying it -------------------------------
     //
     // Clear() alone is NOT a cost saving, and finding that out is the point of this comment.
@@ -201,8 +250,85 @@ internal static class ViewerDistance
     // the bubble gets the engine's answer whether or not our position is stale, so a stale
     // viewer cannot change any result there — and checking it first would put a clock read on
     // every entity in the scene instead of the handful inside 200 m.
+    // ---- THE SWAP GUARD: THE MAIN-WORLD LOD CYCLING FIX -------------------------------
+    //
+    // THE BUG, in one sentence: while our nested Draw holds OUR camera in
+    // CoreSystems.Settings.RenderView, any engine job that calls CalculateDistanceToCamera
+    // for a PLAYER-side entity measures it against a camera 3906 km away.
+    //
+    // AND IT IS NOT A TRANSIENT. DistanceTagManagerComponent.OnUpdateDistanceToCamera CACHES
+    // that one float per entity as DistanceRangeData, and the whole tag family downstream
+    // (StreamingTag, impostor Near/Far, shadow tracking, raytracing near/far, geometry-dirty)
+    // decides from nothing but the cached number. So a single poisoned read demotes an entity
+    // and it STAYS demoted until something recomputes it — which is exactly the user's
+    // long-standing symptom: main-world objects drop to coarse LOD and later recover.
+    //
+    // MEASURED: our swap is installed 12.4% OF WALL CLOCK (581 installs / 15 s, mean 3.20 ms).
+    // Roughly one in eight of those reads is poisoned.
+    //
+    // WHY THIS DISCRIMINATOR IS EXACTLY RIGHT. _inOurRender is [ThreadStatic] and is set only
+    // on the render thread inside our nested Draw. So:
+    //     InOurRender == true   -> this call IS our render: our camera is the correct answer.
+    //     InOurRender == false  -> a job thread (or the render thread outside our Draw). Our
+    //                              camera is in the global only by accident, and the PLAYER'S
+    //                              is the correct answer.
+    // The global's temporary state stops mattering to anyone but us.
+    //
+    // THE APPROXIMATION IS DELIBERATE AND SAFE HERE. We return a CENTRE distance while the
+    // engine returns a bounding-BOX distance, so we can be wrong by up to an entity's own
+    // radius. Against being wrong by 3906 km that is noise, and every threshold this feeds
+    // (RootStreamingDistance 200 m, impostor swap, shadow tracking) is far larger than the
+    // entities it sorts.
+    private static volatile bool _swapInstalled;
+    private static volatile object _playerCam;      // boxed Vector3D; one reference write, cannot tear
+
+    // Called from InstallCamera/RestoreCamera with the PLAYER'S view, captured before we
+    // overwrite the global. Published as a whole boxed value for the same tear-freedom reason
+    // the Viewer class exists.
+    internal static void SwapOpened(Vector3D playerCamera)
+    {
+        _playerCam = playerCamera;
+        _swapInstalled = true;
+    }
+
+    internal static void SwapClosed() => _swapInstalled = false;
+
     internal static float Nearest(double x, double y, double z, float engineDistance)
     {
+        // FIRST, before the bubble logic: this is a correctness fix for the PLAYER'S world,
+        // not a feed enhancement, so it must run even when the nearest-viewer bubble is off.
+        // SPLIT THE ZERO. "0 corrections" is ambiguous between three completely different
+        // worlds, and guessing between them is how this project loses evenings:
+        //   no calls at all inside our window      -> the jobs never overlap our draw, so
+        //                                             CalculateDistanceToCamera is NOT the
+        //                                             vector and the theory is wrong here
+        //   calls inside it, all on our thread     -> those are OUR draw's own queries and
+        //                                             are correct; still no race
+        //   calls inside it, on other threads      -> the race IS real and corrections must
+        //                                             fire; a zero then means MY logic is wrong
+        if (_swapInstalled)
+        {
+            _inWindowCalls++;
+            if (WholeSceneRender.InOurRender) _inWindowOurThread++;
+        }
+
+        if (_swapInstalled && !WholeSceneRender.InOurRender && FeedConfig.FixLodCycling)
+        {
+            if (_playerCam is Vector3D p)
+            {
+                double px = x - p.X, py = y - p.Y, pz = z - p.Z;
+                var corrected = (float)Math.Sqrt(px * px + py * py + pz * pz);
+                if (!float.IsNaN(corrected))
+                {
+                    _swapCorrections++;
+                    // The bubble must not then ALSO apply: this call belongs to the player's
+                    // world, and granting it our bubble would be the very confusion we are
+                    // fixing. Return the player's answer outright.
+                    return corrected;
+                }
+            }
+        }
+
         var v = _viewer;
         if (v == null) return engineDistance;
 

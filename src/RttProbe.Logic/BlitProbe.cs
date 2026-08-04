@@ -91,7 +91,7 @@ internal static class BlitProbe
         // A marker left behind means the previous session recorded a blit and
         // never came back — i.e. the replay rejected the handle. Refuse to repeat
         // it until a human clears the file.
-        if (File.Exists(MarkerPath))
+        if (FileWatch.Exists(MarkerPath))
         {
             _disarmed = true;
             RttLog.Line("!!! PREVIOUS SESSION DIED WITH A BLIT ARMED !!!");
@@ -183,7 +183,7 @@ internal static class BlitProbe
             // the handover writes nothing, so suppressing the test pattern too would
             // leave a blank panel and no way to tell a broken target from a quiet one.
             bool feedArmed = FeedConfig.CopyEnabled &&
-                             File.Exists(Path.Combine(RttLog.OutDir, "handover-armed.marker"));
+                             FileWatch.Exists(Path.Combine(RttLog.OutDir, "handover-armed.marker"));
             if (!FeedOwnsTarget && !feedArmed)
             {
                 if (now - _lastPaint >= 500) { _lastPaint = now; PaintTestPattern(); }
@@ -548,7 +548,10 @@ internal static class BlitProbe
             if (!_blitRecorded)
             {
                 _blitRecorded = true;
-                try { File.WriteAllText(MarkerPath, $"blit armed {DateTime.Now:O}\n"); } catch { }
+                // Invalidate after writing: the existence check now reads a cache refreshed
+                // on a background thread every 500 ms, and observing our OWN write half a
+                // second late would read as the write having failed.
+                try { File.WriteAllText(MarkerPath, $"blit armed {DateTime.Now:O}\n"); FileWatch.Invalidate(MarkerPath); } catch { }
                 RttLog.Line($"Stage 4: recording DrawImage with RT handle {handle} into panel batch.");
                 RttLog.Line("Stage 4: if the game dies now, the replay rejected it (marker file left behind).");
             }

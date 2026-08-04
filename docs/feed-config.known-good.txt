@@ -437,3 +437,33 @@ wholeSceneSubmitEarly = 0
 # ambiguous between OUR far plane and the engine's streaming. Costs draw count: the far
 # plane is what culling reads. Off by default; the perf lever keeps its old behaviour.
 wholeSceneFarClipExtend = 0
+
+# ---- PARALLAX OCCLUSION MAPPING, FEED ONLY -----------------------------------------
+# Tri-state on the bools: -1 = do not scope, 0 = force off, 1 = force on. -1 on the
+# numbers likewise, except wholeSceneParallaxSteps where the sentinel is -999.
+#
+# READ THE PROBE BEFORE TOUCHING THESE. rtt.log prints the live struct from INSIDE our
+# pass, on the GRASS PROBE line: Parallax[Enabled=... Fadeout=... MaxSteps=...].
+# Measured engine state 2026-08-02:
+#     Enabled=True Fadeout=20 SelfShadow=True ShadowMax=0.03 MaxSteps=64
+#
+# THE POINT THAT MATTERS: parallax is ALREADY ON. "Close-up ground is flat" is NOT
+# caused by parallax being disabled, and forcing Enabled=1 is a no-op. The suspect is
+# FadeoutDistance = 20 m against an orbit that sits ~45 m off the ground — every ground
+# pixel is past the fadeout, so the effect is out of RANGE rather than off. Raising
+# wholeSceneParallaxFadeout is therefore the lever; ~150 is the first value to try.
+#
+# SAFE TO SCOPE PER PASS, by call graph rather than by hope:
+#   SettingsManager::get_Parallax()
+#     <- CommonResources.SettingsGroup::CreateFrameSettings()  (TransientConstantBuffer)
+#     <- CommonResources.SettingsGroup::OnBeginDraw()
+# Constant-buffer data, no shader define, so no PSO rebuild — unlike RaytracingSettings,
+# which is why THOSE must never be toggled per frame.
+#
+# COST: MaxSteps is a per-pixel ray-march loop count, so it is the expensive field, and
+# raising Fadeout is what puts more pixels INTO that loop. Change one at a time.
+wholeSceneParallax             = -1
+wholeSceneParallaxFadeout      = -1
+wholeSceneParallaxSelfShadow   = -1
+wholeSceneParallaxShadowLength = -1
+wholeSceneParallaxSteps        = -999

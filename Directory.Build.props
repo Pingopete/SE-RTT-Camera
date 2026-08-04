@@ -1,9 +1,9 @@
-<Project>
+﻿<Project>
   <!-- Machine-specific paths. Override without editing this file:
          dotnet build /p:SE2Dir=... /p:DeployDir=...
        or set the matching environment variables. -->
   <PropertyGroup>
-    <SE2Dir Condition="'$(SE2Dir)' == ''">D:\SteamLibrary\steamapps\common\SpaceEngineers2\Game2</SE2Dir>
+    <SE2Dir Condition="'$(SE2Dir)' == ''">E:\SteamLibrary\steamapps\common\SpaceEngineers2\Game2</SE2Dir>
     <DeployDir Condition="'$(DeployDir)' == ''">D:\SE2Rtt</DeployDir>
   </PropertyGroup>
 

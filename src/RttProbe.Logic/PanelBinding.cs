@@ -449,14 +449,88 @@ internal static class PanelBinding
     // leaves the panel owning a fresh stock material whose lifecycle the LCD system
     // manages normally. Nothing left dangling for anyone to double-release.
     //
-    // Render thread only (FeedGate.Shutdown runs there, same thread the bind ran on).
+    // ...AND IT MUST NOT RUN ON THE RENDER THREAD. That sentence used to read "Render thread
+    // only (FeedGate.Shutdown runs there, same thread the bind ran on)" and it was exactly
+    // backwards.
+    //
+    // SetNewScreenMaterialHandle calls ReleaseScreenMaterialHandle -> RuntimeMaterialHandle
+    // .Dispose() -> RenderCommandBuffer.Default, and the engine guards that property:
+    //     RenderThreadManager.cs:51
+    //     '_renderThread == null || _renderThread == _mainThread || _renderThread != Thread.CurrentThread'
+    // From the IL, Default is not thread-local — it returns the GLOBAL command buffer
+    // (RenderEngineComponent.Instance.CommandBuffer, via a null _currentThreadOverride).
+    // So calling this from the render thread appends a material-release command into the
+    // very buffer the render thread is consuming, mid-frame. The assert fires once per
+    // session in EVERY session, at bind and at unbind alike, and on 2026-08-02 at 19:51:03
+    // the unbind one was followed 108 ms later by the player's next frame dying in
+    // FlaresContext.GetFlareConstants — the exit-to-menu CTD.
+    //
+    // So: if we are on the render thread, HAND THE LIST OFF and let the sim-pump seat do the
+    // engine calls. WorldGrids.OnSimPump runs at the top of every Scene.Tick, on the scene's
+    // own thread, which is not the render thread — the seat already exists and this is
+    // simply the right place for the work.
+    //
+    // WHAT IF THE PUMP NEVER DRAINS IT? At exit-to-menu the pump can stop first, and then
+    // the panels keep our runtime material. That is the acceptable failure: the world is
+    // being torn down, the LCD system releases its own handles, and the worst case is the
+    // "Can't remove material" DEFERRED ASSERT this method was written to avoid. An assert in
+    // a log beats a NullReferenceException on the render thread. Never trade a crash for a
+    // tidier teardown.
     public static void Unbind()
+    {
+        // The render thread's identity, learned from the one place we are certainly on it.
+        // Not read from RenderThreadManager._renderThread: that field is per-INSTANCE and
+        // finding the live manager is one more reflection hunt that can silently return
+        // null — in which case we would decide "not the render thread" and do the unsafe
+        // thing. Observing our own thread is not falsifiable in that way.
+        int rt = WholeSceneRender.RenderThreadId;
+        if (rt != 0 && Environment.CurrentManagedThreadId == rt)
+        {
+            var src = _boundPanels;
+            int handed;
+            lock (src)
+            {
+                lock (_deferredUnbind)
+                {
+                    _deferredUnbind.AddRange(src);
+                    handed = src.Count;
+                }
+                src.Clear();
+            }
+
+            if (handed > 0)
+                RttLog.Line($"Panel material: {handed} panel(s) DEFERRED to the sim-pump seat for unbind — " +
+                            "releasing an LCD runtime material writes into the global render command buffer, " +
+                            "and doing that from the render thread is what preceded the exit-to-menu CTD. " +
+                            "The restore happens on the next Scene.Tick.");
+            return;
+        }
+
+        UnbindNow(_boundPanels, "inline (not on the render thread)");
+    }
+
+    // Handed off by Unbind when it is called on the render thread. Process-global rather
+    // than per-feed: by the time it drains, the feed registry may have moved on, and a
+    // panel wearing our material is a panel wearing our material regardless of who bound it.
+    private static readonly List<(WeakReference Renderer, WeakReference Ctx)> _deferredUnbind = new();
+
+    // Called from WorldGrids.OnSimPump, before its own early-outs — a deferred unbind must
+    // not depend on the marker knobs being on.
+    internal static void DrainDeferredUnbind()
+    {
+        lock (_deferredUnbind)
+        {
+            if (_deferredUnbind.Count == 0) return;
+            UnbindNow(_deferredUnbind, "on the sim-pump seat (deferred off the render thread)");
+        }
+    }
+
+    private static void UnbindNow(List<(WeakReference Renderer, WeakReference Ctx)> list, string where)
     {
         // EVERY bound panel (phase E2 fan-out), each restored independently — one panel
         // having been destroyed must not stop the others being put back. Consume-and-clear:
         // the list is this feed's record of what it changed, and after this it has changed
         // nothing.
-        var list = _boundPanels;
         int restored = 0, gone = 0;
 
         // Locked for the same reason every other access is (see IsAttempted). Held across
@@ -489,7 +563,7 @@ internal static class PanelBinding
         }
 
         if (restored > 0 || gone > 0)
-            RttLog.Line($"Panel material: {restored} panel(s) rebound to the STOCK screen material " +
+            RttLog.Line($"Panel material: {restored} panel(s) rebound to the STOCK screen material {where} " +
                         (gone > 0 ? $"({gone} already destroyed) " : "") +
                         "— our runtime material released through the engine's own path, so nothing " +
                         "dangles for the \"Can't remove material\" double-release.");

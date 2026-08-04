@@ -186,20 +186,20 @@ internal static class CameraRender
         //
         // So the question is asked against the PROCESS: a marker written after this process
         // started was written by us, in this run, and means a reload landed mid-pass.
-        if (File.Exists(LivePath) && !WrittenByThisProcess(LivePath))
+        if (FileWatch.Exists(LivePath) && !WrittenByThisProcess(LivePath))
         {
             _disarmed = true;
             RttLog.Line("!!! PREVIOUS SESSION DIED MID-RENDER — camera pass DISABLED.");
             RttLog.Line($"!!! Delete {LivePath} to try again.");
         }
-        else if (File.Exists(LivePath))
+        else if (FileWatch.Exists(LivePath))
         {
             RttLog.Line("Camera pass: a mid-render marker is present but was written by THIS " +
                         "process, so it is a hot reload landing mid-pass rather than a death. " +
                         "Continuing, and clearing it.");
             try { File.Delete(LivePath); } catch { }
         }
-        _armed = !_disarmed && File.Exists(ArmPath);
+        _armed = !_disarmed && FileWatch.Exists(ArmPath);
         RttLog.Line(_armed
             ? "Camera pass ARMED — will advance the orbit and deliver frames to the panel."
             : $"Camera pass not armed. Create {ArmPath} to arm.");
@@ -320,7 +320,7 @@ internal static class CameraRender
             if (_disarmed && now - _lastDisarmCheck >= ArmPollMs)
             {
                 _lastDisarmCheck = now;
-                if (!File.Exists(LivePath))
+                if (!FileWatch.Exists(LivePath))
                 {
                     _disarmed = false;
                     RttLog.Line("Camera pass re-enabled — the mid-render marker is gone " +
@@ -335,7 +335,7 @@ internal static class CameraRender
             if (now - _lastArmCheck >= ArmPollMs)
             {
                 _lastArmCheck = now;
-                bool armedNow = File.Exists(ArmPath);
+                bool armedNow = FileWatch.Exists(ArmPath);
                 if (armedNow != _armed)
                 {
                     _armed = armedNow;
@@ -481,7 +481,7 @@ internal static class CameraRender
                 FeedHandover.RequestPanelRender(queueRt);
             }
 
-            if (!File.Exists(CopyArmPath)) return;
+            if (!FileWatch.Exists(CopyArmPath)) return;
 
             // The LCD system re-creates the panel's render target periodically
             // (observed changing id mid-session). Everything derived from it — the
@@ -620,9 +620,76 @@ internal static class CameraRender
                         catch { mips = 1; }
                         _ldrMips = mips;
 
+                        // OWNED, NOT BORROWED — see the note above about never returning them.
+                        //
+                        // "Borrowed once and never returned" was the right LIFETIME decision and
+                        // the wrong OWNERSHIP one. A borrow that never comes back sits in
+                        // Pool._allocated forever, so BindableTexturePoolManager.OnFrameEndDisposal
+                        // asserts "Some of the borrowed textures has not been returned" on EVERY
+                        // FRAME — measured at 8187 times in one six-minute session — and
+                        // FirstAssertionException promotes that into the exit-to-menu crash. The
+                        // census reads this as _rwRenderTargetTextures pinned at exactly 3, our
+                        // ring size, non-zero on 99.6% of renders.
+                        //
+                        // CreateRWRenderTargetTexture allocates the same RWRenderTargetTexture
+                        // directly and hands us ownership. It never enters the pool's ledger, so
+                        // there is nothing to assert about, and the ring keeps every property it
+                        // was built for. Same fix that already worked for the FinalLDR.
+                        //
+                        // Args bound BY PARAMETER NAME rather than position: this overload takes
+                        // nine, three of them Nullable<Format>, and a positional list would break
+                        // silently on a reorder in a game update. Unnamed parameters fall through
+                        // to their defaults.
+                        int ownedCount = 0;
+                        var texMgr = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12")
+                            ?.GetField("BindableTextures", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                        var miCreateRt = texMgr?.GetType().GetMethods(Any)
+                            .FirstOrDefault(m => m.Name == "CreateRWRenderTargetTexture");
+
                         for (int i = 0; i < _ldrRing.Length; i++)
-                            _ldrRing[i] = _miBorrowRt.Invoke(_texPool, new object[]
-                                { "RttCameraLdr" + (char)('A' + i), _feedFormat, _feedFormat, res ?? _feedRes, mips, null, 128 });
+                        {
+                            var dbg = "RttCameraLdr" + (char)('A' + i);
+                            object made = null;
+                            if (miCreateRt != null)
+                            {
+                                try
+                                {
+                                    var ps = miCreateRt.GetParameters();
+                                    var ca = new object[ps.Length];
+                                    for (int k = 0; k < ps.Length; k++)
+                                        ca[k] = ps[k].Name switch
+                                        {
+                                            "debugName"      => dbg,
+                                            "resourceFormat" => _feedFormat,
+                                            "resolution"     => res ?? _feedRes,
+                                            "rtvFormat"      => _feedFormat,
+                                            "srvFormat"      => _feedFormat,
+                                            "mipMaps"        => mips,
+                                            _ => ps[k].HasDefaultValue ? ps[k].DefaultValue : null,
+                                        };
+                                    made = miCreateRt.Invoke(texMgr, ca);
+                                }
+                                catch (Exception e) { RttLog.Error("create owned LDR ring target (falling back to the pool borrow)", e); }
+                            }
+
+                            // The borrow stays as the fallback: on a build where the create is
+                            // missing, a feed that asserts beats no feed at all.
+                            _ldrRing[i] = made ?? _miBorrowRt.Invoke(_texPool, new object[]
+                                { dbg, _feedFormat, _feedFormat, res ?? _feedRes, mips, null, 128 });
+                            if (made != null) ownedCount++;
+                        }
+
+                        // NOT DISPOSED ON TEARDOWN, same as before this change: the UI stage may
+                        // still be reading a ring slot, and freeing there is the use-after-free
+                        // that cost two crashes. The difference is that an OWNED texture leaked is
+                        // just memory, whereas a BORROWED one leaked is a per-frame assertion and
+                        // therefore an exit CTD.
+                        RttLog.Line($"Feed LDR ring: {ownedCount}/{_ldrRing.Length} target(s) CREATED outright" +
+                                    (ownedCount == _ldrRing.Length
+                                        ? " — none of them enter Pool._allocated, so the per-frame \"borrowed " +
+                                          "textures has not been returned\" assertion should stop reporting our 3."
+                                        : $", {_ldrRing.Length - ownedCount} fell back to a POOL BORROW — those " +
+                                          "still sit in Pool._allocated forever and will keep the assertion alive."));
                         _ringIndex = -1;
                         RttLog.Line($"Feed: allocated {_ldrRing.Length} persistent LDR targets " +
                                     $"(ring; write N, hand over N-1) with {mips} mip level(s) to match the " +
@@ -1054,6 +1121,10 @@ internal static class CameraRender
             _miRvSetResolution.Invoke(_wsRenderView, new[] { _wsResolution });
 
             float fovH    = System.Convert.ToSingle(Prop2(_wsRenderView, "FovH") ?? 0f);
+            // WHEEL ZOOM. Scaling the horizontal FOV here is the whole of it: SetCameraParameters
+            // rebuilds the projection from this value every pass, so a zoom needs no separate
+            // machinery and cannot desync from the matrix the culling and mip paths read.
+            fovH = (float)CameraControl.ApplyZoom(fovH);
             float near    = System.Convert.ToSingle(Prop2(_wsRenderView, "NearClipping") ?? 0f);
             float far     = System.Convert.ToSingle(Prop2(_wsRenderView, "FarClipping") ?? 0f);
             float veryFar = System.Convert.ToSingle(Prop2(_wsRenderView, "VeryFarClipping") ?? 0f);
@@ -1930,10 +2001,14 @@ internal static class CameraRender
 
         // Grid centre by default; the panel itself is the close-up shot.
         bool grid = FeedConfig.OrbitGrid && target.Extent > 0.0;
+        // MANUAL FLIGHT substitutes for the orbit at this ONE call site. It seeds itself from
+        // the orbit's own matrix the first time it takes over, so switching modes never jumps
+        // the view — you start flying from exactly where the orbit had you.
         var camWorld = CameraFeed.OrbitCameraWorld(
             grid ? target.Centre : target.Position,
             grid ? target.Extent : 0.0,
             t);
+        camWorld = CameraControl.Steer(camWorld);
         var view = InvertMatrixD(camWorld);
         _lastCamWorld = camWorld; _lastViewD = view;   // for the global camera swap
 

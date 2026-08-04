@@ -72,18 +72,18 @@ internal static class FeedHandover
         // Against the PROCESS, not this assembly — a hot reload is not a death. Same fix and
         // same reasoning as CameraRender's latch, which disabled a perfectly healthy camera
         // pass on 2026-08-01 because the previous logic instance was swapped mid-pass.
-        if (File.Exists(LivePath) && !CameraRender.WrittenByThisProcess(LivePath))
+        if (FileWatch.Exists(LivePath) && !CameraRender.WrittenByThisProcess(LivePath))
         {
             _disarmed = true;
             RttLog.Line("!!! PREVIOUS SESSION DIED DURING HANDOVER — disabled. Delete " + LivePath + " to retry.");
         }
-        else if (File.Exists(LivePath))
+        else if (FileWatch.Exists(LivePath))
         {
             RttLog.Line("Handover: mid-copy marker present but written by THIS process — a hot " +
                         "reload landing mid-copy, not a death. Continuing, and clearing it.");
             try { File.Delete(LivePath); } catch { }
         }
-        _armed = !_disarmed && File.Exists(ArmPath);
+        _armed = !_disarmed && FileWatch.Exists(ArmPath);
         RttLog.Line(_armed ? "Handover ARMED." : $"Handover not armed (observation only). Create {ArmPath} to arm.");
     }
 
@@ -285,13 +285,13 @@ internal static class FeedHandover
                 // Deleting the crash marker is an explicit human decision to retry, so
                 // honour it live. Latching until restart made a bisect silently test
                 // nothing and report a false pass.
-                if (_disarmed && !File.Exists(LivePath))
+                if (_disarmed && !FileWatch.Exists(LivePath))
                 {
                     _disarmed = false;
                     RttLog.Line("Handover re-enabled — crash marker cleared.");
                 }
 
-                bool a = !_disarmed && File.Exists(ArmPath);
+                bool a = !_disarmed && FileWatch.Exists(ArmPath);
                 if (a != _armed) { _armed = a; RttLog.Line(_armed ? "Handover ARMED (marker appeared)." : "Handover DISARMED."); }
             }
             return _armed;

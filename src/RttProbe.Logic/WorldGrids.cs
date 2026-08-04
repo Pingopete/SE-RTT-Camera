@@ -1227,7 +1227,23 @@ internal static class WorldGrids
     //
     // The callback fires for BOTH scenes' trigger systems; the SpawnSyncPoint probe (the
     // TryLoad saga's discriminator) picks the server one, cached per component instance.
-    private static readonly Dictionary<object, bool> _pumpSceneIsServer = new();
+    // CONCURRENT, and the plain Dictionary it replaces was a real bug with a real symptom.
+    //
+    // SEVERAL SCENES TICK THROUGH THIS SEAT ON DIFFERENT THREADS — client scenes and the
+    // spawning scene — and they all classify themselves here. A plain Dictionary being read
+    // and written from all of them eventually threw:
+    //
+    //   server presence: InvalidOperationException: Operations that change non-concurrent
+    //                    collections must have exclusive access
+    //
+    // The catch that swallowed it set _serverDisarmed, so the SERVER marker was never created
+    // for the rest of the session while the CLIENT marker carried on happily (418 moves).
+    // That is precisely the reported symptom: "the whole spawned foliage area is locked" —
+    // client-side sectors followed the camera, server-side flora never did.
+    //
+    // It is intermittent by nature, which is why goal 10 landed with this latent: it needs the
+    // two pumps to collide on the same tick.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<object, bool> _pumpSceneIsServer = new();
     private static object _serverMarker;          // DEntityContext in the SERVER scene
     private static Vector3D _serverMarkerPos;
     private static int _serverMarkerMoves;
@@ -1301,6 +1317,21 @@ internal static class WorldGrids
         // methods it patched first are all conditional jobs a quiet session never runs,
         // and two boots produced a seat that provably never fired.
         if (sceneObj == null) return;
+
+        // BEFORE everything, even the null checks below: this stamp is what tells the gate
+        // and the claim expiry that the SIM IS ACTUALLY RUNNING. Silence from a panel only
+        // means "dead" while this heartbeat advances; a pause, the settings menu, a load or
+        // a sim stall freezes it, and with it every liveness judgement. That freeze is the
+        // fix for the settings/exit/load CTD family — see CameraFeed.NotePumpAlive.
+        CameraFeed.NotePumpAlive();
+
+        // BEFORE the early-outs, deliberately. This drains panel unbinds that FeedGate
+        // handed off because they arrived on the render thread (see PanelBinding.Unbind);
+        // it has nothing to do with the marker knobs, and gating it behind them would mean
+        // a feed torn down with every marker knob off never gets its panels restored. Costs
+        // one uncontended lock and a count check per scene tick when the queue is empty.
+        PanelBinding.DrainDeferredUnbind();
+
         var want = FeedConfig.ServerPresenceEntity;
         if (!want && _serverMarker == null
             && !FeedConfig.CameraTriggerEntity && _marker == null
@@ -1339,6 +1370,16 @@ internal static class WorldGrids
             }
             if (_serverFloraSurveyPending) { _serverFloraSurveyPending = false; DumpServerFlora(scene2); }
             if (_serverDisarmed) return;
+            if (_serverRetryAtMs != 0 && Environment.TickCount64 < _serverRetryAtMs) return;   // backing off after a fault
+
+            // Save hold: same rule as the client drive, on this scene's own seat. The
+            // SERVER scene is the one the world save is actually collected from, so this
+            // branch is the one that matters most.
+            if (SaveHoldActive())
+            {
+                if (_serverMarker != null) DestroyServerMarker(scene2, "a save is being collected");
+                return;
+            }
 
             if (!want)
             {
@@ -1347,7 +1388,7 @@ internal static class WorldGrids
                 return;
             }
 
-            var pos = CameraFeed.SubjectCentreCache;
+            var pos = CameraFeed.PresenceCentre;
             if (pos.LengthSquared() <= 1.0) return;                 // no feed target yet
             pos = DriftAround(pos);
 
@@ -1413,6 +1454,10 @@ internal static class WorldGrids
                 _serverMarkerMoves++;
             }
 
+            // A clean pass clears the fault streak, so three failures means three IN A ROW —
+            // an intermittent race can never accumulate its way to a permanent disarm.
+            if (_serverFaults != 0) { _serverFaults = 0; _serverRetryAtMs = 0; }
+
             var now = Environment.TickCount64;
             if (now - _serverLogTicks > 30000)
             {
@@ -1423,10 +1468,31 @@ internal static class WorldGrids
         }
         catch (Exception e)
         {
-            _serverDisarmed = true;      // fault once, stop — this is inside engine trigger code
-            RttLog.Error("server presence", e);
+            // FAULT ONCE, RETRY LATER — not "fault once, dead for the session".
+            //
+            // The old rule was permanent, on the reasoning that a fault inside engine trigger
+            // code will fault again. That is true of a SHAPE problem and false of a RACE, and
+            // this path had a race: a concurrent-collection exception from the shared seat
+            // disarmed server presence for a whole session while the client marker carried on,
+            // which is exactly the "spawned foliage area is locked" report. Nothing said so
+            // afterwards, because the disarmed check returns silently.
+            //
+            // Three consecutive failures still means stop — a genuine shape fault is not
+            // logged forever — but a one-off gets another go ten seconds later.
+            _serverFaults++;
+            _serverRetryAtMs = Environment.TickCount64 + 10000;
+            if (_serverFaults >= 3)
+            {
+                _serverDisarmed = true;
+                RttLog.Line($"SERVER PRESENCE: DISARMED after {_serverFaults} consecutive faults — remote flora will " +
+                            "no longer follow the camera this session. This is a real failure, not a quiet default.");
+            }
+            RttLog.Error($"server presence (fault {_serverFaults}/3, retrying in 10 s)", e);
         }
     }
+
+    private static int _serverFaults;
+    private static long _serverRetryAtMs;
 
     // ── THE VOXEL BODY SURVEY — where does near-mode terrain actually EXIST? ────────────
     //
@@ -1584,7 +1650,7 @@ internal static class WorldGrids
                     // "the camera is over bare rock". Collect (distance, hasGrass) per cell and
                     // print the nearest handful: that is the only sample the PICTURE can be
                     // judged against, and the picture is the thing making the claim.
-                    var cellHits = new List<(double D, bool Grass, int Lod)>();
+                    var cellHits = new List<(double D, double DRoot, bool Grass, int Lod)>();
                     foreach (var ring in rings)
                     {
                         int cells = 0, withGrass = 0, fieldFound = 0;
@@ -1630,16 +1696,48 @@ internal static class WorldGrids
                                         if (Prop(ge, "IsValid") is bool ok && ok) { withGrass++; valid = true; }
                                     }
 
-                                    // The cell's own world position. VoxelCell carries a
-                                    // WorldTransform; _offset alone is body-relative and would
-                                    // silently report nonsense distances, so a missing
-                                    // transform records NOTHING rather than a wrong number —
-                                    // an absent row is honest, a fabricated one is not.
+                                    // THE CELL'S WORLD POSITION, COMPOSED THE WAY THE ENGINE
+                                    // COMPOSES IT.
+                                    //
+                                    // _worldTransform is NOT the cell's position. It belongs to
+                                    // the DistributedRootEntity the cell hangs off, so every
+                                    // cell sharing a root reports one IDENTICAL distance — which
+                                    // is precisely the degeneracy the guard below caught, and
+                                    // why the first run claimed "nearest cell 867 m" for a
+                                    // camera 15 m above the ground. Reading Position alone is
+                                    // the bug, not the world.
+                                    //
+                                    // VoxelCell.CreateModelEntity shows the real composition, so
+                                    // copy it rather than invent one — it builds the model's
+                                    // transform as
+                                    //     RelativeTransform((Vector3)((Vector3I)_offset - _rootOffset))
+                                    // against _rootEntity. The cell therefore sits at the root's
+                                    // world position plus that offset, rotated into world space
+                                    // by the root's orientation.
+                                    //
+                                    // BOTH distances are kept. The old (root-only) number is
+                                    // printed beside the new one so this reader can be JUDGED
+                                    // rather than believed: if they agree the composition adds
+                                    // nothing, and if the old one is degenerate while the new
+                                    // one is not, that is the fix demonstrating itself.
                                     try
                                     {
                                         var wt = Prop(actor, "_worldTransform");
-                                        if (wt != null && Prop(wt, "Position") is Vector3D cp)
-                                            cellHits.Add(((cp - feedPos).Length(), valid, lod));
+                                        if (wt != null && Prop(wt, "Position") is Vector3D rootPos)
+                                        {
+                                            var local = Vector3D.Zero;
+                                            if (Prop(actor, "_offset") is Vector3D off)
+                                            {
+                                                double lx = Math.Truncate(off.X), ly = Math.Truncate(off.Y), lz = Math.Truncate(off.Z);
+                                                if (Prop(actor, "_rootOffset") is Vector3I ro)
+                                                { lx -= ro.X; ly -= ro.Y; lz -= ro.Z; }
+                                                local = new Vector3D(lx, ly, lz);
+                                                var q = Prop(wt, "Orientation");
+                                                if (q != null) local = RotateByQuaternion(local, q);
+                                            }
+                                            cellHits.Add((((rootPos + local) - feedPos).Length(),
+                                                          (rootPos - feedPos).Length(), valid, lod));
+                                        }
                                     }
                                     catch { }
                                 }
@@ -1679,12 +1777,15 @@ internal static class WorldGrids
                         // reasonable. So the two tells are checked explicitly and the verdict
                         // is WITHHELD rather than printed with a caveat nobody would read.
                         int distinct = cellHits.Select(h => Math.Round(h.D)).Distinct().Count();
+                        int rootDistinct = cellHits.Select(h => Math.Round(h.DRoot)).Distinct().Count();
                         bool degenerate = distinct * 4 < cellHits.Count;      // most share a position
                         bool implausible = near[0].D > 300.0;                 // nothing near a camera on the ground
 
                         sb.AppendLine("        per-cell sample: " + string.Join("  ", near.Select(h =>
                                           $"{h.D:F0}m/L{h.Lod}{(h.Grass ? "=GRASS" : "=none")}")));
-                        sb.AppendLine($"        ({cellHits.Count} cells positioned, {distinct} distinct distances)");
+                        sb.AppendLine($"        ({cellHits.Count} cells positioned, {distinct} distinct distances; " +
+                                      $"root-only reader gave {rootDistinct} distinct — if that is far smaller, the " +
+                                      "shared-root theory was right and the composition is what fixed it)");
 
                         if (degenerate || implausible)
                         {
@@ -1722,6 +1823,240 @@ internal static class WorldGrids
         catch (Exception e) { RttLog.Error("voxel body survey", e); }
     }
 
+    // ---- CLAIM STABILITY, PER SECTOR --------------------------------------------------
+    //
+    // THE QUESTION AGGREGATES CANNOT ANSWER. "41% of updates claimed" is identical whether
+    // 41% of sectors are claimed EVERY time (stable, and the flashing is downstream) or
+    // every sector is claimed 41% of the time (thrashing, and the flashing is right here).
+    // Those have completely different fixes, and three config guesses have already been
+    // spent not knowing which it is.
+    //
+    // So: remember each watched octree's last outcome and count TRANSITIONS. A sector that
+    // flips claimed -> rejected -> claimed is being handed between the feed camera and the
+    // player, and its flora is culled at 3906 km on every frame it spends on the player's
+    // side — which is exactly "correctly positioned, correctly scaled, flashing".
+    //
+    // WHY THE RADIUS GUARD. This path rejects ~11,300 times a SECOND; a dictionary write per
+    // call would cost more than the answer is worth. Only sectors within ClaimWatchRadius of
+    // the feed are tracked — those are the ones actually in shot, and the only ones whose
+    // flicker anyone can see. The table is capped for the same reason.
+    private const double ClaimWatchRadius = 3000.0;
+    private const int ClaimWatchCap = 512;
+    private static readonly Dictionary<object, bool> _claimLast = new();
+    private static long _claimFlips, _claimSamples;
+
+    private static void NoteClaimStability(object octree, bool claimed)
+    {
+        try
+        {
+            _claimSamples++;
+            if (_claimLast.TryGetValue(octree, out var was))
+            {
+                if (was != claimed) { _claimFlips++; _claimLast[octree] = claimed; }
+            }
+            else if (_claimLast.Count < ClaimWatchCap)
+            {
+                _claimLast[octree] = claimed;
+            }
+
+            // Remember the cell coords WE just wrote, so the probe can read them back from
+            // inside our pass and see whether anything overwrote them. See CameraCoordsText.
+            if (claimed && _coordsAtClaim.Count < ClaimWatchCap)
+            {
+                _fOctCameraCoords ??= octree.GetType().GetField("_cameraCoords", Any);
+                if (_fOctCameraCoords?.GetValue(octree) is Vector3I c) _coordsAtClaim[octree] = c;
+                NoteVisibility(octree);
+                // NoteBatchVisibility(octree) REMOVED 2026-08-03 — it and the SampleSubSectors
+                // walk it drove were costing ~800,000 reflection-driven samples a SECOND
+                // (7.33M per 15 s window over 4000 batches, plus 4.74M over 6000 subsector
+                // meshes) to watch two mechanisms the flashing hunt conclusively eliminated:
+                // subsector visibility read 0 flips in 4.7M samples, and batch IsVisible was
+                // cumulative-static throughout. The real cause was a RELATIVE texture-camera
+                // delta, fixed elsewhere. Kept in source but no longer driven; delete the
+                // bodies when nothing else wants their field-binding examples.
+            }
+            else if (claimed && _fOctCameraCoords != null)
+            {
+                if (_coordsAtClaim.ContainsKey(octree) &&
+                    _fOctCameraCoords.GetValue(octree) is Vector3I c2) _coordsAtClaim[octree] = c2;
+            }
+        }
+        catch { }
+    }
+
+    // ---- WHOSE CAMERA IS THE OCTREE ACTUALLY POINTED AT, AT DRAW TIME? -----------------
+    //
+    // THE BLIND SPOT THIS CLOSES. ClaimStabilityText counts flips among HOOK INVOCATIONS, so
+    // "0 flips in 161,736 samples" proves the HOOKED PATH is stable — NOT that _cameraCoords
+    // is stable. Any engine path that re-points an octree without going through our prefix is
+    // invisible to that counter and would still read zero.
+    //
+    // So this reads the STATE instead of our view of it: we record the cell coords at the
+    // moment we claim (which are ours by construction), then read them back from INSIDE OUR
+    // PASS, which is where our draw actually consumes them. A mismatch means something
+    // overwrote our camera between the claim and the draw — and an octree pointed at a player
+    // 3906 km away culls that sector's flora to nothing, which is the flash.
+    //
+    // Drift is not a false positive here: the orbit moves ~1.26 m/s and octree cells are far
+    // larger than that, whereas a player-derived value is a completely different cell.
+    private static FieldInfo _fOctCameraCoords;
+    private static readonly Dictionary<object, Vector3I> _coordsAtClaim = new();
+
+    internal static string CameraCoordsText()
+    {
+        try
+        {
+            if (_fOctCameraCoords == null || _coordsAtClaim.Count == 0)
+                return "octree camera: not sampled yet";
+
+            int same = 0, moved = 0;
+            foreach (var kv in _coordsAtClaim)
+            {
+                if (_fOctCameraCoords.GetValue(kv.Key) is not Vector3I now) continue;
+                if (now.X == kv.Value.X && now.Y == kv.Value.Y && now.Z == kv.Value.Z) same++;
+                else moved++;
+            }
+            return $"octree camera at DRAW time: {same} still ours, {moved} overwritten " +
+                   $"(of {_coordsAtClaim.Count} claimed sector(s))" +
+                   (moved == 0
+                       ? "   <-- our camera SURVIVES to the draw, so the octree is not the flash"
+                       : "   <-- OVERWRITTEN: something re-points these octrees after we claim them, " +
+                         "through a path our prefix never sees. That sector's flora is culled at the " +
+                         "PLAYER'S distance on those frames.");
+        }
+        catch (Exception e) { return "octree camera read failed: " + e.Message; }
+    }
+
+    // THE BOUNDARY FLICKER — the user's observation, turned into a measurement.
+    //
+    // Reported: nearby flora NEVER flashes, distant flora does, and REDUCING
+    // worldFloraRadiusMult made it MORE frequent, not less. That last part kills the
+    // "we are asking for flora further out than the engine will hold" theory outright — a
+    // smaller ask would have helped. What it fits instead is a flicker band at the CULLING
+    // THRESHOLD: shrink the radius and the boundary moves into view, so more of it is on
+    // screen. Objects well inside pass under any camera, objects well outside fail under
+    // any camera, and only the band between two candidate thresholds can flip.
+    //
+    // Two candidate cameras is exactly what we have. `_cameraCoords` is now 138/138 ours,
+    // but that is the octree's SPATIAL camera and visibility does not read it:
+    //     InstanceSparseOctree.IsOctreeVisible(Vector3 cameraPosition, out Single distance)
+    //     InstanceSparseOctree.UpdateVisibility(Vector3 cameraRelativePosition)
+    // both take the position as a PARAMETER. So visibility can still be evaluated against
+    // the player on the ~87% of frames we do not hold Settings.RenderView, while the octree
+    // itself is correctly pointed at the feed.
+    //
+    // Same technique that proved the octree race: record at claim, compare at draw. A
+    // sector whose _isVisible flips between the two IS one flickering object.
+    private static FieldInfo _fOctVisible, _fOctMinDist;
+    private static readonly Dictionary<object, (bool Vis, float MinDist)> _visAtClaim = new();
+    private static long _visFlips, _visSamples;
+
+    internal static void NoteVisibility(object octree)
+    {
+        if (octree == null) return;
+        try
+        {
+            _fOctVisible ??= octree.GetType().GetField("_isVisible", Any);
+            _fOctMinDist ??= octree.GetType().GetField("_minDistanceToOctree", Any);
+            if (_fOctVisible == null) return;
+            bool v = _fOctVisible.GetValue(octree) is bool b && b;
+            float d = _fOctMinDist?.GetValue(octree) is float f ? f : -1f;
+            _visAtClaim[octree] = (v, d);
+        }
+        catch { }
+    }
+
+    internal static string VisibilityText()
+    {
+        try
+        {
+            if (_fOctVisible == null || _visAtClaim.Count == 0) return "octree visibility: not sampled yet";
+
+            int flipped = 0, held = 0; float nearestFlip = float.MaxValue, farthestHeld = 0f;
+            foreach (var kv in _visAtClaim)
+            {
+                if (_fOctVisible.GetValue(kv.Key) is not bool now) continue;
+                _visSamples++;
+                if (now != kv.Value.Vis)
+                {
+                    flipped++; _visFlips++;
+                    if (kv.Value.MinDist >= 0 && kv.Value.MinDist < nearestFlip) nearestFlip = kv.Value.MinDist;
+                }
+                else { held++; if (kv.Value.MinDist > farthestHeld) farthestHeld = kv.Value.MinDist; }
+            }
+
+            return $"octree VISIBILITY at draw: {held} held, {flipped} FLIPPED " +
+                   $"(of {_visAtClaim.Count} claimed; {_visFlips} flip(s) in {_visSamples} sample(s) cumulative)" +
+                   (flipped == 0
+                       ? "   <-- visibility is stable too, so the flicker is NOT the octree visibility test " +
+                         "and the next suspect is per-batch culling (InstanceBatch.ComputeCullingDistance)"
+                       : $"   <-- FLIPPING, nearest flip at {(nearestFlip == float.MaxValue ? -1 : nearestFlip):F0} m " +
+                         $"vs farthest stable at {farthestHeld:F0} m. THIS IS THE BOUNDARY BAND: visibility is " +
+                         "being evaluated against two different camera positions, so sectors between the two " +
+                         "thresholds appear and vanish. Nearby flora is inside both and never flickers, which " +
+                         "is exactly what the user reports.");
+        }
+        catch (Exception e) { return "octree visibility read failed: " + e.Message; }
+    }
+
+    // No clock of its own: ClaimStabilityText is called from the FLORA CAMERA report, so it
+    // is already rate-limited and always reports the same window as the counts beside it.
+    private static long _lastFlips, _lastSamples;
+
+    internal static string ClaimStabilityText()
+    {
+        var flips = _claimFlips - _lastFlips;
+        var samples = _claimSamples - _lastSamples;
+        _lastFlips = _claimFlips; _lastSamples = _claimSamples;
+        if (samples == 0) return "claim stability: no in-shot sectors sampled";
+        var pct = 100.0 * flips / samples;
+        return $"claim stability: {flips} flip(s) in {samples} sample(s) ({pct:0.##}%) across " +
+               $"{_claimLast.Count} watched sector(s) within {ClaimWatchRadius:F0} m" +
+               (flips == 0
+                   ? "   <-- STABLE: sectors are NOT being handed back and forth, so the flashing is " +
+                     "DOWNSTREAM of the claim (draw/LOD), not in the flora camera override."
+                   : "   <-- THRASHING: sectors ARE alternating between the feed camera and the player. " +
+                     "Every frame on the player's side culls their flora at 3906 km, which is the flash.");
+    }
+
+    // Rotate a vector by a Quaternion read REFLECTIVELY, component by component.
+    //
+    // Deliberately not Vector3D.Transform or any VRage helper: this runs against whatever
+    // build of the game is installed, and a math overload that exists today can vanish in a
+    // patch and take the whole survey down with a MissingMethodException. X/Y/Z/W are Single
+    // fields on Keen.VRage.Library.Mathematics.Quaternion and are the stable surface.
+    //
+    // Standard v' = v + 2w(q x v) + 2(q x (q x v)), written out so there is no dependency on
+    // a cross-product helper either. Convert.ToDouble rather than a cast: the fields are
+    // Single, and an unboxing cast to double on a boxed float throws.
+    private static Vector3D RotateByQuaternion(Vector3D v, object quaternion)
+    {
+        try
+        {
+            var qt = quaternion.GetType();
+            object G(string n) => qt.GetField(n, Any)?.GetValue(quaternion);
+            var ox = G("X"); var oy = G("Y"); var oz = G("Z"); var ow = G("W");
+            if (ox == null || oy == null || oz == null || ow == null) return v;
+
+            double qx = Convert.ToDouble(ox), qy = Convert.ToDouble(oy),
+                   qz = Convert.ToDouble(oz), qw = Convert.ToDouble(ow);
+
+            // An identity/zero rotation is the common case for a planet root; skip the work
+            // and, more importantly, do not let a zero quaternion (Quaternion.Zero is a real
+            // static on this type) collapse the vector to nothing.
+            if (qx == 0 && qy == 0 && qz == 0) return v;
+
+            double tx = 2.0 * (qy * v.Z - qz * v.Y);
+            double ty = 2.0 * (qz * v.X - qx * v.Z);
+            double tz = 2.0 * (qx * v.Y - qy * v.X);
+            return new Vector3D(
+                v.X + qw * tx + (qy * tz - qz * ty),
+                v.Y + qw * ty + (qz * tx - qx * tz),
+                v.Z + qw * tz + (qx * ty - qy * tx));
+        }
+        catch { return v; }
+    }
+
     // ── THE SERVER FLORA CENSUS — spawned-but-not-replicated vs never-spawned ───────────
     //
     // 2026-08-02: terrain landed; scatters did not. The trigger census left a fork: the
@@ -1742,7 +2077,7 @@ internal static class WorldGrids
     {
         try
         {
-            var centre = CameraFeed.SubjectCentreCache;
+            var centre = CameraFeed.PresenceCentre;
             const double Radius = 3000.0;
 
             _miEnumerate ??= scene.GetType().GetMethod("EnumerateEntities", Any, null, Type.EmptyTypes, null);
@@ -2037,9 +2372,48 @@ internal static class WorldGrids
         catch (Exception e) { RttLog.Error("server marker teardown", e); }
     }
 
+    // A SAVE IS BEING COLLECTED — see RttBridge.SaveHoldUntilMs. The bootstrap prefix on
+    // SaveSessionComponent.SaveGame arms an 8 s hold; both marker drives despawn their
+    // marker on the next pump tick and refuse to recreate until it lapses, so nothing of
+    // ours can be in the entity set a save walks. The despawn lands within one sim frame
+    // of the save starting (SaveGame is async and yields before collection); the marker
+    // recreates itself automatically when the hold ends. Cost: a brief presence gap around
+    // each save — remote flora refs may dip for a few seconds.
+    // IMPLICATED IN A CRASH, 2026-08-04 — hence the knob, and hence it defaults OFF.
+    //
+    //   18:52:17.648  [Saving] Saving finished Success
+    //   18:52:24.977  NullReferenceException
+    //                   at VoxelPhysicsComponent.ReleaseChunk(Vector3I)
+    //                   at SectoredTrigger.RemoveFromCell(...)
+    //                   at SpatialTriggerSystemSessionComponent.RemoveEntityFromTriggers(DEntity)
+    //
+    // Seven seconds after the save: the 8 s hold expiring, the marker being recreated, and
+    // SweepStaleMarkers destroying the previous one. DESTROYING A TRIGGER-REGISTERED MARKER
+    // runs the engine's spatial-trigger removal into voxel-physics chunk release, and that
+    // NREs. The despawn existed to guarantee nothing of ours reaches a save — a guarantee for
+    // a risk that was never actually demonstrated (a save completed with both markers alive,
+    // and VR3B is binary so the grep that "found nothing" was blind).
+    //
+    // Trading a proven crash for an unproven contamination is a bad trade, so this is now
+    // opt-in. If save injection is ever demonstrated, the fix is a SAFE despawn — most likely
+    // removing the trigger registration before destroying, or letting the marker live and
+    // excluding it at serialisation — not this.
+    private static FieldInfo _fSaveHold;
+    private static bool SaveHoldActive()
+    {
+        if (!FeedConfig.MarkerDespawnOnSave) return false;
+        _fSaveHold ??= Type.GetType("RttProbe.RttBridge, RttProbe")?.GetField("SaveHoldUntilMs");
+        return _fSaveHold?.GetValue(null) is long until && Environment.TickCount64 < until;
+    }
+
     private static void DriveClientMarker(object scene)
     {
         if (_markerDisarmed) return;
+        if (SaveHoldActive())
+        {
+            if (_marker != null) DestroyCameraTriggerEntity("a save is being collected — no marker of ours may be in the set it walks");
+            return;
+        }
         if (!FeedConfig.CameraTriggerEntity)
         {
             // Turning the knob off deletes it live, rather than leaving a marker in the world
@@ -2050,7 +2424,7 @@ internal static class WorldGrids
 
         try
         {
-            var cameraPos = CameraFeed.SubjectCentreCache;
+            var cameraPos = CameraFeed.PresenceCentre;
             if (cameraPos.LengthSquared() <= 1.0) return;          // no feed target yet
             cameraPos = DriftAround(cameraPos);
 
@@ -2491,7 +2865,7 @@ internal static class WorldGrids
             // Where the feed camera is. SubjectCentreCache is the orbit CENTRE, published by
             // the tick; the eye orbits within tens of metres of it, which is far below any
             // distance this decision turns on.
-            var feedPos = CameraFeed.SubjectCentreCache;
+            var feedPos = CameraFeed.PresenceCentre;
             if (feedPos.LengthSquared() <= 1.0) return null;      // no feed target yet
 
             if (_cmTransformPos.GetValue(boxedTransform) is not Vector3D playerPos) return null;
@@ -3038,6 +3412,601 @@ internal static class WorldGrids
     // study that predicted it. Predicted and actual disagreeing is the interesting case.
     private static long _coneRejected;
 
+    // Sectors we have adopted. Weak keys, so a destroyed octree is collected normally.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object> _ownedOctrees = new();
+    private static readonly object Sentinel = new();
+
+    // ---- MAKING A LIVE RADIUS CHANGE ACTUALLY APPLY -----------------------------------
+    //
+    // InstanceBatch._cullingDistance = Flora.RenderingDistanceMultiplier * lastLodDistance,
+    // computed ONCE inside InstanceBatch.Initialize, which runs at batch ALLOCATION. Nothing
+    // re-evaluates it. So changing worldFloraRadiusMult live leaves every batch already in
+    // memory on its OLD distance while new allocations take the new one — a patchwork. As the
+    // orbit moves and sectors churn, the same ground re-allocates and FLIPS between the two,
+    // and instances near the boundary appear and vanish. That is the distant-flora flashing,
+    // and it is why lowering the radius made it WORSE: a bigger gap between old and new.
+    //
+    // Rescaling by the ratio restores one consistent world immediately.
+    //
+    // ONE-SHOT AT CHANGE TIME, not lazily per update. A lazy pass cannot tell a stale batch
+    // from one allocated after the change inside a stale octree, and would double-scale the
+    // second kind. Doing it at the moment of the change means anything allocated afterwards
+    // already carries the new multiplier and is never touched.
+    //
+    // REACHES ONLY OCTREES WE OWN. RenderingDistanceMultiplier is global, so the player's
+    // sectors are left patchworked — hence the caller's warning that a fresh load is the
+    // honest test. Fixing the feed's own sectors is what stops the flashing IN THE FEED.
+    internal static int RescaleFloraCullingDistances(float oldMult, float newMult)
+    {
+        if (oldMult <= 0f || newMult <= 0f || Math.Abs(oldMult - newMult) < 1e-6f) return 0;
+        float ratio = newMult / oldMult;
+        int touched = 0;
+
+        try
+        {
+            foreach (var kv in _ownedOctrees)
+            {
+                var oct = kv.Key;
+                if (oct == null) continue;
+                try
+                {
+                    var ot = oct.GetType();
+                    _fOctBatches ??= ot.GetField("_instanceBatches", Any);
+                    _fOctMaxCull ??= ot.GetField("_maxCullingDistance", Any);
+
+                    if (_fOctMaxCull?.GetValue(oct) is float mx && mx > 0f)
+                        _fOctMaxCull.SetValue(oct, mx * ratio);
+
+                    if (_fOctBatches?.GetValue(oct) is System.Collections.IEnumerable batches)
+                    {
+                        foreach (var b in batches)
+                        {
+                            if (b == null) continue;
+                            _fBatchCull ??= b.GetType().GetField("_cullingDistance", Any);
+                            if (_fBatchCull?.GetValue(b) is float cd && cd > 0f)
+                            {
+                                _fBatchCull.SetValue(b, cd * ratio);
+                                touched++;
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+
+        return touched;
+    }
+
+    private static FieldInfo _fOctBatches, _fOctMaxCull, _fBatchCull;
+
+    // ---- THE DISCRIMINATOR: DOES InstanceBatch.IsVisible ACTUALLY FLIP? ----------------
+    //
+    // Every instrument so far measures something UPSTREAM of what draws: _cameraCoords (ours
+    // 138/138), octree _isVisible (0 flips in 214 samples), claim stability (0 flips in
+    // 161,736). All clean, and the trees still flash. Three mechanisms are dead by direct
+    // in-game test — rotation (frozen orbit still flashes), the residency cone (360 = zero
+    // rejections, still flashes) and streaming (queue drained on the NVMe, still flashes).
+    //
+    // So this reads the LAST value in the chain: the per-batch IsVisible that decides whether
+    // a batch is drawn at all. Two outcomes, and they point in completely different
+    // directions, which is the point of measuring it:
+    //
+    //   FLIPS > 0  -> visibility genuinely oscillates. Something writes IsVisible even though
+    //                 we suppress the engine's job for claimed sectors, and the next question
+    //                 is who.
+    //   FLIPS == 0 -> visibility is STABLE and the flicker is not a visibility decision at
+    //                 all. It would then have to be in the draw itself — instance buffer
+    //                 upload, batch culling inside our pass, or the impostor swap — and every
+    //                 flora-residency theory (including the culling-distance patchwork) is
+    //                 dead regardless of how well it explains the symptoms.
+    //
+    // Sampled on the claim path so it costs nothing extra to find the batches, throttled
+    // per octree so a diagnostic cannot become the bottleneck (unthrottled it walked ~97k
+    // batches a second).
+    //
+    // FORENSICS, NOT JUST A COUNTER. The first version proved the flips exist (2015 in a
+    // 2-minute window) and nothing more. The decoded IL of InstanceBatch.UpdateVisibility
+    // says the decision has exactly three inputs — the camera we pass, the batch's bounding
+    // box (recomputed every pass, moves when instances mutate), and CullingDistance (which
+    // the metre cap now edits live, up to a second late for a fresh batch). So each flip is
+    // classified by which input plausibly moved:
+    //
+    //   toVisible      direction — a pop-IN; the rest are pop-OUTs
+    //   gate           CullingDistance < octree._minDistanceToOctree at sample time (the
+    //                  hard SetNonVisible gate at the top of the method)
+    //   atClamp        CullingDistance sits exactly at wholeSceneFloraMaxMetres — the flip
+    //                  involves a batch the cap has touched; a fresh batch drawing for the
+    //                  <=1 s before the cadence clamps it lands here (self-inflicted)
+    //   countChanged   the instance list changed since the last sample — streaming mutation
+    //   boxMoved       the box centre moved >1 m since the last sample — same family
+    //   QUIET          none of the above: nothing local changed and it still flipped, so the
+    //                  INPUT changed — the camera or minDistance differed between calls,
+    //                  i.e. two different viewers are evaluating the same batch. This class
+    //                  is the smoking gun if it dominates.
+    private sealed class BatchSeen
+    {
+        public bool Vis;
+        public float Cull, CX, CY, CZ;
+        public int Count;
+    }
+
+    // THE CHURN LAYER. IsVisible froze twice while the user watched flashing, and the IL
+    // says why that is possible: the screen shows BUILT RENDER DATA (UpdateRenderData /
+    // BuildRenderData snapshots) plus a streamed entity model — a batch can sit at
+    // IsVisible=true forever while its on-screen presence churns through (a) batch-list
+    // membership (rebuilds destroy+recreate batches), (b) instance lists emptying and
+    // refilling (Count==0 early-returns the visibility update, so no flip is ever recorded),
+    // (c) the entity handle appearing/disappearing. These per-octree aggregates watch all
+    // three. All zero while the feed visibly flashes = the blink is below the component
+    // (BuildRenderData / model residency) and needs a bootstrap counter instead.
+    private sealed class OctreeSeen { public int Batches, Insts, Handles, Vis; }
+    private sealed class SsSeen { public bool Loaded, Vis; }
+    private static readonly Dictionary<object, SsSeen> _ssLast = new();
+    private static long _ssLoadedUp, _ssLoadedDown, _ssVisFlips, _ssSamples;
+    private static FieldInfo _fOctSubSectors, _fSsVis;
+    private static MethodInfo _miSsIsLoaded;
+    private static System.Reflection.PropertyInfo _pKvValue;
+    private static readonly Dictionary<object, OctreeSeen> _octreeChurnLast = new();
+    private static long _chBatchUp, _chBatchDown, _chInstUp, _chInstDown;
+    private static long _chHandleUp, _chHandleDown, _chVisUp, _chVisDown;
+    private static long _lastChBatchUp, _lastChBatchDown, _lastChInstUp, _lastChInstDown;
+    private static long _lastChHandleUp, _lastChHandleDown, _lastChVisUp, _lastChVisDown;
+    private static int _countReaderState;   // 0 untested, 1 ok, -1 FAILED (all counts -1)
+
+    private static readonly Dictionary<object, BatchSeen> _batchVisLast = new();
+    private static readonly Dictionary<object, long> _batchWalkAt = new();
+    private static long _batchVisSamples, _batchVisFlips;
+    private static long _flipToVis, _flipGate, _flipAtClamp, _flipCountChanged, _flipBoxMoved, _flipQuiet;
+    private static FieldInfo _fBatchIsVisible, _fBatchBoxField, _fBoxMin, _fBoxMax;
+    private static FieldInfo _fVecX, _fVecY, _fVecZ, _fOctMinDistForBatches, _fBatchInstList, _fBatchHandle;
+    private static System.Reflection.PropertyInfo _pBufCount;
+    private static FieldInfo _fBufCountField;
+
+    private static void NoteBatchVisibility(object octree)
+    {
+        try
+        {
+            var now = Environment.TickCount64;
+            // The BATCH walk stays cheap at 500 ms; the SUBSECTOR walk below runs at 20 ms
+            // and is gated separately, because that is the tier that actually flickers.
+            bool doSubsectors = true;
+            if (_ssWalkAt.TryGetValue(octree, out var sat) && now - sat < 20) doSubsectors = false;
+            else { if (_ssWalkAt.Count > 2000) _ssWalkAt.Clear(); _ssWalkAt[octree] = now; }
+
+            if (_batchWalkAt.TryGetValue(octree, out var at) && now - at < 500)
+            {
+                if (doSubsectors) SampleSubSectors(octree);
+                return;
+            }
+            if (_batchWalkAt.Count > 2000) _batchWalkAt.Clear();      // dead-octree entries
+            _batchWalkAt[octree] = now;
+
+            _fOctBatches ??= octree.GetType().GetField("_instanceBatches", Any);
+            _fOctMinDistForBatches ??= octree.GetType().GetField("_minDistanceToOctree", Any);
+            if (_fOctBatches?.GetValue(octree) is not System.Collections.IEnumerable batches) return;
+            float minDist = _fOctMinDistForBatches?.GetValue(octree) is float md ? md : float.NaN;
+            float clampV = (float)FeedConfig.WholeSceneFloraMaxMetres;
+
+            int aggBatches = 0, aggInsts = 0, aggHandles = 0, aggVis = 0;
+
+            foreach (var b in batches)
+            {
+                if (b == null) continue;
+                var bt = b.GetType();
+                _fBatchIsVisible ??= bt.GetField("<IsVisible>k__BackingField", Any) ?? bt.GetField("_isVisible", Any);
+                _fBatchCull ??= bt.GetField("_cullingDistance", Any);
+                _fBatchBoxField ??= bt.GetField("_boundingBox", Any);
+                _fBatchInstList ??= bt.GetField("InstanceList", Any);
+                if (_fBatchIsVisible?.GetValue(b) is not bool vis) continue;
+
+                float cull = _fBatchCull?.GetValue(b) is float cd ? cd : float.NaN;
+
+                // Box centre from Min/Max — resolved once, read boxed per sample.
+                float cx = 0, cy = 0, cz = 0; bool haveBox = false;
+                var box = _fBatchBoxField?.GetValue(b);
+                if (box != null)
+                {
+                    var boxT = box.GetType();
+                    _fBoxMin ??= boxT.GetField("Min", Any);
+                    _fBoxMax ??= boxT.GetField("Max", Any);
+                    var mn = _fBoxMin?.GetValue(box); var mx = _fBoxMax?.GetValue(box);
+                    if (mn != null && mx != null)
+                    {
+                        var vt = mn.GetType();
+                        _fVecX ??= vt.GetField("X", Any); _fVecY ??= vt.GetField("Y", Any); _fVecZ ??= vt.GetField("Z", Any);
+                        if (_fVecX?.GetValue(mn) is float ax && _fVecX?.GetValue(mx) is float bx2 &&
+                            _fVecY?.GetValue(mn) is float ay && _fVecY?.GetValue(mx) is float by &&
+                            _fVecZ?.GetValue(mn) is float az && _fVecZ?.GetValue(mx) is float bz)
+                        { cx = (ax + bx2) * 0.5f; cy = (ay + by) * 0.5f; cz = (az + bz) * 0.5f; haveBox = true; }
+                    }
+                }
+
+                // The count reader PROVES itself or confesses. The first forensic pass
+                // reported countChanged=0 and there was no way to tell "no mutations" from
+                // "the reader silently returns -1 on every batch" — the same ambiguity that
+                // made the swap guard lie. State is reported in the churn line.
+                int count = -1;
+                var buf = _fBatchInstList?.GetValue(b);
+                if (buf != null)
+                {
+                    if (_pBufCount == null && _fBufCountField == null && _countReaderState >= 0)
+                    {
+                        var bufT = buf.GetType();
+                        _pBufCount = bufT.GetProperty("Count", Any);
+                        _fBufCountField = bufT.GetField("_count", Any) ?? bufT.GetField("Count", Any);
+                        _countReaderState = (_pBufCount != null || _fBufCountField != null) ? 1 : -1;
+                    }
+                    if (_pBufCount?.GetValue(buf) is int n) count = n;
+                    else if (_fBufCountField?.GetValue(buf) is int nf) count = nf;
+                }
+
+                bool hasHandle = _fBatchHandle == null
+                    ? (_fBatchHandle = b.GetType().GetField("_handle", Any)) != null && _fBatchHandle.GetValue(b) != null
+                    : _fBatchHandle.GetValue(b) != null;   // Nullable<T> boxes to null when empty
+
+                aggBatches++;
+                if (count > 0) aggInsts += count;
+                if (hasHandle) aggHandles++;
+                if (vis) aggVis++;
+
+                _batchVisSamples++;
+                if (_batchVisLast.TryGetValue(b, out var was))
+                {
+                    if (was.Vis != vis)
+                    {
+                        _batchVisFlips++;
+                        if (vis) _flipToVis++;
+                        bool gate = !float.IsNaN(minDist) && !float.IsNaN(cull) && cull < minDist;
+                        bool clamped = clampV > 0 && !float.IsNaN(cull) && Math.Abs(cull - clampV) < 0.5f;
+                        bool mutated = count >= 0 && was.Count >= 0 && count != was.Count;
+                        float dx = cx - was.CX, dy = cy - was.CY, dz = cz - was.CZ;
+                        bool moved = haveBox && (dx * dx + dy * dy + dz * dz) > 1.0f;
+                        if (gate) _flipGate++;
+                        if (clamped) _flipAtClamp++;
+                        if (mutated) _flipCountChanged++;
+                        if (moved) _flipBoxMoved++;
+                        if (!gate && !clamped && !mutated && !moved) _flipQuiet++;
+                    }
+                    was.Vis = vis; was.Cull = cull; was.CX = cx; was.CY = cy; was.CZ = cz; was.Count = count;
+                }
+                else if (_batchVisLast.Count < 4000)
+                {
+                    _batchVisLast[b] = new BatchSeen { Vis = vis, Cull = cull, CX = cx, CY = cy, CZ = cz, Count = count };
+                }
+            }
+
+            // THE SUB-SECTOR MESHES — THE DISTANT TIER, and the only thing in the feed the
+            // user has ever seen flicker. Sampled on a 20 ms per-octree throttle, NOT the
+            // 500 ms one above.
+            //
+            // WHY THE RATE MATTERS AND WHY THE OLD ZERO WAS WORTHLESS. The earlier version
+            // shared the 500 ms throttle and reported "0 flips", which I offered as evidence
+            // that visibility was stable. The user describes flicker with SUB-SECOND gaps in
+            // batches: a flag that toggles and returns between two samples 500 ms apart reads
+            // as zero. That was aliasing presented as proof — on the exact object class the
+            // symptom is confined to. 20 ms is ~50 Hz, comfortably above Nyquist for anything
+            // the eye reads as flicker.
+            //
+            // WHAT THE GATE ACTUALLY IS (IL of FloraSubSectorMesh.UpdateVisibility, line 1):
+            //     if (Settings.Raytracing.FloraMaxDistance * 1.2f < minDistanceToOctree)
+            //         { SetNonVisible(); return; }
+            // A RAYTRACING distance gates the DISTANT FLORA TIER — and nothing else in the
+            // scene consults it. That is the only discriminator found all session that
+            // applies to this tier and to nothing else. So the margin is sampled too: if
+            // minDistanceToOctree straddles that threshold, sectors flip in and out as the
+            // two views' updates interleave, which is the symptom exactly.
+            SampleSubSectors(octree);
+
+            // Per-octree deltas since the last walk — the three churn channels themselves.
+            if (_octreeChurnLast.TryGetValue(octree, out var seen))
+            {
+                int db = aggBatches - seen.Batches, di = aggInsts - seen.Insts;
+                int dh = aggHandles - seen.Handles, dv = aggVis - seen.Vis;
+                if (db > 0) _chBatchUp += db; else _chBatchDown -= db;
+                if (di > 0) _chInstUp += di; else _chInstDown -= di;
+                if (dh > 0) _chHandleUp += dh; else _chHandleDown -= dh;
+                if (dv > 0) _chVisUp += dv; else _chVisDown -= dv;
+                seen.Batches = aggBatches; seen.Insts = aggInsts;
+                seen.Handles = aggHandles; seen.Vis = aggVis;
+            }
+            else if (_octreeChurnLast.Count < 1000)
+            {
+                _octreeChurnLast[octree] = new OctreeSeen
+                    { Batches = aggBatches, Insts = aggInsts, Handles = aggHandles, Vis = aggVis };
+            }
+        }
+        catch { }
+    }
+
+    // The bootstrap's execution-census counters, read via reflection like every bridge
+    // field. Absent on an older bootstrap -> "census not on this bootstrap" rather than
+    // zeros, because a zero from a missing instrument is the lie this project keeps
+    // catching itself telling.
+    private static FieldInfo _fCensusBuild, _fCensusUpdate, _fCensusSs, _fCensusUpload;
+    private static FieldInfo _fCensusImpostor, _fCensusDistUpd;
+    private static bool _censusLooked;
+    private static long _lastCensusBuild, _lastCensusUpdate, _lastCensusSs, _lastCensusUpload, _censusStamp;
+    private static long _lastCensusImpostor, _lastCensusDistUpd;
+
+    private static string CensusText()
+    {
+        if (!_censusLooked)
+        {
+            _censusLooked = true;
+            var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
+            _fCensusBuild  = bridge?.GetField("FloraBuildRenderDataCalls");
+            _fCensusUpdate = bridge?.GetField("FloraUpdateRenderDataCalls");
+            _fCensusSs     = bridge?.GetField("FloraSsUpdateCalls");
+            _fCensusUpload = bridge?.GetField("FloraUploadGpuCalls");
+            _fCensusImpostor = bridge?.GetField("ImpostorTagCalls");
+            _fCensusDistUpd = bridge?.GetField("DistanceToCameraUpdateCalls");
+        }
+        if (_fCensusBuild == null) return "EXECUTION CENSUS not on this bootstrap (restart to adopt)";
+
+        var now = Environment.TickCount64;
+        double secs = _censusStamp == 0 ? 0 : (now - _censusStamp) / 1000.0;
+        _censusStamp = now;
+
+        long b = (long)_fCensusBuild.GetValue(null);
+        long u = (long)(_fCensusUpdate?.GetValue(null) ?? 0L);
+        long s = (long)(_fCensusSs?.GetValue(null) ?? 0L);
+        long g = (long)(_fCensusUpload?.GetValue(null) ?? 0L);
+        var db = b - _lastCensusBuild; _lastCensusBuild = b;
+        var du = u - _lastCensusUpdate; _lastCensusUpdate = u;
+        var ds = s - _lastCensusSs; _lastCensusSs = s;
+        var dg = g - _lastCensusUpload; _lastCensusUpload = g;
+        if (secs <= 0) return $"EXECUTION CENSUS armed (cumulative: build={b} updateRd={u} ssUpdate={s} uploadGpu={g})";
+
+        long im = (long)(_fCensusImpostor?.GetValue(null) ?? 0L);
+        long dd = (long)(_fCensusDistUpd?.GetValue(null) ?? 0L);
+        var dim = im - _lastCensusImpostor; _lastCensusImpostor = im;
+        var ddd = dd - _lastCensusDistUpd; _lastCensusDistUpd = dd;
+
+        return $"EXECUTION CENSUS: BuildRenderData {db / secs:0.0}/s, batch UpdateRenderData {du / secs:0.0}/s, " +
+               $"subsector Update {ds / secs:0.0}/s, UploadEntitiesOnGpu {dg / secs:0.0}/s, " +
+               $"impostorTag {dim / secs:0.0}/s, distToCamera {ddd / secs:0.0}/s" +
+               (_fCensusUpload == null ? " (uploadGpu NOT COUNTED — older bootstrap)" : "") +
+               (dg > 0 && db == 0 && du == 0 && ds == 0
+                   ? " — THE UPLOAD IS THE ONLY LIVE WRITER: per-entity GPU instance state is being " +
+                     "rewritten continuously against otherwise-static flora. The blink is in WHOSE " +
+                     "frustum each upload serves; next question is its view scoping."
+                   : (db == 0 && du == 0 && ds == 0 && dg == 0
+                       ? " — ZERO EXECUTIONS anywhere, including the upload: the GPU-side content is not " +
+                         "being rewritten by this component at all."
+                       : ""));
+    }
+
+    // THE DISTANT-TIER MONITOR. Runs at ~50 Hz per octree so a sub-second toggle cannot
+    // alias to zero, and reads the gate's OWN terms so a flip can be attributed rather
+    // than merely counted.
+    private static void SampleSubSectors(object octree)
+    {
+        try
+        {
+            _fOctSubSectors ??= octree.GetType().GetField("_subSectors", Any);
+            _fOctMinDist2 ??= octree.GetType().GetField("_minDistanceToOctree", Any);
+            if (_fOctSubSectors?.GetValue(octree) is not System.Collections.IEnumerable subs) return;
+
+            float minDist = _fOctMinDist2?.GetValue(octree) is float md ? md : float.NaN;
+            float gate = FloraMaxDistanceGate();          // Raytracing.FloraMaxDistance * 1.2f
+
+            foreach (var kvp in subs)
+            {
+                if (kvp == null) continue;
+                _pKvValue ??= kvp.GetType().GetProperty("Value", Any);
+                var mesh = _pKvValue?.GetValue(kvp);
+                if (mesh == null) continue;
+                var mt = mesh.GetType();
+                _miSsIsLoaded ??= mt.GetMethod("IsLoaded", Any);
+                _fSsVis ??= mt.GetField("_isVisible", Any);
+                bool loaded = _miSsIsLoaded?.Invoke(mesh, null) is true;
+                bool svis = _fSsVis?.GetValue(mesh) is true;
+                _ssSamples++;
+
+                if (_ssLast.TryGetValue(mesh, out var ss))
+                {
+                    if (ss.Loaded != loaded) { if (loaded) _ssLoadedUp++; else _ssLoadedDown++; }
+                    if (ss.Vis != svis)
+                    {
+                        _ssVisFlips++;
+                        // ATTRIBUTION AT THE MOMENT OF THE FLIP. If the octree's distance sits
+                        // near the RT gate when visibility changes, the gate is the cause; if
+                        // flips happen with the distance far inside the gate, something else is.
+                        if (!float.IsNaN(minDist) && gate > 0f)
+                        {
+                            if (minDist > gate) _ssFlipBeyondGate++;
+                            else if (minDist > gate * 0.8f) _ssFlipNearGate++;
+                            else _ssFlipInsideGate++;
+
+                            // WHOSE CAMERA MEASURED IT — the pause observation's prediction,
+                            // made falsifiable. minDistanceToOctree is a DISTANCE, so its
+                            // MAGNITUDE names the viewer without ambiguity: hundreds of metres
+                            // is our orbit camera, millions is the player 3906 km away. A flip
+                            // where the distance jumps between those two scales IS the two
+                            // viewers alternating, which is the whole hypothesis.
+                            if (minDist > 100000f) _ssFlipPlayerScale++;
+                            else _ssFlipFeedScale++;
+                            if (minDist > _ssFlipMaxDist) _ssFlipMaxDist = minDist;
+                            if (minDist < _ssFlipMinDist) _ssFlipMinDist = minDist;
+                        }
+                    }
+                    ss.Loaded = loaded; ss.Vis = svis;
+                }
+                else if (_ssLast.Count < 6000)
+                {
+                    _ssLast[mesh] = new SsSeen { Loaded = loaded, Vis = svis };
+                }
+            }
+        }
+        catch { }
+    }
+
+    private static FieldInfo _fRtFloraMax, _fOctMinDist2;
+    private static object _rtSettingsBox;
+    private static int _rtGateState;      // 0 untried, 1 ok, -1 unreadable
+
+    private static float FloraMaxDistanceGate()
+    {
+        if (_rtGateState == -1) return -1f;
+        try
+        {
+            var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            var settings = core?.GetField("Settings", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var rt = settings?.GetType().GetProperty("Raytracing", Any)?.GetValue(settings)
+                  ?? settings?.GetType().GetField("Raytracing", Any)?.GetValue(settings);
+            if (rt == null) { _rtGateState = -1; return -1f; }
+            _fRtFloraMax ??= rt.GetType().GetField("FloraMaxDistance", Any);
+            if (_fRtFloraMax?.GetValue(rt) is float f) { _rtGateState = 1; _rtFloraMaxSeen = f; return f * 1.2f; }
+            _rtGateState = -1; return -1f;
+        }
+        catch { _rtGateState = -1; return -1f; }
+    }
+
+    private static float _rtFloraMaxSeen = float.NaN;
+    private static long _ssFlipBeyondGate, _ssFlipNearGate, _ssFlipInsideGate;
+    private static long _ssFlipPlayerScale, _ssFlipFeedScale;
+    private static float _ssFlipMaxDist = 0f, _ssFlipMinDist = float.MaxValue;
+    private static long _lastSsFlips, _lastSsSamples;
+    private static readonly Dictionary<object, long> _ssWalkAt = new();
+
+    internal static string DistantTierText()
+    {
+        var df = _ssVisFlips - _lastSsFlips; _lastSsFlips = _ssVisFlips;
+        var dsamp = _ssSamples - _lastSsSamples; _lastSsSamples = _ssSamples;
+        if (dsamp == 0) return "DISTANT TIER: no subsector samples this window";
+        // The LIVE value, and whether it is what we asked for. A flip count is only
+        // attributable to the boundary fix when the boundary is actually installed —
+        // iteration 1 read 0 flips while this said 250, i.e. the lever was NOT applied and
+        // the zero proved nothing.
+        var want = FeedConfig.FeedFloraMaxDistance;
+        var applied = want <= 0 || Math.Abs(_rtFloraMaxSeen - want) < 0.5f;
+        var gateTxt = _rtGateState == 1
+            ? $"RT FloraMaxDistance={_rtFloraMaxSeen:0} (gate={_rtFloraMaxSeen * 1.2f:0} m)" +
+              (applied ? "" : $" *** NOT THE REQUESTED {want:0} — lever not applied, any flip count here is UNATTRIBUTABLE ***")
+            : "RT FloraMaxDistance UNREADABLE";
+        var whose = (_ssFlipPlayerScale + _ssFlipFeedScale) == 0
+            ? ""
+            : $" WHOSE CAMERA at flip time — feed-scale {_ssFlipFeedScale}, PLAYER-scale {_ssFlipPlayerScale} " +
+              $"(minDist range {_ssFlipMinDist:0}..{_ssFlipMaxDist:0} m)." +
+              (_ssFlipPlayerScale > 0
+                  ? " PLAYER-SCALE FLIPS PRESENT: the job measured these sectors from a camera ~3900 km away, " +
+                    "so the RT gate culled them — this IS the two-viewer alternation."
+                  : " All flips measured from the FEED — the alternation hypothesis is WRONG and the trigger " +
+                    "is something else on this tier.");
+        return $"DISTANT TIER (50 Hz): {df} visibility FLIP(s) in {dsamp} sample(s) over " +
+               $"{_ssLast.Count} subsector mesh(es); flips by position — beyond gate {_ssFlipBeyondGate}, " +
+               $"near gate {_ssFlipNearGate}, well inside {_ssFlipInsideGate}. {gateTxt}.{whose} " +
+               (df > 0
+                   ? "FLIPPING — this tier's visibility oscillates."
+                   : "no flips at 50 Hz — the distant tier's visibility flag is genuinely static.");
+    }
+
+    internal static string FloraChurnText()
+    {
+        var bu = _chBatchUp - _lastChBatchUp; _lastChBatchUp = _chBatchUp;
+        var bd = _chBatchDown - _lastChBatchDown; _lastChBatchDown = _chBatchDown;
+        var iu = _chInstUp - _lastChInstUp; _lastChInstUp = _chInstUp;
+        var idn = _chInstDown - _lastChInstDown; _lastChInstDown = _chInstDown;
+        var hu = _chHandleUp - _lastChHandleUp; _lastChHandleUp = _chHandleUp;
+        var hd = _chHandleDown - _lastChHandleDown; _lastChHandleDown = _chHandleDown;
+        var vu = _chVisUp - _lastChVisUp; _lastChVisUp = _chVisUp;
+        var vd = _chVisDown - _lastChVisDown; _lastChVisDown = _chVisDown;
+        var reader = _countReaderState == 1 ? "count reader OK"
+                   : _countReaderState == -1 ? "COUNT READER FAILED — instance numbers are lies"
+                   : "count reader untested";
+        bool quiet = bu + bd + iu + idn + hu + hd == 0;
+        var ss = _ssSamples == 0
+            ? "subsectors not seen"
+            : $"SUBSECTOR MESHES: {_ssLast.Count} tracked, IsLoaded {_ssLoadedUp} up / {_ssLoadedDown} DOWN " +
+              $"(cumulative), _isVisible flips {_ssVisFlips}";
+        return $"CHURN/window: batches +{bu}/-{bd}, instances +{iu}/-{idn}, entityHandles +{hu}/-{hd}, " +
+               $"visibleFlag +{vu}/-{vd} ({reader}). {ss}. {CensusText()}. " +
+               $"{RttProbe.WholeSceneRender.CullClassifierText()}" +
+               (quiet ? "" : " — component-side churn present");
+    }
+
+    internal static string BatchVisibilityText()
+    {
+        if (_batchVisSamples == 0) return "batch IsVisible: not sampled";
+        if (_batchVisFlips == 0)
+            return $"batch IsVisible: 0 flips in {_batchVisSamples} sample(s) over {_batchVisLast.Count} batch(es) — " +
+                   "stable; the flicker is not a visibility decision on the sampled batches.";
+        return $"batch IsVisible: {_batchVisFlips} FLIP(s) in {_batchVisSamples} sample(s) over " +
+               $"{_batchVisLast.Count} batch(es) — toVisible={_flipToVis}, gate={_flipGate}, " +
+               $"atClamp={_flipAtClamp}, countChanged={_flipCountChanged}, boxMoved={_flipBoxMoved}, " +
+               $"QUIET={_flipQuiet}. Read the dominant class: atClamp = the metre cap's own lag " +
+               "(self-inflicted, fix the clamp timing); countChanged/boxMoved = streaming mutations " +
+               "re-deciding edge batches (fix = hysteresis); QUIET = the evaluation INPUT changed " +
+               "between calls, i.e. two viewers are still evaluating the same batch (find the second caller).";
+    }
+
+    // ---- A HARD METRE CAP ON FLORA DRAW DISTANCE --------------------------------------
+    //
+    // WHY THIS IS NOT worldFloraRadiusMult. That knob is a MULTIPLIER on each model's own
+    // last-LOD distance, so the resulting metres differ per model and none of them are a
+    // number anyone chose. And wholeSceneLodShift is worse for this job: it biases LOD at
+    // EVERY distance, so buying a cheaper horizon costs you a mushy foreground — measured
+    // in game, that is exactly what shift=1 did.
+    //
+    // _cullingDistance is what InstanceBatch.UpdateVisibility actually tests against, so
+    // clamping it is a true distance cull with no LOD term in it at all. Near flora keeps
+    // its detail; far flora simply stops being drawn.
+    //
+    // SIZED AGAINST THE HORIZON, not by feel. From the orbit camera (~20 m up) on a 60 km
+    // planet the geometric horizon is sqrt(2*60000*20) ~= 1550 m, while wholeSceneFarClip is
+    // 2500 m — so a full kilometre of flora was being drawn BEYOND any visible ground. That
+    // is what "distant flora loading off over the curvature" was.
+    //
+    // IDEMPOTENT, WHICH IS THE WHOLE DESIGN. min() applied twice is min() applied once, so
+    // unlike the ratio rescale above this can run on a cadence forever and simply catch
+    // batches as they are allocated. That is what makes a live cap possible at all: the
+    // engine bakes _cullingDistance once, at allocation, and never revisits it.
+    internal static int ClampFloraCullingDistances(float maxMetres)
+    {
+        if (maxMetres <= 0f) return 0;
+        int clamped = 0;
+        try
+        {
+            foreach (var kv in _ownedOctrees)
+                if (kv.Key != null) clamped += ClampOctree(kv.Key, maxMetres);
+        }
+        catch { }
+        return clamped;
+    }
+
+    private static int ClampOctree(object oct, float maxMetres)
+    {
+        int clamped = 0;
+        try
+        {
+            var ot = oct.GetType();
+            _fOctBatches ??= ot.GetField("_instanceBatches", Any);
+            _fOctMaxCull ??= ot.GetField("_maxCullingDistance", Any);
+
+            if (_fOctMaxCull?.GetValue(oct) is float mx && mx > maxMetres)
+                _fOctMaxCull.SetValue(oct, maxMetres);
+
+            if (_fOctBatches?.GetValue(oct) is System.Collections.IEnumerable batches)
+            {
+                foreach (var b in batches)
+                {
+                    if (b == null) continue;
+                    _fBatchCull ??= b.GetType().GetField("_cullingDistance", Any);
+                    if (_fBatchCull?.GetValue(b) is float cd && cd > maxMetres)
+                    {
+                        _fBatchCull.SetValue(b, maxMetres);
+                        clamped++;
+                    }
+                }
+            }
+        }
+        catch { }
+        return clamped;
+    }
+    private static long _coneAdoptions, _coneHeldThroughRejection;
+
     internal static string ConeStudyText()
     {
         var t = _coneTotal;
@@ -3055,6 +4024,9 @@ internal static class WorldGrids
                       "the cone. If these two ever diverge, the shell has started doing work and is worth tuning"
                     : " | cone OFF, so nothing was rejected");
         _coneTotal = _cone70 = _cone140 = _cone200 = _coneNoDir = _coneRejected = 0;   // per-window
+        // Per-window too: "held 400,000 times" only means something as a RATE. Adoptions
+        // stay cumulative on purpose — that one is a population, not a rate.
+        _coneHeldThroughRejection = 0;
         return s;
     }
 
@@ -3146,7 +4118,18 @@ internal static class WorldGrids
                         $"with {_modelsNearPlayer}. Similar counts mean the data is there and the gap is LOD or " +
                         "culling; a much lower feed count means the sectors themselves were generated thinner. " +
                         $"Last rejection: {FloraRejectText()}. " +
-                        $"CONE STUDY (counts only, culls nothing) — {ConeStudyText()}.");
+                        $"CONE STUDY (counts only, culls nothing) — {ConeStudyText()}. " +
+                        $"STICKY CLAIM: {_coneAdoptions} sector(s) adopted, {_coneHeldThroughRejection} update(s) " +
+                        "HELD through a cone rejection because the sector was already ours. Every one of those " +
+                        "was previously a frame where that sector's flora got culled at the PLAYER'S distance " +
+                        "and vanished — so this number IS the popping we removed. Read it next to the octree " +
+                        "camera line below: 'still ours' should now dominate 'overwritten'. " +
+                        $"{ClaimStabilityText()}. {CameraCoordsText()}. {VisibilityText()}. " +
+                        // BatchVisibilityText and DistantTierText dropped with their samplers.
+                        // A counter whose walk no longer runs would print a frozen zero, which
+                        // reads as "clean" — the single most expensive mistake of this hunt.
+                        $"{FloraChurnText()}. " +
+                        $"{ViewerDistance.SwapGuardText()}.");
             // Re-arm so each window reports a fresh sample rather than a session minimum.
             _dNearFeed = _dNearPlayer = double.MaxValue;
             _modelsNearFeed = _modelsNearPlayer = -1;
@@ -3154,7 +4137,7 @@ internal static class WorldGrids
 
         try
         {
-            var feedPos = CameraFeed.SubjectCentreCache;
+            var feedPos = CameraFeed.PresenceCentre;
             if (feedPos.LengthSquared() <= 1.0) return false;
 
             _fOctree ??= component.GetType().GetField("_octree", Any);
@@ -3206,13 +4189,68 @@ internal static class WorldGrids
             // THE CONE, after the study has counted this sample so the study keeps measuring
             // the FULL population rather than only what survives the cone — otherwise turning
             // the cone on would make its own prediction look like zero.
-            if (!InFeedCone(sectorWorld))
-            { _coneRejected++; _floraRejectCode = 3; return false; }
+            // THE CONE IS AN ADOPTION FILTER, NOT A PER-UPDATE FILTER. This is the foliage
+            // popping, and it was our own optimisation doing it.
+            //
+            // Returning false here does not mean "leave this sector alone" — it means the
+            // ENGINE'S UpdateCameraPosition runs, and that method reads
+            // Settings.RenderView.CameraPosition, a global we hold for only ~12.9% of wall
+            // clock. So every cone rejection hands an already-claimed sector back to the
+            // player's camera and its flora is culled at the player's distance. Measured on
+            // 2026-08-02 with the feed live:
+            //
+            //   octree camera at DRAW time: 36 still ours, 102 OVERWRITTEN (of 138 claimed)
+            //   claim stability:            0 flip(s) in 43378 samples
+            //   cone:                       rejected 89.0% of sector updates
+            //
+            // The claim was rock stable and the octree camera still flipped on 74% of
+            // sectors, because the two are not the same decision. `_cameraCoords` has
+            // exactly two writers (verified by IL: the octree ctor and UpdateCamera), and
+            // UpdateCamera's only caller is the method our prefix declines to suppress.
+            //
+            // So: the cone decides what to ADOPT. Once a sector is ours we keep answering
+            // for it, and only a genuine "the player is closer" test hands it back. A sector
+            // drifting across the cone edge as the camera orbits no longer flickers between
+            // two viewers — which is precisely what the user sees as foliage popping in and
+            // out at distance.
+            bool owned = _ownedOctrees.TryGetValue(octree, out _);
 
+            if (!InFeedCone(sectorWorld))
+            {
+                if (!owned) { _coneRejected++; _floraRejectCode = 3; return false; }
+                // Outside the cone but ALREADY OURS. This counter is the whole point of the
+                // change: every one of these used to be a sector handed back to the player's
+                // camera for a frame, i.e. one flicker.
+                _coneHeldThroughRejection++;
+            }
+
+            // These two ARE genuine releases: the player really is nearer, so the sector
+            // should go back to being LODed for them. Drop the ownership as well as
+            // declining, or we would hold a sector we have just agreed is not ours.
             if (dFeed * 2.0 >= dPlayer)
-            { _floraRejectCode = 1; _floraRejectFeed = dFeed; _floraRejectPlayer = dPlayer; return false; }
+            { _ownedOctrees.Remove(octree);
+              _floraRejectCode = 1; _floraRejectFeed = dFeed; _floraRejectPlayer = dPlayer;
+              if (dFeed < ClaimWatchRadius) NoteClaimStability(octree, false); return false; }
             if (dPlayer < FeedConfig.ClipmapMinPlayerDistance)
-            { _floraRejectCode = 2; _floraRejectPlayer = dPlayer; return false; }
+            { _ownedOctrees.Remove(octree);
+              _floraRejectCode = 2; _floraRejectPlayer = dPlayer;
+              if (dFeed < ClaimWatchRadius) NoteClaimStability(octree, false); return false; }
+
+            // Adopted. WEAK KEYS: octrees are created and destroyed as flora streams, and a
+            // strong reference here would pin every sector the feed has ever looked at for
+            // the life of the process.
+            _ownedOctrees.Remove(octree);
+            _ownedOctrees.Add(octree, Sentinel);
+            if (!owned) _coneAdoptions++;
+
+            // A FRESH ADOPTION CLAMPS IMMEDIATELY, not on the 1 s cadence. Without this a
+            // newly streamed-in sector's batches carry their engine-baked culling distance
+            // for up to a second — visible, then clamped, then culled — which is a flash WE
+            // manufacture. The cadence still covers batches allocated later into an octree
+            // that is already ours; this closes the big window (new octrees) for free, since
+            // adoption transitions are rare and the clamp is idempotent.
+            if (!owned && FeedConfig.WholeSceneFloraMaxMetres > 0)
+                ClampOctree(octree, (float)FeedConfig.WholeSceneFloraMaxMetres);
 
             // Our camera in this sector's root frame — the same two lines the engine would
             // have run, with a different position. We then run the octree update ourselves
@@ -3225,6 +4263,7 @@ internal static class WorldGrids
             else _miOctUpdateCam.Invoke(octree, new[] { rel });
 
             _floraClaims++;
+            NoteClaimStability(octree, true);
             return true;
         }
         catch (Exception e)

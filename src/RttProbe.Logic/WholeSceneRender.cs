@@ -213,6 +213,68 @@ internal static class WholeSceneRender
                 // targets. That is the whole point of the change.
                 var srvFmt = MemberValue(current, "_srvFormat") ?? fmt;
                 var uavFmt = MemberValue(current, "_uavFormat") ?? fmt;
+
+                // CREATE IT, DO NOT BORROW IT. This is task #34 and it is also the last
+                // per-frame assertion we cause.
+                //
+                // The borrow below asks BindableTexturePoolManager for a texture with
+                // lifetime 128 and then keeps it for the whole gate cycle — the old comment
+                // on RestoreEngineFinalLdr even says so, "a pool borrow that outlives the
+                // gate cycle deliberately". But a borrow the pool has lent and not had back
+                // sits in Pool._allocated, and Pool.OnFrameEndDisposal asserts
+                //     Some of the borrowed textures has not been returned; '_allocated.Count == 0'
+                // EVERY FRAME for as long as we hold it. One session's deferred summary
+                // counted 9872 of them. And since the crash reporter promotes the FIRST
+                // assertion of a session into a fatal exception at exit, a permanent borrow
+                // is also a permanent exit-to-menu CTD.
+                //
+                // BindableTextureManager.CreateRWResizableRenderTargetTexture returns the
+                // same ResizableRWRenderTargetTexture type, allocated directly and owned by
+                // us. It never enters the pool's ledger, so there is nothing to assert about
+                // — and we keep every property the borrow was chosen for, because the size we
+                // ask for is still the feed size and it still cannot alias the player's
+                // swapchain-sized targets.
+                //
+                // The borrow stays as the fallback: on a build where this method is missing,
+                // a feed that asserts is better than no feed at all.
+                _ownFinalLdrOwned = false;
+                var texMgr = _coreType?.GetField("BindableTextures", BindingFlags.Public | BindingFlags.Static)
+                                      ?.GetValue(null);
+                var miCreate = texMgr?.GetType().GetMethods(Any)
+                    .FirstOrDefault(m => m.Name == "CreateRWResizableRenderTargetTexture");
+                if (miCreate != null)
+                {
+                    try
+                    {
+                        var cps = miCreate.GetParameters();
+                        var cargs = new object[cps.Length];
+                        for (int i = 0; i < cps.Length; i++)
+                            cargs[i] = cps[i].Name switch
+                            {
+                                "debugName"  => name,
+                                "srvFormat"  => srvFmt,
+                                "resolution" => res,
+                                "uavFormat"  => uavFmt,
+                                "mipMaps"    => 1,
+                                _            => cps[i].HasDefaultValue ? cps[i].DefaultValue : null,
+                            };
+                        _ownFinalLdr = miCreate.Invoke(texMgr, cargs);
+                    }
+                    catch (Exception e) { RttLog.Error("create own FinalLDR (falling back to the pool borrow)", e); }
+                }
+
+                if (_ownFinalLdr != null)
+                {
+                    _ownFinalLdrOwned = true;
+                    RttLog.Line($"Own FinalLDR: CREATED \"{name}\" at {w}x{h} via " +
+                                "BindableTextures.CreateRWResizableRenderTargetTexture — ours outright, not a " +
+                                "pool borrow. It never enters Pool._allocated, so the per-frame " +
+                                "\"borrowed textures has not been returned\" assertion stops, and with it the " +
+                                "exit-to-menu crash that assertion was being promoted into.");
+                }
+                else
+                {
+
                 var ps = CameraRender.BorrowResizableRt.GetParameters();
                 var args = new object[ps.Length];
                 var sig = new System.Text.StringBuilder();
@@ -245,10 +307,12 @@ internal static class WholeSceneRender
                     EnsureFinalLdrSize(commandList);
                     return;
                 }
-                RttLog.Line($"Own FinalLDR: borrowed \"{name}\" at {w}x{h} in the feed's own pool bucket. " +
-                            "It cannot alias the player's swapchain-sized targets, so the ghost has no " +
-                            "route, and nothing resizes it any more — which is where the 56 MB/min drift " +
-                            "was coming from.");
+                RttLog.Line($"Own FinalLDR: BORROWED \"{name}\" at {w}x{h} in the feed's own pool bucket " +
+                            "(the create path was unavailable on this build). It cannot alias the player's " +
+                            "swapchain-sized targets, so the ghost has no route — but the pool will assert " +
+                            "\"borrowed textures has not been returned\" once per frame for as long as we " +
+                            "hold it, and that assertion becomes the exit-to-menu crash.");
+                }
             }
 
             // THE POOL HANDS BACK A WRAPPER, NOT THE TEXTURE.
@@ -315,16 +379,40 @@ internal static class WholeSceneRender
         catch { return null; }
     }
 
-    // Put the engine's buffer back so ScreenBuffers.Dispose frees what IT allocated. Ours is a
-    // pool borrow that outlives the gate cycle deliberately.
+    // Put the engine's buffer back so ScreenBuffers.Dispose frees what IT allocated, then
+    // release ours.
+    //
+    // The second half is new and is the other half of the create-instead-of-borrow change.
+    // While ours was a pool borrow there was nothing to do here — the pool nominally owned
+    // it (which is precisely why it asserted every frame). Now that we allocate it, nobody
+    // else will ever free it, so a gate cycle that forgot this would leak a full feed-sized
+    // RW render target per cycle. Ordering matters: the engine's texture goes back on the
+    // ScreenBuffers FIRST, so nothing is pointing at ours when it is disposed.
+    private static bool _ownFinalLdrOwned;
+    private static long _lastFloraClamp, _floraClampedTotal;
+    private static bool _floraClampLogged;
+    private static long _lastEpisodeCheck, _lastFullRefresh, _lastSsUpdateW;
+    private static bool _episodeLooked, _ssWatchLooked;
+    private static FieldInfo _fFullRefresh, _fSsUpdateW;
+
     private static void RestoreEngineFinalLdr()
     {
         try
         {
-            if (_ourScreenBuffers == null || _engineFinalLdr == null) return;
-            _ourScreenBuffers.GetType().GetProperty("FinalLDRTexture", Any)
-                ?.SetValue(_ourScreenBuffers, _engineFinalLdr);
-            _engineFinalLdr = null;
+            if (_ourScreenBuffers != null && _engineFinalLdr != null)
+            {
+                _ourScreenBuffers.GetType().GetProperty("FinalLDRTexture", Any)
+                    ?.SetValue(_ourScreenBuffers, _engineFinalLdr);
+                _engineFinalLdr = null;
+            }
+
+            if (_ownFinalLdrOwned && _ownFinalLdr is IDisposable d)
+            {
+                d.Dispose();
+                RttLog.Line("Own FinalLDR: disposed — we allocated it, so nobody else was ever going to.");
+            }
+            _ownFinalLdr = null;
+            _ownFinalLdrOwned = false;
         }
         catch (Exception e) { RttLog.Error("restore engine FinalLDR", e); }
     }
@@ -413,6 +501,615 @@ internal static class WholeSceneRender
     private static long _grassProbeTicks;
     private static bool _grassProbeShapeLogged;
 
+    // ---- THE RAYTRACING RESIDENCY PROBE ------------------------------------------------
+    //
+    // THE QUESTION: stage 0 (ExecuteAccelerationStructuresBuilding) is skipped for our pass
+    // and always has been, because RayTracingSceneManager.CreateTLAS is CAMERA-DEPENDENT AND
+    // WORLD-SPACE SHARED — building it from our camera corrupted the player's, and there is
+    // only one. But stage 17 (RaytraceGIJob.DoWork, the trace itself) is NOT skipped, and
+    // wholeSceneDisableRaytracing is 0. So we trace OUR camera's rays against a structure
+    // built around the PLAYER.
+    //
+    // At ~100 m — every early test, in space — that was approximately right and nobody could
+    // have noticed. At remote-feed range it means the rays hit nothing: we pay for GI and
+    // reflections of a world that is not in the acceleration structure.
+    //
+    // BEFORE OWNING A SECOND RayTracingSceneManager (a big change: park it in the bootstrap
+    // so it survives hot reloads, install for our render, restore on unwind — the
+    // EnvironmentProbeManager pattern), PROVE THE PREMISE. That is what this reads.
+    //
+    // WHAT IS READABLE AND WHAT IS NOT, stated up front so a blind column is never mistaken
+    // for a zero: the Buffer<T> fields are NATIVE (IntPtr _data + _count), so Count is
+    // readable but ELEMENTS ARE NOT — no positions can come from them. _rootEntityToIndex is
+    // a managed Dictionary, so its KEYS are enumerable and are the only route to "is any RT
+    // root entity actually near our camera".
+    private static long _rtProbeTicks;
+    private static bool _rtProbeShapeLogged;
+
+    private static void RaytracingProbe()
+    {
+        var now = Environment.TickCount64;
+        if (now - _rtProbeTicks < 15000) return;
+        _rtProbeTicks = now;
+
+        try
+        {
+            _coreType ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            var rt = _coreType?.GetField("RayTracingScene", BindingFlags.Public | BindingFlags.Static)
+                              ?.GetValue(null);
+            if (rt == null) { RttLog.Line("RT PROBE: CoreSystems.RayTracingScene is NULL."); return; }
+
+            var t = rt.GetType();
+            object F(string n) => t.GetField(n, Any)?.GetValue(rt);
+            object P(string n) => t.GetProperty(n, Any)?.GetValue(rt);
+
+            // Native Buffer<T>: Count only. A null here means the FIELD did not resolve,
+            // which is a blind reader, not an empty buffer — say which.
+            string Cnt(string n)
+            {
+                var b = F(n);
+                if (b == null) return "?";
+                var c = b.GetType().GetProperty("Count", Any)?.GetValue(b);
+                return c?.ToString() ?? "unreadable";
+            }
+
+            // THE ROW THAT DECIDES IT. If the TLAS holds instances but the nearest RT root
+            // entity is hundreds of km away, the structure is centred on the player and our
+            // rays trace empty space — which is the whole premise of owning our own.
+            string nearest = "root positions unreadable (reader blind, not the scene)";
+            try
+            {
+                if (F("_rootEntityToIndex") is System.Collections.IDictionary map)
+                {
+                    object[] keys;
+                    try { keys = new object[map.Count]; map.Keys.CopyTo(keys, 0); }
+                    catch { keys = null; }          // torn snapshot: report fewer, never guess
+
+                    if (keys != null)
+                    {
+                        var eye = CameraFeed.EyeCache;
+                        double best = double.MaxValue; int positioned = 0;
+                        foreach (var k in keys)
+                        {
+                            if (k == null) continue;
+                            var pos = TryWorldPosition(k);
+                            if (pos == null) continue;
+                            positioned++;
+                            var d = (pos.Value - eye).Length();
+                            if (d < best) best = d;
+                        }
+                        nearest = positioned == 0
+                            ? $"{keys.Length} root(s), NONE positionable — reader blind, draw no conclusion"
+                            : $"{keys.Length} root(s), {positioned} positionable, NEAREST TO OUR CAMERA = " +
+                              (best > 1000.0 ? $"{best / 1000.0:F1} km" : $"{best:F0} m") +
+                              (best > 10000.0
+                                  ? "   <-- TLAS IS NOT AROUND OUR CAMERA: our rays trace empty space"
+                                  : "   <-- RT geometry IS near our camera");
+                    }
+                }
+            }
+            catch { }
+
+            if (!_rtProbeShapeLogged)
+            {
+                _rtProbeShapeLogged = true;
+                RttLog.Line("RT PROBE shape: RayTracingSceneManager fields = " +
+                            string.Join(", ", t.GetFields(Any).Select(f => f.Name).Take(24)));
+            }
+
+            RttLog.Line($"RT PROBE (inside our pass): HasScene={P("HasScene")} " +
+                        $"RTInstanceCount={P("RTInstanceCount")} instances={F("_currentInstancesCount")} " +
+                        $"geometries={F("_currentGeometriesCount")} | roots={Cnt("_rootEntities")} " +
+                        $"instancedModels={Cnt("_instancedModelEntities")} flora={Cnt("_floraSubSectorEntity")} " +
+                        $"pointLights={Cnt("_pointLightEntities")} spotLights={Cnt("_spotLightEntities")} " +
+                        $"| {nearest}");
+        }
+        catch (Exception e) { RttLog.Line("RT PROBE failed: " + e.Message); }
+    }
+
+    // Best-effort world position off an unknown handle/struct. Tries the shapes this engine
+    // actually uses, in order, and returns null rather than a fabricated origin — a wrong
+    // position here would read as "RT geometry is right next to us" and kill a correct
+    // diagnosis, which is exactly how the clipmap cell reader misled us for a day.
+    private static Vector3D? TryWorldPosition(object o)
+    {
+        try
+        {
+            var t = o.GetType();
+            foreach (var n in new[] { "Position", "WorldPosition", "Translation" })
+            {
+                var v = t.GetProperty(n, Any)?.GetValue(o) ?? t.GetField(n, Any)?.GetValue(o);
+                if (v is Vector3D d) return d;
+            }
+            foreach (var n in new[] { "_worldTransform", "WorldTransform", "Transform" })
+            {
+                var wt = t.GetProperty(n, Any)?.GetValue(o) ?? t.GetField(n, Any)?.GetValue(o);
+                if (wt == null) continue;
+                var p = wt.GetType().GetProperty("Position", Any)?.GetValue(wt)
+                        ?? wt.GetType().GetField("Position", Any)?.GetValue(wt);
+                if (p is Vector3D d2) return d2;
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // ---- THE TEXTURE STREAMING PROBE ---------------------------------------------------
+    //
+    // THE QUESTION, in the user's words: "what texture resolution setting is in the feed for
+    // objects?" The answer is that there is no feed-specific one — the feed inherits the
+    // game's global StreamingSettings, and an object's effective resolution is DERIVED:
+    // f(texel density target, distance to camera, screen resolution).
+    //
+    // The distance term is the one that betrays us. Confirmed in IL:
+    //   ManagedTexturePrioritizerComponent.OnCollectStandardsRoot
+    //       reads Settings.Streaming.EnableCollectingMaterialDistances   <- GATE
+    //       reads Settings.RenderView.CameraPosition                     <- THE CAMERA
+    //       -> CollectStandards(ref cameraPositionRS, ...)
+    // and StandardMaterialJobContext holds two ClosestDistanceCollector fields, so mips are
+    // picked by CLOSEST DISTANCE TO A CAMERA — a nearest-viewer model by design, which is
+    // why our viewerDistance postfix (min() only, never raises) composes with it correctly.
+    //
+    // READ THE GATE FIRST. If EnableCollectingMaterialDistances is FALSE, the camera position
+    // never enters at all, priority is density-only, and the entire "tiers come from the
+    // player's position" theory is dead however good it looks. That single boolean decides
+    // whether any of this work is worth doing.
+    //
+    // SkipMipLevels is the other one that would end the discussion: it is a flat, global
+    // "drop N mip levels" applied to everything. A non-zero value there means the feed looks
+    // soft because the whole GAME is running reduced textures, not because of us.
+    private static long _streamProbeTicks;
+
+    private static void StreamingProbe()
+    {
+        var now = Environment.TickCount64;
+        if (now - _streamProbeTicks < 15000) return;
+        _streamProbeTicks = now;
+
+        try
+        {
+            var field = ResolveSettingsField("StreamingSettings", out var settings);
+            if (settings == null || field == null)
+            {
+                RttLog.Line("STREAMING PROBE: no StreamingSettings on SettingsManager — reader blind.");
+                return;
+            }
+
+            var s = field.GetValue(settings);
+            if (s == null) { RttLog.Line("STREAMING PROBE: StreamingSettings value null."); return; }
+            var st = s.GetType();
+            object F(string n) => st.GetField(n, Any)?.GetValue(s);
+
+            var gate = F("EnableCollectingMaterialDistances");
+            var skip = F("SkipMipLevels");
+
+            RttLog.Line($"STREAMING PROBE (inside our pass): EnableCollectingMaterialDistances={gate} " +
+                        $"SkipMipLevels={skip} DefaultTexelDensity={F("DefaultTexelDensity")} " +
+                        $"ArmorTexelDensity={F("ArmorTexelDensity")} " +
+                        $"TargetDensityAndNonPinnedRatio={F("TargetDensityAndNonPinnedRatio")} " +
+                        $"MinTextureStreamingBytes={F("MinTextureStreamingBytes")} " +
+                        $"TargetUnusedVRAMMult={F("TargetUnusedVRAMMult")} EnableCaching={F("EnableCaching")} " +
+                        $"| playerSwapchainY={ScatterControl.PlayerSwapchainHeight()} feedY={FeedConfig.WholeSceneHeight}" +
+                        (gate is bool g && !g
+                            ? "   <-- GATE IS OFF: material distances are NOT collected, so camera position " +
+                              "never enters texture priority. The player-position theory is DEAD and " +
+                              "viewerDistance cannot help textures."
+                            : "") +
+                        (skip is byte b && b > 0
+                            ? $"   <-- SkipMipLevels={b}: the WHOLE GAME is dropping {b} mip level(s). The feed " +
+                              "looks soft because everything does; fix this before blaming the feed."
+                            : ""));
+        }
+        catch (Exception e) { RttLog.Line("STREAMING PROBE failed: " + e.Message); }
+    }
+
+    // ---- THE STREAMING BUDGET PROBE — the unified theory's instrument -----------------
+    //
+    // THE HYPOTHESIS (user, 2026-08-02, and it unifies two bugs this project has never
+    // explained): the PLAYER'S main-world LOD cycling AND the phantom mild frame hitching in
+    // both views, present since the mod's beginning, are ONE effect of a GLOBAL STREAMING
+    // BUDGET OSCILLATING — not of anything camera-specific.
+    //
+    // WHY A BUDGET AND NOT A RACE. The user's decisive observation is that the player's
+    // objects and the feed's flora degrade AT THE SAME INSTANT. A race hits them
+    // independently; only a single shared decision hits everything at once. And we have now
+    // MEASURED that the distance/LOD-tag path never even overlaps our draw (0 of ~2.3M calls
+    // inside our swap window), so the race explanation is dead on that path anyway.
+    //
+    // THE MECHANISM, from the engine's own types:
+    //     WindowHisteresisFilter.ComputeMinimum(Int64 newRawBudget)
+    //         fields: _windowFilter, _histeresisRatio, _lastReturnedBudget
+    // It returns a MINIMUM OVER A WINDOW. So a transient dip in available streaming memory —
+    // which a second full scene render at a remote location makes far more likely — is not a
+    // momentary downgrade. It is LATCHED for the whole window: textures and LODs drop
+    // globally, then recover when the window rolls off. That is a cycle whose period is the
+    // filter's window length, applied to one budget that BOTH views read.
+    //
+    // AND IT EXPLAINS THE HITCHING TOO. Releasing the latch means re-streaming and
+    // re-uploading everything that was dropped — a real burst of copy/upload work landing in
+    // one or two frames. Same event, two symptoms. It also explains why every previous
+    // explanation failed: it is not GC (task #18 exonerated that by measurement), it does not
+    // track our render rate (measured today), and it does not track our draw cost.
+    //
+    // WHAT TO READ. StreamingStatManager publishes both sides of the filter:
+    //     AvailableRaw       <- the filter's INPUT
+    //     AvailableFiltered  <- its OUTPUT
+    // If Filtered sits BELOW Raw for stretches and then snaps back, the latch is real and
+    // visible. That single comparison is the whole test.
+    private static long _streamProbe2Ticks;
+    private static object _streamStats;
+    private static readonly Dictionary<string, PropertyInfo> _statReaderProp = new();
+    private static float _rawMin = float.MaxValue, _rawMax, _filtMin = float.MaxValue, _filtMax;
+    private static bool _streamSurveyDone;
+    private static int _latchedSamples, _totalSamples;
+
+    // ---- THE GRASS PROBE: which input is empty? ---------------------------------------
+    //
+    // ESTABLISHED: RenderGrass RUNS in our pass (census: 3541 calls ours vs 5872 the
+    // player's), yet the picture has no blades. So the DRAW is not the problem — generation
+    // produced nothing, or produced something that never reached the screen. Those need
+    // completely different fixes, and no amount of staring at the image separates them.
+    //
+    // RenderGrass sources every input from DrawContextManager — and we own OURS:
+    //     MainViewCulling.EntityProxies   the culled set grass scatters onto
+    //     MainOutputGeometryBuffers       the terrain geometry it scatters over
+    //     GrassBufferContext              where generated blades land
+    // EntityProxyContext has no CPU-side count (it lives in a GPU counter buffer), but
+    // GrassBufferContext publishes STAT KEYS for exactly what we need:
+    //
+    //     grassInstancesRendered == 0  -> generation produced NOTHING. The inputs are empty,
+    //                                    and the fix is upstream: our culling context or our
+    //                                    output geometry buffers are not being populated.
+    //     grassInstancesRendered  > 0  -> blades WERE generated and the loss is downstream in
+    //                                    the draw or the material.
+    //
+    // One number, two completely different investigations. Reported once every 15 s.
+    private static object _grassCtx;
+    private static long _grassProbeMs;
+
+    internal static void GrassProbe()
+    {
+        var now = Clock.Ms;
+        if (now - _grassProbeMs < 15000) return;
+        _grassProbeMs = now;
+        try
+        {
+            if (_ourDrawContexts == null)
+            {
+                RttLog.Line("GRASS PROBE: we have no DrawContextManager of our own this pass — " +
+                            "cannot read the grass counters. NOT a zero-blade result.");
+                return;
+            }
+            _grassCtx ??= _ourDrawContexts.GetType().GetProperty("GrassBufferContext", Any)?.GetValue(_ourDrawContexts);
+            if (_grassCtx == null)
+            {
+                RttLog.Line("GRASS PROBE: DrawContextManager exposes no GrassBufferContext — SHAPE MISS, not a zero.");
+                return;
+            }
+
+            var rendered = ReadInstanceStat(_grassCtx, "_grassInstancesRenderedCountStatKey");
+            var max = ReadInstanceStat(_grassCtx, "_maxGrassInstancesCountStatKey");
+            if (rendered == null)
+            {
+                RttLog.Line("GRASS PROBE: the instance-count stat could not be read — BROKEN INSTRUMENT, not zero blades.");
+                return;
+            }
+
+            RttLog.Line($"GRASS PROBE: instances rendered={rendered:F0}, max={(max?.ToString("F0") ?? "n/a")} in OUR grass buffer. " +
+                        (rendered > 0.5f
+                            ? "GENERATION WORKS — blades exist, so the loss is DOWNSTREAM: the draw, the material, or the " +
+                              "target they land in. Stop looking at culling and geometry inputs."
+                            : "GENERATION PRODUCED NOTHING. This does NOT by itself name our contexts — read the gate " +
+                              "line below, which is what decides whether the generator ran at all.")
+                        + "\n" + GpuSceneGrassGate());
+        }
+        catch (Exception e) { RttLog.Error("grass probe", e); }
+    }
+
+    // ---- THE TWO GATES THAT SIT BEFORE OUR CONTEXTS EVER MATTER ------------------------
+    //
+    // Read straight off the IL of GrassGenerationCommandsCreationJob.DoWork, whose first
+    // instructions are:
+    //
+    //     n = GPUScene.GrassEntityData.MaxUsedIndex + 1
+    //     if (GPUScene.GrassMaterialsBuffer == null || n == 0) return;     <-- both gates
+    //     ...
+    //     Dispatch(_createGenCommandsPSO, ceil(n / 64.0), 1, 1)
+    //
+    // TWO CONSEQUENCES, and both contradict what this probe used to conclude.
+    //
+    // FIRST, THE DISPATCH IS SIZED BY THE GLOBAL GRASS-ENTITY COUNT, NOT BY OUR CULLED SET.
+    // EntityProxyOutputBuffer and CounterBuffer are bound as SRVs the SHADER reads for its
+    // per-entity visibility test; they do not decide whether the shader runs. So "generation
+    // produced nothing" never implied "our EntityProxies is empty" — that was one candidate
+    // stated as a conclusion, and it sent this investigation at culling for two sessions.
+    //
+    // SECOND, BOTH GATES READ CoreSystems.GPUScene, WHICH IS A GLOBAL WE DO NOT SWAP. It is
+    // the same object in the player's pass and in ours. If it is empty then grass is
+    // impossible for EITHER camera, no per-pass state can change it, and every knob aimed at
+    // this so far (HiZ, per-pass NoHiZ, draw distance, density, the stage-1 split) was tuning
+    // a stage the code never reaches — which is exactly why none of them moved the number.
+    //
+    // MaxUsedIndex == -1 means NO GRASS ENTITY IS REGISTERED IN THE GPU SCENE AT ALL. That is
+    // the prediction if grass models arrive solely through the streaming path and nothing has
+    // streamed grass for a site with no player near it — and it is consistent with the one
+    // control we have: the player stands in bare sandstone desert, with no grass anywhere.
+    //
+    // Every failure to read says so in words. A blind reader printing 0 here would fabricate
+    // the very answer being tested, which is the specific mistake this project has already
+    // made once with the grass census.
+    private static string GpuSceneGrassGate()
+    {
+        try
+        {
+            var core = _coreType ?? Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            var gpuScene = core?.GetField("GPUScene", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            if (gpuScene == null)
+                return "  GPU-SCENE GATE UNREADABLE: no CoreSystems.GPUScene (blind, NOT zero).";
+
+            var gt = gpuScene.GetType();
+            var grassData = gt.GetProperty("GrassEntityData", Any)?.GetValue(gpuScene);
+            var matsProp = gt.GetProperty("GrassMaterialsBuffer", Any);
+            object mats = matsProp?.GetValue(gpuScene);
+
+            if (grassData == null)
+                return "  GPU-SCENE GATE UNREADABLE: GPUScene exposes no GrassEntityData (blind, NOT zero).";
+            if (grassData.GetType().GetProperty("MaxUsedIndex", Any)?.GetValue(grassData) is not int mid)
+                return "  GPU-SCENE GATE UNREADABLE: GrassEntityData exposes no MaxUsedIndex (blind, NOT zero).";
+
+            int n = mid + 1;
+            string matsText = matsProp == null ? "GrassMaterialsBuffer NOT A MEMBER (blind)"
+                            : mats == null ? "GrassMaterialsBuffer=NULL"
+                                             : "GrassMaterialsBuffer=present";
+
+            return (n == 0 || (matsProp != null && mats == null))
+                ? $"  GPU-SCENE GATE SHUT: MaxUsedIndex={mid} (grass entities={n}), {matsText}. DoWork RETURNS " +
+                   "BEFORE ITS DISPATCH, so nothing our pass owns is ever consulted. This is a SHARED global: " +
+                   "grass is equally impossible for the PLAYER's camera right now. The fix belongs in grass-entity " +
+                   "registration / model streaming, NOT in our draw contexts, and no per-pass knob can reach it."
+                : $"  GPU-scene gate OPEN: MaxUsedIndex={mid} (grass entities={n}, dispatch={(n + 63) / 64} group(s)), " +
+                  $"{matsText}. The generator DOES run, so a zero result IS a genuine per-pass failure: the shader's " +
+                   "visibility test against OUR EntityProxyOutputBuffer/CounterBuffer rejected every entity.";
+        }
+        catch (Exception e)
+        {
+            return "  GPU-SCENE GATE UNREADABLE: " + e.GetType().Name + " (blind, NOT zero).";
+        }
+    }
+
+    private static float? ReadInstanceStat(object owner, string keyField)
+    {
+        try
+        {
+            var key = owner.GetType().GetField(keyField, Any)?.GetValue(owner);
+            var reader = key?.GetType().GetProperty("Reader", Any)?.GetValue(key);
+            if (reader?.GetType().GetProperty("Value", Any)?.GetValue(reader) is float v) return v;
+        }
+        catch { }
+        return null;
+    }
+
+    private static float? ReadStat(string keyField)
+    {
+        try
+        {
+            if (_streamStats == null)
+            {
+                _coreType ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+                _streamStats = _coreType?.GetField("StreamingStats", BindingFlags.Public | BindingFlags.Static)
+                                        ?.GetValue(null);
+                if (_streamStats == null) return null;
+            }
+            var kf = _streamStats.GetType().GetField(keyField, Any);
+            var key = kf?.GetValue(_streamStats);
+            if (key == null) return null;
+
+            if (!_statReaderProp.TryGetValue(keyField, out var rp))
+            {
+                rp = key.GetType().GetProperty("Reader", Any);
+                _statReaderProp[keyField] = rp;
+            }
+            var reader = rp?.GetValue(key);
+            if (reader?.GetType().GetProperty("Value", Any)?.GetValue(reader) is float v) return v;
+        }
+        catch { }
+        return null;
+    }
+
+    // Sampled on EVERY render (41/s), not on the 15 s report clock: a latch that lasts a few
+    // hundred milliseconds is invisible to a 15 s sample, and the whole question is whether
+    // there IS a sub-second oscillation.
+    internal static void SampleStreamingBudget()
+    {
+        var raw = ReadStat("AvailableRaw");
+        var filt = ReadStat("AvailableFiltered");
+        if (raw == null || filt == null) return;
+
+        _totalSamples++;
+        if (raw.Value < _rawMin) _rawMin = raw.Value;
+        if (raw.Value > _rawMax) _rawMax = raw.Value;
+        if (filt.Value < _filtMin) _filtMin = filt.Value;
+        if (filt.Value > _filtMax) _filtMax = filt.Value;
+        // "Latched" = the filter is holding a value materially below what it is being fed.
+        if (raw.Value > 0 && filt.Value < raw.Value * 0.95f) _latchedSamples++;
+    }
+
+    private static void StreamingBudgetProbe()
+    {
+        var now = Environment.TickCount64;
+        if (now - _streamProbe2Ticks < 15000) return;
+        _streamProbe2Ticks = now;
+
+        if (_totalSamples == 0)
+        {
+            if (ReadStat("AvailableRaw") == null)
+                RttLog.Line("STREAMING BUDGET: CoreSystems.StreamingStats unreadable — probe blind.");
+            return;
+        }
+
+        // SURVEY BEFORE FOCUS. AvailableRaw/Filtered turned out to be ~14 GB with a 2% swing —
+        // i.e. no pressure at all — which says the hysteresis latch is not firing but says
+        // NOTHING about the other twenty-odd counters. Dumping every StatKey once, with its
+        // magnitude, is how we find which quantity is actually under pressure instead of
+        // picking another pair by name and guessing again.
+        if (!_streamSurveyDone)
+        {
+            _streamSurveyDone = true;
+            try
+            {
+                var sb = new System.Text.StringBuilder("STREAMING STAT SURVEY (one-shot, MB where plausible): ");
+                foreach (var f in _streamStats.GetType().GetFields(Any))
+                {
+                    if (f.FieldType.Name != "StatKey") continue;
+                    var v = ReadStat(f.Name);
+                    if (v == null) continue;
+                    sb.Append($"{f.Name}=")
+                      .Append(Math.Abs(v.Value) > 1048576.0
+                                ? $"{v.Value / 1048576.0:F0}MB "
+                                : $"{v.Value:F0} ");
+                }
+                RttLog.Line(sb.ToString());
+            }
+            catch (Exception e) { RttLog.Line("STREAMING STAT SURVEY failed: " + e.Message); }
+        }
+
+        double pct = 100.0 * _latchedSamples / _totalSamples;
+        double rawSwing = _rawMax - _rawMin, filtSwing = _filtMax - _filtMin;
+
+        // THE ACCEPTANCE TEST FOR THE RATCHET FIX, printed every window so it can be watched
+        // across reloads rather than reconstructed afterwards. KnownNonStreaming is the
+        // quantity that grew ~1.1 GB per hot reload; RealAvailableStreaming going negative is
+        // what puts the streaming pool into thrash. If parking works, the first stays flat
+        // across reloads and the second stays positive.
+        // ---- THE SHARED POOL: CHURN OR DOUBLE RESIDENCY? -----------------------------
+        //
+        // THE USER'S QUESTION (2026-08-02), and it is a good one: we build our OWN
+        // ScreenBuffers and DrawContextManager, so what happens to the engine resources that
+        // are SHARED and keyed on resolution? They see the size flip between the player's
+        // 3840x2160 and our 1024x1024, 41 TIMES A SECOND.
+        //
+        // We already have one confirmed casualty: CloudJob's CloudAccumulateLightAlpha was
+        // disposed and recreated at our resolution 20x/sec and REMOVED THE DEVICE (skip 26).
+        // The audit that found it cleared HighlightJob / TerrainBlendingJob /
+        // AtmosphereAdditiveJob because they only call Resize(commandList, res) on a BORROWED
+        // POOL TEXTURE — "the designed per-frame path". That reasoning is sound for a window
+        // resize. It is not obviously sound at 41 flips per second between two very
+        // different sizes, and those three jobs all RUN in our pass.
+        //
+        // TWO OUTCOMES, DIFFERENT BUGS, DIFFERENT FIXES — which is why this measures rather
+        // than assumes:
+        //   borrow count OSCILLATES + disposal traffic -> real churn. Cost is TIME
+        //       (allocate/free), which is the frame hitching.
+        //   borrow count STABLE                        -> the pool is caching BOTH sizes.
+        //       Cost is SPACE: a permanent second set of full-size targets sitting in
+        //       KnownNonStreaming, squeezing the streaming pool -> eviction cycling.
+        try
+        {
+            _coreType ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            var pool = _coreType?.GetField("GPUResourcePool", BindingFlags.Public | BindingFlags.Static)
+                                ?.GetValue(null);
+            if (pool != null)
+            {
+                var pt = pool.GetType();
+                object G(string n) => pt.GetField(n, Any)?.GetValue(pool);
+                var gpuBorrowed = G("_gpuBorrowedObjects");
+                var cpuBorrowed = G("_cpuBorrowedObjects");
+                int disposalQueued = -1;
+                if (G("ParallelD3DResourceDisposalQueue") is System.Collections.ICollection q)
+                    disposalQueued = q.Count;
+
+                RttLog.Line($"GPU POOL: gpuBorrowed={gpuBorrowed} cpuBorrowed={cpuBorrowed} " +
+                            $"d3dDisposalQueue={(disposalQueued < 0 ? "unreadable" : disposalQueued.ToString())}. " +
+                            "Watch gpuBorrowed ACROSS windows: a steady value means the pool caches both the " +
+                            "player's 4K set and our 1024 set (a permanent memory cost, squeezing streaming); " +
+                            "a value that swings, with disposal-queue traffic, means real allocate/free churn " +
+                            "at 41 Hz (a time cost — the hitching).");
+            }
+        }
+        catch { }
+
+        var nonStream = ReadStat("KnownNonStreaming");
+        var realAvail = ReadStat("RealAvailableStreaming");
+        var missing = ReadStat("Missing");
+        if (nonStream != null && realAvail != null)
+            RttLog.Line($"STREAMING HEALTH: KnownNonStreaming {nonStream.Value / 1048576.0:F0} MB, " +
+                        $"RealAvailableStreaming {realAvail.Value / 1048576.0:F0} MB, " +
+                        $"Missing {(missing ?? 0) / 1048576.0:F0} MB. " +
+                        (realAvail.Value < 0
+                            ? "NEGATIVE — the streaming pool is clamped to its floor and THRASHING: evict, " +
+                              "re-need, re-fetch. That is the LOD cycling and the frame hitching, both views, " +
+                              "one pool. Baseline on a fresh session was +6505 MB."
+                            : "positive — the pool has real room. Watch this across hot reloads: it fell " +
+                              "~1.1 GB per reload before the bootstrap park."));
+
+        // THE FETCH QUEUE — the one instrument that can join all three symptoms.
+        //
+        // The user's report is that the residual foliage popping happens IN SYNC with the
+        // main world's object LOD cycling, and separately that world loads block the engine's
+        // EndOfLoadingFence. Those are three symptoms of one thing if the shared texture
+        // fetch pipeline is not keeping up, and everything measured so far points that way:
+        // Missing sits at 1.1-1.7 GB for minutes while RealAvailableStreaming reports 3.5-6.7
+        // GB free, so the pool has room and the FETCH is what is not happening.
+        //
+        // Where the fetch actually parks, from the IL: DirectStorage.WaitFence awaits
+        // Task.SetLifetime(CoreSystems.RenderLifetime, ...) BEFORE it creates its D3D fence,
+        // and DirectStorage owns a `ContinuationQueue _moveToRenderThread` — so texture load
+        // continuations are resumed ON THE RENDER THREAD. That is the same thread our nested
+        // Draw occupies for ~13% of wall clock and adds ~8 ms of GPU work to every frame.
+        //
+        // A queue depth that is persistently non-zero means continuations are waiting for a
+        // render thread that is busy being us. A depth of zero means the render thread is
+        // keeping up and the stall is upstream (the disk — and D: is the machine's slowest,
+        // shared with SE2's own streaming), which sends the next move somewhere completely
+        // different. Either answer is worth more than another guess.
+        try
+        {
+            var core = _coreType ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            var ds = core?.GetField("DirectStorage", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var q = ds?.GetType().GetField("_moveToRenderThread", Any)?.GetValue(ds);
+            var cnt = q?.GetType().GetProperty("Count", Any)?.GetValue(q);
+            if (cnt is int depth)
+            {
+                if (depth > _dsQueueMax) _dsQueueMax = depth;
+                RttLog.Line($"FETCH QUEUE: DirectStorage._moveToRenderThread has {depth} continuation(s) " +
+                            $"waiting (peak {_dsQueueMax} this session). " +
+                            (depth > 0
+                                ? "NON-ZERO: texture loads are parked waiting to resume ON THE RENDER THREAD — " +
+                                  "the thread our nested Draw occupies. That would make our second render the " +
+                                  "cause of Missing never draining, and therefore of the LOD cycling in BOTH " +
+                                  "views and the loading-fence blocks. Test it by dropping wholeSceneIntervalMs " +
+                                  "and watching whether this drains."
+                                : "ZERO: the render thread is keeping up with the continuations, so the stall is " +
+                                  "UPSTREAM of it — the disk, not us. D: is a DRAM-less SATA SSD shared with " +
+                                  "SE2's own DirectStorage reads."));
+            }
+            else if (!_dsShapeLogged)
+            {
+                _dsShapeLogged = true;
+                RttLog.Line($"FETCH QUEUE: shape not found — DirectStorage={(ds == null ? "NULL" : "ok")}, " +
+                            $"_moveToRenderThread={(q == null ? "NOT FOUND" : "ok")}. No reading available.");
+            }
+        }
+        catch (Exception e) { RttLog.Error("fetch queue probe", e); }
+
+        RttLog.Line($"STREAMING BUDGET: over {_totalSamples} sample(s) — " +
+                    $"AvailableRaw {_rawMin / 1048576.0:F0}..{_rawMax / 1048576.0:F0} MB (swing {rawSwing / 1048576.0:F0}), " +
+                    $"AvailableFiltered {_filtMin / 1048576.0:F0}..{_filtMax / 1048576.0:F0} MB (swing {filtSwing / 1048576.0:F0}); " +
+                    $"filter LATCHED below its input on {pct:F1}% of samples. " +
+                    (pct > 5.0
+                        ? "LATCHING CONFIRMED: WindowHisteresisFilter.ComputeMinimum is holding a low-water " +
+                          "budget, which downgrades textures/LOD GLOBALLY for both views and then re-streams " +
+                          "on release — the LOD cycling AND the hitch, one cause."
+                        : filtSwing > 64 * 1048576.0
+                            ? "The filtered budget SWINGS but is not latching by this threshold — the " +
+                              "oscillation is real, so tighten the test rather than dismissing it."
+                            : "No latching and little swing: the budget is steady, and this theory does NOT " +
+                              "explain the cycling. Look elsewhere."));
+
+        _rawMin = float.MaxValue; _rawMax = 0; _filtMin = float.MaxValue; _filtMax = 0;
+        _latchedSamples = 0; _totalSamples = 0;
+    }
+
     private static void GrassProbe(object sceneDrawSystem)
     {
         var now = Environment.TickCount64;
@@ -463,6 +1160,37 @@ internal static class WholeSceneRender
                         var v = pt.GetProperty(n, Any)?.GetValue(proxies) ?? pt.GetField(n, Any)?.GetValue(proxies);
                         if (v != null) { pc = $"{n}={v}"; break; }
                     }
+
+                    // THE SET THE WHOLE GRASS QUESTION TURNS ON, finally readable.
+                    //
+                    // EntityProxyContext has NO CPU-side count — the visible-entity tally lives
+                    // in CounterBuffer, on the GPU, which is exactly why every "Count"-style
+                    // probe above came back blind and why this link stayed unmeasured while the
+                    // bootstrap comment named it as the cause of "no grass appears AT ALL".
+                    //
+                    // _outputRanges IS on the CPU: a BufferRange[] of {Start, Count}. It is the
+                    // allocation the culling job writes its survivors into, so a total of 0 means
+                    // this context has no room for proxies at all and RenderGrass would be
+                    // generating from nothing. Non-zero does NOT prove the set was FILLED this
+                    // frame — it is capacity, not occupancy — so it is reported as ranges, not
+                    // as a visible count, and the census below is what settles occupancy.
+                    try
+                    {
+                        if (pt.GetField("_outputRanges", Any)?.GetValue(proxies) is Array ranges)
+                        {
+                            int total = 0, nonEmpty = 0;
+                            for (int i = 0; i < ranges.Length; i++)
+                            {
+                                var r = ranges.GetValue(i);
+                                if (r == null) continue;
+                                var cf = r.GetType().GetField("Count", Any);
+                                if (cf?.GetValue(r) is int c) { total += c; if (c > 0) nonEmpty++; }
+                            }
+                            pc += $" outputRanges[{ranges.Length} range(s), {nonEmpty} non-empty, {total} slot(s) total]" +
+                                  (total == 0 ? "  <-- ZERO CAPACITY: nothing can be generated from this set" : "");
+                        }
+                    }
+                    catch { }
                     if (!_grassProbeShapeLogged)
                     {
                         _grassProbeShapeLogged = true;
@@ -503,8 +1231,24 @@ internal static class WholeSceneRender
             // a real change look identical from the config side — only a read-back tells them
             // apart. Printed next to grass because they are one control surface with one
             // question behind it: how much is out there, and how far out.
+            // Parallax read back the same way, and for the same reason as flora: this is the
+            // "close-up ground is flat" candidate, and the FIRST thing worth knowing is
+            // whether the engine already has it ON. If it does, parallax is not the missing
+            // piece and the flatness is somewhere else — a negative that is worth more here
+            // than a knob turned hopefully.
+            var parallax = settings?.GetType().GetProperty("Parallax", Any)?.GetValue(settings);
+            string ps = "Parallax UNREADABLE";
+            if (parallax != null)
+            {
+                var pt2 = parallax.GetType();
+                object P(string n) => pt2.GetField(n, Any)?.GetValue(parallax);
+                ps = $"Enabled={P("Enabled")} Fadeout={P("FadeoutDistance")} " +
+                     $"SelfShadow={P("EnableSelfShadow")} ShadowMax={P("ShadowMaxLength")} " +
+                     $"MaxSteps={P("MaxStepCount")}";
+            }
+
             RttLog.Line($"GRASS PROBE (inside our pass): {gs} | Is3DMapEnabled={map} | {ctx} " +
-                        $"| Flora[{ScatterControl.Describe()}]");
+                        $"| Flora[{ScatterControl.Describe()}] | Parallax[{ps}]");
         }
         catch (Exception e) { RttLog.Line("GRASS PROBE failed: " + e.Message); }
     }
@@ -846,6 +1590,14 @@ internal static class WholeSceneRender
         _pPeModifiersCtx = null;
         _peBufMgr = null;
         _peSaved = null;
+        _peCbsAreOurs = false;
+        // CLEARED, NOT DISPOSED. Reset can arrive on a thread that is not the render
+        // thread, and the engine asserts on exactly that ('_renderThread == null ||
+        // _renderThread == _mainThread || _renderThread != Thread.CurrentThread' — it fired
+        // 4 times last session). Dropping at most two renders' worth of buffers is bounded
+        // and rare; a cross-thread free is neither.
+        _cbStaged.Clear();
+        _cbPrev.Clear();
         _planetEnvState = 0;
         _planetEnvLogged = _planetEnvCountsLogged = _peEmptyLogged = false;
         // Rearm() cleared these and Reset() did not, which is backwards: Reset is the
@@ -935,6 +1687,82 @@ internal static class WholeSceneRender
     //   3 RenderShadows                            shadow cascades
     //   4 ComputeExposure                          auto-exposure history
     //   5 UpdateSurfels                            water surfels
+    // The culling-view classifier — consulted from the bootstrap's DoWork prefixes on the
+    // culling jobs, on WHATEVER thread the job system runs them. Argument-derived.
+    //
+    // v2.1: RenderViewSlim carries NO resolution (the v2 bind confessed and died on that —
+    // its fields are ViewD/InvViewD/Projection/CullingFarPlane, verified by IL). The view
+    // is fingerprinted from what it does carry, three terms that are jointly unique to the
+    // feed among every view this session composes:
+    //   PERSPECTIVE   Projection.M34 != 0      excludes the ORTHO shadow cascades
+    //   SQUARE        M11 == M22 (within 1e-3) excludes the player's 16:9 main view
+    //                                          (measured: ours 1.0913/1.0913, player
+    //                                          0.6139/1.0913)
+    //   FAR == ours   CullingFarPlane ~= wholeSceneFarClip (2500) excludes square-
+    //                                          perspective LOCAL-LIGHT shadow views, whose
+    //                                          far planes are light radii
+    // And v2.1 carries TELEMETRY — calls and fired-true counts — because "the lever is
+    // engaged" must be a number after v2 shipped inert and nearly buried the theory.
+    private static FieldInfo _fRvsProjection, _fRvsFarPlane, _fMatM11, _fMatM22, _fMatM34;
+    private static int _cullClassifierState;    // 0 untried, 1 ok, -1 unbindable
+    private static long _cullClassCalls, _cullClassOurs;
+
+    public static bool CullingViewIsOurs(object boxedViewSlim)
+    {
+        if (!FeedConfig.WholeSceneNoOcclusion || boxedViewSlim == null) return false;
+        try
+        {
+            if (_cullClassifierState == -1) return false;
+            _cullClassCalls++;
+            var vt = boxedViewSlim.GetType();
+            if (_cullClassifierState == 0)
+            {
+                _fRvsProjection = vt.GetField("Projection", Any);
+                _fRvsFarPlane = vt.GetField("CullingFarPlane", Any);
+                var mt = _fRvsProjection?.FieldType;
+                _fMatM11 = mt?.GetField("M11", Any);
+                _fMatM22 = mt?.GetField("M22", Any);
+                _fMatM34 = mt?.GetField("M34", Any);
+                bool ok = _fRvsProjection != null && _fRvsFarPlane != null
+                       && _fMatM11 != null && _fMatM22 != null && _fMatM34 != null;
+                _cullClassifierState = ok ? 1 : -1;
+                RttLog.Line(ok
+                    ? "Culling-view classifier v2.1 BOUND: Projection(M11/M22/M34) + CullingFarPlane " +
+                      "readable — fingerprint is perspective AND square AND far==wholeSceneFarClip."
+                    : "Culling-view classifier v2.1 UNBINDABLE — wholeSceneNoOcclusion will have NO " +
+                      "EFFECT (and this zero is the reason). Fields missing on RenderViewSlim/Matrix.");
+                if (!ok) return false;
+            }
+
+            var proj = _fRvsProjection.GetValue(boxedViewSlim);
+            if (proj == null) return false;
+            if (_fMatM11.GetValue(proj) is not float m11 ||
+                _fMatM22.GetValue(proj) is not float m22 ||
+                _fMatM34.GetValue(proj) is not float m34) return false;
+            if (_fRvsFarPlane.GetValue(boxedViewSlim) is not float far) return false;
+
+            bool ours = Math.Abs(m34) > 1e-6f                                   // perspective
+                     && Math.Abs(m11 - m22) < 1e-3f                             // square
+                     && Math.Abs(far - (float)FeedConfig.WholeSceneFarClip) < 1.0f;
+            if (ours) _cullClassOurs++;
+            return ours;
+        }
+        catch { return false; }
+    }
+
+    private static long _lastCullCalls, _lastCullOurs;
+
+    internal static string CullClassifierText()
+    {
+        var dc = _cullClassCalls - _lastCullCalls; _lastCullCalls = _cullClassCalls;
+        var doo = _cullClassOurs - _lastCullOurs; _lastCullOurs = _cullClassOurs;
+        if (_cullClassifierState == -1) return "noOcclusion classifier UNBINDABLE (lever inert)";
+        if (_cullClassifierState == 0) return "noOcclusion classifier not yet consulted";
+        return $"noOcclusion classifier: {dc} call(s), {doo} classified OURS this window" +
+               (doo == 0 ? " — ZERO: the lever is armed but never firing; the fingerprint is wrong or " +
+                           "the feed is not composing" : "");
+    }
+
     public static bool ShouldSkipStage(int id)
     {
         if (!_inOurRender) return false;
@@ -1049,6 +1877,13 @@ internal static class WholeSceneRender
               "stage 2 already discards the queue)",
         28 => "LocalLightsManager.FlushUpdates — stop draining the SHARED local-light shadow " +
               "update queue in our render (the feed uses the player's local-light shadows)",
+        31 => "force IsOcclusionCullingAllowed false for our render — single-phase culling, no " +
+              "HiZ/two-phase path. The two-phase classifier keys on GPUModelEntity.LastVisibleFrame, " +
+              "a per-entity SCENE-WIDE stamp both views write, so an entity visible only to the feed " +
+              "oscillates between first-pass and occlusion-tested as the views' counters interleave — " +
+              "measured as the distant-flora flashing that survived seven static state layers and an " +
+              "execution census of zero. Per-call override, no shared state touched; costs feed overdraw " +
+              "at 1024x1024 only",
         29 => "ScreenSpaceReflections.DoWork — THE PHANTOM BLEED. Stop writing our scene's " +
               "radiance into the SHARED SSR temporal history (AverageRadianceHistory / " +
               "VarianceHistory / SampleCountHistory live on SceneDrawSystem._screenSpaceReflectionsJob, " +
@@ -1064,9 +1899,185 @@ internal static class WholeSceneRender
     // body, not just the render — ShouldSkipStage is called from deep inside the nested
     // Draw with no arguments identifying a feed, so it can only read the ambient, and the
     // ambient has to still be set when it does.
+    // THE RENDER THREAD'S IDENTITY, learned rather than looked up.
+    //
+    // This hook is a postfix on SceneDrawSystem.Draw, so whatever thread reaches it IS the
+    // render thread — that is not an assumption, it is the definition of where we are.
+    // Anything that needs to ask "am I on the render thread?" compares against this.
+    //
+    // The alternative was reflecting RenderThreadManager._renderThread, and that field is
+    // per-INSTANCE: finding the live manager is another hunt that can quietly come back
+    // null, and a null there would answer "no, you are not on the render thread" — the
+    // wrong answer, in the direction that does the unsafe thing. See PanelBinding.Unbind.
+    internal static int RenderThreadId;
+
+    private static FieldInfo _reloadReqField, _reloadQuiField;
+    private static bool _handoverDone;
+
+    // Returns true when this frame belongs to the handover and must do nothing else.
+    //
+    // Reached through the bridge by reflection like every other bootstrap field: an older
+    // bootstrap without these fields simply never requests, and this returns false forever —
+    // which is the pre-handover behaviour, not a crash. A build of the logic that assumed
+    // the fields exist would refuse to run against the bootstrap it shipped with.
+    private static bool ReloadHandover()
+    {
+        try
+        {
+            if (_reloadReqField == null)
+            {
+                var t = Type.GetType("RttProbe.RttBridge, RttProbe");
+                _reloadReqField = t?.GetField("ReloadRequested", BindingFlags.Public | BindingFlags.Static);
+                _reloadQuiField = t?.GetField("ReloadQuiesced", BindingFlags.Public | BindingFlags.Static);
+                if (_reloadReqField == null)
+                {
+                    RttLog.Global("Hot-reload handover NOT available on this bootstrap — restart the game to " +
+                                  "adopt it. Until then every reload strands a ScreenBuffers and a " +
+                                  "DrawContextManager, and about six of those exhaust VRAM.");
+                    _reloadQuiField = null;
+                    return false;
+                }
+            }
+
+            if (_reloadReqField.GetValue(null) is not true) { _handoverDone = false; return false; }
+            if (_handoverDone) return true;                 // already released; just stop rendering
+            _handoverDone = true;
+
+            long before = Perf.SampleVramMb();
+            RttLog.Global("=== HOT-RELOAD HANDOVER: the bootstrap is about to unload this assembly. " +
+                          "Shutting every feed down from the render thread so its GPU resources are " +
+                          "DISPOSED rather than abandoned. ===");
+
+            Feeds.ForEachSlot(() => { try { FeedGate.Shutdown(); } catch (Exception e) { RttLog.Error("handover shutdown", e); } });
+
+            long after = Perf.SampleVramMb();
+            RttLog.Global($"=== HOT-RELOAD HANDOVER complete: VRAM {before} MB -> {after} MB " +
+                          $"({after - before:+#;-#;0} MB). A NEGATIVE delta is the point; a flat one means " +
+                          "something we own is still not being disposed. ===");
+
+            _reloadQuiField?.SetValue(null, true);
+            return true;
+        }
+        catch (Exception e)
+        {
+            // Never let the handover itself stop the render permanently — confirm and move
+            // on, because a bootstrap blocked for 3 s every reload is worse than a leak.
+            RttLog.Error("reload handover", e);
+            try { _reloadQuiField?.SetValue(null, true); } catch { }
+            return true;
+        }
+    }
+
     public static void OnWholeScene(object sceneDrawSystem, object finalLdrBuffer)
     {
         if (_inOurRender) return;               // our own nested Draw — do nothing
+
+        RenderThreadId = Environment.CurrentManagedThreadId;
+
+        // THE SCATTER RADIUS HAS TO LAND BEFORE THE FIRST FLORA BATCH IS ALLOCATED.
+        //
+        // InstanceBatch._cullingDistance is baked ONCE, at allocation, from
+        // Flora.RenderingDistanceMultiplier. The only other call to Apply() sits inside the
+        // render bracket, which cannot run until the feed has a panel and starts rendering —
+        // measured at ~40 s after world load. Everything the world builds in those 40 s bakes
+        // at the ENGINE default (10) and everything after bakes at ours (25), so the session
+        // runs a permanent 2.5x patchwork and the boundary instances flip as sectors churn.
+        // That is the distant-flora flashing, and it meant there was no such thing as a clean
+        // load to test against — the "fresh load" control was never controlling anything.
+        //
+        // Here it runs from the FIRST FRAME, on the render thread, throughout loading. Apply()
+        // early-returns once the value is unchanged, so the steady-state cost is one double
+        // compare per frame. The in-bracket call stays: it must run before ScopeSharedState so
+        // the global survives our pass unwind (see the note there).
+        try { ScatterControl.Apply(); } catch { }
+
+        // THE EPISODE WATCHER. DistanceThresholdContainer.FullRefresh re-buckets EVERY
+        // entity's distance thresholds in one sweep — the mechanism whose episodic firing
+        // would blip the main world's object LODs and blink the feed's impostor-tier
+        // foliage TOGETHER, which is exactly the pairing the user keeps observing. It is
+        // expected to be RARE, so a per-window rate would hide the timing; this logs a
+        // loud, TIMESTAMPED line the moment the counter moves, so "I just saw an episode"
+        // can be matched against the log to the second.
+        if (Clock.Ms - _lastEpisodeCheck >= 250)
+        {
+            _lastEpisodeCheck = Clock.Ms;
+            try
+            {
+                if (!_episodeLooked)
+                {
+                    _episodeLooked = true;
+                    _fFullRefresh = Type.GetType("RttProbe.RttBridge, RttProbe")?.GetField("DistanceFullRefreshCalls");
+                }
+                if (_fFullRefresh?.GetValue(null) is long fr && fr != _lastFullRefresh)
+                {
+                    var d = fr - _lastFullRefresh;
+                    _lastFullRefresh = fr;
+                    RttLog.Line($"DISTANCE FULL REFRESH fired (+{d}, cumulative {fr}) — every entity's " +
+                                "distance thresholds re-bucketed in one sweep. If the feed's distant " +
+                                "foliage blinked and the main world's LODs blipped around this timestamp, " +
+                                "this is the episode driver.");
+                }
+
+                // THE CONFIRMED CORRELATE (user's "now" = 19:06:38; ssUpdate's first-ever
+                // non-zero window = the same window). Each firing is a sub-sector mesh
+                // REBUILD — absent mid-rebuild, i.e. one blink of one patch of distant
+                // foliage. Timestamped per event so every future blink the user calls out
+                // can be matched to the second, and so the TRIGGER (whatever dirtied the
+                // mesh) can be hunted in the surrounding lines.
+                if (_fSsUpdateW == null && !_ssWatchLooked)
+                {
+                    _ssWatchLooked = true;
+                    _fSsUpdateW = Type.GetType("RttProbe.RttBridge, RttProbe")?.GetField("FloraSsUpdateCalls");
+                }
+                if (_fSsUpdateW?.GetValue(null) is long ss && ss != _lastSsUpdateW)
+                {
+                    var d2 = ss - _lastSsUpdateW;
+                    _lastSsUpdateW = ss;
+                    RttLog.Line($"SUBSECTOR MESH REBUILD fired (+{d2}, cumulative {ss}) — a merged " +
+                                "distant-flora mesh (and its RT BLAS) is rebuilding RIGHT NOW; the patch " +
+                                "it covers is absent until the rebuild lands. This is the blink.");
+                }
+            }
+            catch { }
+        }
+
+        // THE FLORA DISTANCE CAP, on a cadence rather than per frame.
+        //
+        // Cadenced because the walk is over every owned octree's batch list and there is no
+        // event to hang it on: the engine bakes _cullingDistance at allocation and never
+        // revisits it, so the only way to catch new batches is to look again. One second is
+        // far below the rate at which a 1.26 m/s orbit brings new sectors into range, and the
+        // clamp is idempotent so a late pass costs nothing but the walk.
+        if (FeedConfig.WholeSceneFloraMaxMetres > 0 && Clock.Ms - _lastFloraClamp >= 1000)
+        {
+            _lastFloraClamp = Clock.Ms;
+            try
+            {
+                int n = WorldGrids.ClampFloraCullingDistances((float)FeedConfig.WholeSceneFloraMaxMetres);
+                _floraClampedTotal += n;
+                // Level-triggered on the FIRST pass only: after that the count settles to the
+                // trickle of newly allocated batches, and a per-second line would be noise.
+                if (n > 0 && !_floraClampLogged)
+                {
+                    _floraClampLogged = true;
+                    RttLog.Line($"FLORA DISTANCE CAP: clamped {n} batch(es) to {FeedConfig.WholeSceneFloraMaxMetres:0} m " +
+                                "on the first pass. This is a pure distance cull — LOD selection is untouched, so " +
+                                "foreground plants keep the detail wholeSceneLodShift would have taken from them.");
+                }
+            }
+            catch { }
+        }
+
+        // THE HOT-RELOAD HANDOVER, performed here because this is the render thread and the
+        // render thread is the only place the gate may release GPU resources. The bootstrap
+        // has asked us to let go and is waiting up to 3 s; see RttBridge.ReloadRequested.
+        //
+        // Before this existed a reload simply abandoned our ScreenBuffers and
+        // DrawContextManager — FeedGate.Shutdown disposes both correctly, it just never ran —
+        // and six reloads in one session took VRAM to 17.5 GB against a 14.8 GiB budget and
+        // removed the device. Ahead of every other consideration in this method, because a
+        // reload that arrives mid-frame must not be answered by starting another render.
+        if (ReloadHandover()) return;
 
         // OUTSIDE the render-slot scope, and deliberately so. The render thread is the only
         // place the gate may RELEASE anything (disposing from the LCD tick raced the frame
@@ -1114,10 +2125,28 @@ internal static class WholeSceneRender
             //
             // Scoped to Primary for its log lines: the configuration is process-wide, and this
             // runs outside any feed scope.
+            // WIDEN THE BRACKET. The camera-swap window peaked at 83 ms while the engine
+            // reported 369-721 ms render-thread maxima in the same minutes, so most of the
+            // hitch happens in this postfix but OUTSIDE the swap. These three calls are what
+            // is left, they run EVERY frame on the render thread, and none of them was ever
+            // timed: Poll stats (and sometimes reparses) a 58 KB config file, PollAll walks
+            // every gate, PumpAll runs teardown countdowns and can dispose GPU resources.
+            long pt0 = System.Diagnostics.Stopwatch.GetTimestamp();
             using (Feeds.Enter(Feeds.Primary)) FeedConfig.Poll();
-
+            long pt1 = System.Diagnostics.Stopwatch.GetTimestamp();
             FeedGate.PollAll();
+            long pt2 = System.Diagnostics.Stopwatch.GetTimestamp();
             FeedGate.PumpAll();
+            long pt3 = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            double f = System.Diagnostics.Stopwatch.Frequency / 1000.0;
+            double totalMs = (pt3 - pt0) / f;
+            if (totalMs >= SwapOutlierMs)
+                RttLog.Line($"!!! PUMP OUTLIER: the per-frame lifecycle pump took {totalMs:F1} ms " +
+                            $"(FeedConfig.Poll {(pt1 - pt0) / f:F1}, FeedGate.PollAll {(pt2 - pt1) / f:F1}, " +
+                            $"FeedGate.PumpAll {(pt3 - pt2) / f:F1}). This runs on the RENDER THREAD every " +
+                            "frame and is outside the camera-swap bracket, which is why the swap outliers " +
+                            "never accounted for the 400-700 ms stalls the engine reports.");
         }
         catch (Exception e)
         {
@@ -1361,6 +2390,218 @@ internal static class WholeSceneRender
     // part of an unattributable failure. Three things moving at once is what made the
     // deferred route's failures impossible to read.
     //
+    // THE SAVE THUMBNAIL WAS BEING TAKEN OFF OUR FEED. This is the one defect in this
+    // file that reached outside the process and wrote a wrong file to disk.
+    //
+    // SceneDrawSystem.Draw calls ScreenshotsManager.TakeRequestedScreenshots(copySource)
+    // as part of its own body — so OUR nested Draw services the engine's pending screenshot
+    // requests, with OUR feed buffer as the copy source. From the game log, timestamp-matched
+    // to "[Saving] Starting save":
+    //
+    //     [Saving] Starting save
+    //     Assertion Failure: 'screenshot.DownsampleResolution == null ||
+    //       (DownsampleResolution?.X <= copySource.Resolution.X && ...)'
+    //         at ScreenshotsManager.TakeRequestedScreenshots
+    //         at RttProbe.WholeSceneRender.RunSecondRender
+    //     Assertion Failure: Destination texture must be smaller or equal in size to source
+    //         at CopyJob.DoWork  <- the thumbnail copy itself
+    //     [Saving] screenshotTask Start / Done      <- and the save went on regardless
+    //
+    // The request is queued by the SERVER thread the moment a save begins, so it can land
+    // after the engine's own Draw has already passed its screenshot point in that frame.
+    // Ours is then the next Draw to run, it takes the request, and the copy fails because
+    // the save wants a thumbnail bigger than a 1024x1024 feed. The save still reports
+    // Success — with a thumb.jpg that came from the wrong place or not at all.
+    //
+    // Skipping our render for that frame is the whole fix: the request stays queued and the
+    // engine's own Draw services it next frame, from the player's full-size buffer, which is
+    // what it was always asking for. One dropped feed frame per save is not observable.
+    // NOT a swap-the-list-and-restore, deliberately — mutating the engine's request queue
+    // around a call that can throw is how you lose a screenshot request permanently.
+    private static int _screenshotSkips, _dsQueueMax;
+    private static bool _dsShapeLogged;
+    private static FieldInfo _shotsMgrField, _shotsListField;
+    private static bool _shotsShapeLogged;
+
+    // ===================== THE PER-FRAME POOL LEAK =====================
+    //
+    // The game's deferred-assertion summary, printed at exit, gave the count that turned
+    // this from a curiosity into the main line of enquiry. One session, ~4458 second-renders:
+    //
+    //     Some of the borrowed textures has not been returned; '_allocated.Count == 0'
+    //       (BindableTexturePoolManager.cs:526)              triggered 9872 time(s)
+    //     'CoreSystems.BindableBuffers.AliveConstantBufferCount == 0'
+    //       (BindableBufferManager.cs:201)                   triggered 4936 time(s)
+    //
+    // 4936 tracks our render count; 9872 is exactly twice it. Both fire from
+    // IRender_Present -> CoreSystems.OnFrameEndDisposal, AFTER our postfix has returned. So
+    // every nested Draw ends the frame with TWO pools holding an unreturned texture and one
+    // constant buffer still alive — not occasionally, every single frame, all session.
+    //
+    // WHY IT IS WORTH INSTRUMENTING RATHER THAN GUESSING. Reading Draw's IL, the borrows look
+    // balanced: BorrowResizableRWRenderTargetTexture (the LBuffer, keyed on
+    // ScreenBuffers.MaxPreUpscaleResolution — OURS during our pass) and a second borrow that
+    // comes back out of ExecuteForwardAndPostProcess for the screenshot copy, both Returned
+    // before Draw exits. Balanced in source and unbalanced in fact means the imbalance comes
+    // from state WE swap between the Borrow and the Return, and only the pool itself can say
+    // which resource and which key.
+    //
+    // THE DISCRIMINATOR is sampling either side of our Draw. Our postfix runs after the
+    // engine's Draw has completed, so every pool should read zero going in. Zero before and
+    // non-zero after is ours and nobody else's; non-zero before means we inherited it.
+    private static readonly string[] PoolFields =
+    {
+        "_renderTargetTextures", "_rwRenderTargetTextures", "_resizableRenderTargetTextures",
+        "_resizableRenderTargetTextureArrays", "_resizableRWRenderTargetTextures",
+        "_resizableDepthStencilTextures", "_depthStencilTextures",
+    };
+
+    private static FieldInfo[] _poolInfos;
+    private static FieldInfo _poolMgrField, _bufMgrField, _aliveCbField;
+    private static readonly FieldInfo[] _allocFields = new FieldInfo[PoolFields.Length];
+    private static readonly int[] _poolBefore = new int[PoolFields.Length];
+    private static readonly int[] _poolAfter  = new int[PoolFields.Length];
+    private static readonly long[] _poolLeaked = new long[PoolFields.Length];
+    private static readonly int[] _poolPeakBefore = new int[PoolFields.Length];
+    private static readonly int[] _poolPeakAfter = new int[PoolFields.Length];
+    private static readonly long[] _poolNonZeroAfter = new long[PoolFields.Length];
+    private static int _cbBefore, _poolSamples, _cbPeakBefore, _cbPeakAfter;
+    private static long _cbLeaked;
+    private static bool _poolShapeLogged, _poolDetailDumped;
+
+    // Fills `into` with each pool's _allocated.Count and returns AliveConstantBufferCount.
+    // Never throws: an instrument that can break the render is not an instrument.
+    private static int SamplePools(int[] into)
+    {
+        try
+        {
+            _coreType ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            _poolMgrField ??= _coreType?.GetField("BindableTexturePool", BindingFlags.Public | BindingFlags.Static);
+            _bufMgrField  ??= _coreType?.GetField("BindableBuffers", BindingFlags.Public | BindingFlags.Static);
+
+            var mgr = _poolMgrField?.GetValue(null);
+            if (mgr != null)
+            {
+                if (_poolInfos == null)
+                {
+                    var t = mgr.GetType();
+                    _poolInfos = new FieldInfo[PoolFields.Length];
+                    for (int i = 0; i < PoolFields.Length; i++) _poolInfos[i] = t.GetField(PoolFields[i], Any);
+
+                    if (!_poolShapeLogged)
+                    {
+                        _poolShapeLogged = true;
+                        var missing = new List<string>();
+                        for (int i = 0; i < PoolFields.Length; i++)
+                            if (_poolInfos[i] == null) missing.Add(PoolFields[i]);
+                        if (missing.Count > 0)
+                            RttLog.Line("POOL CENSUS: these pool fields were not found on this game build — " +
+                                        string.Join(", ", missing) + ". The census is partial; a zero for a " +
+                                        "missing pool means UNREAD, not empty.");
+                    }
+                }
+
+                // ONE FieldInfo PER POOL, NOT ONE SHARED. The seven pools are seven DIFFERENT
+                // closed generics of Pool`2, and a FieldInfo obtained from one of them throws
+                // ArgumentException when used against another — straight into the catch, which
+                // returned 0. So this census read pool[0] correctly and silently reported ZERO
+                // for the other six, which is exactly how it came to announce "every texture
+                // pool balanced" while the engine was asserting that they were not.
+                for (int i = 0; i < _poolInfos.Length; i++)
+                {
+                    into[i] = 0;
+                    var pool = _poolInfos[i]?.GetValue(mgr);
+                    if (pool == null) continue;
+                    _allocFields[i] ??= pool.GetType().GetField("_allocated", Any);
+                    try
+                    {
+                        if (_allocFields[i]?.GetValue(pool) is System.Collections.ICollection c) into[i] = c.Count;
+                    }
+                    catch { into[i] = -1; }   // -1 = UNREADABLE, never confuse it with empty
+                }
+            }
+
+            var bufs = _bufMgrField?.GetValue(null);
+            if (bufs == null) return 0;
+            _aliveCbField ??= bufs.GetType().GetField("AliveConstantBufferCount", Any);
+            return _aliveCbField?.GetValue(bufs) is int n ? n : 0;
+        }
+        catch { return 0; }
+    }
+
+    // One-shot: name what is actually stuck in a pool, the first time we see it. Key is the
+    // resolution the texture was sized from, which is the whole point — it says whose
+    // ScreenBuffers was installed at the moment of the borrow.
+    private static void DumpLeakedRecords()
+    {
+        if (_poolDetailDumped) return;
+        _poolDetailDumped = true;
+        try
+        {
+            var mgr = _poolMgrField?.GetValue(null);
+            if (mgr == null || _poolInfos == null) return;
+
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < _poolInfos.Length; i++)
+            {
+                var pool = _poolInfos[i]?.GetValue(mgr);
+                if (pool == null) continue;
+                System.Collections.IEnumerable list;
+                try { list = _allocFields[i]?.GetValue(pool) as System.Collections.IEnumerable; }
+                catch { continue; }
+                if (list == null) continue;
+
+                foreach (var rec in list)
+                {
+                    if (rec == null) continue;
+                    var rt = rec.GetType();
+                    var key = rt.GetField("Key", Any)?.GetValue(rec);
+                    var bytes = rt.GetField("ByteSize", Any)?.GetValue(rec);
+                    var life = rt.GetField("Lifetime", Any)?.GetValue(rec);
+                    var tex = rt.GetField("Texture", Any)?.GetValue(rec);
+                    var name = tex == null ? "?"
+                        : (tex.GetType().GetProperty("DebugName", Any)?.GetValue(tex)
+                           ?? tex.GetType().GetField("DebugName", Any)?.GetValue(tex))?.ToString() ?? tex.GetType().Name;
+                    sb.Append($"\n    {PoolFields[i]}: \"{name}\" key={key} bytes={bytes} lifetime={life}");
+                }
+            }
+
+            RttLog.Line("POOL LEAK — what our nested Draw left borrowed at the moment it returned:" +
+                        (sb.Length == 0 ? " (nothing; the leak is not visible at this sampling point)" : sb.ToString()) +
+                        "\n  The KEY is the resolution the texture was sized from, so it names whose " +
+                        "ScreenBuffers was installed when the borrow happened. This dumps once per load.");
+        }
+        catch (Exception e) { RttLog.Error("pool leak dump", e); }
+    }
+
+    private static bool ScreenshotPending()
+    {
+        try
+        {
+            _coreType ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            _shotsMgrField ??= _coreType?.GetField("ScreenshotsManager",
+                BindingFlags.Public | BindingFlags.Static | BindingFlags.NonPublic);
+            var mgr = _shotsMgrField?.GetValue(null);
+            if (mgr == null) return false;
+
+            _shotsListField ??= mgr.GetType().GetField("_requestedScreenshots", Any);
+            if (_shotsListField == null)
+            {
+                if (!_shotsShapeLogged)
+                {
+                    _shotsShapeLogged = true;
+                    RttLog.Line("Whole-scene: ScreenshotsManager._requestedScreenshots not found on this game " +
+                                "build — the save-thumbnail guard is INACTIVE, so a save taken while the feed " +
+                                "renders can still capture the thumbnail off our buffer.");
+                }
+                return false;
+            }
+
+            return _shotsListField.GetValue(mgr) is System.Collections.ICollection c && c.Count > 0;
+        }
+        catch { return false; }   // never let the guard itself break the render
+    }
+
     // RESTORE ORDERING. The restore is in a finally and runs even if Draw throws
     // mid-frame, because leaving the engine pointed at a 512x512 ScreenBuffers would
     // render the player's next frame into our buffers — visually catastrophic and not
@@ -1372,6 +2613,10 @@ internal static class WholeSceneRender
     private static void RunSecondRender(object sceneDrawSystem)
     {
         if (sceneDrawSystem == null) return;
+
+        // NEVER RUN OUR DRAW WHILE THE ENGINE HAS A SCREENSHOT PENDING. See ScreenshotPending.
+        if (ScreenshotPending()) { _screenshotSkips++; return; }
+
         try
         {
             _miDraw ??= sceneDrawSystem.GetType().GetMethods(Any)
@@ -1402,6 +2647,9 @@ internal static class WholeSceneRender
             var savedSb = _sbField.GetValue(null);
             object savedCam = null, savedDc = null, savedProbes = null, savedEyeJob = null;
             object[] savedCb = null;
+            // Hoisted out of the install block: the finally has to free it, and it is
+            // orphaned whether or not the swap actually took.
+            object ourCameraCb = null;
             bool camSwapped = false, ownShadows = false, planetEnvSwapped = false;
 
             _inOurRender = true;
@@ -1469,6 +2717,7 @@ internal static class WholeSceneRender
                     var cb = CameraRender.WholeSceneCameraCb();
                     if (cb != null)
                     {
+                        ourCameraCb = cb;
                         savedCb = CameraCbSwap.Install(cb);
                         if (!_cbSwapLogged)
                         {
@@ -1544,10 +2793,61 @@ internal static class WholeSceneRender
                 // and the aliasing that was "excluded" is excluded no longer.
                 string before = LdrRes(ourLdr);
 
+                // Sampled here, every render, because a latch lasting a few hundred ms is
+                // invisible to the 15 s report clock and the whole question is sub-second.
+                SampleStreamingBudget();
+
+                // Either side of the Draw and nowhere else — see the POOL LEAK block above.
+                // The engine's own Draw has already finished by the time our postfix runs, so
+                // a non-zero reading HERE would mean we inherited an imbalance rather than
+                // caused one. That distinction is the entire value of the instrument.
+                _cbBefore = SamplePools(_poolBefore);
+
                 long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                // Split the swap window into SETUP / DRAW / TEARDOWN. Only the Draw genuinely
+                // requires our camera to be the installed global; anything either side of it
+                // that does not is exposure we are paying for nothing, and this says how much
+                // of the 3.28 ms mean hold is actually reclaimable before we start moving code.
+                _lastSetupTicks = t0 - _swapOpenedTicks;
+                _setupTicks += _lastSetupTicks;
                 _miDraw.Invoke(sceneDrawSystem, new[] { ourLdr });
-                Perf.NoteOurDraw((System.Diagnostics.Stopwatch.GetTimestamp() - t0)
-                                 * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                _lastDrawTicks = t1 - t0;
+                _drawTicks += _lastDrawTicks;
+                _drawEndTicks = t1;
+
+                int cbAfter = SamplePools(_poolAfter);
+                _poolSamples++;
+
+                // DELTAS ALONE WERE A DEAD INSTRUMENT, and it reported CLEAN while the engine
+                // was asserting. Our postfix runs AFTER the engine's own Draw, so if the
+                // engine legitimately holds N borrows in flight at that moment, before reads
+                // N, after reads N, the delta is zero and the census announces "balanced" —
+                // about a frame that ends with N textures unreturned. The engine's assert is
+                // on the ABSOLUTE count at frame end (`_allocated.Count == 0`), so that is
+                // what has to be tracked. Deltas are kept because they still answer the
+                // separate question of whether WE unbalanced anything; the absolutes answer
+                // whether the frame is clean, which is the one the assert asks.
+                bool anyDelta = false;
+                for (int i = 0; i < _poolAfter.Length; i++)
+                {
+                    int d = _poolAfter[i] - _poolBefore[i];
+                    if (d != 0) { _poolLeaked[i] += d; anyDelta = true; }
+
+                    if (_poolBefore[i] > _poolPeakBefore[i]) _poolPeakBefore[i] = _poolBefore[i];
+                    if (_poolAfter[i]  > _poolPeakAfter[i])  _poolPeakAfter[i]  = _poolAfter[i];
+                    if (_poolAfter[i] != 0) _poolNonZeroAfter[i]++;
+                }
+                _cbLeaked += cbAfter - _cbBefore;
+                if (_cbBefore > _cbPeakBefore) _cbPeakBefore = _cbBefore;
+                if (cbAfter  > _cbPeakAfter)   _cbPeakAfter  = cbAfter;
+
+                // Dump on the first frame that ends our pass with anything outstanding —
+                // that is the state the engine will assert on a few microseconds later.
+                bool outstanding = cbAfter != 0;
+                for (int i = 0; i < _poolAfter.Length && !outstanding; i++) outstanding = _poolAfter[i] != 0;
+                if (outstanding || anyDelta) DumpLeakedRecords();
+                Perf.NoteOurDraw((t1 - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
                 _renderCount++;
 
                 // GRASS PROBE — read the gate FROM INSIDE OUR PASS, while our contexts are
@@ -1556,6 +2856,12 @@ internal static class WholeSceneRender
                 // whose render is running: after the finally below, CoreSystems.DrawContexts
                 // is the player's again and the answer would be about their frame, not ours.
                 if (FeedConfig.GrassProbe) GrassProbe(sceneDrawSystem);
+
+                // Rides the same gate: all three answer "is this subsystem working for OUR
+                // camera or the player's", all are read-only and rate-limited to 15 s.
+                if (FeedConfig.GrassProbe) RaytracingProbe();
+                if (FeedConfig.GrassProbe) StreamingProbe();
+                if (FeedConfig.GrassProbe) StreamingBudgetProbe();
 
                 string after = LdrRes(ourLdr);
                 if (before != after || (_lastLdrRes != null && _lastLdrRes != before))
@@ -1586,7 +2892,24 @@ internal static class WholeSceneRender
                 // whatever is in the field), then camera, scoped settings groups, and
                 // both global families the engine's next frame renders through.
                 if (ownShadows) EndOwnShadows();
-                if (savedCb != null) { try { CameraCbSwap.Restore(savedCb); } catch (Exception e) { RttLog.Error("whole-scene CB restore", e); } }
+                if (savedCb != null)
+                {
+                    try
+                    {
+                        CameraCbSwap.Restore(savedCb);
+                        // Only now is ours out of the field and nobody's to free but us.
+                        // A restore that THREW leaves ours installed, and OnEndDraw will
+                        // dispose it — staging it there would be a double-free.
+                        StageCb(ourCameraCb);
+                    }
+                    catch (Exception e) { RttLog.Error("whole-scene CB restore", e); }
+                }
+                else
+                {
+                    // Built but never installed (Install skips outside an OnBeginDraw
+                    // bracket), so it was orphaned the moment we made it.
+                    StageCb(ourCameraCb);
+                }
                 if (camSwapped) RestoreCamera(savedCam);
                 // After RestoreCamera and before anything else: the rebuild reads the
                 // installed view, and this run regenerates the planet sort, the
@@ -1616,6 +2939,11 @@ internal static class WholeSceneRender
                 if (savedDc != null) _dcField.SetValue(null, savedDc);
                 _sbField.SetValue(null, savedSb);
                 _inOurRender = false;
+
+                // Every swap is unwound, so everything staged above is now unreachable from
+                // any engine field. Frees the PREVIOUS render's batch and rotates this one
+                // in behind it — see the reclaim block for why one render of extra life.
+                ReclaimStagedCbs();
 
                 // Now that every swap is unwound and _inOurRender is clear, a Reset that
                 // arrived mid-render can safely run.
@@ -2081,10 +3409,34 @@ internal static class WholeSceneRender
         //
         // The fixed stop remains the fallback whenever we are NOT running our own adaptation,
         // which is the pre-existing behaviour and the safe default.
+        // THE DARKENING OFFSET, and it is deliberately a SEPARATE knob from the fixed stop.
+        //
+        // wholeSceneExposure is the fixed-stop FALLBACK for when we are not adapting; layering
+        // a second meaning onto it would make "the feed is dark" ambiguous between "adaptation
+        // settled there" and "someone pinned it". wholeSceneExposureOffset instead biases the
+        // ADAPTED result: negative = darker, and adaptation keeps working underneath.
+        //
+        // IT ALSO SETTLES THE OPEN QUESTION IN THE COMMENT ABOVE. Nobody has established
+        // whether LuminanceExposure layers on top of the adapted value or is ignored by the
+        // dynamic path. With adaptation ON and a non-zero offset: if the feed darkens it
+        // layers, and this is a real exposure bias; if nothing changes it is ignored and the
+        // adaptation result is the whole story. Either answer is worth having, so the log says
+        // which one to look for rather than leaving it to be re-derived a third time.
+        var evOffset = FeedConfig.WholeSceneExposureOffset;
+        if (FeedConfig.WholeSceneOwnEyeAdaptation && evOffset != 0)
+        {
+            ScopeSetValues("PostProcessSettings", "feed exposure DARKENING OFFSET (adaptation stays live)",
+                ("LuminanceExposure", (float)evOffset));
+            if (_scopeWarned.Add("evOffsetArmed"))
+                RttLog.Line($"Whole-scene: exposure offset {evOffset:0.###} EV applied on top of the feed's own " +
+                            "adaptation. IF THE IMAGE DOES NOT CHANGE, LuminanceExposure is ignored by the dynamic " +
+                            "path and the adapted result is the whole story — that is a finding, not a failed knob.");
+        }
+
         if (ev != 0 && !FeedConfig.WholeSceneOwnEyeAdaptation)
             ScopeSetValues("PostProcessSettings", "feed exposure (auto aperture)",
                 ("LuminanceExposure", (float)ev));
-        else if (ev != 0 && _scopeWarned.Add("evYieldsToAdaptation"))
+        else if (ev != 0 && evOffset == 0 && _scopeWarned.Add("evYieldsToAdaptation"))
             RttLog.Line($"Whole-scene: NOT forcing LuminanceExposure {ev:0.###} — wholeSceneOwnEyeAdaptation is on, " +
                         "so the feed's own DynamicExposure decides the stop. If the feed looks unchanged from the " +
                         "fixed-stop version, the override was never what pinned it and the histogram source is the " +
@@ -2195,6 +3547,36 @@ internal static class WholeSceneRender
                 (FeedConfig.WholeSceneGrassDrawDistance > 0 ? $"drawDist={FeedConfig.WholeSceneGrassDrawDistance:0.#} " : "") +
                 (FeedConfig.WholeSceneGrassDensity > 0 ? $"density={FeedConfig.WholeSceneGrassDensity:0.###} " : "") +
                 "]", grass.ToArray());
+
+        // PARALLAX OCCLUSION MAPPING, our render only. The "close-up ground is flat" knob,
+        // and unlike everything above it this one is a MATERIAL SHADER effect — it fakes
+        // surface relief by ray-marching a height map per pixel. Geometry LOD could never
+        // have produced the reported symptom, which is why that line went nowhere.
+        //
+        // UNPROVEN UNTIL THE PROBE REPORTS: whether the consumer reads this per-pass or
+        // bakes it into a shader define. If it is a define then toggling it per frame is the
+        // RaytracingSettings mistake again — see the header of this method. That is why the
+        // default is "do not scope" and why the probe prints the live struct.
+        var par = new List<(string, object)>();
+        if (FeedConfig.WholeSceneParallax >= 0)
+            par.Add(("Enabled", FeedConfig.WholeSceneParallax != 0));
+        if (FeedConfig.WholeSceneParallaxFadeout > 0)
+            par.Add(("FadeoutDistance", (float)FeedConfig.WholeSceneParallaxFadeout));
+        if (FeedConfig.WholeSceneParallaxSelfShadow >= 0)
+            par.Add(("EnableSelfShadow", FeedConfig.WholeSceneParallaxSelfShadow != 0));
+        if (FeedConfig.WholeSceneParallaxShadowLength > 0)
+            par.Add(("ShadowMaxLength", (float)FeedConfig.WholeSceneParallaxShadowLength));
+        if (FeedConfig.WholeSceneParallaxSteps != -999)
+            par.Add(("MaxStepCount", FeedConfig.WholeSceneParallaxSteps));
+        if (par.Count > 0)
+            ScopeSetValues("ParallaxSettings",
+                "feed parallax [" +
+                (FeedConfig.WholeSceneParallax >= 0 ? $"on={FeedConfig.WholeSceneParallax != 0} " : "") +
+                (FeedConfig.WholeSceneParallaxFadeout > 0 ? $"fade={FeedConfig.WholeSceneParallaxFadeout:0.#} " : "") +
+                (FeedConfig.WholeSceneParallaxSelfShadow >= 0 ? $"selfShadow={FeedConfig.WholeSceneParallaxSelfShadow != 0} " : "") +
+                (FeedConfig.WholeSceneParallaxShadowLength > 0 ? $"shadowLen={FeedConfig.WholeSceneParallaxShadowLength:0.###} " : "") +
+                (FeedConfig.WholeSceneParallaxSteps != -999 ? $"steps={FeedConfig.WholeSceneParallaxSteps} " : "") +
+                "]", par.ToArray());
     }
 
 
@@ -3360,6 +4742,8 @@ internal static class WholeSceneRender
         {
             RefillList(data, _peSaved.Data);
             _peSaved = null;
+            // No creates happened above, so nothing here is ours to free.
+            _peCbsAreOurs = false;
             if (!_peEmptyLogged)
             {
                 _peEmptyLogged = true;
@@ -3380,8 +4764,100 @@ internal static class WholeSceneRender
         // Writes _allPlanetSpheresData AND the _allPlanetSpheres CB itself.
         _miPeFillSlim.Invoke(_planetEnvGroup, new[] { viewD });
 
+        // Every CB in these fields is now one we minted. Consumed by RestorePlanetEnv,
+        // which is the only place that can know they have been orphaned.
+        _peCbsAreOurs = true;
+
         GuardPlanetEnvInvariant(label);
         return true;
+    }
+
+    // ---- TRANSIENT CB RECLAIM ---------------------------------------------------------
+    //
+    // Every nested render mints N+3 transient constant buffers — one camera
+    // ("rttCameraSettings"), one per planet setup, one setup0, and the spheres buffer
+    // FillPlanetEnvironmentSlimSetup writes — and then puts the engine's originals back
+    // over the top of them. The engine only ever disposes what is SITTING IN THE FIELD when
+    // OnEndDraw runs, so everything we displace is orphaned the instant we restore.
+    //
+    // Measured, three consecutive censuses, one planet under the orbit camera:
+    //     AliveConstantBufferCount  26381 -> 28865 -> 31417
+    //     our renders                6627 ->  7248 ->  7886
+    //     = 4.00 per render, twice, to two decimals. N+3 with N=1.
+    //
+    // It never comes down, and BindableBufferManager asserts on it EVERY FRAME (8187 times
+    // in a six-minute session), which FirstAssertionException then promotes into the
+    // exit CTD. This is task #48's constant-buffer half.
+    //
+    // DISPOSED ONE RENDER LATE, DELIBERATELY. The engine's own policy is frame-scoped: it
+    // frees transients at OnEndDraw, after the recorder has finished with them. Our pass
+    // ends mid-frame, so freeing inline would hand the GPU a buffer it has not necessarily
+    // read yet — a use-after-free that surfaces as a device removal, and we have already
+    // paid for three of those. Draining on the NEXT render gives every buffer a strictly
+    // LONGER life than the engine gives its own. That is the conservative side of the only
+    // mistake that matters here.
+    //
+    // STAGED, NOT GUESSED. A buffer is only ever staged once we have proof we displaced it:
+    // _peCbsAreOurs is set after the create loop completes and consumed by the put-back, so
+    // a rebuild that bailed early leaves the engine's buffers in the fields and we free
+    // nothing. Identity comparison would not work here — these are boxed structs, and two
+    // boxes of the same buffer are never reference-equal.
+    private static readonly List<object> _cbStaged = new();     // orphaned by THIS render
+    private static readonly List<object> _cbPrev   = new();     // orphaned by the previous one
+    private static MethodInfo _miCbDispose;
+    private static bool _peCbsAreOurs;
+    private static long _cbReclaimed, _cbReclaimFailed;
+
+    private static void StageCb(object cb)
+    {
+        if (cb != null) _cbStaged.Add(cb);
+    }
+
+    // Free the previous render's orphans, then rotate this render's in behind them.
+    // Never throws: a reclaim that can break the render is worse than the leak.
+    private static void ReclaimStagedCbs()
+    {
+        for (int i = 0; i < _cbPrev.Count; i++)
+        {
+            var cb = _cbPrev[i];
+            try
+            {
+                // Nullable<TransientConstantBuffer> reads back as a boxed
+                // TransientConstantBuffer, so Dispose comes off the struct type itself.
+                // The engine disposes a copy too (get_Value(); Dispose(); initobj), so the
+                // handle plainly lives inside the struct — this mirrors its own teardown.
+                _miCbDispose ??= cb.GetType().GetMethod("Dispose", Type.EmptyTypes);
+                if (_miCbDispose == null) { _cbReclaimFailed++; continue; }
+                _miCbDispose.Invoke(cb, null);
+                _cbReclaimed++;
+            }
+            catch { _cbReclaimFailed++; }
+        }
+
+        _cbPrev.Clear();
+        _cbPrev.AddRange(_cbStaged);
+        _cbStaged.Clear();
+    }
+
+    // THE LAST FIVE. The one-render delay above fixed the LEAK (31417 alive and climbing ->
+    // flat 18) but NOT the assertion, because 'AliveConstantBufferCount == 0' tests against
+    // ZERO and ~5 of ours are alive at every frame end by design. A bounded leak still
+    // asserts every frame, and FirstAssertionException still promotes that into the exit CTD.
+    //
+    // So the bootstrap calls this from a prefix on Render12EngineComponent.IRender_Present —
+    // which is the method that calls BindableTexturePoolManager.OnFrameEndDisposal, the exact
+    // frame in the FirstAssertionException stack. Running immediately before the engine's own
+    // disposal point is safe by construction: it is where the engine frees ITS transients, so
+    // the recorder is provably finished with the frame. That is the one place the inline free
+    // we could not do mid-pass becomes correct.
+    //
+    // Drains BOTH lists — after this there is nothing of ours outstanding for the assert to
+    // find. Idempotent, so a frame with no render of ours costs two empty loops.
+    internal static void DrainAllStagedCbs()
+    {
+        if (_cbPrev.Count == 0 && _cbStaged.Count == 0) return;
+        ReclaimStagedCbs();   // frees the previous batch, rotates this one in
+        ReclaimStagedCbs();   // frees the batch just rotated
     }
 
     // Verbatim put-back of the snapshot — no second fill, no second weather-culling
@@ -3395,12 +4871,34 @@ internal static class WholeSceneRender
             var s = _peSaved;
             _peSaved = null;
 
+            // Read OURS out before the put-back buries them. Only when the create loop
+            // actually finished — otherwise these fields still hold the engine's own and
+            // freeing them would be a double-free at OnEndDraw.
+            object[] mineCbs = null;
+            object mineFirst = null, mineSpheres = null;
+            if (_peCbsAreOurs)
+            {
+                _peCbsAreOurs = false;
+                mineCbs     = SnapshotList((System.Collections.IList)_fPeSetupsCbs.GetValue(_planetEnvGroup));
+                mineFirst   = _fPeFirst.GetValue(_planetEnvGroup);
+                mineSpheres = _fPeSpheres.GetValue(_planetEnvGroup);
+            }
+
             RefillList((System.Collections.IList)_fPeSetupsCbs.GetValue(_planetEnvGroup), s.Cbs);
             RefillList((System.Collections.IList)_fPeSetupsData.GetValue(_planetEnvGroup), s.Data);
             _fPeFirst.SetValue(_planetEnvGroup, s.First);
             _fPeFirstData.SetValue(_planetEnvGroup, s.FirstData);
             _fPeSpheres.SetValue(_planetEnvGroup, s.Spheres);
             _fPeSpheresData.SetValue(_planetEnvGroup, s.SpheresData);
+
+            // Staged only after the put-back has succeeded: until this line the engine
+            // still owns them through the fields.
+            if (mineCbs != null)
+            {
+                foreach (var c in mineCbs) StageCb(c);
+                StageCb(mineFirst);
+                StageCb(mineSpheres);
+            }
         }
         catch (Exception e) { RttLog.Error("whole-scene planet env restore", e); }
     }
@@ -3423,7 +4921,20 @@ internal static class WholeSceneRender
 
             _settingsObj = settings;
             saved = _rvField.GetValue(settings);
+
+            // Capture the PLAYER'S camera BEFORE we overwrite the global — this is the only
+            // moment it is still readable. ViewerDistance.Nearest hands it back to any engine
+            // job that asks for a distance from a thread that is not our render thread, which
+            // is what stops our camera poisoning the player's per-entity distance cache.
+            try
+            {
+                var rvPos = saved?.GetType().GetProperty("CameraPosition", Any)?.GetValue(saved);
+                if (rvPos is Vector3D pc) ViewerDistance.SwapOpened(pc);
+            }
+            catch { }
+
             _rvField.SetValue(settings, ours);
+            _swapOpenedTicks = System.Diagnostics.Stopwatch.GetTimestamp();
             return true;
         }
         catch (Exception e) { RttLog.Error("whole-scene camera install", e); return false; }
@@ -3433,12 +4944,297 @@ internal static class WholeSceneRender
     {
         try { if (_rvField != null && _settingsObj != null) _rvField.SetValue(_settingsObj, saved); }
         catch (Exception e) { RttLog.Error("whole-scene camera restore", e); }
+        // Close the guard only AFTER the global is genuinely the player's again. Closing it
+        // first would leave a window where jobs read our camera with the guard disarmed —
+        // small, but it is the exact bug we are fixing.
+        ViewerDistance.SwapClosed();
+        NoteSwapClosed();
+    }
+
+    // ---- THE SWAP WINDOW — how long is the PLAYER'S world looking through OUR camera? ---
+    //
+    // THE BUG THIS EXISTS TO PRICE (user, 2026-08-02): the player's main-world object LODs
+    // cycle down to coarse levels and back, at random, and it has done so since the earliest
+    // testing whenever the camera render is running. The user then spotted the thing that
+    // makes it tractable — the feed's own residual flora dropout happens IN SYNC with it. One
+    // bug, one shared cause.
+    //
+    // THE MECHANISM UNDER TEST. InstallCamera writes SettingsManager._renderView, a
+    // PROCESS-WIDE GLOBAL. The engine's LOD, streaming and culling jobs run asynchronously on
+    // job threads. Any that samples RenderView.CameraPosition while our swap is installed
+    // computes the PLAYER'S object LODs from OUR camera — 3906 km away — and collapses them
+    // to the coarsest level until the next update after we restore.
+    //
+    // WHAT THIS MEASURES, and why it is the right first number: the DUTY CYCLE. If our swap
+    // is installed for x% of wall-clock time, then roughly x% of async samples land inside it
+    // and the cycling rate should scale with x. That converts a vague "intermittent" into a
+    // prediction, and the render-rate A/B then either confirms or kills it.
+    //
+    // IT ALSO SETTLES AN OPEN CONTRADICTION. This task previously recorded "the feed causes
+    // it, but NOT via render rate". If the duty cycle turns out to be near 100% — because we
+    // render EVERY frame (wholeSceneIntervalMs = 0) and hold the swap across the whole nested
+    // Draw — then lowering the render rate would barely move it, and that old null result is
+    // explained rather than contradictory.
+    //
+    // Stopwatch ticks, not TickCount64: the window is single-digit milliseconds and
+    // TickCount64's resolution (~15 ms) would report most of them as zero.
+    private static long _swapOpenedTicks;
+    private static long _swapTotalTicks, _swapCount, _swapMaxTicks;
+    private static long _swapWindowStartTicks, _swapReportTicks;
+
+    // The SETUP / DRAW / TEARDOWN split of that window. Only DRAW genuinely needs our camera
+    // to be the installed global; setup and teardown are exposure we may be able to reclaim
+    // by moving work outside the bracket. This says how much is worth moving BEFORE any code
+    // is moved — the alternative is guessing, which is how tonight went wrong twice.
+    private static long _setupTicks, _drawTicks, _teardownTicks, _drawEndTicks;
+
+    // Per-render copies, so an outlier can be split without the 15 s aggregate polluting it.
+    private static long _lastSetupTicks, _lastDrawTicks;
+    private static int _swapOutliers;
+
+    // 50 ms: two frames at the 58 fps mod-off baseline. Below that it is jitter and the
+    // averages already describe it; above it the user sees a hitch.
+    private const double SwapOutlierMs = 50.0;
+
+    private static void NoteSwapClosed()
+    {
+        if (_swapOpenedTicks == 0) return;
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var held = now - _swapOpenedTicks;
+        _swapOpenedTicks = 0;
+        if (held < 0) return;
+
+        _swapTotalTicks += held;
+        _swapCount++;
+        if (held > _swapMaxTicks) _swapMaxTicks = held;
+        long teardownThis = _drawEndTicks != 0 ? now - _drawEndTicks : 0;
+        if (_drawEndTicks != 0) { _teardownTicks += teardownThis; _drawEndTicks = 0; }
+        if (_swapWindowStartTicks == 0) _swapWindowStartTicks = now;
+
+        // OUTLIER ATTRIBUTION — the hitch, named rather than averaged.
+        //
+        // The 15 s report says mean 3.70 ms and max 257.07 ms in the same breath, and an
+        // average that contains a 257 ms frame is not describing anything that happens. The
+        // engine agrees: with the feed running, MAX frame per minute is 378-730 ms against a
+        // 24-34 ms mod-off baseline, while our own submit cost (`ourDraw`) stays at 3.1 ms
+        // mean / 4.6 ms max. So the hitch is NOT the draw we measure, and averaging will
+        // never find it.
+        //
+        // Split THIS window rather than the 15 s aggregate: setup and teardown are ~0.2 ms
+        // combined at the mean, so if a 250 ms window is mostly setup we know it is a build
+        // or a lock, and if it is mostly draw we know it is the engine inside our nested
+        // call. One line per outlier, so a quiet session says nothing at all.
+        double heldMs = 1000.0 * held / System.Diagnostics.Stopwatch.Frequency;
+        if (heldMs >= SwapOutlierMs)
+        {
+            _swapOutliers++;
+            double freq1 = System.Diagnostics.Stopwatch.Frequency;
+            double setupMs = 1000.0 * _lastSetupTicks / freq1;
+            double drawMs  = 1000.0 * _lastDrawTicks  / freq1;
+            double downMs  = 1000.0 * teardownThis    / freq1;
+            // Name the ACTUAL largest phase. The first version of this line compared setup
+            // against draw and said "DRAW dominates" for everything else — which promptly
+            // reported "DRAW dominates" for an 82.9 ms window whose draw was 2.9 ms and
+            // whose teardown was 79.9 ms. A diagnostic that names the wrong phase is worse
+            // than none: it sends the next hour of work at the wrong code.
+            string worst = setupMs >= drawMs && setupMs >= downMs
+                ? "SETUP dominates — a resource build, a reflection miss or a lock, not the render"
+                : downMs >= drawMs
+                    ? "TEARDOWN dominates — the unwind, not the render: restoring the scoped settings, " +
+                      "contexts and camera is what blocked"
+                    : "DRAW dominates — the engine stalled inside our nested Draw; compare against " +
+                      "ourDraw(cpu submit) in the PERF line, which measures the same call";
+
+            RttLog.Line($"!!! SWAP OUTLIER #{_swapOutliers}: our camera was installed for {heldMs:F1} ms " +
+                        $"(setup {setupMs:F1}, draw {drawMs:F1}, teardown {downMs:F1}). " +
+                        $"Feed render #{_renderCount}. {worst}.");
+        }
+
+        var nowMs = Environment.TickCount64;
+        if (nowMs - _swapReportTicks < 15000) return;
+        _swapReportTicks = nowMs;
+
+        double freq = System.Diagnostics.Stopwatch.Frequency;
+        double elapsed = (now - _swapWindowStartTicks) / freq;
+        double heldSec = _swapTotalTicks / freq;
+        double duty = elapsed > 0 ? 100.0 * heldSec / elapsed : 0.0;
+
+        RttLog.Line($"CAMERA SWAP WINDOW: our RenderView was installed {_swapCount} time(s) over " +
+                    $"{elapsed:F1}s, holding it {heldSec:F2}s = {duty:F1}% OF WALL CLOCK " +
+                    $"(mean {1000.0 * heldSec / Math.Max(1, _swapCount):F2} ms, max " +
+                    $"{1000.0 * _swapMaxTicks / freq:F2} ms). " +
+                    (duty > 60.0
+                        ? "HIGH: any async job sampling Settings.RenderView is MORE LIKELY THAN NOT to see " +
+                          "OUR camera, so the player's LOD would collapse constantly and render RATE would " +
+                          "barely change it — which explains the old 'not via render rate' null result."
+                        : duty > 10.0
+                            ? "MODERATE: a real race window. Cycling frequency should scale with this, so " +
+                              "the render-rate A/B is now a sharp test."
+                            : "LOW: too small to explain frequent cycling on its own — if the player's LODs " +
+                              "still collapse often, the cause is a PERSISTENT WRITE we leave behind, not a " +
+                              "sampling race."));
+
+        // Rides this report rather than logging per skip: saves are minutes apart, so a
+        // per-event line would read as silence and a cumulative count reads as a rate.
+        // Non-zero is the GOOD state — it means a save asked for its thumbnail and we
+        // stood aside instead of handing it a 1024x1024 feed frame.
+        if (_screenshotSkips > 0)
+            RttLog.Line($"SCREENSHOT GUARD: {_screenshotSkips} feed frame(s) skipped so far because the engine " +
+                        "had a screenshot request pending — save thumbnails and F12 captures come from the " +
+                        "player's buffer, not ours.");
+
+        // LOG COST. Emitted before the census so it is adjacent to the other per-window
+        // numbers. See RttLog.Emit for why this class became a suspect: the mod's only
+        // global lock, held across a synchronous file write, taken from both the render
+        // thread and the sim-pump thread. maxWait in the hundreds of ms would place the
+        // hitch here; single-digit maxWait rules it out and the search moves on.
+        {
+            var (n, writeMs, maxWriteMs, queued, dropped) = RttLog.TakeStats();
+            if (n > 0 || queued > 0 || dropped > 0)
+                RttLog.Line($"LOG COST: {n} line(s) written by the BACKGROUND writer — {writeMs:F1} ms total / " +
+                            $"{maxWriteMs:F1} ms worst single write, {queued} still queued, {dropped} dropped. " +
+                            (maxWriteMs > 50.0
+                                ? "The disk still stalls (SE2 streams textures off the same drive), but it now " +
+                                  "stalls a background thread instead of the render thread."
+                                : "Disk healthy this window.") +
+                            (dropped > 0
+                                ? " !!! DROPPED LINES: the writer could not keep up and the queue hit its cap. " +
+                                  "The log has GAPS — do not read a quiet stretch as nothing happening."
+                                : ""));
+        }
+
+        // POOL CENSUS. The acceptance test for task #48 is that this line reads all zeroes:
+        // the game promotes the first assertion of a session into a fatal exception at exit
+        // (see FirstAssertionException), so a per-frame assert is a per-session crash.
+        if (_poolSamples > 0)
+        {
+            var deltas = new System.Text.StringBuilder();
+            for (int i = 0; i < _poolLeaked.Length; i++)
+                if (_poolLeaked[i] != 0) deltas.Append($" {PoolFields[i]}={_poolLeaked[i]:+#;-#;0}");
+
+            // The absolutes are the ones the engine asserts on. Reported per pool that was
+            // ever non-zero after our pass, with how OFTEN, because "peaked at 2 once" and
+            // "2 on every single render" are different bugs.
+            var abs = new System.Text.StringBuilder();
+            for (int i = 0; i < _poolPeakAfter.Length; i++)
+                if (_poolPeakAfter[i] != 0 || _poolPeakBefore[i] != 0)
+                    abs.Append($"\n    {PoolFields[i]}: peak {_poolPeakBefore[i]} before / {_poolPeakAfter[i]} after our Draw, " +
+                               $"non-zero after on {_poolNonZeroAfter[i]}/{_poolSamples} render(s)");
+
+            // THE ACCEPTANCE TEST FOR THE CB RECLAIM. AliveConstantBufferCount climbed a
+            // dead-linear 4.00 per render before this existed; the reclaim should hold the
+            // ABSOLUTE flat instead. Reported as a rate so one window grades it: reclaimed
+            // per render should sit at N+3, and the peak should stop rising window over
+            // window. A non-zero failed count means Dispose could not be reached at all and
+            // the leak is still running.
+            RttLog.Line($"CB RECLAIM: {_cbReclaimed} transient constant buffer(s) freed, " +
+                        $"{_cbReclaimFailed} could not be freed, " +
+                        $"{_cbStaged.Count + _cbPrev.Count} in flight. " +
+                        (_cbReclaimFailed > 0
+                            ? "!!! Dispose was unreachable — the per-frame leak is STILL RUNNING."
+                            : "Compare the ABSOLUTE peak below ACROSS windows: flat = fixed, " +
+                              "still climbing ~4/render = the reclaim is not reaching the real owner."));
+
+            RttLog.Line($"POOL CENSUS over {_poolSamples} render(s). " +
+                        $"NET across our Draw:{(deltas.Length == 0 ? " every texture pool balanced," : deltas.ToString() + ",")}" +
+                        $" constant buffers {_cbLeaked:+#;-#;0}" +
+                        (deltas.Length == 0 && _cbLeaked == 0
+                            ? " — so WE are not the one unbalancing them."
+                            : " — WE are unbalancing them.") +
+                        $"\n  ABSOLUTE outstanding (this is what OnFrameEndDisposal asserts on): " +
+                        $"constant buffers peak {_cbPeakBefore} before / {_cbPeakAfter} after." +
+                        (abs.Length == 0
+                            ? " Every texture pool read ZERO on both sides of every render — if the engine is still " +
+                              "asserting, the borrow happens AFTER our postfix returns and this sampling point cannot see it."
+                            : abs.ToString()));
+        }
+
+        // THE HEADROOM LINE. setup+teardown is what could in principle move outside the
+        // bracket; draw is irreducible without changing the architecture.
+        double setupSec = _setupTicks / freq, drawSec = _drawTicks / freq, downSec = _teardownTicks / freq;
+        double reclaimable = elapsed > 0 ? 100.0 * (setupSec + downSec) / elapsed : 0.0;
+        RttLog.Line($"CAMERA SWAP SPLIT: setup {1000.0 * setupSec / Math.Max(1, _swapCount):F2} ms, " +
+                    $"draw {1000.0 * drawSec / Math.Max(1, _swapCount):F2} ms, " +
+                    $"teardown {1000.0 * downSec / Math.Max(1, _swapCount):F2} ms per render. " +
+                    $"Setup+teardown = {reclaimable:F1} percentage points of the {duty:F1}% duty cycle — " +
+                    (reclaimable > duty * 0.25
+                        ? "WORTH MOVING: a meaningful share of our exposure is not the draw at all."
+                        : "NOT WORTH MOVING: the draw dominates, so narrowing the bracket buys little and " +
+                          "the fix has to be hooking the consumers (option 2) or the outliers instead."));
+
+        _swapTotalTicks = 0; _swapCount = 0; _swapMaxTicks = 0; _swapWindowStartTicks = now;
+        _setupTicks = 0; _drawTicks = 0; _teardownTicks = 0;
     }
 
     private static MethodInfo _miDraw;
     private static Type _coreType;
     private static FieldInfo _sbField, _rvField;
     private static object _settingsObj;
+
+    // ---- THE HOT-RELOAD PARK: GENERALISED ---------------------------------------------
+    //
+    // THE LEAK, priced from the engine's own counters on 2026-08-02:
+    //     fresh session (0 reloads):  KnownNonStreaming 6024 MB, RealAvailableStreaming +6505 MB
+    //     after SIX reloads:          KnownNonStreaming 12781 MB, RealAvailableStreaming -1240 MB
+    // ~1.1 GB of NON-EVICTABLE memory stranded per hot reload. Once RealAvailableStreaming
+    // goes negative the streaming pool is clamped to a floor and thrashes, which is the LOD
+    // cycling AND the frame hitching — one global pool, so both views at once.
+    //
+    // WHY: every one of our GPU-resource owners hangs off Feeds.Cur, which lives in the
+    // COLLECTIBLE logic assembly. A reload discards the registry and the objects become
+    // unreachable while still holding depth buffers, the GBuffer array, the LDR texture,
+    // visibility lists and occlusion contexts. Nothing can dispose what nothing can reach.
+    //
+    // The probe manager already had a bespoke version of this fix; these two helpers are the
+    // same idea written once so the remaining owners get it too. Failing to resolve the park
+    // is NOT fatal — we simply construct as before and leak as before, which is strictly no
+    // worse than the old behaviour and lets an older bootstrap still run.
+    private static object[] ParkArray(string name)
+    {
+        try
+        {
+            return Type.GetType("RttProbe.RttBridge, RttProbe")
+                ?.GetField(name, BindingFlags.Public | BindingFlags.Static)
+                ?.GetValue(null) as object[];
+        }
+        catch { return null; }
+    }
+
+    // Type-checked on purpose: a slot parked by an older build can hold an object of a type
+    // this build cannot use, and adopting it blind would be a crash rather than a leak.
+    private static object AdoptParked(string parkName, Type expected)
+    {
+        try
+        {
+            var slots = ParkArray(parkName);
+            var i = Feeds.Cur.Id;
+            if (slots == null || i < 0 || i >= slots.Length) return null;
+            var parked = slots[i];
+            if (parked == null) return null;
+            if (expected != null && !expected.IsInstanceOfType(parked)) return null;
+
+            if (_parkAdoptLogged.Add(parkName + i))
+                RttLog.Line($"HOT-RELOAD PARK: adopted the parked {parkName}[{i}] instead of building a new one. " +
+                            "Its GPU resources survive this reload rather than being stranded beyond the reach " +
+                            "of anything that could free them (~1.1 GB per reload before this).");
+            return parked;
+        }
+        catch { return null; }
+    }
+
+    private static void ParkIt(string parkName, object value)
+    {
+        try
+        {
+            var slots = ParkArray(parkName);
+            var i = Feeds.Cur.Id;
+            if (slots == null || i < 0 || i >= slots.Length) return;
+            slots[i] = value;                 // every construction writes the park, so the
+        }                                     // NEXT reload adopts instead of building
+        catch { }
+    }
+
+    private static readonly HashSet<string> _parkAdoptLogged = new();
 
     // PER-FEED (phase C1a): this feed's rate stamp. The phase E slot scheduler replaces
     // the comparison against WholeSceneIntervalMs with "is it my turn", but the stamp
@@ -3520,6 +5316,33 @@ internal static class WholeSceneRender
             var t = Type.GetType("Keen.VRage.Render12.Core.Systems.DrawContextManager, VRage.Render12");
             if (t == null) { RttLog.Line("Whole-scene: DrawContextManager type not found."); NoteDcFailure(); return; }
 
+            // DO NOT PARK THE DrawContextManager. BACKED OUT 2026-08-02 AFTER IT CRASHED.
+            //
+            // Parking this one looked identical to parking ScreenBuffers, and it is not. A
+            // DrawContextManager owns a CascadeShadowsContext, which holds POOLED GPU TOKENS.
+            // Adopting it across a hot reload carries tokens borrowed by the PREVIOUS logic
+            // assembly into a new one, and the first thing our own-shadows path does is:
+            //     BeginOwnShadows -> FlushInto -> CascadeShadowsContext.FlushUpdates()
+            //         -> ResizeCascades(count, size) -> Token.Dispose()
+            // The pool then asserts
+            //     '_lifetime == Lifetime.Used' evaluated to false   (GPUResourcePool.cs:168)
+            // and the follow-on disposes an already-dead depth stencil
+            //     D3DCommittedResourceWrap.GPUDispose(), 'IsValid' evaluated to false
+            // which takes the render thread down. The assertion appears in exactly ONE log in
+            // this project's history: the first session after the park was added.
+            //
+            // WHY THAT MATTERED MORE THAN THE MEMORY: the user could no longer exit to the
+            // main menu without a CTD, and exiting triggers a WORLD SAVE — a save interrupted
+            // by a render-thread crash is how "this save is corrupt" happens. Never trade a
+            // crash-during-save for a memory saving.
+            //
+            // ScreenBuffers stays parked: it owns plain textures, not pool tokens, and it
+            // carried most of the win anyway (the InitializeBuffers skip is what took the
+            // ratchet from +1637 MB to +36 MB per reload).
+            //
+            // If this is ever revisited, the missing piece is releasing the cascade tokens
+            // BEFORE the assembly unloads, or rebuilding CascadeShadowsContext on adoption —
+            // not adopting the manager wholesale.
             _ourDrawContexts = Activator.CreateInstance(t);
 
             // Share the ENGINE'S DirectionalLightShadowResources into our manager.
@@ -3732,6 +5555,49 @@ internal static class WholeSceneRender
     private static void ScrubMirroredFlareRefs()
     {
         _flaresReady = false;
+
+        // THE HOLE THIS GUARD CLOSES. The line below used to be a plain
+        //     if (_ourFreshFlares == null || _flareOriginals == null) return;
+        // and the second half of that condition is a silent no-scrub: a context that still
+        // holds the ENGINE'S _flaresBuffer goes on to be disposed, which frees the PLAYER'S
+        // flare buffer, and the player's very next frame dies exactly here:
+        //     NullReferenceException at FlaresContext.GetFlareConstants()
+        //       at FlaresOcclusionJob.DoWork -> RenderFlares_Patch1 -> Draw_Patch1
+        // — the same signature as the 2026-07-29 CTD, and the one that killed the session
+        // at 19:51 on 2026-08-02 while exiting to the main menu.
+        //
+        // The pair is captured together and dropped together WITHIN one assembly load, so
+        // originals-null-while-context-live should be impossible. It stopped being
+        // impossible the moment the DrawContextManager was parked across hot reloads (a
+        // context from the previous load, originals from a registry that no longer exists).
+        // That park is backed out, but "should be impossible" is what the last four CTDs
+        // had in common, so this checks rather than assumes: if our buffer is REFERENCE-
+        // EQUAL to the engine's, unhook it before anything can dispose it. Only
+        // _flaresBuffer is nulled — the ctor never writes it and Dispose null-checks it,
+        // whereas the dictionaries and the allocator are walked unguarded and must stay
+        // non-null.
+        if (_ourFreshFlares != null && _flareOriginals == null)
+        {
+            try
+            {
+                var fb = _ourFreshFlares.GetType().GetField("_flaresBuffer", Any);
+                var ours = fb?.GetValue(_ourFreshFlares);
+                var theirs = _engineFlares != null
+                    ? _engineFlares.GetType().GetField("_flaresBuffer", Any)?.GetValue(_engineFlares)
+                    : null;
+                if (ours != null && ReferenceEquals(ours, theirs))
+                {
+                    fb.SetValue(_ourFreshFlares, null);
+                    RttLog.Line("!!! Whole-scene flares: our FlaresContext was about to be torn down still " +
+                                "holding the ENGINE'S _flaresBuffer, with no captured originals to restore. " +
+                                "Unhooked it. Disposing it in that state frees the player's flare buffer and " +
+                                "NREs their next frame in FlaresContext.GetFlareConstants — the exit-to-menu " +
+                                "CTD. If this line appears, find out how the context outlived its originals.");
+                }
+            }
+            catch (Exception e) { RttLog.Error("flare buffer alias check", e); }
+        }
+
         if (_ourFreshFlares == null || _flareOriginals == null) { _flareOriginals = null; return; }
         try
         {
@@ -4247,19 +6113,152 @@ internal static class WholeSceneRender
                 return;
             }
 
-            var sb = ctor.Invoke(null);
+            // ADOPT BEFORE CONSTRUCTING — the ratchet fix. A ScreenBuffers owns depth, the
+            // GBuffer array and the final LDR texture, all NON-EVICTABLE, and it hangs off
+            // Feeds.Cur inside the collectible logic assembly. Every hot reload built a fresh
+            // one and stranded the last beyond the reach of anything that could dispose it.
+            // Measured cost of that (with DrawContexts): ~1.1 GB of KnownNonStreaming per
+            // reload, which is what drove RealAvailableStreaming negative and set the
+            // streaming pool thrashing.
+            var adopted = AdoptParked("ParkedScreenBuffers", sbType);
+            var sb = adopted ?? ctor.Invoke(null);
 
             // InitializeBuffers(in Vector2I maxResolution) is internal and is what the
             // engine's own instance is set up with. Update(cl, maxRes, preUpscaleRes) is
             // the public alternative but wants a command list we do not have here, so
             // the internal one is the right call at construction time.
+            //
+            // DO NOT RE-INITIALISE AN ADOPTED INSTANCE THAT IS ALREADY THE RIGHT SIZE.
+            //
+            // The first version of this fix called InitializeBuffers unconditionally, on the
+            // assumption that sizing is idempotent. IT IS NOT. Read from the IL:
+            //     CreateResizableDepthStencil(...)        <- allocates a NEW depth stencil
+            //     newarr ResizableRWRenderTargetTexture   <- allocates a NEW GBuffer array
+            //     set_GBuffer(...)
+            // with no Dispose of what was there. So re-initialising an adopted instance
+            // strands its ENTIRE previous buffer set — depth, GBuffer, LDR — and parking the
+            // container achieves nothing. Measured: KnownNonStreaming still grew +1637 MB
+            // across one reload WITH both parks confirmed adopted, which is what exposed it.
+            //
+            // READ THE ENGINE'S OWN GUARD FIELD, NOT PreUpscaleResolution.
+            //
+            // The first version of this check compared PreUpscaleResolution against the feed
+            // size, and it did not work: the game log asserted
+            //     '_usedMaxResolution == Vector2.Zero' evaluated to false
+            //       at ScreenBuffers.InitializeBuffers
+            //       at RttProbe.WholeSceneRender.EnsureScreenBuffers()
+            // ONCE PER SESSION, in every session on 2026-08-02, i.e. the skip never fired.
+            //
+            // The reason is in this file already, at the RESOLUTION TRIPWIRE in
+            // RunSecondRender: PreUpscaleResolution is REWRITTEN by ScreenBuffers.Update()
+            // during a draw, and ours had been observed carrying the PLAYER'S resolution.
+            // So it is not a record of what the instance was built at — it is per-frame
+            // state, and comparing against it reports "wrong size" on an instance that is
+            // perfectly sized, every time.
+            //
+            // _usedMaxResolution is the field InitializeBuffers itself asserts on and the
+            // one it writes; nothing in the draw path touches it. Non-zero means "this
+            // instance has already been initialised", which is exactly the question.
             var res = MakeVector2I(FeedConfig.WholeSceneWidth, FeedConfig.WholeSceneHeight);
             var init = sbType.GetMethod("InitializeBuffers", Any);
             string how;
-            if (init != null && res != null)
+
+            // Vector2I is a struct with int X/Y fields; boxed here, read by field.
+            static bool NonZeroXY(object v)
             {
+                if (v == null) return false;
+                var t = v.GetType();
+                var x = t.GetField("X", Any)?.GetValue(v);
+                var y = t.GetField("Y", Any)?.GetValue(v);
+                return (x is int ix && ix != 0) || (y is int iy && iy != 0);
+            }
+
+            // CHECK THE INSTANCE WE ARE ABOUT TO INITIALISE, WHATEVER ITS PROVENANCE.
+            //
+            // The first version of this guard only read _usedMaxResolution when the instance
+            // came from the park, on the reasoning that a ctor.Invoke result must be virgin.
+            // The game log says otherwise. From the initprobe, one gate cycle, ONE instance:
+            //     [20:22:37.822] InitializeBuffers(3840, 2160) instance=#03855cc0
+            //     [20:22:38.005] InitializeBuffers(1024, 1024) instance=#03855cc0   <- ours
+            //     [20:22:38.008] Assertion Failure: '_usedMaxResolution == Vector2.Zero'
+            // Same object, initialised at the player's resolution and then again at ours,
+            // 183 ms apart. Whatever route hands us that object, "we constructed it so it is
+            // fresh" is not a fact we get to assume — so the check is now unconditional.
+            bool initialised = false, sizeMatches = false;
+            try
+            {
+                var used = sbType.GetField("_usedMaxResolution", Any)?.GetValue(sb);
+                initialised = NonZeroXY(used);
+                if (used != null)
+                {
+                    var ut = used.GetType();
+                    var ux = ut.GetField("X", Any)?.GetValue(used);
+                    var uy = ut.GetField("Y", Any)?.GetValue(used);
+                    sizeMatches = ux is int mx && uy is int my
+                                  && mx == FeedConfig.WholeSceneWidth
+                                  && my == FeedConfig.WholeSceneHeight;
+                }
+            }
+            catch { }
+
+            // IDENTITY GUARD. The one outcome that must never happen is re-initialising the
+            // ENGINE'S ScreenBuffers at the feed's resolution — that is the player's depth
+            // stencil, GBuffer and final LDR target, resized to 1024x1024 underneath them.
+            // Reference equality against the live CoreSystems.ScreenBuffers is the whole
+            // test, and it costs one field read. If it ever fires, the route disables itself
+            // rather than continuing: a feed that does not render is a bad day, and a player
+            // whose framebuffer we resized is a broken game.
+            var liveSb = _coreType?.GetField("ScreenBuffers", BindingFlags.Public | BindingFlags.Static)
+                                  ?.GetValue(null);
+            if (liveSb != null && ReferenceEquals(liveSb, sb))
+            {
+                _state = -1;
+                _ourScreenBuffers = null;
+                RttLog.Line("!!! Whole-scene: the ScreenBuffers we were about to initialise at " +
+                            $"{FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight} IS the engine's own " +
+                            $"instance (#{sb.GetHashCode():x8}) — adopted={(adopted != null ? "from the park" : "no, freshly constructed")}. " +
+                            "Initialising it would resize the PLAYER'S depth stencil, GBuffer and final LDR " +
+                            "target to the feed's resolution. Route DISABLED for this session. Check what " +
+                            "wrote the engine's instance into RttBridge.ParkedScreenBuffers.");
+                return;
+            }
+
+            if (initialised && sizeMatches)
+            {
+                how = $"already initialised at {FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight} " +
+                      $"(read from _usedMaxResolution on instance #{sb.GetHashCode():x8}, " +
+                      $"{(adopted != null ? "adopted from the park" : "freshly constructed")}) — " +
+                      "InitializeBuffers SKIPPED, so its existing buffers are reused rather than reallocated " +
+                      "and stranded";
+            }
+            else if (init != null && res != null)
+            {
+                // A GENUINE resize, or a first build.
+                //
+                // DisposeBuffers() exists — the earlier note here claiming "the engine gives
+                // us no disposal path" was wrong, it is right there on the type next to
+                // Dispose(). Calling it first is what turns a resize from "strand the whole
+                // previous depth+GBuffer+LDR set" into an actual resize. It is only correct
+                // on an instance that HAS buffers, hence the `initialised` guard: on a fresh
+                // construction there is nothing to dispose and calling it would be a
+                // null-walk through fields the ctor never filled.
+                if (initialised)
+                {
+                    try
+                    {
+                        sbType.GetMethod("DisposeBuffers", Any)?.Invoke(sb, null);
+                        RttLog.Line("Whole-scene: adopted ScreenBuffers was initialised at a DIFFERENT size — " +
+                                    "DisposeBuffers() called before re-initialising, so the previous depth " +
+                                    "stencil, GBuffer array and LDR texture are released instead of stranded.");
+                    }
+                    catch (Exception e) { RttLog.Error("ScreenBuffers.DisposeBuffers before resize", e); }
+                }
+
                 init.Invoke(sb, new[] { res });
-                how = $"InitializeBuffers({FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight})";
+                how = $"InitializeBuffers({FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight})" +
+                      (adopted != null
+                          ? $" on the ADOPTED instance (was {(initialised ? "a different size — old set disposed first" : "never initialised")})"
+                          : "");
             }
             else
             {
@@ -4268,6 +6267,7 @@ internal static class WholeSceneRender
             }
 
             _ourScreenBuffers = sb;
+            ParkIt("ParkedScreenBuffers", sb);
 
             // Arm the settle window here too. The DrawContextManager build is the known
             // hazard and arms it as well, but this call site is the one that also covers

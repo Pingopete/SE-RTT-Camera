@@ -1,7 +1,7 @@
-# Point TriplanarGIGlobal at the REAL triplanar shaders.
+﻿# Point TriplanarGIGlobal at the REAL triplanar shaders.
 #
 # WHY. The feed's terrain draws through the Indirect pass group, and the only terrain
-# material declaring PassIndirect is TriplanarGIGlobal — "Low quality master terrain
+# material declaring PassIndirect is TriplanarGIGlobal â€” "Low quality master terrain
 # material used for GI. Uses Far3 colors." Its pixel shader is 52 lines and samples NO
 # TEXTURES AT ALL:
 #
@@ -23,7 +23,7 @@
 # ProcessorInfo "P_DEF" and a ContentFiles.MainOutput entry. Assets is the input, Content
 # is the output, and the output is what ships.
 #
-# Note Materials\Global\TriplanarGIGlobal.def is a different thing again — a
+# Note Materials\Global\TriplanarGIGlobal.def is a different thing again â€” a
 # MaterialDefinition whose DefaultState points at this state's GUID. Leave it alone.
 #
 # WHY THE SWAP SHOULD WORK. TriplanarGIGlobal and TriplanarSingleGlobal are identical
@@ -43,7 +43,7 @@
 #         (!defined(PASS_DEFERRED_TEXTURING) || defined(PASS_DEFERRED_TEXTURING_MATERIAL))
 #
 # means that in an Indirect pass it takes the #else branch and samples triplanar textures
-# DIRECTLY — no deferred-texturing stage, which is the stage we could not get working.
+# DIRECTLY â€” no deferred-texturing stage, which is the stage we could not get working.
 #
 # Both shaders move together. The pair shares a Custom struct via
 # TriplanarSingleShared.hlsli (scalar MatIndex, PositionObjectSpace,
@@ -51,14 +51,14 @@
 # MatIndex[3]). Mixing them will not compile.
 #
 # SCOPE. This edits the game install, not a mod, and TriplanarGIGlobal is used by the
-# engine's own GI and reflection probes as well as our feed — so every probe face now
+# engine's own GI and reflection probes as well as our feed â€” so every probe face now
 # runs a 172-line textured shader instead of a 52-line flat one. Expect a global cost;
 # that is part of what this measures. restore.ps1 undoes it, as does Steam's file
 # verification.
 
 $ErrorActionPreference = 'Stop'
 
-$def    = "D:\SteamLibrary\steamapps\common\SpaceEngineers2\VRage\GameData\Engine\Content\Materials\States\TriplanarGIGlobal.def"
+$def    = "E:\SteamLibrary\steamapps\common\SpaceEngineers2\VRage\GameData\Engine\Content\Materials\States\TriplanarGIGlobal.def"
 $backup = Join-Path $PSScriptRoot "original\Content-TriplanarGIGlobal.def"
 
 if (-not (Test-Path $backup)) {

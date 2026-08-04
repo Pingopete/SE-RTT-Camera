@@ -132,6 +132,40 @@ internal static class FeedConfig
     // recorded where someone would otherwise retry it. Use WholeSceneGrassNoHiZ instead.
     public static bool WholeSceneNoHzbo { get; private set; }
 
+    // v2 of the occlusion scope — the sound one. Occlusion culling disabled ONLY for
+    // culling-job compositions whose RenderViewSlim RESOLUTION matches the feed's, the
+    // verdict carried in a [ThreadStatic] bracketed around the job's own DoWork. No shared
+    // setting is touched (unlike wholeSceneNoHzbo) and no ambient in-our-render flag is
+    // trusted across threads (unlike the retired skip id 31, whose misclassification
+    // whited the feed and strobed the player's lighting on 2026-08-03).
+    //
+    // DELIBERATELY NOT IN THE REBUILD SIGNATURE: consulted per call, allocates nothing,
+    // so it is safe to flip live — one of the few knobs that genuinely is.
+    public static bool WholeSceneNoOcclusion { get; private set; }
+
+    // THE DISTANT-FLORA VISIBILITY THRESHOLD. -1 = leave the engine's value alone.
+    //
+    // Decoded from FloraSubSectorMesh.UpdateVisibility (the DISTANT merged tier, and the
+    // only thing in the feed that has ever flickered):
+    //     threshold = Raytracing.FloraMaxDistance * 1.2f
+    //     vis       = boundingBox.Distance(camera) < threshold
+    //     if (vis != _isVisible) { _isVisible = vis;
+    //                              vis ? Update()               // REBUILD the merged mesh
+    //                                  : EvictFromRaytracingScene(); }
+    //
+    // Stock is 250, so the boundary sits at 300 m — INSIDE the band the feed draws (the
+    // flora cap runs to 900 m, far clip 2500 m). Every metre of orbit drags meshes across
+    // it, and each crossing rebuilds or evicts a whole merged patch: measured at 33 flips
+    // per 15 s window, which is exactly the "batchy, sub-second to a second" cadence.
+    //
+    // Raising it moves the boundary BEYOND anything the feed can see, so crossings stop
+    // happening where they are visible. GLOBAL (a RaytracingSettings field), so the
+    // player's world gets the same threshold — cost is more distant merged meshes resident,
+    // and it is a RAYTRACING setting, so with RT off the extra cost is small.
+    //
+    // Set it comfortably past wholeSceneFloraMaxMetres: threshold = value * 1.2.
+    public static double FeedFloraMaxDistance { get; private set; } = -1;
+
     // Force RenderGrass's enableHiZ ARGUMENT false inside our render. This is the safe half of
     // the HZBO question: GrassRendering selects its NoHiZ pipeline from that argument alone, so
     // this reaches the grass generator and nothing else — no shared setting, no other consumer,
@@ -264,6 +298,47 @@ internal static class FeedConfig
     // Was gated `> 0`, which silently made the knob brighten-only. A 512px feed pointed
     // at a sunlit planet needs to come DOWN more often than up.
     public static double WholeSceneExposure { get; private set; }
+
+    // DARKENING OFFSET ON THE ADAPTED EXPOSURE. Negative = darker. 0 = off.
+    //
+    // SEPARATE FROM WholeSceneExposure ON PURPOSE. That one is the FIXED-STOP FALLBACK used
+    // when we are not adapting; giving it a second meaning would make "the feed is dark"
+    // ambiguous between "adaptation settled there" and "someone pinned it". This one biases
+    // the ADAPTED result and leaves adaptation running underneath.
+    //
+    // Live-tunable; NOT in the rebuild signature — it is a per-render settings scope, so
+    // retuning it costs nothing and needs no gate cycle.
+    public static double WholeSceneExposureOffset { get; private set; }
+
+    // ---- MANUAL CAMERA FLIGHT ---------------------------------------------------------
+    // 1 = the orbit is suspended and the feed camera flies on WASD / Space / Ctrl / Q / E.
+    // Live: flipping it mid-session takes effect on the next render, and the flown position
+    // survives in output/camera-state.<anchor>.txt — never in the world save.
+    public static bool CameraManualControl { get; private set; }
+
+    // Degrees per second of roll on Q/E.
+    public static double CameraRollRate { get; private set; } = 45.0;
+
+    // Metres per second. The live value is owned by CameraControl once flying (so it can be
+    // changed in-game later); this is the starting value and the one a fresh site uses.
+    public static double CameraSpeed { get; private set; } = 20.0;
+
+    // Mouse-look sensitivity. Scaled by the zoom factor at use, so aiming stays proportional
+    // when zoomed in rather than becoming unusably twitchy.
+    public static double CameraLookSensitivity { get; private set; } = 1.0;
+
+    // Per-axis look inversion, LIVE. Ship both as knobs because a sign is not something to
+    // guess: yaw came back inverted in game and pitch could not be judged because it was dead.
+    // On this machine a restart is the only safe deploy, so a sign question must be a config
+    // edit, never a rebuild.
+    // Despawn the presence markers while a save is collected. DEFAULTS OFF: it caused a
+    // NullReferenceException in the engine's spatial-trigger removal (VoxelPhysicsComponent
+    // .ReleaseChunk) when the marker was destroyed, and the save contamination it guards
+    // against was never demonstrated. See WorldGrids.SaveHoldActive for the full evidence.
+    public static bool MarkerDespawnOnSave { get; private set; }
+
+    public static bool CameraInvertLookX { get; private set; }
+    public static bool CameraInvertLookY { get; private set; }
 
     // ---- AUTO APERTURE (2026-08-01) ----------------------------------------------
     //
@@ -540,6 +615,25 @@ internal static class FeedConfig
     // something we invented. -999 = do not scope (0 and negatives are meaningful values:
     // LODShift = -1 asks for one level MORE detail than the distance would pick).
     public static int WholeSceneLodShift    { get; private set; } = -999;
+
+    // HARD METRE CAP ON FLORA DRAW DISTANCE. -1 = off, use whatever the engine baked.
+    //
+    // The separate distance cull, kept separate from LOD ON PURPOSE. worldFloraRadiusMult
+    // multiplies each model's own LOD distance, so it yields metres nobody chose and a
+    // different answer per model; wholeSceneLodShift trades foreground detail for background
+    // cost across the board. This clamps InstanceBatch._cullingDistance — the field
+    // UpdateVisibility actually tests — so near flora keeps full detail and far flora simply
+    // is not drawn.
+    //
+    // PICK IT AGAINST THE HORIZON. From ~20 m up on a 60 km planet the geometric horizon is
+    // sqrt(2*60000*20) ~= 1550 m. Anything past that is flora drawn over the curvature with
+    // no ground under it, which is what the feed was doing at a 2500 m far clip.
+    //
+    // Safe to change live: the clamp is idempotent and re-applied on a cadence, so a NEW
+    // value only ever takes effect downward. Raising it back does NOT restore batches
+    // already clamped — those keep the lower distance until they cycle out — so treat an
+    // increase as needing a reload, the same way the radius multiplier does.
+    public static double WholeSceneFloraMaxMetres { get; private set; } = -1;
     public static int WholeSceneFloraMinLod { get; private set; } = -999;
 
     // General object LOD distance, OUR RENDER ONLY. -1 = do not scope. These reach every
@@ -554,6 +648,159 @@ internal static class FeedConfig
     // than it will simply be ignored by the engine rather than misbehave.
     public static double WholeSceneGrassDrawDistance { get; private set; } = -1;
     public static double WholeSceneGrassDensity      { get; private set; } = -1;
+
+    // Parallax occlusion mapping, OUR RENDER ONLY. This is the "close-up ground is flat"
+    // knob, and it is a MATERIAL SHADER effect, not geometry: it fakes depth in the surface
+    // by ray-marching a height map in the pixel shader. That is why the LOD work did nothing
+    // for the reported symptom — no amount of geometry LOD adds relief to a flat texture.
+    //
+    // ParallaxSettings sits on SettingsManager as `_parallax`, alongside `_grass`, `_flora`
+    // and `_lod`, and carries {Enabled, FadeoutDistance, EnableSelfShadow, ShadowMaxLength,
+    // MaxStepCount}. Same family, same ScopeSetValues path.
+    //
+    // WHAT IS NOT YET PROVEN, and the reason the probe below exists: whether the consumer
+    // reads it per-pass (inside our nested Draw) or bakes it into a shader define. If it is
+    // a define, this scope will be inert at best — see the RaytracingSettings note in
+    // WholeSceneRender.ScopeScatter for why a define-driven setting must NOT be toggled per
+    // frame. So DO NOT raise these until the probe has reported the consumer.
+    //
+    // Tri-state on the bools: -1 = do not scope, 0 = force off, 1 = force on. -1 for the
+    // numbers likewise, except MaxStepCount where -999 is the sentinel (0 is meaningful).
+    public static int    WholeSceneParallax             { get; private set; } = -1;
+    public static double WholeSceneParallaxFadeout      { get; private set; } = -1;
+    public static int    WholeSceneParallaxSelfShadow   { get; private set; } = -1;
+    public static double WholeSceneParallaxShadowLength { get; private set; } = -1;
+    public static int    WholeSceneParallaxSteps        { get; private set; } = -999;
+
+    // Give the feed camera a vote in TEXTURE MIP selection. See TextureCamera.cs for the
+    // mechanism and the safety argument; the short version is that CollectStandards feeds a
+    // CLOSEST-distance collector, so our camera can only ever demand HIGHER resolution and
+    // can never demote a texture the player needs.
+    //
+    // THIS IS NOT viewerDistance. That one patches CalculateDistanceToCamera, which sets the
+    // streaming BUCKET. This one sets WHICH MIP IS RESIDENT. They are different code paths
+    // with different consumers, and treating them as one thing is what left the feed looking
+    // flat while viewerDistance was reported as "no visible difference".
+    //
+    // BOOTSTRAP FEATURE: the prefix lives in RttProbe.dll, so a GAME RESTART is required to
+    // adopt it. Until then this knob does nothing however it is set, and TextureCamera says
+    // so out loud rather than failing silently.
+    //
+    // COST: the prefix runs per root entity per collection pass on scene job threads. It is
+    // branch-and-arithmetic only, no allocation, and early-outs on one static bool when off.
+    // VRAM: resident textures go UP when this works — that is the entire point — so watch
+    // headroom and do not arm it while already over budget.
+    public static bool FeedTextureCamera { get; private set; }
+
+    // HOW MUCH NEARER OUR CAMERA MUST BE TO TAKE AN ENTITY OVER. 1.0 = the old strict
+    // comparison, i.e. no hysteresis.
+    //
+    // MEASURED, NOT GUESSED: with the strict comparison, 4.2% of repeat decisions alternated
+    // — ~4000 entities a second swapping which camera picks their mip. A demanded mip that
+    // oscillates is a texture that loads and drops, and a texture that is not resident is not
+    // drawn, which is the distant-foliage flashing. Proven by the user's own A/B: with
+    // feedTextureCamera off, that foliage is not merely flatter, it is ABSENT.
+    //
+    // ONLY THE ENTRY SIDE IS DAMPED. Holding an entity past the point where our camera stops
+    // being nearer would write a LARGER distance than the engine's own and demote a texture
+    // the player needs — the one direction this path must never move. So entry costs a
+    // margin, exit is immediate.
+    //
+    // Read the effect in the FEED TEXTURE CAMERA line's STABILITY field: this is aimed at
+    // the alternation percentage, and a fix that does not move it did not work.
+    public static double FeedTextureCameraEnterRatio { get; private set; } = 0.85;
+
+    // HOW FAR AN ENTITY'S DISTANCE MUST MOVE BEFORE WE RE-PRESENT IT. 0 = no latch.
+    //
+    // THIS IS THE FIX; the enter ratio above is not. Measured: tier requests per 15 s window
+    // ran 9000-16500 with the mip override ON versus 172-532 with it OFF — a 25-30x
+    // amplification that is ours — with up and down balanced and ~88% of movements being
+    // direction REVERSALS. That is oscillation, not a world settling.
+    //
+    // The cause is that our camera ORBITS: every entity's distance slides continuously, so
+    // target tiers cross boundaries constantly and thousands of textures re-tier every
+    // second. Foliage is alpha-tested, so a texture dropping a tier does not soften, it
+    // vanishes. Latching the presented distance makes tiers change in deliberate steps
+    // instead of sliding with the orbit.
+    //
+    // Judge it on TEXTURE TIER CHURN, specifically the REVERSAL count — that is the number
+    // this exists to move, and the control arm (override off) is the floor to aim at.
+    public static double FeedTextureCameraDistanceStep { get; private set; } = 0.20;
+
+    // ---- THE SATURATION FLOOR: the fix the mechanism actually points at ---------------
+    //
+    // ApplyStandardMaterials clamps priority at 2.0, which every texture presented closer
+    // than P/(2D) hits — P = pixelsPerSurfaceMeterBase, D = DefaultTexelDensity. Full
+    // resolution is already reached at P/D, so presenting closer than P/2D CANNOT improve the
+    // image; it only collapses our textures into one tied priority band in the single global
+    // streaming pool. When that pool fills, which tied entry survives is decided by
+    // tie-breaking and can change every cycle — textures form, drop, re-form. The log line
+    // TEXTURE PRIORITY SATURATION prints the measured floor.
+    //
+    // MULT is applied to that computed floor. 1.0 sits exactly on the clamp; slightly above 1
+    // buys a graded priority, so the cut falls at a defined point in OUR set (nearest kept,
+    // farthest dropped) instead of reshuffling. Needs the bootstrap floor — a RESTART.
+    public static double FeedTextureCameraMinDistMult { get; private set; } = 1.0;
+
+    // The HOT-RELOADABLE approximation of the same thing: pull the virtual texture-camera
+    // back along the centre->eye ray, in metres, so near content is presented farther and
+    // lifts out of the clamp. Coarser than the per-entity floor because it is one global
+    // offset, but it needs no restart. 0 = off.
+    public static double FeedTextureCameraBackoff { get; private set; }
+
+    // CEILING on the presented distance, metres. 0 = off. THE UNTESTED DIRECTION of the
+    // priority hypothesis: priority = P/(distance*D), so clamping distance DOWN pushes our
+    // foliage UP the single global priority ordering, off the eviction cut it currently sits
+    // on. 900 m -> 20 m is roughly 44x more priority.
+    //
+    // Only the floor was ever tested (priority DOWN, no change), and calling the hypothesis
+    // dead on that was an overclaim: a null result in the direction that makes things worse
+    // proves little.
+    //
+    // *** VRAM: raising priority also drops the demanded mip, ~4x the bytes per step, on a
+    // machine already VRAM-bound before the mod loads. Warn, watch, never set this
+    // automatically. ***
+    public static double FeedTextureCameraMaxDist { get; private set; }
+
+    // GLOBAL flora LOD distance multiplier. -1 = leave the engine's value alone.
+    //
+    // THE PER-PASS VERSION COULD NEVER WORK, and this is the measured reason rather than a
+    // design preference. The OCTREE decides which instances a sector supplies OUTSIDE our
+    // render, reading FloraSettings.LODDistanceMultiplier as it stands then; our draw filters
+    // that set INSIDE our render. A per-pass scope therefore guarantees disagreement, and
+    // instances in the gap are supplied-by-one-half-and-rejected-by-the-other — which
+    // flickers as the orbit shifts distances slightly.
+    //
+    // A/B IN GAME 2026-08-02, both directions, user-observed:
+    //     scoped 0.85 (octree 1.2 / draw 0.85) -> finer detail, MORE popping
+    //     unscoped     (octree 1.2 / draw 1.2) -> coarser detail, LESS popping
+    // Agreement reduced the popping. So agree at the value we WANT, globally.
+    //
+    // SIGN (got wrong twice, so state it plainly): this scales the MEASURED DISTANCE that LOD
+    // selection consumes. LOWER = plants read as CLOSER = finer meshes = more detail and more
+    // cost. It does NOT extend range — below 1 makes plants lie about their distance and draw
+    // close-up LODs far away, which is what tanked fps at 0.5.
+    //
+    // GLOBAL: the player's flora LOD changes too, exactly like worldFloraRadiusMult. One
+    // setting, two viewers.
+    public static double WorldFloraLodMult { get; private set; } = -1;
+
+    // THE MAIN-WORLD LOD CYCLING FIX. On by default: this repairs a bug in the PLAYER'S
+    // world that our feed causes, so it is not an enhancement to opt into.
+    //
+    // While our nested Draw holds our camera in CoreSystems.Settings.RenderView, any engine
+    // job calling RenderUtilities.CalculateDistanceToCamera for a PLAYER-side entity measures
+    // it against a camera 3906 km away. DistanceTagManagerComponent CACHES that float per
+    // entity, and StreamingTag / impostor swap / shadow tracking / raytracing near-far all
+    // read only the cache — so one poisoned read demotes an object until something recomputes
+    // it. Measured exposure: our swap is installed 12.4% of wall clock.
+    //
+    // The guard uses [ThreadStatic] _inOurRender to tell our render thread from the job
+    // threads, and hands the PLAYER'S camera to everyone who is not us.
+    //
+    // Keep the knob so the A/B stays possible: this is a long-standing symptom and being able
+    // to switch the fix off live is how we prove it was the cause.
+    public static bool FixLodCycling { get; private set; } = true;
 
     // ---- GLOBAL. THE PLAYER'S VIEW AND VRAM CHANGE TOO. -------------------------------
     //
@@ -1215,14 +1462,14 @@ internal static class FeedConfig
 
     private static string ReadLoadAreaMarker()
     {
-        try { return System.IO.File.Exists(LoadAreaMarkerPath)
+        try { return FileWatch.Exists(LoadAreaMarkerPath)
                   ? System.IO.File.ReadAllText(LoadAreaMarkerPath).Trim() : ""; }
         catch { return ""; }
     }
 
     private static void WriteLoadAreaMarker(string value)
     {
-        try { System.IO.File.WriteAllText(LoadAreaMarkerPath, value); }
+        try { System.IO.File.WriteAllText(LoadAreaMarkerPath, value); FileWatch.Invalidate(LoadAreaMarkerPath); }
         catch { /* an unwritable marker means a re-fire after restart; log-worthy but not fatal */ }
     }
 
@@ -1252,7 +1499,7 @@ internal static class FeedConfig
 
         try
         {
-            if (!File.Exists(Path_))
+            if (!FileWatch.Exists(Path_))
             {
                 // Write the defaults out once so the knobs are discoverable rather than
                 // something you have to read the source to find.
@@ -1265,7 +1512,7 @@ internal static class FeedConfig
                 return;
             }
 
-            var stamp = File.GetLastWriteTimeUtc(Path_).Ticks;
+            var stamp = FileWatch.StampTicks(Path_);
             if (stamp == _lastStamp) return;
             _lastStamp = stamp;
 
@@ -1323,7 +1570,7 @@ internal static class FeedConfig
             // entity in the scene — ~107,000 calls a second still paying a delegate dispatch
             // and a contended counter increment to reach a method that does nothing. Only
             // removing the hook lets the postfix early-out. Idempotent, so it is safe here.
-            ViewerDistance.SetHook(ViewerDistanceOverride);
+            ViewerDistance.SetHook(ViewerDistanceOverride || FixLodCycling);
             if (viewerWas != ViewerDistanceOverride)
                 RttLog.Global($"Config: viewerDistance {viewerWas} -> {ViewerDistanceOverride}" +
                     (ViewerDistanceOverride
@@ -1353,6 +1600,23 @@ internal static class FeedConfig
             TagAnchorForClutter      = Bool(kv, "tagAnchorForClutter", TagAnchorForClutter);
 
             var markerWas = CameraTriggerEntity;
+            {
+                var manWas = CameraManualControl;
+                CameraManualControl = Bool(kv, "cameraManualControl", CameraManualControl);
+                CameraRollRate = Dbl(kv, "cameraRollRate", CameraRollRate);
+                CameraSpeed = Dbl(kv, "cameraSpeed", CameraSpeed);
+                CameraLookSensitivity = Dbl(kv, "cameraLookSensitivity", CameraLookSensitivity);
+                MarkerDespawnOnSave = Bool(kv, "markerDespawnOnSave", MarkerDespawnOnSave);
+                CameraInvertLookX = Bool(kv, "cameraInvertLookX", CameraInvertLookX);
+                CameraInvertLookY = Bool(kv, "cameraInvertLookY", CameraInvertLookY);
+                if (manWas != CameraManualControl)
+                    RttLog.Global($"Config: cameraManualControl {manWas} -> {CameraManualControl}. " +
+                        (CameraManualControl
+                            ? "The orbit is SUSPENDED and the camera flies on WASD / Space / Ctrl / Q / E. It resumes " +
+                              "from where the orbit left it, or from the saved sidecar position if there is one."
+                            : "Back to the orbit. The flown position is kept in the sidecar and restored when you re-arm."));
+            }
+
             CameraTriggerEntity = Bool(kv, "cameraTriggerEntity", CameraTriggerEntity);
             CameraTriggerDynamicTag = Bool(kv, "cameraTriggerDynamicTag", CameraTriggerDynamicTag);
             var extWas = CameraTriggerExtent;
@@ -1502,6 +1766,16 @@ internal static class FeedConfig
             WholeSceneIntervalMs    = Int(kv, "wholeSceneIntervalMs", WholeSceneIntervalMs);
             WholeSceneAAMode        = Int(kv, "wholeSceneAAMode", WholeSceneAAMode);
             WholeSceneExposure      = Dbl(kv, "wholeSceneExposure", WholeSceneExposure);
+            {
+                var offWas = WholeSceneExposureOffset;
+                WholeSceneExposureOffset = Dbl(kv, "wholeSceneExposureOffset", WholeSceneExposureOffset);
+                if (Math.Abs(offWas - WholeSceneExposureOffset) > 1e-9)
+                    RttLog.Global($"Config: wholeSceneExposureOffset {offWas:0.###} -> {WholeSceneExposureOffset:0.###} EV. " +
+                        (WholeSceneExposureOffset == 0
+                            ? "Off — the feed's adapted exposure is used unbiased."
+                            : (WholeSceneExposureOffset < 0 ? "Darker" : "Brighter") +
+                              " by that many stops on top of the feed's own adaptation, which keeps running underneath."));
+            }
             // Auto aperture — read INSIDE the signature window is harmless because none of
             // these are put INTO the signature (see WholeSceneSignature). Tuning is free.
             FeedAutoExposure         = Bool(kv, "feedAutoExposure", FeedAutoExposure);
@@ -1563,15 +1837,88 @@ internal static class FeedConfig
                           "feed rather than only in a counter."
                         : "OFF — residency is omnidirectional again, as it was before the cone."));
             WholeSceneLodShift          = Int(kv, "wholeSceneLodShift", WholeSceneLodShift);
+            var floraMaxWas = WholeSceneFloraMaxMetres;
+            WholeSceneFloraMaxMetres    = Dbl(kv, "wholeSceneFloraMaxMetres", WholeSceneFloraMaxMetres);
+            if (Math.Abs(floraMaxWas - WholeSceneFloraMaxMetres) > 1e-9)
+                RttLog.Global($"Config: wholeSceneFloraMaxMetres {floraMaxWas:0.#} -> {WholeSceneFloraMaxMetres:0.#}. " +
+                    (WholeSceneFloraMaxMetres > 0
+                        ? $"Flora batches are now clamped to draw no further than {WholeSceneFloraMaxMetres:0} m, " +
+                          "independent of LOD — near detail is untouched. Applied on a cadence and idempotent, so " +
+                          "newly allocated batches get caught too. LOWERING takes effect within a second; RAISING " +
+                          "does not restore batches already clamped (the engine bakes _cullingDistance once, at " +
+                          "allocation) — reload to go back up."
+                        : "OFF — flora draws to whatever distance the engine baked from its LOD multiplier."));
             WholeSceneFloraMinLod       = Int(kv, "wholeSceneFloraMinLod", WholeSceneFloraMinLod);
             WholeSceneObjectDistanceMult= Dbl(kv, "wholeSceneObjectDistanceMult", WholeSceneObjectDistanceMult);
             WholeSceneSmallObjectMult   = Int(kv, "wholeSceneSmallObjectMult", WholeSceneSmallObjectMult);
             WholeSceneGrassDrawDistance = Dbl(kv, "wholeSceneGrassDrawDistance", WholeSceneGrassDrawDistance);
             WholeSceneGrassDensity      = Dbl(kv, "wholeSceneGrassDensity", WholeSceneGrassDensity);
+            WholeSceneParallax             = Int(kv, "wholeSceneParallax", WholeSceneParallax);
+            WholeSceneParallaxFadeout      = Dbl(kv, "wholeSceneParallaxFadeout", WholeSceneParallaxFadeout);
+            WholeSceneParallaxSelfShadow   = Int(kv, "wholeSceneParallaxSelfShadow", WholeSceneParallaxSelfShadow);
+            WholeSceneParallaxShadowLength = Dbl(kv, "wholeSceneParallaxShadowLength", WholeSceneParallaxShadowLength);
+            WholeSceneParallaxSteps        = Int(kv, "wholeSceneParallaxSteps", WholeSceneParallaxSteps);
+
+            var texCamWas = FeedTextureCamera;
+            FeedTextureCamera = Bool(kv, "feedTextureCamera", FeedTextureCamera);
+            if (texCamWas != FeedTextureCamera)
+            {
+                RttLog.Global($"Config: feedTextureCamera {texCamWas} -> {FeedTextureCamera}" +
+                    (FeedTextureCamera
+                        ? ". Texture mips for entities NEARER THE FEED than the player are now chosen from " +
+                          "the feed camera. Expect resident texture memory to RISE — that is the feature " +
+                          "working, not a leak. Watch headroom."
+                        : ". Texture priority is the player's alone again."));
+                if (!FeedTextureCamera) TextureCamera.Stand_Down();
+            }
+            {
+                var ratioWas = FeedTextureCameraEnterRatio;
+                FeedTextureCameraEnterRatio = Dbl(kv, "feedTextureCameraEnterRatio", FeedTextureCameraEnterRatio);
+                if (Math.Abs(ratioWas - FeedTextureCameraEnterRatio) > 1e-9)
+                    RttLog.Global($"Config: feedTextureCameraEnterRatio {ratioWas:0.###} -> {FeedTextureCameraEnterRatio:0.###}. " +
+                        (FeedTextureCameraEnterRatio >= 1.0
+                            ? "1.0 or above disables the hysteresis — this is the OLD strict comparison that measured 4.2% alternation."
+                            : "Our camera must now be this much nearer to TAKE an entity over; it keeps it until we stop being nearer at all. " +
+                              "Watch the STABILITY field in the FEED TEXTURE CAMERA line — that alternation percentage is what this moves."));
+            }
+            {
+                var stepWas = FeedTextureCameraDistanceStep;
+                FeedTextureCameraDistanceStep = Dbl(kv, "feedTextureCameraDistanceStep", FeedTextureCameraDistanceStep);
+                if (Math.Abs(stepWas - FeedTextureCameraDistanceStep) > 1e-9)
+                    RttLog.Global($"Config: feedTextureCameraDistanceStep {stepWas:0.###} -> {FeedTextureCameraDistanceStep:0.###}. " +
+                        (FeedTextureCameraDistanceStep <= 0
+                            ? "0 DISABLES the latch — entities are presented at the raw orbiting distance, which is the arrangement that measured 25-30x tier churn."
+                            : "An entity keeps its presented distance until the true distance departs by this fraction, so tiers step instead of sliding with the orbit. " +
+                              "Judge it on the REVERSAL count in TEXTURE TIER CHURN, against the override-off control arm as the floor."));
+            }
+            {
+                FeedTextureCameraMinDistMult = Dbl(kv, "feedTextureCameraMinDistMult", FeedTextureCameraMinDistMult);
+                var backWas = FeedTextureCameraBackoff;
+                FeedTextureCameraBackoff = Dbl(kv, "feedTextureCameraBackoff", FeedTextureCameraBackoff);
+                if (Math.Abs(backWas - FeedTextureCameraBackoff) > 1e-9)
+                    RttLog.Global($"Config: feedTextureCameraBackoff {backWas:0.#} -> {FeedTextureCameraBackoff:0.#} m. " +
+                        (FeedTextureCameraBackoff <= 0
+                            ? "0 — the virtual texture-camera sits exactly at the feed eye again."
+                            : "The virtual texture-camera is pulled back along the centre->eye ray by this much, so near content " +
+                              "is presented farther and lifts out of the priority clamp at P/2D. Compare the computed floor in the " +
+                              "TEXTURE PRIORITY SATURATION line, and judge on the REVERSAL count in TEXTURE TIER CHURN."));
+                var maxWas = FeedTextureCameraMaxDist;
+                FeedTextureCameraMaxDist = Dbl(kv, "feedTextureCameraMaxDist", FeedTextureCameraMaxDist);
+                if (Math.Abs(maxWas - FeedTextureCameraMaxDist) > 1e-9)
+                    RttLog.Global($"Config: feedTextureCameraMaxDist {maxWas:0.#} -> {FeedTextureCameraMaxDist:0.#} m. " +
+                        (FeedTextureCameraMaxDist <= 0
+                            ? "0 — no ceiling; presented distance is whatever the feed camera actually sees."
+                            : "Distant content is now presented as if this close, which RAISES its streaming priority off the " +
+                              "eviction cut. *** THIS COSTS VRAM: a lower demanded mip is ~4x the bytes per step. Watch the " +
+                              "budget — it is not throttled automatically. ***"));
+            }
 
             // GLOBAL — announced on every change, because unlike everything above this one
             // changes the PLAYER'S world and its VRAM. Logged here as well as at the apply
             // site so the transition is in the log even if the apply is what fails.
+            WorldFloraLodMult = Dbl(kv, "worldFloraLodMult", WorldFloraLodMult);
+            FixLodCycling     = Bool(kv, "fixLodCycling", FixLodCycling);
+
             var floraRadiusWas = WorldFloraRadiusMult;
             WorldFloraRadiusMult = Dbl(kv, "worldFloraRadiusMult", WorldFloraRadiusMult);
             if (Math.Abs(floraRadiusWas - WorldFloraRadiusMult) > 1e-9)
@@ -1594,6 +1941,26 @@ internal static class FeedConfig
                           "longer occlusion-tested against a depth pyramid. If grass appears, the pyramid " +
                           "was rejecting every instance because it does not match our camera."
                         : ". Grass generation goes back to occlusion-testing against HiZ."));
+
+            var floraMaxWasD = FeedFloraMaxDistance;
+            FeedFloraMaxDistance = Dbl(kv, "feedFloraMaxDistance", FeedFloraMaxDistance);
+            if (Math.Abs(floraMaxWasD - FeedFloraMaxDistance) > 1e-9)
+                RttLog.Global($"Config: feedFloraMaxDistance {floraMaxWasD:0.#} -> {FeedFloraMaxDistance:0.#}. " +
+                    (FeedFloraMaxDistance > 0
+                        ? $"Distant merged flora meshes now stay visible to {FeedFloraMaxDistance * 1.2:0} m " +
+                          "(threshold = value x1.2). GLOBAL — the player's world too. Watch DISTANT TIER " +
+                          "flips: they should fall to ~0 once the boundary is past what the feed draws."
+                        : "Left at the engine's own value (stock 250 -> a 300 m boundary)."));
+
+            var noOccWas = WholeSceneNoOcclusion;
+            WholeSceneNoOcclusion = Bool(kv, "wholeSceneNoOcclusion", WholeSceneNoOcclusion);
+            if (noOccWas != WholeSceneNoOcclusion)
+                RttLog.Global($"Config: wholeSceneNoOcclusion {noOccWas} -> {WholeSceneNoOcclusion}" +
+                    (WholeSceneNoOcclusion
+                        ? ". Culling compositions whose view is the FEED'S resolution now run WITHOUT " +
+                          "occlusion culling — no HiZ test, no shared LastVisibleFrame classifier. " +
+                          "Player compositions untouched by construction (argument-derived, per call)."
+                        : ". Feed compositions occlusion-cull normally again."));
 
             var hzboWas = WholeSceneNoHzbo;
             WholeSceneNoHzbo = Bool(kv, "wholeSceneNoHzbo", WholeSceneNoHzbo);

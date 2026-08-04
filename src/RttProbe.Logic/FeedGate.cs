@@ -97,7 +97,7 @@ internal static class FeedGate
         //
         // Failing CLOSED is the right default besides: if the marker cannot be read we stay
         // paused, because the marker's whole purpose is "do not touch GPU resources now".
-        try { _paused = File.Exists(PausePath); }
+        try { _paused = FileWatch.Exists(PausePath); }
         catch { _paused = true; }
     }
 
@@ -107,7 +107,15 @@ internal static class FeedGate
         $"teardownIn={_teardownIn}";
 
     // Called from CameraFeed whenever a panel carrying the tag is seen ticking.
-    public static void NotePanelAlive() => _lastPanelMs = Clock.Ms;
+    public static void NotePanelAlive()
+    {
+        _lastPanelMs = Clock.Ms;
+        // The SESSION'S first panel tick starts the load-settling grace period — see
+        // CameraFeed.EffectiveIdleMs. Session-first deliberately, not cycle-first: the grace
+        // exists for the post-load window only, and a panel that dies mid-play must still
+        // expire on the normal 1.5 s window.
+        if (CameraFeed.FirstPanelTickMs == 0) CameraFeed.FirstPanelTickMs = _lastPanelMs;
+    }
 
     // Safe from ANY hook, on any thread. It only flips a bool and arms a countdown; it
     // never touches a GPU resource.
@@ -196,7 +204,7 @@ internal static class FeedGate
         // Draw is recording has caused several of tonight's crashes, and a dormant mod
         // has nothing in flight to land on.
         bool paused = false;
-        try { paused = File.Exists(PausePath); } catch { }
+        try { paused = FileWatch.Exists(PausePath); } catch { }
         if (paused != _paused)
         {
             _paused = paused;
@@ -285,9 +293,20 @@ internal static class FeedGate
         // signature — switching one feed off must not quiesce the whole mod, and the point
         // of the lever is to exercise exactly the "one of N goes away" contract that a
         // destroyed panel exercises, repeatably and without grinding a block down.
+        // PAUSE-AWARE (2026-08-03): judge panel silence against the SIM, not the wall clock.
+        // This is the same rule as CameraFeed.ExpireClaims, and it is the crash fix for the
+        // settings-menu / exit / load-save CTD family: the wall-clock window read a pause as
+        // "panel destroyed", tore the feed down under peak load, and the teardown removed
+        // the device. While the sim is not ticking, the gate HOLDS its current state; when a
+        // stall ends, the panel gets a fresh idle window before silence can mean dormancy.
+        bool panelFresh = _lastPanelMs != 0
+                          && (now - CameraFeed.EffectiveStamp(_lastPanelMs))
+                             < CameraFeed.EffectiveIdleMs(FeedConfig.PanelIdleMs);
+        if (!panelFresh && _active && !CameraFeed.SimTickingNow)
+            panelFresh = true;                     // sim is stalled: silence is not death
         bool alive = !_paused && !_quiesceRebuild
                      && !FeedConfig.IsFeedDisabled(Feeds.Cur.Id)
-                     && _lastPanelMs != 0 && (now - _lastPanelMs) < FeedConfig.PanelIdleMs;
+                     && panelFresh;
         if (alive == _active) return;
 
         _active = alive;
@@ -501,7 +520,10 @@ internal static class FeedGate
     // reads, or a pass already in flight can be handed a disposed resource. Every step is
     // independently guarded, because a shutdown that throws half way through is worse
     // than either state.
-    private static void Shutdown()
+    // Internal rather than private since the hot-reload handover needs it: on reload the
+    // gate is still ACTIVE, so no normal path would ever call this, and the resources it
+    // disposes would be abandoned with the assembly. See WholeSceneRender.ReloadHandover.
+    internal static void Shutdown()
     {
         // IS THIS THE LAST FEED OUT? (phase F2)
         //

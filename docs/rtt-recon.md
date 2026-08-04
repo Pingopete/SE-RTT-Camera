@@ -1,6 +1,6 @@
-# SE2 render-to-texture reconnaissance
+﻿# SE2 render-to-texture reconnaissance
 
-Generated from `D:\SteamLibrary\steamapps\common\SpaceEngineers2\Game2`.
+Generated from `E:\SteamLibrary\steamapps\common\SpaceEngineers2\Game2`.
 
 Question this answers: can a second camera render the 3D scene into an
 offscreen target that we can blit onto an LCD panel?
@@ -13,7 +13,7 @@ Every method that calls `CreateOffscreenTarget`, `Borrow`, or reads
 
 **13 call sites.**
 
-### `Game2.Client: Keen.Game2.Client.WorldObjects.CubeBlocks.Render.Lcd.LcdPanelSurfaceRenderComponent.TransitionToCustomRender` — borrows+reads-handle
+### `Game2.Client: Keen.Game2.Client.WorldObjects.CubeBlocks.Render.Lcd.LcdPanelSurfaceRenderComponent.TransitionToCustomRender` â€” borrows+reads-handle
 
 ```
   LcdMultiPanelComponent.GetSurfaceState
@@ -31,7 +31,7 @@ Every method that calls `CreateOffscreenTarget`, `Borrow`, or reads
   LcdPanelSurfaceRenderComponent.UpdateMaterialReplacements
 ```
 
-### `Game2.Client: Keen.Game2.Client.WorldObjects.CubeBlocks.Render.Lcd.LcdRenderTargetPoolSessionComponent.Borrow` — creates
+### `Game2.Client: Keen.Game2.Client.WorldObjects.CubeBlocks.Render.Lcd.LcdRenderTargetPoolSessionComponent.Borrow` â€” creates
 
 ```
   LcdRenderTargetPoolSessionComponent.EstimateBytes
@@ -41,7 +41,7 @@ Every method that calls `CreateOffscreenTarget`, `Borrow`, or reads
   RenderContracts.CreateOffscreenTarget
 ```
 
-### `Game2.Client: Keen.Game2.Client.WorldObjects.CubeBlocks.Render.Lcd.LcdRenderTargetPoolSessionComponent.Return` — takes-rt-param
+### `Game2.Client: Keen.Game2.Client.WorldObjects.CubeBlocks.Render.Lcd.LcdRenderTargetPoolSessionComponent.Return` â€” takes-rt-param
 
 ```
   LcdRenderTargetPoolSessionComponent.EstimateBytes
@@ -49,7 +49,7 @@ Every method that calls `CreateOffscreenTarget`, `Borrow`, or reads
   LcdRenderTargetPoolSessionComponent.PublishStats
 ```
 
-### `VRage.Render12: Keen.VRage.Render12.UIStage.OffscreenUIRenderer.DrawOne` — takes-rt-param
+### `VRage.Render12: Keen.VRage.Render12.UIStage.OffscreenUIRenderer.DrawOne` â€” takes-rt-param
 
 ```
   OffscreenRenderTargetComponent.get_Handle
@@ -76,7 +76,7 @@ Every method that calls `CreateOffscreenTarget`, `Borrow`, or reads
   ProfilingScope.Dispose
 ```
 
-### `VRage.Render12: Keen.VRage.Render12.Utils.OffscreenTargetManager.EnqueueTakingScreenshotToMemory` — takes-rt-param
+### `VRage.Render12: Keen.VRage.Render12.Utils.OffscreenTargetManager.EnqueueTakingScreenshotToMemory` â€” takes-rt-param
 
 ```
   CoreSystems.AssertRenderThread
@@ -84,7 +84,7 @@ Every method that calls `CreateOffscreenTarget`, `Borrow`, or reads
   Assert.True
 ```
 
-### `VRage.Render12: Keen.VRage.Render12.Utils.OffscreenTargetManager.RegisterOffscreenTexture` — takes-rt-param
+### `VRage.Render12: Keen.VRage.Render12.Utils.OffscreenTargetManager.RegisterOffscreenTexture` â€” takes-rt-param
 
 ```
   CoreSystems.AssertRenderThread
@@ -92,20 +92,20 @@ Every method that calls `CreateOffscreenTarget`, `Borrow`, or reads
   Assert.True
 ```
 
-### `VRage.Render12: Keen.VRage.Render12.Utils.OffscreenTargetManager.TryDequeueNextRenderRequest` — takes-rt-param
+### `VRage.Render12: Keen.VRage.Render12.Utils.OffscreenTargetManager.TryDequeueNextRenderRequest` â€” takes-rt-param
 
 ```
   CoreSystems.AssertRenderThread
 ```
 
-### `VRage.Render12: Keen.VRage.Render12.Utils.OffscreenTargetManager.TryDequeueWork` — takes-rt-param
+### `VRage.Render12: Keen.VRage.Render12.Utils.OffscreenTargetManager.TryDequeueWork` â€” takes-rt-param
 
 ```
   LoadingMonitor.get_LoadingCount
   CollectionExtensions.First
 ```
 
-### `VRage.Render12: Keen.VRage.Render12.Utils.OffscreenTargetManager.UnregisterOffscreenTexture` — takes-rt-param
+### `VRage.Render12: Keen.VRage.Render12.Utils.OffscreenTargetManager.UnregisterOffscreenTexture` â€” takes-rt-param
 
 ```
   CoreSystems.AssertRenderThread
@@ -113,7 +113,7 @@ Every method that calls `CreateOffscreenTarget`, `Borrow`, or reads
   Assert.True
 ```
 
-### `VRage.Render: Keen.VRage.Render.Contracts.UISystem.CreateImmediateBatchFor` — takes-rt-param
+### `VRage.Render: Keen.VRage.Render.Contracts.UISystem.CreateImmediateBatchFor` â€” takes-rt-param
 
 ```
   Singleton`1.get_Instance
@@ -124,7 +124,7 @@ Every method that calls `CreateOffscreenTarget`, `Borrow`, or reads
   ImmediateDrawBatch.Init
 ```
 
-### `VRage.Render: Keen.VRage.Render.Contracts.UISystem.CreatePersistentBatchFor` — takes-rt-param
+### `VRage.Render: Keen.VRage.Render.Contracts.UISystem.CreatePersistentBatchFor` â€” takes-rt-param
 
 ```
   Singleton`1.get_Instance
@@ -136,12 +136,12 @@ Every method that calls `CreateOffscreenTarget`, `Borrow`, or reads
   PersistentDrawBatch.Init
 ```
 
-### `VRage.Render: Keen.VRage.Render.OutputContracts.RenderOutputManager.add_OnScreenshotToMemoryTaken` — takes-rt-param
+### `VRage.Render: Keen.VRage.Render.OutputContracts.RenderOutputManager.add_OnScreenshotToMemoryTaken` â€” takes-rt-param
 
 ```
 ```
 
-### `VRage.Render: Keen.VRage.Render.OutputContracts.RenderOutputManager.remove_OnScreenshotToMemoryTaken` — takes-rt-param
+### `VRage.Render: Keen.VRage.Render.OutputContracts.RenderOutputManager.remove_OnScreenshotToMemoryTaken` â€” takes-rt-param
 
 ```
 ```
@@ -406,7 +406,7 @@ VRage.Render12     int Keen.VRage.Render12.SceneSystem.Jobs.RenderUpdateOrder/Fl
   int Void .cctor()
 ```
 
-### `RenderCameraComponent` — not found
+### `RenderCameraComponent` â€” not found
 
 ### `Keen.Game2.Client.GameSystems.CameraSystems.CameraSystemComponent`
 
@@ -763,7 +763,7 @@ VRage.Render12     int Keen.VRage.Render12.SceneSystem.Jobs.RenderUpdateOrder/Fl
 
 IL of the UI recorder's texture-handle classification. A generated
 (render-target) handle must not fall into the file-backed content-cache
-path — that throws inside the render thread's replay, which crashes.
+path â€” that throws inside the render thread's replay, which crashes.
 
 ### `VRage.Render: Keen.VRage.Render.Contracts.ImmediateDrawBatch.DrawImage`
 
@@ -776,7 +776,7 @@ path — that throws inside the render thread's replay, which crashes.
   ldarg.s        ignoreBounds
   ldarg.s        maskTexture
   ldarg.s        sourceRectangle
-  callvirt       System.Void Keen.VRage.Render.FrameData.RenderDrawCommandBuffer::IDrawBatch_DrawImage(Keen.VRage.Library.Utils.ResourceHandle,Keen.VRage.Library.Mathe…
+  callvirt       System.Void Keen.VRage.Render.FrameData.RenderDrawCommandBuffer::IDrawBatch_DrawImage(Keen.VRage.Library.Utils.ResourceHandle,Keen.VRage.Library.Matheâ€¦
   ret            
 ```
 
@@ -794,7 +794,7 @@ path — that throws inside the render thread's replay, which crashes.
   ldarg.s        rotationSpeed
   ldarg.s        maskTexture
   ldarg.s        sourceRectangle
-  callvirt       System.Void Keen.VRage.Render.FrameData.RenderDrawCommandBuffer::IDrawBatch_DrawImageExt(Keen.VRage.Library.Utils.ResourceHandle,Keen.VRage.Library.Ma…
+  callvirt       System.Void Keen.VRage.Render.FrameData.RenderDrawCommandBuffer::IDrawBatch_DrawImageExt(Keen.VRage.Library.Utils.ResourceHandle,Keen.VRage.Library.Maâ€¦
   ret            
 ```
 
@@ -809,7 +809,7 @@ path — that throws inside the render thread's replay, which crashes.
   ldarg.s        ignoreBounds
   ldarg.s        maskTexture
   ldarg.s        sourceRectangle
-  callvirt       System.Void Keen.VRage.Render.FrameData.RenderDrawCommandBuffer::IDrawBatch_DrawImage(Keen.VRage.Library.Utils.ResourceHandle,Keen.VRage.Library.Mathe…
+  callvirt       System.Void Keen.VRage.Render.FrameData.RenderDrawCommandBuffer::IDrawBatch_DrawImage(Keen.VRage.Library.Utils.ResourceHandle,Keen.VRage.Library.Matheâ€¦
   ret            
 ```
 
@@ -827,7 +827,7 @@ path — that throws inside the render thread's replay, which crashes.
   ldarg.s        rotationSpeed
   ldarg.s        maskTexture
   ldarg.s        sourceRectangle
-  callvirt       System.Void Keen.VRage.Render.FrameData.RenderDrawCommandBuffer::IDrawBatch_DrawImageExt(Keen.VRage.Library.Utils.ResourceHandle,Keen.VRage.Library.Ma…
+  callvirt       System.Void Keen.VRage.Render.FrameData.RenderDrawCommandBuffer::IDrawBatch_DrawImageExt(Keen.VRage.Library.Utils.ResourceHandle,Keen.VRage.Library.Maâ€¦
   ret            
 ```
 
@@ -842,9 +842,9 @@ path — that throws inside the render thread's replay, which crashes.
   ldc.i4         236
   call           System.Void Keen.VRage.Library.Diagnostics.Assert::True(System.Boolean,System.String,System.String,System.String,System.Int32)
   ldarg.0        
-  ldfld          Keen.VRage.Render12.Resources.ManagedResources.ManagedTextureManagerComponent Keen.VRage.Render12.SceneSystem.Components.UISystemComponent::_managedTe…
+  ldfld          Keen.VRage.Render12.Resources.ManagedResources.ManagedTextureManagerComponent Keen.VRage.Render12.SceneSystem.Components.UISystemComponent::_managedTeâ€¦
   ldarg.1        
-  callvirt       Keen.VRage.Render12.Resources.ManagedResources.IManagedTexture Keen.VRage.Render12.Resources.ManagedResources.ManagedTextureManagerComponent::GetTextu…
+  callvirt       Keen.VRage.Render12.Resources.ManagedResources.IManagedTexture Keen.VRage.Render12.Resources.ManagedResources.ManagedTextureManagerComponent::GetTextuâ€¦
   ret            
 ```
 
@@ -852,7 +852,7 @@ path — that throws inside the render thread's replay, which crashes.
 
 ```
   ldarg.0        
-  call           !!1 Keen.VRage.Library.Extensions.ResourceHandleExtensions::GetMetadata<Keen.VRage.Library.Utils.ResourceHandle,Keen.VRage.Core.Utils.GraphicsMetadata…
+  call           !!1 Keen.VRage.Library.Extensions.ResourceHandleExtensions::GetMetadata<Keen.VRage.Library.Utils.ResourceHandle,Keen.VRage.Core.Utils.GraphicsMetadataâ€¦
   ldfld          Keen.VRage.Core.Utils.GraphicsMetadata/GraphicsTypeEnum Keen.VRage.Core.Utils.GraphicsMetadata::GraphicsType
   stloc.0        
   leave.s        IL_003e: ldloc.0
@@ -902,7 +902,7 @@ path — that throws inside the render thread's replay, which crashes.
   ldc.r4         0
   ldarg.s        maskTexture
   ldarg.s        sourceRectangle
-  call           System.Void Keen.VRage.Render12.SceneSystem.Components.UISystemComponent/UIBatchRecorder::DrawImageExt(Keen.VRage.Library.Utils.ResourceHandle,Keen.VR…
+  call           System.Void Keen.VRage.Render12.SceneSystem.Components.UISystemComponent/UIBatchRecorder::DrawImageExt(Keen.VRage.Library.Utils.ResourceHandle,Keen.VRâ€¦
   ret            
 ```
 
@@ -938,7 +938,7 @@ path — that throws inside the render thread's replay, which crashes.
   ldarg.0        
   ldfld          Keen.VRage.Render.CoreConfigurations.RenderConfiguration Keen.VRage.Render12.SceneSystem.Components.UISystemComponent/UIBatchRecorder::_renderConfig
   callvirt       System.Boolean Keen.VRage.Render.CoreConfigurations.RenderConfiguration::get_AnyResourceErrorFatal()
-  call           Keen.VRage.Core.Utils.GraphicsMetadata/GraphicsTypeEnum Keen.VRage.Render12.SceneSystem.Components.UISystemComponent::TryExtractGraphicsType(Keen.VRag…
+  call           Keen.VRage.Core.Utils.GraphicsMetadata/GraphicsTypeEnum Keen.VRage.Render12.SceneSystem.Components.UISystemComponent::TryExtractGraphicsType(Keen.VRagâ€¦
   stloc.1        
   ldloc.1        
   switch         Mono.Cecil.Cil.Instruction[]
@@ -951,11 +951,11 @@ path — that throws inside the render thread's replay, which crashes.
   ldsfld         Keen.VRage.Render12.Resources.ManagedResources.ManagedTextureManagerComponent Keen.VRage.Render12.Core.CoreSystems::ManagedTextures
   ldarga.s       maskTexture
   call           !0 System.Nullable`1<Keen.VRage.Library.Utils.ResourceHandle>::get_Value()
-  callvirt       Keen.VRage.Render12.Resources.ManagedResources.IManagedTexture Keen.VRage.Render12.Resources.ManagedResources.ManagedTextureManagerComponent::GetTextu…
+  callvirt       Keen.VRage.Render12.Resources.ManagedResources.IManagedTexture Keen.VRage.Render12.Resources.ManagedResources.ManagedTextureManagerComponent::GetTextuâ€¦
   stloc.3        
   ldsfld         Keen.VRage.Render12.Resources.ManagedResources.ManagedTextureManagerComponent Keen.VRage.Render12.Core.CoreSystems::ManagedTextures
   ldarg.1        
-  callvirt       Keen.VRage.Render12.Resources.ManagedResources.IManagedTexture Keen.VRage.Render12.Resources.ManagedResources.ManagedTextureManagerComponent::GetTextu…
+  callvirt       Keen.VRage.Render12.Resources.ManagedResources.IManagedTexture Keen.VRage.Render12.Resources.ManagedResources.ManagedTextureManagerComponent::GetTextuâ€¦
   stloc.s        V_4
   ldarg.0        
   ldfld          Keen.VRage.Render12.UIStage.BatchBase.UIBatcher Keen.VRage.Render12.SceneSystem.Components.UISystemComponent/UIBatchRecorder::_uiBatcher
@@ -963,7 +963,7 @@ path — that throws inside the render thread's replay, which crashes.
   ldarg.s        ignoreBounds
   ldc.i4.1       
   ldloc.3        
-  callvirt       Keen.VRage.Render12.UIStage.Sprites.SpriteBatch Keen.VRage.Render12.UIStage.BatchBase.UIBatcher::GetSpriteBatch(Keen.VRage.Render12.Resources.ManagedR…
+  callvirt       Keen.VRage.Render12.UIStage.Sprites.SpriteBatch Keen.VRage.Render12.UIStage.BatchBase.UIBatcher::GetSpriteBatch(Keen.VRage.Render12.Resources.ManagedRâ€¦
   ldarg.3        
   ldarg.s        rotationPivot
   ldloc.0        
@@ -971,7 +971,7 @@ path — that throws inside the render thread's replay, which crashes.
   ldobj          System.Nullable`1<Keen.VRage.Library.Mathematics.BoundingBox2I>
   ldarg.2        
   ldobj          Keen.VRage.Library.Mathematics.BoundingBox2
-  callvirt       System.Void Keen.VRage.Render12.UIStage.Sprites.SpriteBatch::Add(Keen.VRage.Library.Mathematics.ColorSRGB,Keen.VRage.Library.Mathematics.Vector2,Keen.…
+  callvirt       System.Void Keen.VRage.Render12.UIStage.Sprites.SpriteBatch::Add(Keen.VRage.Library.Mathematics.ColorSRGB,Keen.VRage.Library.Mathematics.Vector2,Keen.â€¦
   ret            
   ldarga.s       maskTexture
   call           System.Boolean System.Nullable`1<Keen.VRage.Library.Utils.ResourceHandle>::get_HasValue()
@@ -993,7 +993,7 @@ path — that throws inside the render thread's replay, which crashes.
   call           System.Void Keen.VRage.Library.Diagnostics.Assert::True(System.Boolean,System.String,System.String,System.String,System.Int32)
   ldsfld         Keen.VRage.Render12.UIStage.Vectors.VectorImageManager Keen.VRage.Render12.Core.CoreSystems::VectorImages
   ldarg.1        
-  callvirt       Keen.VRage.Render12.UIStage.Vectors.VectorImage Keen.VRage.Render12.UIStage.Vectors.VectorImageManager::GetVectorImage(Keen.VRage.Library.Utils.Resour…
+  callvirt       Keen.VRage.Render12.UIStage.Vectors.VectorImage Keen.VRage.Render12.UIStage.Vectors.VectorImageManager::GetVectorImage(Keen.VRage.Library.Utils.Resourâ€¦
   stloc.s        V_5
   ldloc.s        V_5
   callvirt       System.Boolean Keen.VRage.Render12.UIStage.Vectors.VectorImage::get_IsLoadedSuccessful()
@@ -1002,13 +1002,13 @@ path — that throws inside the render thread's replay, which crashes.
   ldfld          Keen.VRage.Render12.UIStage.BatchBase.UIBatcher Keen.VRage.Render12.SceneSystem.Components.UISystemComponent/UIBatchRecorder::_uiBatcher
   ldloc.s        V_5
   ldarg.s        ignoreBounds
-  callvirt       Keen.VRage.Render12.UIStage.Vectors.VectorImageBatch Keen.VRage.Render12.UIStage.BatchBase.UIBatcher::GetVectorImageBatch(Keen.VRage.Render12.UIStage.…
+  callvirt       Keen.VRage.Render12.UIStage.Vectors.VectorImageBatch Keen.VRage.Render12.UIStage.BatchBase.UIBatcher::GetVectorImageBatch(Keen.VRage.Render12.UIStage.â€¦
   ldarg.3        
   ldarg.s        rotationPivot
   ldloc.0        
   ldarg.2        
   ldobj          Keen.VRage.Library.Mathematics.BoundingBox2
-  callvirt       System.Void Keen.VRage.Render12.UIStage.Vectors.VectorImageBatch::Add(Keen.VRage.Library.Mathematics.ColorSRGB,Keen.VRage.Library.Mathematics.Vector2,…
+  callvirt       System.Void Keen.VRage.Render12.UIStage.Vectors.VectorImageBatch::Add(Keen.VRage.Library.Mathematics.ColorSRGB,Keen.VRage.Library.Mathematics.Vector2,â€¦
   ret            
   ldloca.s       V_6
   ldc.i4.s       32
@@ -1019,7 +1019,7 @@ path — that throws inside the render thread's replay, which crashes.
   call           System.Void System.Runtime.CompilerServices.DefaultInterpolatedStringHandler::AppendLiteral(System.String)
   ldloca.s       V_6
   ldloc.1        
-  call           System.Void System.Runtime.CompilerServices.DefaultInterpolatedStringHandler::AppendFormatted<Keen.VRage.Core.Utils.GraphicsMetadata/GraphicsTypeEnum>…
+  call           System.Void System.Runtime.CompilerServices.DefaultInterpolatedStringHandler::AppendFormatted<Keen.VRage.Core.Utils.GraphicsMetadata/GraphicsTypeEnum>â€¦
   ldloca.s       V_6
   ldstr           is not supported.
   call           System.Void System.Runtime.CompilerServices.DefaultInterpolatedStringHandler::AppendLiteral(System.String)
@@ -1032,7 +1032,7 @@ path — that throws inside the render thread's replay, which crashes.
 
 ## 6. View / viewport / pass / frame-graph types
 
-Candidates for a second scene view. Names only — the shortlist gets a
+Candidates for a second scene view. Names only â€” the shortlist gets a
 full dump on the next pass once we know which are real.
 
 ```
@@ -1203,7 +1203,7 @@ prop   Keen.VRage.Render12.Core.Systems.SettingsManager.RenderView setter=none
 
 ## 8. Frame structure
 
-### `Keen.VRage.Render12.EngineComponents.Render12EngineComponent.RenderFrame` — call sequence
+### `Keen.VRage.Render12.EngineComponents.Render12EngineComponent.RenderFrame` â€” call sequence
 
 ```
   call Render12EngineComponent.get_Conc
@@ -1386,7 +1386,7 @@ prop   Keen.VRage.Render12.Core.Systems.SettingsManager.RenderView setter=none
   call ProfilingScope.Dispose
 ```
 
-### `Keen.VRage.Render12.Core.Contracts.ContractsProcessor.ProcessRenderFrame` — call sequence
+### `Keen.VRage.Render12.Core.Contracts.ContractsProcessor.ProcessRenderFrame` â€” call sequence
 
 ```
   call Profiler.Begin
@@ -1416,7 +1416,7 @@ prop   Keen.VRage.Render12.Core.Systems.SettingsManager.RenderView setter=none
   call ProfilingScope.Dispose
 ```
 
-### `Keen.VRage.Render12.Primitives.Frame.CameraSettings.EnableCompositeRenderView` — call sequence
+### `Keen.VRage.Render12.Primitives.Frame.CameraSettings.EnableCompositeRenderView` â€” call sequence
 
 ```
 ```
@@ -1527,7 +1527,7 @@ Keen.Game2.Simulation.GameSystems.Missions.MissionPostprocessor..ctor  field  _b
 ## 11. Scene draw stages
 
 Types in the Render12 stage namespaces, with any method that takes a
-view or a target — the signature that a second pass would need.
+view or a target â€” the signature that a second pass would need.
 
 ```
 Keen.VRage.Render12.UIStage.MainUISystem
@@ -1675,7 +1675,7 @@ Keen.VRage.Render12.Core.Systems.ScreenBuffers
     set_FinalLDRPlaceholder(ResizableRWRenderTargetTexture value)
 ```
 
-## 12. Environment probes — the only arbitrary-viewpoint scene render
+## 12. Environment probes â€” the only arbitrary-viewpoint scene render
 
 ### `Keen.VRage.Render12.LightingStage.EnvironmentProbeManager`
 
@@ -1713,9 +1713,9 @@ Keen.VRage.Render12.Core.Systems.ScreenBuffers
   pub Void .ctor()
 ```
 
-### `EnvironmentProbeComponent` — not found
+### `EnvironmentProbeComponent` â€” not found
 
-### `EnvironmentProbeEntity` — not found
+### `EnvironmentProbeEntity` â€” not found
 
 ### Probe references from outside VRage.Render12
 
@@ -2448,7 +2448,7 @@ Keen.VRage.Render12.Core.Systems.CommonResources.WeatherModifiersCullingContext.
 
 Methods that bind render targets (`OMSetRenderTargets` /
 `SetRenderTargets` / `ClearRenderTargetView`) and where the target
-value originates — parameter, field, or frame-global.
+value originates â€” parameter, field, or frame-global.
 
 ```
 WaterShadingJob.DoWaterStochastic  fromParam=True
@@ -2518,7 +2518,7 @@ DirectCommandList.PrepareDraw  fromParam=False
   pub Boolean ReadyToTakeScreenshot()
 ```
 
-### `GBuffer` — not found
+### `GBuffer` â€” not found
 
 ### Fields typed ScreenBuffers
 
@@ -2526,7 +2526,7 @@ DirectCommandList.PrepareDraw  fromParam=False
 Keen.VRage.Render12.Core.CoreSystems.ScreenBuffers static
 ```
 
-## 20. RenderCommandBuffer — what can be sent to the renderer
+## 20. RenderCommandBuffer â€” what can be sent to the renderer
 
 ### `Keen.VRage.Render.FrameData.RenderCommandBuffer`
 
@@ -2619,7 +2619,7 @@ Keen.VRage.Render12.Core.CoreSystems.ScreenBuffers static
   pub Void IDrawBatch_ScissorPop()
 ```
 
-## 21. CoreSystems — the swappable globals
+## 21. CoreSystems â€” the swappable globals
 
 ```
   int static field TimeSpan _disposeTimeout
@@ -2779,7 +2779,7 @@ Keen.VRage.Render12.Core.CoreSystems.ScreenBuffers static
 
 ## 22. What orchestrates the scene draw
 
-Methods that touch three or more distinct render stages — the
+Methods that touch three or more distinct render stages â€” the
 orchestrators, whatever they are called.
 
 ```
@@ -2934,7 +2934,7 @@ Locals: 25, instructions: 316
   ldstr          EnvProbe_Render
   ldc.i4.0       
   ldc.i4         185
-  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Scene…
+  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Sceneâ€¦
   call           Profiler.Begin
   stloc.0        
   ldarg.1        
@@ -2944,7 +2944,7 @@ Locals: 25, instructions: 316
   ldstr          Setup
   ldc.i4.0       
   ldc.i4         188
-  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Scene…
+  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Sceneâ€¦
   call           Profiler.Begin
   stloc.2        
   ldarg.1        
@@ -3090,7 +3090,7 @@ Locals: 25, instructions: 316
   callvirt       OutputGeometryBufferContext.Return
   ldarg.0        
   call           SceneDrawSystem.get_Is3DMapEnabled
-  brtrue.s       IL_028a: ldsfld Keen.VRage.Render12.Resources.BindableTextures.BindableTexturePoolManager Keen.VRage.Render12.…
+  brtrue.s       IL_028a: ldsfld Keen.VRage.Render12.Resources.BindableTextures.BindableTexturePoolManager Keen.VRage.Render12.â€¦
   ldarg.0        
   ldfld          SceneDrawSystem._indirectPlanetEnvironmentJob : IndirectPlanetEnvironmentJob
   ldarg.1        
@@ -3127,7 +3127,7 @@ Locals: 25, instructions: 316
   ldstr          EnvProbe_MipMapGeneration
   ldc.i4.0       
   ldc.i4         266
-  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Scene…
+  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Sceneâ€¦
   call           Profiler.Begin
   stloc.s        V_16
   ldarg.1        
@@ -3161,7 +3161,7 @@ Locals: 25, instructions: 316
   ldstr          EnvProbe_PreFiltering
   ldc.i4.0       
   ldc.i4         279
-  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Scene…
+  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Sceneâ€¦
   call           Profiler.Begin
   stloc.s        V_19
   ldarg.1        
@@ -3196,7 +3196,7 @@ Locals: 25, instructions: 316
   ldstr          EnvProbe_Blending
   ldc.i4.0       
   ldc.i4         293
-  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Scene…
+  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Sceneâ€¦
   call           Profiler.Begin
   stloc.s        V_22
   ldarg.1        
@@ -3251,7 +3251,7 @@ Locals: 17, instructions: 277
   ldstr          ShadowCascade
   ldc.i4.0       
   ldc.i4         524
-  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Scene…
+  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Sceneâ€¦
   call           Profiler.Begin
   stloc.2        
   ldarg.1        
@@ -3310,7 +3310,7 @@ Locals: 17, instructions: 277
   ldstr          CascadeCulling[FirstPass]
   ldc.i4.0       
   ldc.i4         539
-  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Scene…
+  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Sceneâ€¦
   call           Profiler.Begin
   stloc.s        V_9
   ldarg.1        
@@ -3391,11 +3391,11 @@ Locals: 17, instructions: 277
   ldsfld         CoreSystems.Settings : SettingsManager
   callvirt       SettingsManager.get_HZBO
   ldfld          HZBOSettings.Enabled : Boolean
-  brfalse        IL_0312: ldsfld Keen.VRage.Render12.Core.Systems.DrawContextManager Keen.VRage.Render12.Core.CoreSystems::Draw…
+  brfalse        IL_0312: ldsfld Keen.VRage.Render12.Core.Systems.DrawContextManager Keen.VRage.Render12.Core.CoreSystems::Drawâ€¦
   ldsfld         CoreSystems.Settings : SettingsManager
   callvirt       SettingsManager.get_HZBO
   ldfld          HZBOSettings.CascadesEnabled : Boolean
-  brfalse        IL_0312: ldsfld Keen.VRage.Render12.Core.Systems.DrawContextManager Keen.VRage.Render12.Core.CoreSystems::Draw…
+  brfalse        IL_0312: ldsfld Keen.VRage.Render12.Core.Systems.DrawContextManager Keen.VRage.Render12.Core.CoreSystems::Drawâ€¦
   ldloca.s       V_10
   ldstr          Cascades HiZBuffer
   call           BlockScope.BeginNextBlock
@@ -3484,14 +3484,14 @@ Locals: 17, instructions: 277
   ldloca.s       V_0
   call           Enumerator.MoveNext
   brtrue         IL_0034: ldloca.s V_0
-  leave.s        IL_036c: ldsfld Keen.VRage.Render12.Core.Systems.SettingsManager Keen.VRage.Render12.Core.CoreSystems::Setting…
+  leave.s        IL_036c: ldsfld Keen.VRage.Render12.Core.Systems.SettingsManager Keen.VRage.Render12.Core.CoreSystems::Settingâ€¦
   ldloca.s       V_0
   call           Enumerator.Dispose
   ldsfld         CoreSystems.Settings : SettingsManager
   callvirt       SettingsManager.get_Shadow
   ldfld          ShadowSettings.DirectionalLight : DirectionalLightSettings
   ldfld          DirectionalLightSettings.EnableCascadeMerging : Boolean
-  brfalse.s      IL_038e: ldsfld Keen.VRage.Render12.Core.Systems.DrawContextManager Keen.VRage.Render12.Core.CoreSystems::Draw…
+  brfalse.s      IL_038e: ldsfld Keen.VRage.Render12.Core.Systems.DrawContextManager Keen.VRage.Render12.Core.CoreSystems::Drawâ€¦
   ldarg.0        
   ldfld          SceneDrawSystem._cascadeShadowsMergeJob : CascadeShadowsMergeJob
   ldarg.1        
@@ -3513,7 +3513,7 @@ Locals: 3, instructions: 62
   ldstr          UnlitPass
   ldc.i4.0       
   ldc.i4         700
-  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Scene…
+  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\Core\Systems\Sceneâ€¦
   call           Profiler.Begin
   stloc.0        
   ldarg.1        
@@ -3650,7 +3650,7 @@ Locals: 18, instructions: 388
   ldloca.s       V_8
   initobj        Render
   ldloc.s        V_8
-  br.s           IL_00f7: newobj System.Void System.Nullable`1<Keen.VRage.Render12.LightingStage.EnvironmentProbeManager/Render…
+  br.s           IL_00f7: newobj System.Void System.Nullable`1<Keen.VRage.Render12.LightingStage.EnvironmentProbeManager/Renderâ€¦
   ldarg.0        
   ldloc.s        V_6
   ldarg.0        
@@ -3902,7 +3902,7 @@ Locals: 18, instructions: 388
   ldc.i4         128
   ldnull         
   ldstr          _state < MAX_STATE_COUNT
-  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\LightingStage\Envi…
+  ldstr          C:\BuildAgent\work\e958cd452eaeb7c\KeenSWH\Stable_VS2.3\VRage\Sources\Render\VRage.Render12\LightingStage\Enviâ€¦
   ldc.i4         174
   call           Assert.True
   ldarg.0        
@@ -4172,9 +4172,9 @@ _traceChannel                      <- CoreSystems.Initialize
   int Void DisposeContexts()
 ```
 
-### `DrawContext` — not found
+### `DrawContext` â€” not found
 
-## 28. Route B — GPU readback to a file-backed texture
+## 28. Route B â€” GPU readback to a file-backed texture
 
 `DrawImage` rejects generated (render-target) handles but accepts
 file-backed guid handles. So the frame has to leave the GPU, land on
@@ -4378,7 +4378,7 @@ VRage.Render12: Keen.VRage.Render12.SceneSystem.Components.OffscreenRenderTarget
 VRage.Render12: Keen.VRage.Render12.EngineComponents.Render12EngineComponent.SendScreenshotToUser  ->  ScreenshotToMemoryTaken
 ```
 
-### `OffscreenTargetManager.TryDequeueWork` — full IL
+### `OffscreenTargetManager.TryDequeueWork` â€” full IL
 
 ```
   ldsfld         Keen.VRage.Render12.Core.Systems.LoadingMonitor Keen.VRage.Render12.Core.CoreSystems::LoadingMonitor
@@ -4425,7 +4425,7 @@ VRage.Render12: Keen.VRage.Render12.EngineComponents.Render12EngineComponent.Sen
   ret            
 ```
 
-### `OffscreenTargetManager.TryDequeueNextRenderRequest` — full IL
+### `OffscreenTargetManager.TryDequeueNextRenderRequest` â€” full IL
 
 ```
   call           System.Void Keen.VRage.Render12.Core.CoreSystems::AssertRenderThread()
@@ -4466,7 +4466,7 @@ VRage.Render12: Keen.VRage.Render12.EngineComponents.Render12EngineComponent.Sen
 
 ## 31. What populates the offscreen render-request queue
 
-### `TryDequeueNextRenderRequest` — which field it drains
+### `TryDequeueNextRenderRequest` â€” which field it drains
 ```
   ldfld      OffscreenTargetManager._pendingRenderList : List`1
   ldfld      OffscreenTargetManager._pendingRenderList : List`1
@@ -4555,7 +4555,7 @@ VRage.Render12: Keen.VRage.Render12.Core.CoreSystems.Initialize  ->  .ctor
   Void OnResetContext()
 ```
 
-### `TonemappingJob` — not found
+### `TonemappingJob` â€” not found
 
 ### `Keen.VRage.Render12.PostProcessStage.ToneMappingJob`
 ```
@@ -4645,7 +4645,7 @@ Game2.Client: Keen.Game2.Client.WorldObjects.Character.ToggleStatByExposureDefin
   ScreenshotsManager.TakeRequestedScreenshots
 ```
 
-### `IndirectEnvironmentPassJob.DoWork` — what it draws
+### `IndirectEnvironmentPassJob.DoWork` â€” what it draws
 ```
   List`1.get_Count
   Assert.True
@@ -4863,7 +4863,7 @@ Calls, in order:
   ToneMappingJob.DoWork
   CopyJob.DoWork
   IDisposable.Dispose
-  === reads global ScreenBuffers: no — callable with our own textures
+  === reads global ScreenBuffers: no â€” callable with our own textures
 ```
 
 ### `SceneDrawSystem.ComputeExposure`
@@ -4884,7 +4884,7 @@ Calls, in order:
   EnvironmentProbeExposureJob.get_Exposure
   RenderOutputContracts.ExposureChanged
   IDisposable.Dispose
-  === reads global ScreenBuffers: no — callable with our own textures
+  === reads global ScreenBuffers: no â€” callable with our own textures
 ```
 
 ### `SceneDrawSystem.ApplyBloom`
@@ -4908,7 +4908,7 @@ Calls, in order:
   Borrowed`1.get_Resource
   DirectCommandList.ClearRenderTargetView
   IDisposable.Dispose
-  === reads global ScreenBuffers: no — callable with our own textures
+  === reads global ScreenBuffers: no â€” callable with our own textures
 ```
 
 ### `SceneDrawSystem.PatchHoles`
@@ -4923,7 +4923,7 @@ Calls, in order:
   ScreenBuffers.get_DepthStencilBuffer
   PatchHolesJob.DoJob
   IDisposable.Dispose
-  === reads global ScreenBuffers: YES — needs a buffer swap
+  === reads global ScreenBuffers: YES â€” needs a buffer swap
 ```
 
 ### `SceneDrawSystem.DrawSkybox`
@@ -4934,7 +4934,7 @@ Calls, in order:
   CopyCommandList.BeginBlock
   SkyboxMotionVectorsJob.DoWork
   IDisposable.Dispose
-  === reads global ScreenBuffers: no — callable with our own textures
+  === reads global ScreenBuffers: no â€” callable with our own textures
 ```
 
 ## 36. Resource state transitions
@@ -4970,7 +4970,7 @@ Calls, in order:
 ```
 ```
 
-### `OffscreenUIRenderer.DrawOne` — full call order
+### `OffscreenUIRenderer.DrawOne` â€” full call order
 ```
   OffscreenRenderTargetComponent.get_Handle
   OffscreenRenderTargetComponent.get_Resolution
@@ -5000,7 +5000,7 @@ Calls, in order:
   UIBatcher.EndDrawKeepBuffers
 ```
 
-## 37. AutoResourceState — how to get one from a texture
+## 37. AutoResourceState â€” how to get one from a texture
 
 ### `Keen.VRage.Render12.Resources.StateResolver.AutoResourceState`
 ```

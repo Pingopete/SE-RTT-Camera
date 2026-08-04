@@ -65,6 +65,22 @@ internal static class CameraFeed
     // dump now says so out loud instead of silently scanning against a wrong position.
     internal static Vector3D SubjectCentreCache;
 
+    // WHERE THE WORLD SHOULD BE RESIDENT — the one point every presence mechanism follows.
+    //
+    // SubjectCentreCache is the ORBIT ANCHOR. While the orbit flies the camera, the anchor and
+    // the camera are the same neighbourhood, so everything that materialises world content
+    // (the client marker, the server presence entity, the viewer-distance bubble) read the
+    // anchor and it was right by accident.
+    //
+    // MANUAL FLIGHT BREAKS THAT: the camera leaves the anchor and never comes back. Reported
+    // in game as "the whole spawned foliage area is locked and stationary — I can move the
+    // camera away and no new foliage spawns, and the original never gets removed." Exactly
+    // right: presence was still pinned to the anchor kilometres behind.
+    //
+    // So presence follows the CAMERA when we are flying it, and the anchor otherwise.
+    internal static Vector3D PresenceCentre
+        => CameraControl.Flying ? CameraControl.Position : SubjectCentreCache;
+
     // WHERE THE CAMERA ACTUALLY IS AND WHAT IT ACTUALLY LOOKS AT, for the residency cone.
     //
     // Every world-residency mechanism this project has built is OMNIDIRECTIONAL — the flora
@@ -279,12 +295,73 @@ internal static class CameraFeed
     // Called once per engine frame per slot from FeedGate.PumpOne; at most one expiry per
     // call, which keeps it allocation-free (the dictionary enumerator is a struct) and is
     // plenty — claims are counted in single digits.
+    // ---- PAUSE-AWARE LIVENESS (2026-08-03) --------------------------------------------
+    //
+    // THE CRASH CHAIN THIS BREAKS, read out of two sessions' logs (22:33 and 22:37):
+    // pause / settings menu / load stutter / a sim stall stops the LCD tick -> the
+    // wall-clock idle window read that silence as "panel destroyed" -> full feed teardown
+    // fired UNDER PEAK LOAD -> the teardown's material release and resource Reset hit a
+    // renderer mid-stress -> DXGI_ERROR_DEVICE_REMOVED ~2 s later. When that kill landed
+    // during an exit save, the save file tore — which is the "corrupted save" family.
+    //
+    // THE PRINCIPLE: a panel is only DEAD if the sim kept running and the panel still went
+    // silent. While the SIM ITSELF is not ticking, no panel can tick, and silence means
+    // nothing. So: (a) while the pump is stalled, liveness judgements are FROZEN, and
+    // (b) when a stall ends, every stamp gets a fresh idle window — judging pre-stall
+    // stamps by post-stall wall clock is exactly how a pause became a teardown.
+    //
+    // If the bootstrap predates the SimPumpHook, _pumpAliveMs stays 0 and everything below
+    // degrades to the old wall-clock behaviour rather than freezing forever.
+    private static long _pumpAliveMs, _stallEndedMs;
+
+    internal static void NotePumpAlive()
+    {
+        var now = Clock.Ms;
+        var prev = _pumpAliveMs;
+        _pumpAliveMs = now;
+        if (prev != 0 && now - prev > 1000)
+        {
+            _stallEndedMs = now;
+            RttLog.Line($"SIM PUMP: stall of {now - prev} ms ended (pause, menu, load or hitch) — every panel " +
+                        "gets a fresh idle window. Silence during a stall is not death.");
+        }
+    }
+
+    internal static bool SimTickingNow => _pumpAliveMs == 0 || Clock.Ms - _pumpAliveMs < 500;
+    internal static long EffectiveStamp(long stamp) => Math.Max(stamp, _stallEndedMs);
+
+    // ---- THE LOAD-SETTLING GRACE (the stall-freeze's second leg, 2026-08-03) ----------
+    //
+    // THE HOLE THE FIRST LEG LEFT, measured the same evening it shipped: during load the
+    // SIM PUMP keeps ticking — no >1000 ms gap, so the stall freeze sees nothing — while
+    // the LCD tick specifically is starved. Observed: the panel ticked once at world-up,
+    // then went silent for ~35 s of settling; the gate expired it at 1.5 s and ran a FULL
+    // TEARDOWN mid-load (17:51:54 — no crash that time, which was luck, and exactly the
+    // 22:37 crash with better weather).
+    //
+    // So for the first two minutes after the session's FIRST panel tick, the idle window is
+    // 60 s instead of 1.5 s. A truly dead panel at session start is held a little longer —
+    // costs a few wasted renders. A live panel starved by streaming is no longer torn down
+    // at the exact moment the engine is least able to survive it. After the grace, the
+    // normal window applies and mid-play panel deaths expire exactly as before.
+    internal static long FirstPanelTickMs;
+
+    internal static long EffectiveIdleMs(long baseMs)
+    {
+        var first = FirstPanelTickMs;
+        if (first != 0 && Clock.Ms - first < 120_000) return Math.Max(baseMs, 60_000);
+        return baseMs;
+    }
+
     internal static void ExpireClaims()
     {
         var feed = Feeds.Cur;
         if (feed.ClaimedPanels.Count == 0) return;    // unlocked fast path: an int read
 
-        long now = Clock.Ms, idle = FeedConfig.PanelIdleMs;
+        // While the sim is not ticking, nothing can expire — see NotePumpAlive.
+        if (!SimTickingNow) return;
+
+        long now = Clock.Ms, idle = EffectiveIdleMs(FeedConfig.PanelIdleMs);
         string dead = null;
         int left;
         bool wasPrimary;
@@ -295,7 +372,7 @@ internal static class CameraFeed
         lock (feed.ClaimedPanels)
         {
             foreach (var kv in feed.ClaimedPanels)
-                if (now - kv.Value > idle) { dead = kv.Key; break; }
+                if (now - EffectiveStamp(kv.Value) > idle) { dead = kv.Key; break; }
             if (dead == null) return;
 
             feed.ClaimedPanels.Remove(dead);
@@ -582,6 +659,32 @@ internal static class CameraFeed
                 ViewerDistance.Publish(centre, FeedConfig.ViewerDistanceRadius);
                 ViewerDistance.Report();
             }
+
+            // The TEXTURE half of the same idea, and a lease for the same reason.
+            //
+            // Published from the EYE rather than the orbit centre: mip choice is about how
+            // close the camera actually is to a surface, and at orbitRadius 40 the centre is
+            // 40 m from the eye — small against the player delta, but not small against the
+            // distances that decide a near-field mip.
+            //
+            // EyeCache is at most one camera pass stale (33 ms), which is nothing here. It is
+            // default until the first pass has run, though, and publishing a delta computed
+            // from the origin would point texture streaming at 0,0,0 — so fall back to the
+            // centre until it is populated rather than emit one poisoned frame.
+            if (FeedConfig.FeedTextureCamera)
+            {
+                TextureCamera.Publish(EyeCache == default ? centre : EyeCache, centre);
+                TextureCamera.Report();
+            }
+
+            // OUTSIDE the gate deliberately: feedTextureCamera=0 is the control arm for this
+            // measurement — the one where the foliage is absent rather than flashing — and
+            // the report above never runs there. See TextureCamera.ReportTierChurn.
+            TextureCamera.ReportTierChurn();
+
+            // Manual camera control. Stage 1 is the key-encoding probe only — it reads state
+            // the bootstrap seat published and steers nothing yet. See CameraControl.
+            CameraControl.Poll();
 
             // The camera trigger marker is NOT driven from here any more. The census proved
             // an entity created on this thread never enters the trigger system's candidate

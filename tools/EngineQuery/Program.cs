@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.RegularExpressions;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
@@ -15,7 +15,7 @@ namespace RttCamera.EngineQuery;
 // Read-only, offline, no game required.
 internal static class Program
 {
-    private static string _gameDir = @"D:\SteamLibrary\steamapps\common\SpaceEngineers2\Game2";
+    private static string _gameDir = @"E:\SteamLibrary\steamapps\common\SpaceEngineers2\Game2";
     private static int _max = 400;
     private static int _ilMax = 400;
     private static bool _quiet;
@@ -186,7 +186,7 @@ internal static class Cmd
 {
     private static Regex Rx(string p) => new(p, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
-    // Type::Method — both halves optional-ish, both regexes.
+    // Type::Method â€” both halves optional-ish, both regexes.
     private static (Regex T, Regex M) Split(string spec)
     {
         var parts = spec.Split("::", 2);
@@ -258,7 +258,7 @@ internal static class Cmd
         foreach (var (asm, t, m) in w.AllMethods())
         {
             if (!tr.IsMatch(t.FullName) || !mr.IsMatch(m.Name)) continue;
-            if (!m.HasBody) { r.AppendLine($"### {t.FullName}.{m.Name} — no body ({(m.IsAbstract ? "abstract" : "extern")})"); r.AppendLine(); continue; }
+            if (!m.HasBody) { r.AppendLine($"### {t.FullName}.{m.Name} â€” no body ({(m.IsAbstract ? "abstract" : "extern")})"); r.AppendLine(); continue; }
             if (n++ >= Cap) { r.AppendLine($"... (capped at {Cap} methods)"); break; }
 
             r.AppendLine($"### {asm.Name.Name}: {t.FullName}.{Sig(m)}");
@@ -517,7 +517,7 @@ internal static class Cmd
         Instruction[] a => string.Join(", ", a.Select(x => $"IL_{x.Offset:x4}")),
         VariableDefinition v => $"V_{v.Index}",
         ParameterDefinition p => $"arg:{p.Name}",
-        string s => $"\"{(s.Length > 200 ? s[..200] + "…" : s)}\"",
+        string s => $"\"{(s.Length > 200 ? s[..200] + "â€¦" : s)}\"",
         _ => o.ToString(),
     };
 }

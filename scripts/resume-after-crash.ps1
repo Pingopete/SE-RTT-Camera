@@ -105,13 +105,37 @@ Write-Output "process up (pid $((GameAny).Id)); waiting for the main menu"
 
 # No reliable log marker for "menu ready", so retry rather than try to time it. Enter at the
 # wrong moment is harmless - the menu ignores it.
+$script:absent = 0
 for ($attempt = 1; $attempt -le 12; $attempt++) {
     Start-Sleep -Seconds 20
     # A MISSING PROCESS IS NOT YET A FAILURE. Steam can restart the exe during startup, so the
     # process legitimately disappears and comes back. The first version treated one absent
     # sample as fatal and gave up while the game was still coming up.
     $p = Game
-    if (-not $p) { Write-Output "attempt ${attempt}: process not present (Steam may be restarting it), waiting"; continue }
+    if (-not $p) {
+        # A missing process is not IMMEDIATELY fatal — Steam can restart the exe during
+        # startup — but it is not endlessly excusable either. The original loop waited out
+        # all twelve attempts (4 minutes) on a game that had died during world load, never
+        # exited non-zero, and never notified: the caller sat believing a session was
+        # coming up while the desktop was showing. THREE consecutive absent samples (60 s)
+        # is a death, not a restart.
+        $script:absent++
+        Write-Output "attempt ${attempt}: process not present (${script:absent} consecutive)"
+        if ($script:absent -ge 3) {
+            Write-Output "!!! GAME DIED DURING STARTUP - three consecutive absent samples"
+            $glDead = Get-ChildItem "$env:APPDATA\SpaceEngineers2\Temp\Logs" -Filter "SpaceEngineers2_*.log" -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -notmatch 'Stats|Render12|Mission' } |
+                      Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($glDead) {
+                Write-Output ("    log: " + $glDead.Name)
+                Select-String -Path $glDead.FullName -Pattern 'Exception occurred: (.{0,110})' |
+                    Select-Object -Last 2 | ForEach-Object { Write-Output ("    EXC: " + $_.Matches[0].Groups[1].Value) }
+            }
+            exit 2
+        }
+        continue
+    }
+    $script:absent = 0
     if ($p.MainWindowHandle -eq 0) { continue }
 
     [void][Win]::ShowWindow($p.MainWindowHandle, 9)

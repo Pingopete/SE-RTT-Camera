@@ -1,6 +1,6 @@
-# Put the shipped TriplanarGIGlobal back.
+﻿# Put the shipped TriplanarGIGlobal back.
 #
-# Only Content\Materials\States is touched by apply.ps1 — that is the built output the
+# Only Content\Materials\States is touched by apply.ps1 â€” that is the built output the
 # game actually loads. Assets\Materials\States is the content-pipeline SOURCE and is not
 # read at runtime; the copies of it here exist because it was edited first, by mistake,
 # and are kept so that mistake stays documented.
@@ -9,7 +9,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$engine = "D:\SteamLibrary\steamapps\common\SpaceEngineers2\VRage\GameData\Engine"
+$engine = "E:\SteamLibrary\steamapps\common\SpaceEngineers2\VRage\GameData\Engine"
 $backup = Join-Path $PSScriptRoot "original"
 
 Copy-Item (Join-Path $backup "Content-TriplanarGIGlobal.def") `

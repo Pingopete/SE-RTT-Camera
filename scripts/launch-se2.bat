@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 rem Launch SE2 with the bootstrap plugin via Keen's own -plugins: argument.
 rem Steam must be running. Build first: scripts\build.bat
 rem
@@ -28,7 +28,7 @@ if not "%RTT_ONLY%"=="1" (
   )
 )
 
-cd /d "D:\SteamLibrary\steamapps\common\SpaceEngineers2\Game2"
+cd /d "E:\SteamLibrary\steamapps\common\SpaceEngineers2\Game2"
 start "" SpaceEngineers2.exe "-plugins:%PLUGIN_ARG%"
 echo Launched. Watch output\rtt.log, then output\scene-draw-recon.txt.
 endlocal
