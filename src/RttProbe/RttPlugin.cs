@@ -1636,7 +1636,44 @@ public sealed class RttPlugin : IPlugin
         {
             var p = __0.Position;
             var r = hook(p.X, p.Y, p.Z, __result);
-            if (r < __result) { __result = r; RttBridge.ViewerDistanceOverrides++; }
+
+            // A DISTANCE BECOMES AN ARRAY INDEX, so "smaller is safe" was wrong.
+            //
+            // This used to accept ANY r < __result, on the argument that under-estimating a
+            // distance can only PROMOTE detail and never demote it. True for LOD selection —
+            // and false for the one consumer that divides by it. ManagedTexturePrioritizerComponent
+            // computes priority = (P / distance) / D and mip = log2(1 / ratio), then INDEXES a
+            // PooledList with the result. A distance of zero (or a denormal, or a NaN that
+            // fails every comparison) produces an infinite or negative index and the game dies
+            // in CollectStandardMaterials — confirmed 2026-08-04 at 21:18, 21:52 and 23:03.
+            //
+            // I chased that crash to the feed texture camera twice and was wrong both times:
+            // it fired again with feedTextureCamera = 0 and never armed. THIS is the shared
+            // path — viewerDistance overrides the distance for the mip prioritiser, the
+            // impostor swap, shadow tracking and the raytracing tags all at once.
+            //
+            // Why it only bit recently: presence used to be pinned to the orbit anchor, so the
+            // bubble sat in open space and never produced a near-zero distance. Once residency
+            // followed the flying camera, the camera routinely sits ON geometry — a hovering
+            // camera a few centimetres from a boulder is an ordinary situation now, and it was
+            // impossible before. Same shape as the other two failures today: correct-looking
+            // code whose hidden precondition held only while an input stayed constant.
+            //
+            // 0.05 m is far below anything that changes a tier decision and far above the
+            // range where the reciprocal explodes. NaN fails the range test and is rejected.
+            const float MinDist = 0.05f;
+            if (r >= MinDist && r < __result && !float.IsNaN(r) && !float.IsInfinity(r))
+            {
+                __result = r;
+                RttBridge.ViewerDistanceOverrides++;
+            }
+            else if (r < MinDist && !float.IsNaN(r) && r >= 0f && __result > MinDist)
+            {
+                // Genuinely on top of the thing: clamp rather than discard, so the entity still
+                // gets the nearest tier without handing the prioritiser a divide-by-zero.
+                __result = MinDist;
+                RttBridge.ViewerDistanceOverrides++;
+            }
         }
         catch { }
     }
