@@ -1437,6 +1437,27 @@ internal static class FeedConfig
     // becomes one data point. Changing this re-binds on the next park cycle — no restart.
     public static double PanelBindAspect { get; private set; } = -1.0;
 
+    // Fill the panel edge-to-edge with no bars and no distortion, by rendering the square
+    // target ANAMORPHIC (projection widened to the panel's aspect) so the panel's own stretch
+    // undoes the squeeze. See the anamorphic-fit note in CameraRender.
+    // OFF gives the previous square projection, which is the control for judging it.
+    // REJECTED BY DESIGN (2026-08-04): rendering the projection wider than the target made the
+    // panel's own stretch cancel out, but it changes WHAT IS CAPTURED — a squeezed wide-FOV
+    // image, not a true 1:1 view. The render portal must always capture a genuine square; all
+    // fitting belongs at DISPLAY time. Kept only as a comparison control.
+    public static bool PanelAspectFit { get; private set; }
+
+    // Bind each feed panel to a PRIVATE clone of the screen material instead of the shared
+    // one. Prerequisite for ANY per-panel display fitting: the engine borrows runtime LCD
+    // materials from a store keyed on {MaterialDefinition, AspectRatio, Orientation}, so with
+    // a shared definition every framing change reaches other panels — and our texture override
+    // is visible to them (the [RTS] mirror, task #31).
+    //
+    // DEFAULT OFF, deliberately. This touches the material path that sits behind several of
+    // this project's device removals, and three "this is safe now" claims were wrong on
+    // 2026-08-04 alone. It gets switched on as a deliberate test, not as a silent default.
+    public static bool PanelPrivateMaterial { get; private set; }
+
     // WHEN THE MANUAL CAMERA IS ALLOWED TO LISTEN TO INPUT.
     //
     // Names are engine INPUT LAYERS, published by the bootstrap from
@@ -1645,6 +1666,8 @@ internal static class FeedConfig
             GrassProbe = Bool(kv, "grassProbe", GrassProbe);
             PanelRebindOnLoss = Bool(kv, "panelRebindOnLoss", PanelRebindOnLoss);
             PanelBindAspect = Dbl(kv, "panelBindAspect", PanelBindAspect);
+            PanelAspectFit = Bool(kv, "panelAspectFit", PanelAspectFit);
+            PanelPrivateMaterial = Bool(kv, "panelPrivateMaterial", PanelPrivateMaterial);
             CameraRequireLayers = Strs(kv, "cameraRequireLayers", CameraRequireLayers);
             CameraBlockLayers = Strs(kv, "cameraBlockLayers", CameraBlockLayers);
             CameraBlockKeys = Ints(kv, "cameraBlockKeys", CameraBlockKeys);

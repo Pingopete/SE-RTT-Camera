@@ -169,6 +169,18 @@ internal static class PanelBinding
         return true;
     }
 
+    // The shape of the panel this feed is actually driving. 0 = not yet known, in which case
+    // the camera renders square exactly as before — an unknown must never be guessed at as
+    // 1.0 and silently framed wrong.
+    internal static double PrimaryPanelAspect;
+
+    // Per-panel private material definitions — see the clone note in TryBind. Weak keys, so a
+    // destroyed panel takes its clone with it and this never pins dead render objects alive.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object>
+        _privateMaterial = new();
+    private static System.Reflection.MethodInfo _cloneMi;
+    private static bool _cloneMissLogged;
+
     private static bool _surveyed, _disarmed;
 
     // The bind happens inside the content-render hook, which an idle panel never
@@ -770,6 +782,19 @@ internal static class PanelBinding
             // or be ignored. So we pass a CHOSEN value and print both numbers; each panel on
             // the multi-panel block is then one labelled data point, and the mapping gets
             // measured instead of assumed.
+            // PUBLISH THE PANEL'S REAL SHAPE. CameraRender uses it to pre-squeeze the
+            // projection so the panel's own stretch lands undistorted and full-bleed — see the
+            // anamorphic-fit note there. Taken from the panel we are ACTUALLY binding, so a
+            // rebuilt or retagged panel re-fits on its next bind with no restart.
+            if (defAspect is float pa && pa > 0.05f && pa < 20.0f)
+            {
+                if (System.Math.Abs(PrimaryPanelAspect - pa) > 0.001)
+                    RttLog.Line($"PANEL FIT: primary panel aspect {pa:F3} published for feed " +
+                                $"{Feeds.Cur.Id} (was {PrimaryPanelAspect:F3}). The projection re-shapes " +
+                                "on the next camera pass; the render target does not change.");
+                PrimaryPanelAspect = pa;
+            }
+
             object aspect = defAspect;
             var wantAspect = FeedConfig.PanelBindAspect;
             string aspectWhy = "panel's own Definition.AspectRatio (unchanged)";
@@ -780,6 +805,62 @@ internal static class PanelBinding
                 aspectWhy = wantAspect > 0.0
                     ? $"forced {use:F3} by panelBindAspect"
                     : $"1.000 — declaring the CONTENT square (panel's own is {dA:F3})";
+            }
+
+            // ---- A PRIVATE MATERIAL PER PANEL, and why it is the keystone ------------------
+            //
+            // The engine borrows runtime LCD materials from a SHARED store keyed on
+            //     SharedRuntimeMaterialKey { MaterialDefinition, AspectRatio, Orientation }
+            // (read from IL). Every panel matching all three gets the SAME runtime material
+            // instance — and we bind our render target into it as a colorMetal override.
+            //
+            // TWO CONSEQUENCES, one observed today and one long open:
+            //  * Changing the aspect changes the key, so we silently BORROW A DIFFERENT
+            //    PANEL'S MATERIAL. In game 2026-08-04 that showed as a flipped, glitched
+            //    display the moment panelBindAspect moved off native.
+            //  * Any other panel whose key matches ours displays OUR FEED. That is the
+            //    [RTS] mirror (task #31), open for weeks with two theories already killed —
+            //    the mechanism was sitting in the key definition the whole time.
+            //
+            // Passing a CLONE of the base definition makes MaterialDefinition unique to this
+            // panel, so the key can never collide: a private runtime material, holding our
+            // override, that nobody else can borrow and whose aspect we may set freely. That
+            // last part is what unblocks per-panel framing of ONE shared texture — different
+            // panels sampling the same square differently, with no extra render.
+            //
+            // ONE CLONE PER PANEL, CACHED. Cloning per bind would mint a new key every time
+            // and defeat the store completely; the table is weak-keyed so a destroyed panel
+            // takes its clone with it.
+            if (FeedConfig.PanelPrivateMaterial && baseMaterial != null)
+            {
+                try
+                {
+                    if (!_privateMaterial.TryGetValue(ctx, out var mine) || mine == null)
+                    {
+                        _cloneMi ??= baseMaterial.GetType().GetMethods(Any)
+                            .FirstOrDefault(m => m.Name == "DeepClone" && m.GetParameters().Length == 0);
+                        mine = _cloneMi?.Invoke(baseMaterial, null);
+                        if (mine != null)
+                        {
+                            _privateMaterial.Remove(ctx);
+                            _privateMaterial.Add(ctx, mine);
+                            RttLog.Line($"PANEL MATERIAL: bound with a PRIVATE clone of " +
+                                        $"{baseMaterial.GetType().Name}#{baseMaterial.GetHashCode():x8} " +
+                                        $"-> #{mine.GetHashCode():x8}. The shared-material key is now unique to " +
+                                        "this panel, so no other panel can borrow the material carrying our feed " +
+                                        "(the [RTS] mirror, task #31) and this panel's aspect is ours to set.");
+                        }
+                        else if (!_cloneMissLogged)
+                        {
+                            _cloneMissLogged = true;
+                            RttLog.Line("PANEL MATERIAL: no parameterless DeepClone on " +
+                                        $"{baseMaterial.GetType().Name} — falling back to the SHARED material. " +
+                                        "Mirroring and aspect collisions remain possible. Shape miss, not a safe result.");
+                        }
+                    }
+                    if (mine != null) baseMaterial = mine;
+                }
+                catch (Exception e) { RttLog.Error("panel material clone", e); }
             }
 
             // colorMetalOverride is Nullable<ResourceHandle<TextureAsset>>; our target

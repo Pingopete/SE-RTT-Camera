@@ -1107,16 +1107,67 @@ internal static class CameraRender
             }
 
             // 1:1 render target, built from the same Vector2I type the view carries.
-            if (_wsResolution == null)
+            // ---- ANAMORPHIC FIT: FILL THE PANEL, NO BARS, NO STRETCH, STILL ONE RENDER ----
+            //
+            // THE PROBLEM (user, 2026-08-04): the feed is always a 1024x1024 SQUARE render and
+            // the panel may be any shape. Told the content is square the engine LETTERBOXES it
+            // (measured: black bars either side on a 1.5 panel); told the panel's own aspect it
+            // STRETCHES it. Neither is wanted, and the material route to a real crop is barred —
+            // aspectRatio is part of SharedRuntimeMaterialKey, so changing it makes us borrow a
+            // DIFFERENT panel's runtime material (observed in game as a flipped, glitched
+            // display). Cropping per panel would also mean per-panel sampling work, and the
+            // hard requirement is that N panels on one feed never duplicate rendering.
+            //
+            // THE INSIGHT: the panel is going to stretch our square by exactly the panel's
+            // aspect. So render PRE-SQUEEZED by that same factor and the stretch undoes it.
+            // The projection aspect comes from SetResolution — and, per the mode-2 note below,
+            // the render's actual pixel count comes from the LDR buffer we hand Draw, NOT from
+            // this field. So resolution here is a pure PROJECTION-SHAPE lever: we can ask for a
+            // 1536x1024 projection while still rendering into a 1024x1024 target.
+            //
+            // The result is anamorphic — squeezed in the texture, correct on the panel:
+            //   full horizontal FOV, vertical FOV divided by the panel aspect, no bars, no
+            //   distortion, ONE 1024x1024 render shared by every panel.
+            //
+            // It also BEATS the crop the user described: a crop would throw away the pixels
+            // that overrun the display, while this spends all 1024x1024 on what is actually
+            // visible.
+            //
+            // THE HONEST LIMIT: one render can only be correct for ONE aspect. Panels of a
+            // different shape sharing this feed get this framing, not their own — the direct
+            // consequence of the no-duplicate-rendering requirement, and the trade the user
+            // chose. Feeds with a single panel, or several panels of the same shape, are exact.
+            double panelAspect = FeedConfig.PanelAspectFit ? PanelBinding.PrimaryPanelAspect : 0.0;
+            if (!(panelAspect > 0.05 && panelAspect < 20.0)) panelAspect = 0.0;   // absent/absurd -> square
+            int projW = FeedConfig.WholeSceneWidth;
+            int projH = FeedConfig.WholeSceneHeight;
+            if (panelAspect > 0.0)
+            {
+                // Widen the PROJECTION only. Square target, anamorphic content.
+                projW = (int)System.Math.Round(FeedConfig.WholeSceneHeight * panelAspect);
+                if (projW < 16) projW = 16;
+            }
+
+            if (_wsResolution == null || projW != _wsResProjW || projH != _wsResProjH)
             {
                 var resField = _rvFields.FirstOrDefault(f => f.Name == "_resolution");
                 var ctor = resField?.FieldType.GetConstructor(new[] { typeof(int), typeof(int) });
-                _wsResolution = ctor?.Invoke(new object[] { FeedConfig.WholeSceneWidth, FeedConfig.WholeSceneHeight });
+                _wsResolution = ctor?.Invoke(new object[] { projW, projH });
                 if (_wsResolution == null)
                 {
                     if (_wsRvErrs++ < 2) RttLog.Line("Whole-scene camera: could not build Vector2I resolution.");
                     return null;
                 }
+                _wsResProjW = projW; _wsResProjH = projH;
+                if (_aspectLogs++ < 6)
+                    RttLog.Line(panelAspect > 0.0
+                        ? $"PANEL FIT: projection shaped {projW}x{projH} (aspect {panelAspect:F3}) while the " +
+                          $"render target stays {FeedConfig.WholeSceneWidth}x{FeedConfig.WholeSceneHeight}. " +
+                          "The image is stored ANAMORPHIC (squeezed) and the panel's own stretch undoes it — " +
+                          "full bleed, no black bars, no distortion, and still ONE render for every panel " +
+                          "on this feed. Panels of a DIFFERENT shape on this feed inherit this framing."
+                        : $"PANEL FIT: projection square {projW}x{projH} — no panel aspect available yet " +
+                          "(or panelAspectFit is off), so the feed renders 1:1 as before.");
             }
             _miRvSetResolution.Invoke(_wsRenderView, new[] { _wsResolution });
 
@@ -1520,6 +1571,12 @@ internal static class CameraRender
     { get => Feeds.Cur.CbRenderView; set => Feeds.Cur.CbRenderView = value; }
 
     private static MethodInfo _miCreateNonjittered, _miRvSetCamera, _miRvSetResolution;
+
+    // Projection shape currently baked into _wsResolution — see the anamorphic-fit note.
+    // Rebuilt when the primary panel's aspect changes, so retagging or rebinding to a
+    // differently-shaped panel re-fits without a restart.
+    private static int _wsResProjW, _wsResProjH;
+    private static int _aspectLogs;
     private static bool _fullCbBlocked, _fullCbLogged;
 
     private static object FullCameraSettings(object res)
