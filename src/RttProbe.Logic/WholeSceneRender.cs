@@ -801,7 +801,7 @@ internal static class WholeSceneRender
                               "target they land in. Stop looking at culling and geometry inputs."
                             : "GENERATION PRODUCED NOTHING. This does NOT by itself name our contexts — read the gate " +
                               "line below, which is what decides whether the generator ran at all.")
-                        + "\n" + GpuSceneGrassGate());
+                        + "\n" + GpuSceneGrassGate(rendered > 0.5f));
         }
         catch (Exception e) { RttLog.Error("grass probe", e); }
     }
@@ -838,7 +838,12 @@ internal static class WholeSceneRender
     // Every failure to read says so in words. A blind reader printing 0 here would fabricate
     // the very answer being tested, which is the specific mistake this project has already
     // made once with the grass census.
-    private static string GpuSceneGrassGate()
+    // `producing` = the instance counter is non-zero this window. The verdict has to depend on
+    // it: this method used to end with "...so a zero result IS a genuine per-pass failure"
+    // UNCONDITIONALLY, which kept asserting a failure after grass started working (measured
+    // 796 instances). A probe that states a conclusion the number contradicts is the exact
+    // fault that sent this investigation at culling for two sessions — see the note above.
+    private static string GpuSceneGrassGate(bool producing)
     {
         try
         {
@@ -868,8 +873,13 @@ internal static class WholeSceneRender
                    "grass is equally impossible for the PLAYER's camera right now. The fix belongs in grass-entity " +
                    "registration / model streaming, NOT in our draw contexts, and no per-pass knob can reach it."
                 : $"  GPU-scene gate OPEN: MaxUsedIndex={mid} (grass entities={n}, dispatch={(n + 63) / 64} group(s)), " +
-                  $"{matsText}. The generator DOES run, so a zero result IS a genuine per-pass failure: the shader's " +
-                   "visibility test against OUR EntityProxyOutputBuffer/CounterBuffer rejected every entity.";
+                  $"{matsText}. " +
+                  (producing
+                    ? "The generator runs AND is producing instances, so this gate is not the constraint. " +
+                      "Grass entity COUNT is the number to watch from here: it tracks how much world is " +
+                      "resident around the feed camera."
+                    : "The generator DOES run, so a zero result IS a genuine per-pass failure: the shader's " +
+                      "visibility test against OUR EntityProxyOutputBuffer/CounterBuffer rejected every entity.");
         }
         catch (Exception e)
         {
