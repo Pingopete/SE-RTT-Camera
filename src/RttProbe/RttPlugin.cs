@@ -431,6 +431,31 @@ public static class RttBridge
     // an engine type. A torn read costs one entity one slightly wrong distance for one pass,
     // which is invisible in a texture LOD and not worth a lock.
     public static volatile bool TextureCameraActive;
+
+    // ---- THE ENGAGE MUST BE CYCLE-ALIGNED --------------------------------------------
+    //
+    // TWO ACTIVATION CRASHES (21:18 and 21:52 on 2026-08-04, 2 of 3 feed activations),
+    // both IndexOutOfRange in ManagedTexturePrioritizerComponent.CollectStandardMaterials
+    // — 173 ms after FEED GATE: ACTIVE the second time — while the SAME build engaged
+    // cleanly at 21:34 and then ran for 13 minutes. An intermittent fault pinned to the
+    // moment of engagement, surviving the atomic-eye fix, is a RACE ON THE FLIP ITSELF:
+    // the prioritiser builds its per-cycle helper state from one camera, and flipping
+    // TextureCameraActive mid-cycle hands the rest of that cycle a different frame of
+    // reference than the helper's lists were sized and ordered for.
+    //
+    // So the logic no longer writes TextureCameraActive directly. It writes ARMED, and the
+    // cycle-start prefix (PrepareStandardMaterials) copies Armed -> Active — the one moment
+    // when no helper state exists yet, on the thread that is about to build it. Mid-cycle
+    // the flag is now constant by construction.
+    //
+    // COMPAT, stated precisely: THIS bootstrap copies Armed -> Active every cycle, so a
+    // logic DLL that writes only Active would be stomped a frame later — the logic ships
+    // with this change and writes Armed. The direction that can actually occur in the field
+    // is NEW logic on an OLD bootstrap (hot reload before a restart): the logic detects the
+    // missing Armed field and falls back to writing Active directly — the old behaviour,
+    // with the old activation-race risk, and it says so in the log rather than silently
+    // losing the feature.
+    public static volatile bool TextureCameraArmed;
     public static float TextureCameraDX, TextureCameraDY, TextureCameraDZ;
 
     // ---- IS THE OVERRIDE RATE SPATIAL OR TEMPORAL? (2026-08-03) -----------------------
@@ -1328,7 +1353,13 @@ public sealed class RttPlugin : IPlugin
         catch (Exception e) { Log("Patching CollectStandards FAILED: " + e.Message); }
     }
 
-    private static void PrepareStandardMaterialsPrefix() => RttBridge.TextureCameraCycle++;
+    private static void PrepareStandardMaterialsPrefix()
+    {
+        RttBridge.TextureCameraCycle++;
+        // The ONLY place Active may change — see RttBridge.TextureCameraArmed. Cycle start,
+        // before any helper state exists, on the thread about to build it.
+        RttBridge.TextureCameraActive = RttBridge.TextureCameraArmed;
+    }
 
     // Runs immediately before the CollectStandards calls for one root entity, on the same
     // thread, and carries the WorldTransform those calls' frame is built from. Rotating our

@@ -17,9 +17,12 @@ if not exist "%RTT_DLL%" (
   exit /b 1
 )
 
-rem Both mods by default; set RTT_ONLY=1 for a clean single-mod run.
+rem RTT ONLY BY DEFAULT (changed 2026-08-04 by request). Loading GridProbe as well adds a
+rem pop-up to the launch sequence that this script does not answer, so an automated relaunch
+rem stalls waiting on a dialog nobody is watching. Grid Schematics is not under test here.
+rem Set BOTH=1 to load GridProbe alongside RttProbe again.
 set PLUGIN_ARG=%RTT_DLL%
-if not "%RTT_ONLY%"=="1" (
+if "%BOTH%"=="1" (
   if exist "%GS_DLL%" (
     set PLUGIN_ARG=%RTT_DLL%;%GS_DLL%
     echo Loading RttProbe + GridProbe.

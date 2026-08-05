@@ -131,7 +131,22 @@ internal static class TextureCamera
         if (_looked) return;
         _looked = true;
         _bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
-        _fActive = _bridge?.GetField("TextureCameraActive");
+        // PREFER THE ARMED SEAM. On the new bootstrap, "TextureCameraArmed" is copied to
+        // Active only at PrepareStandardMaterials — the cycle boundary — because flipping
+        // Active MID-CYCLE raced the mip prioritiser's per-cycle helper state and crashed
+        // 2 of 3 activations (IndexOutOfRange in CollectStandardMaterials, 173 ms after
+        // FEED GATE: ACTIVE). On an older bootstrap the Armed field does not exist and we
+        // fall back to writing Active directly — old behaviour, old risk, said out loud.
+        _fActive = _bridge?.GetField("TextureCameraArmed");
+        if (_fActive == null)
+        {
+            _fActive = _bridge?.GetField("TextureCameraActive");
+            if (_fActive != null)
+                RttLog.Line("TEXTURE CAMERA: this bootstrap has no cycle-aligned engage (TextureCameraArmed) — " +
+                            "falling back to flipping Active directly, which can race the prioritiser's " +
+                            "collection cycle AT ACTIVATION (2 of 3 activations crashed on 2026-08-04). " +
+                            "RESTART to adopt the new bootstrap before re-enabling feedTextureCamera.");
+        }
         _fDX = _bridge?.GetField("TextureCameraDX");
         _fDY = _bridge?.GetField("TextureCameraDY");
         _fDZ = _bridge?.GetField("TextureCameraDZ");
