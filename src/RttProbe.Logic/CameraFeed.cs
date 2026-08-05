@@ -644,10 +644,27 @@ internal static class CameraFeed
             // marker in the scene whose triggers actually matter. Publishes once.
             WorldGrids.PublishPanelScene(entity);
 
+            // PresenceCentre, NOT centre. `centre` is the ORBIT ANCHOR, and under manual
+            // flight the camera leaves it and never returns — measured 2026-08-04 with the
+            // camera at 99560,-58108,-235370 while the preload cube and the viewer bubble
+            // were both still pinned to the Red Ship at 250572,8858,-12813. That is 277 km of
+            // separation, so every residency mechanism was making the world exist somewhere
+            // nothing was looking, and nothing at all around the actual camera.
+            //
+            // PresenceCentre was written for precisely this and its own comment quotes the
+            // in-game report ("the whole spawned foliage area is locked and stationary"). It
+            // was wired into the clipmap and flora sites in WorldGrids and these three call
+            // sites were missed — so the fix was half-applied and looked done.
+            //
+            // THE HOUSE BUG AGAIN, in its commonest form: one concept (where the feed is
+            // looking) with two representations (anchor vs camera), and only some readers
+            // updated. Anything added here later wants PresenceCentre too.
+            var presence = PresenceCentre;
+
             if (FeedConfig.PreloadAroundCamera)
-                WorldGrids.PreloadAroundCamera(entity, centre, FeedConfig.PreloadRadius);
+                WorldGrids.PreloadAroundCamera(entity, presence, FeedConfig.PreloadRadius);
             if (FeedConfig.ServerPreload)
-                WorldGrids.ServerPreloadAroundCamera(centre, FeedConfig.PreloadRadius);
+                WorldGrids.ServerPreloadAroundCamera(presence, FeedConfig.PreloadRadius);
 
             // Renew the nearest-viewer bubble. This is a LEASE, not a latch: publishing again
             // every camera pass is what keeps it alive, so a dormant gate, a torn-down feed or
@@ -656,7 +673,7 @@ internal static class CameraFeed
             // foliage density and whether grass exists at all.
             if (FeedConfig.ViewerDistanceOverride)
             {
-                ViewerDistance.Publish(centre, FeedConfig.ViewerDistanceRadius);
+                ViewerDistance.Publish(presence, FeedConfig.ViewerDistanceRadius);
                 ViewerDistance.Report();
             }
 

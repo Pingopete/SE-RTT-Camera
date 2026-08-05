@@ -4641,7 +4641,13 @@ internal static class WholeSceneRender
                 // Feeds.Cur.Target across the thread boundary returned 0,0,0 here while the
                 // tick was logging a real one, so this takes the value by the same route
                 // PlanetUpCache travels back on.
-                var subject = CameraFeed.SubjectCentreCache;
+                // PresenceCentre, not SubjectCentreCache: planet-radial up is a function of
+                // WHERE YOU ARE on the sphere, so computing it at the orbit anchor gives the
+                // wrong horizon for a camera that has flown away from it — and under manual
+                // flight that separation reached 277 km (a different planet entirely). The
+                // zero-check below still works: PresenceCentre falls back to the anchor when
+                // we are not flying, and both are zero before the tick has published.
+                var subject = CameraFeed.PresenceCentre;
                 if (subject.LengthSquared() <= 1.0)
                 {
                     // A SKIP MUST NOT CONSUME THE ATTEMPT.

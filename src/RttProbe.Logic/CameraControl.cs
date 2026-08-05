@@ -285,6 +285,29 @@ internal static class CameraControl
     internal static double ApplyZoom(double fovH)
         => FeedConfig.CameraManualControl ? fovH * _zoom : fovH;
 
+    // Move the baseline forward WITHOUT acting on what arrived. Used while the controls are
+    // blocked, so notches turned during freelook are dropped rather than banked up and applied
+    // as one jump on release.
+    private static bool _keyBlocked;
+
+    private static void DiscardWheel()
+    {
+        _fWheelAccum ??= _bridge?.GetField("MouseWheelAccum");
+        if (_fWheelAccum == null) return;
+        try { _lastAccum = Convert.ToSingle(_fWheelAccum.GetValue(null)); _wheelPrimed = true; }
+        catch { }
+    }
+
+    // Any configured freelook modifier down = hands off. Empty list disables the check.
+    private static bool BlockedByHeldKey(int count, int[] held)
+    {
+        var keys = FeedConfig.CameraBlockKeys;
+        if (keys == null || keys.Length == 0) return false;
+        for (int i = 0; i < keys.Length; i++)
+            if (Held(count, held, keys[i])) return true;
+        return false;
+    }
+
     private static void ConsumeWheel(int count, int[] held)
     {
         _fWheelAccum ??= _bridge?.GetField("MouseWheelAccum");
@@ -479,6 +502,110 @@ internal static class CameraControl
         return BuildMatrix();
     }
 
+    // ---- IS THE PLAYER ALLOWED TO FLY THE FEED RIGHT NOW? ------------------------------
+    //
+    // Two conditions, both requested directly: the player must be SEATED, and must not be in
+    // FREELOOK. Freelook matters because it is how you look around from inside a seat — the
+    // mouse is then aiming the player's head, and it must not simultaneously swing a camera
+    // 279 km away.
+    //
+    // Both are answered from the engine's own ACTIVE INPUT LAYERS, published per frame by the
+    // bootstrap. Layer names live in config (see FeedConfig.CameraRequireLayers) because the
+    // seat here is on a STATIC grid the game does not treat as a vehicle, so which layer means
+    // "seated" is measured, not assumed.
+    //
+    // PERMISSIVE WHEN BLIND, AND LOUD ABOUT IT. If the bootstrap could not read the layer set
+    // at all, this returns true — the pre-gating behaviour. Failing CLOSED would be worse in
+    // the exact way that matters: the camera would stop responding with no visible cause, and
+    // "controls are dead" is a far harder thing to diagnose than "controls are not gated yet".
+    // The bootstrap logs the reader failure on its side; this logs the fallback on ours.
+    private static bool _gateBlindLogged, _gateStateLogged;
+    private static bool _lastAllowed = true;
+    private static FieldInfo _fLayers, _fLayersReadable;
+    private static bool _layerFieldsBound;
+
+    private static bool ControlsAllowed()
+    {
+        try
+        {
+            if (!_layerFieldsBound)
+            {
+                _layerFieldsBound = true;
+                _fLayers = _bridge?.GetField("InputLayers");
+                _fLayersReadable = _bridge?.GetField("InputLayersReadable");
+            }
+
+            // An older bootstrap simply does not have these fields. That is not a gating
+            // decision, it is a missing feature, and it must not silently disable the camera.
+            if (_fLayers == null || _fLayersReadable == null)
+            {
+                if (!_gateBlindLogged)
+                {
+                    _gateBlindLogged = true;
+                    RttLog.Line("MANUAL CAMERA: this bootstrap publishes no input layers — seat/freelook " +
+                                "gating is INACTIVE and the controls behave as before. Restart the game to " +
+                                "adopt the new bootstrap. NOT a gating result.");
+                }
+                return true;
+            }
+
+            if (_fLayersReadable.GetValue(null) is not true)
+            {
+                if (!_gateBlindLogged)
+                {
+                    _gateBlindLogged = true;
+                    RttLog.Line("MANUAL CAMERA: the engine's active input layers could not be read, so " +
+                                "seat/freelook gating cannot be evaluated. Controls stay ACTIVE (the " +
+                                "pre-gating behaviour) rather than failing closed. Reader problem, NOT " +
+                                "'the player is not seated'.");
+                }
+                return true;
+            }
+
+            var layers = _fLayers.GetValue(null) as string ?? "";
+
+            bool blocked = AnyLayer(layers, FeedConfig.CameraBlockLayers);
+            bool required = FeedConfig.CameraRequireLayers.Length == 0
+                            || AnyLayer(layers, FeedConfig.CameraRequireLayers);
+            bool allowed = required && !blocked;
+
+            if (allowed != _lastAllowed || !_gateStateLogged)
+            {
+                _gateStateLogged = true;
+                _lastAllowed = allowed;
+                RttLog.Line($"MANUAL CAMERA: controls {(allowed ? "ENABLED" : "disabled")} — active layers " +
+                            $"[{(layers.Length == 0 ? "<none>" : layers)}], " +
+                            $"require=[{string.Join(",", FeedConfig.CameraRequireLayers)}] " +
+                            $"block=[{string.Join(",", FeedConfig.CameraBlockLayers)}]" +
+                            (blocked ? " — BLOCKED (freelook or another blocking layer is active)"
+                                     : required ? "" : " — no required layer active (not seated)"));
+            }
+            return allowed;
+        }
+        catch { return true; }   // never let a gating fault take the controls away
+    }
+
+    private static bool AnyLayer(string layers, string[] wanted)
+    {
+        if (string.IsNullOrEmpty(layers) || wanted == null) return false;
+        foreach (var w in wanted)
+        {
+            if (string.IsNullOrWhiteSpace(w)) continue;
+            int i = layers.IndexOf(w, StringComparison.OrdinalIgnoreCase);
+            while (i >= 0)
+            {
+                // Whole-segment match against the '|'-joined list, so "Camera FreeLook" never
+                // matches merely because "Camera Controller" shares a prefix.
+                bool leftOk = i == 0 || layers[i - 1] == '|';
+                int end = i + w.Length;
+                bool rightOk = end == layers.Length || layers[end] == '|';
+                if (leftOk && rightOk) return true;
+                i = layers.IndexOf(w, i + 1, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        return false;
+    }
+
     private static void Step()
     {
         var now = Clock.Ms;
@@ -486,11 +613,43 @@ internal static class CameraControl
         _lastStepMs = now;
         if (dt <= 0.0) return;
 
+        // SEAT AND FREELOOK GATING. Nothing below this line runs when the player is not in a
+        // controlling seat, or is holding freelook to look around inside it — the whole point
+        // being that walking around, or glancing over your shoulder, must not fly the feed.
+        if (!ControlsAllowed()) return;
+
         int count;
         int[] held;
         var bridgeCount = _fHeldCount?.GetValue(null) as int?;
         if (!bridgeCount.HasValue || _fHeld?.GetValue(null) is not int[] hb) return;
         count = bridgeCount.Value; held = hb;
+
+        // FREELOOK BLOCK, on the KEY rather than a layer — see FeedConfig.CameraBlockKeys for
+        // why the layer route is a dead end. Checked HERE rather than in ControlsAllowed
+        // because it needs the held-key array, which is read just above.
+        //
+        // Everything below is suppressed while the modifier is down: movement, roll, mouse
+        // look and the wheel. That is the whole point — looking around from inside the seat
+        // must not also fly a camera hundreds of kilometres away.
+        if (BlockedByHeldKey(count, held))
+        {
+            if (!_keyBlocked)
+            {
+                _keyBlocked = true;
+                RttLog.Line($"MANUAL CAMERA: controls disabled — freelook modifier held " +
+                            $"(cameraBlockKeys=[{string.Join(",", FeedConfig.CameraBlockKeys)}]).");
+            }
+            // The wheel accumulator still has to be RE-BASELINED, or every notch turned while
+            // blocked would land in one jump the moment the key is released. Discard, not
+            // consume: ConsumeWheel would apply them, which is the opposite of blocking.
+            DiscardWheel();
+            return;
+        }
+        if (_keyBlocked)
+        {
+            _keyBlocked = false;
+            RttLog.Line("MANUAL CAMERA: controls re-enabled — freelook modifier released.");
+        }
 
         // MOUSE LOOK AND THE WHEEL RUN WHETHER OR NOT A KEY IS DOWN. The first version sat
         // below an `if (count <= 0) return;`, so looking around only worked while some key

@@ -1412,6 +1412,52 @@ internal static class FeedConfig
     // only meaningful while our contexts are installed — there is nothing to consume once.
     public static bool GrassProbe { get; private set; }
 
+    // Re-bind the panel when our screen material is found to have been replaced.
+    //
+    // ON by default because the failure it fixes is total — the feed's picture is gone until
+    // a park cycle — and the detection is exact rather than heuristic (we compare the runtime
+    // material handle the engine created for us against what is on the panel now). It is a
+    // knob at all because the re-bind goes through SetNewScreenMaterialHandle, the call
+    // implicated in the [RTS] mirror leak, so there has to be a way to switch it off without
+    // a rebuild if it ever destabilises. A blind reader never re-binds regardless.
+    public static bool PanelRebindOnLoss { get; private set; } = true;
+
+    // WHEN THE MANUAL CAMERA IS ALLOWED TO LISTEN TO INPUT.
+    //
+    // Names are engine INPUT LAYERS, published by the bootstrap from
+    // GameInputProcessorComponent.ActiveContexts and listed in the game's own layer table
+    // (GameInputLayers.def): "Ship Movement", "Character Movement", "Camera FreeLook",
+    // "Camera Controller", "Hot Keys", "UI", and so on.
+    //
+    // These are STRINGS IN CONFIG rather than constants in code for one specific reason: the
+    // seat in question sits on a STATIC grid that the game does not treat as a vehicle, so
+    // the layer that actually means "seated" here is an empirical question. The bootstrap
+    // logs "INPUT LAYERS -> [...]" on every change; read it while sitting down and standing
+    // up, then put the right name here — no rebuild.
+    //
+    // Empty require-list = require nothing (controls always on, subject to the block list).
+    public static string[] CameraRequireLayers { get; private set; } = { "Ship Movement" };
+    public static string[] CameraBlockLayers { get; private set; } = Array.Empty<string>();
+
+    // FREELOOK IS NOT A LAYER — measured, not assumed (2026-08-04).
+    //
+    // The engine's layer table declares "Camera FreeLook", and the obvious implementation was
+    // to block on it. In game it NEVER activates. Searching the game's own definition data
+    // says why: that layer's GUID appears in GameInputLayers.def and NOWHERE ELSE — no input
+    // context is assigned to it, so nothing can ever raise it. The cockpit look context
+    // ("Camera First Person") sits on the "Camera Controller" layer, which is active the whole
+    // time you are seated, and its only actions are MouseDelta and ResetFreeLook. There is no
+    // layer that means "freelook is being held".
+    //
+    // So block on the KEY instead. That reuses the one input path already proven to work — the
+    // bootstrap's held-key capture — instead of a second piece of engine archaeology. Windows
+    // VIRTUAL-KEY codes, the same encoding CameraControl's movement keys use (learned the hard
+    // way: Enum.GetName on the UI key enum returned plausible WRONG names for three codes).
+    //
+    // Default 18 = VK_MENU (Alt), the usual freelook modifier. If yours is bound elsewhere,
+    // put its VK code here — several may be listed. Blank disables key blocking entirely.
+    public static int[] CameraBlockKeys { get; private set; } = { 18 };
+
     public static bool PerBodyClipmapCamera { get; private set; }
     public static double ClipmapMinPlayerDistance { get; private set; } = 100000.0;
 
@@ -1582,6 +1628,10 @@ internal static class FeedConfig
                         : ". Every entity goes back to being measured from the player alone."));
 
             GrassProbe = Bool(kv, "grassProbe", GrassProbe);
+            PanelRebindOnLoss = Bool(kv, "panelRebindOnLoss", PanelRebindOnLoss);
+            CameraRequireLayers = Strs(kv, "cameraRequireLayers", CameraRequireLayers);
+            CameraBlockLayers = Strs(kv, "cameraBlockLayers", CameraBlockLayers);
+            CameraBlockKeys = Ints(kv, "cameraBlockKeys", CameraBlockKeys);
 
             var clipWas = PerBodyClipmapCamera;
             PerBodyClipmapCamera     = Bool(kv, "perBodyClipmapCamera", PerBodyClipmapCamera);

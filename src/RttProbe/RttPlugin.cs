@@ -313,6 +313,27 @@ public static class RttBridge
     public static volatile bool InputSeatAlive;
     public static volatile Action InputProbeHook;
 
+    // ---- WHICH INPUT LAYERS ARE ACTIVE (seat gating, freelook gating) -----------------
+    //
+    // GameInputProcessorComponent exposes a PUBLIC ListReader<InputContext> ActiveContexts,
+    // and our ProcessInput prefix already holds that very instance — so this needs no extra
+    // Harmony patch. Each InputContext carries a Layer string; the engine's own layer table
+    // (GameData/.../Input/GameInputLayers.def) names them "Ship Movement", "Character
+    // Movement", "Camera FreeLook", "Camera Controller", and so on.
+    //
+    // PUBLISHED AS RAW NAMES, DECIDED ON THE LOGIC SIDE. Same discipline as InputHeld: the
+    // bootstrap reports what the engine says, and every judgement about what counts as
+    // "seated" lives in config where it can be retuned without a rebuild. That matters here
+    // more than usual, because the user's seat sits on a STATIC grid that the game does not
+    // treat as a vehicle — so "Ship Movement" may well never activate, and the layer that
+    // does have to be read off a live log rather than assumed.
+    //
+    // LayersReadable is separate from the names on purpose: an empty list because the reader
+    // is blind and an empty list because nothing is active are opposite facts, and gating a
+    // feature off the first one would look exactly like broken controls.
+    public static volatile bool InputLayersReadable;
+    public static volatile string InputLayers = "";
+
     // ---- FLORA SECTOR CAMERA (goal 10, the client-visibility half) --------------------
     //
     // FloraSectorEntityComponent.UpdateCameraPosition and .UpdateVisibility both read
@@ -1684,12 +1705,102 @@ public sealed class RttPlugin : IPlugin
         catch (Exception e) { Log("Patching ProcessInput FAILED: " + e.Message); }
     }
 
+    // ---- ACTIVE INPUT LAYERS, read off the component we are already sitting on ---------
+    //
+    // GameInputProcessorComponent.ActiveContexts is PUBLIC (ListReader<InputContext>), and
+    // ListReader exposes Count plus an indexer — so this walks it by index rather than
+    // allocating an enumerator every frame. InputContext.Layer is the string the engine's own
+    // layer table names ("Ship Movement", "Character Movement", "Camera FreeLook", ...).
+    //
+    // Runs once per frame, not per key, so the cost is a handful of reflection calls over a
+    // list that is normally two or three entries long. The joined string is rebuilt only when
+    // the SET changes, so the steady state allocates nothing.
+    private static System.Reflection.PropertyInfo _piActiveContexts, _piCtxCount, _piCtxItem, _piCtxLayer;
+    private static bool _layersBound, _layersBlindLogged;
+    private static string _lastLayers = "";
+
+    private static void ReadActiveLayers(object processor)
+    {
+        try
+        {
+            if (!_layersBound)
+            {
+                _layersBound = true;
+                _piActiveContexts = processor.GetType().GetProperty("ActiveContexts",
+                                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (_piActiveContexts == null)
+                {
+                    Log("INPUT LAYERS: GameInputProcessorComponent exposes no ActiveContexts — seat and " +
+                        "freelook gating cannot be evaluated. The camera falls back to ALWAYS ACTIVE, which " +
+                        "is the pre-gating behaviour. This is a READER failure, not 'no layers are active'.");
+                    return;
+                }
+            }
+            if (_piActiveContexts == null) return;
+
+            var list = _piActiveContexts.GetValue(processor);
+            if (list == null) return;
+
+            if (_piCtxCount == null)
+            {
+                var lt = list.GetType();
+                _piCtxCount = lt.GetProperty("Count", BindingFlags.Instance | BindingFlags.Public);
+                _piCtxItem = lt.GetProperty("Item", BindingFlags.Instance | BindingFlags.Public);
+                if (_piCtxCount == null || _piCtxItem == null)
+                {
+                    if (!_layersBlindLogged)
+                    {
+                        _layersBlindLogged = true;
+                        Log("INPUT LAYERS: ActiveContexts has no Count/indexer — cannot enumerate. Camera " +
+                            "falls back to ALWAYS ACTIVE. Reader failure, not an empty layer set.");
+                    }
+                    return;
+                }
+            }
+
+            int n = (int)_piCtxCount.GetValue(list);
+            var sb = new System.Text.StringBuilder(64);
+            for (int i = 0; i < n; i++)
+            {
+                var ctx = _piCtxItem.GetValue(list, new object[] { i });
+                if (ctx == null) continue;
+                _piCtxLayer ??= ctx.GetType().GetProperty("Layer",
+                                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                var layer = _piCtxLayer?.GetValue(ctx) as string;
+                if (string.IsNullOrEmpty(layer)) continue;
+                if (sb.Length > 0) sb.Append('|');
+                sb.Append(layer);
+            }
+
+            var joined = sb.ToString();
+            RttBridge.InputLayersReadable = true;
+            if (joined != _lastLayers)
+            {
+                _lastLayers = joined;
+                RttBridge.InputLayers = joined;
+                // Edge-triggered, so sitting down, standing up and toggling freelook each
+                // produce exactly one line. This is the trace that says which layer actually
+                // means "seated" on a STATIC grid, which is not something to assume.
+                Log("INPUT LAYERS -> [" + (joined.Length == 0 ? "<none>" : joined) + "]");
+            }
+        }
+        catch (Exception e)
+        {
+            if (!_layersBlindLogged)
+            {
+                _layersBlindLogged = true;
+                Log("INPUT LAYERS: read threw " + e.GetType().Name + " — camera falls back to ALWAYS ACTIVE.");
+            }
+        }
+    }
+
     // __instance is taken as object so no VRage.Input type has to be named here.
     private static void ProcessInputPrefix(object __instance)
     {
         try
         {
             RttBridge.InputSeatAlive = true;
+            ReadActiveLayers(__instance);
 
             // Bind once. The manager is not a field on the processor — it is reached through
             // whichever member exposes Keyboard/Mouse; find it by SHAPE rather than by name so

@@ -170,12 +170,14 @@ internal static class WorldGrids
     {
         try
         {
-            var player = CameraFeed.SubjectCentreCache;
+            var player = CameraFeed.PresenceCentre;
             var sb = new StringBuilder();
             sb.AppendLine("=== WORLD SURVEY ===");
             sb.AppendLine("Written by WorldGrids.DumpGrids (worldGridSurvey = 1).");
-            sb.AppendLine("Distances are from the feed's current subject centre (the panel's own grid),");
-            sb.AppendLine("which is the best proxy available here for 'where the player is'.");
+            sb.AppendLine("Distances are from the feed camera's CURRENT position (PresenceCentre): the");
+            sb.AppendLine("flying camera when manual control has it, otherwise the orbit anchor. This used");
+            sb.AppendLine("to report from the anchor alone, which under manual flight was measured 277 km");
+            sb.AppendLine("from where the camera actually was — every distance in the file was wrong.");
             sb.AppendLine("Use the grid NAME as orbitAnchor (substring, case-insensitive), or \"x,y,z\"");
             sb.AppendLine("to aim at raw coordinates (e.g. a planet surface point with no grid on it).");
             sb.AppendLine();
@@ -3080,8 +3082,8 @@ internal static class WorldGrids
 
             var sb = new StringBuilder("LOD PROBE: _lodDistances slots (LastPosition per slot). " +
                 "Feed camera at " +
-                $"{CameraFeed.SubjectCentreCache.X:F0},{CameraFeed.SubjectCentreCache.Y:F0}," +
-                $"{CameraFeed.SubjectCentreCache.Z:F0}.");
+                $"{CameraFeed.PresenceCentre.X:F0},{CameraFeed.PresenceCentre.Y:F0}," +
+                $"{CameraFeed.PresenceCentre.Z:F0}.");
             // InlineArray: invisible to plain reflection (its span cannot be boxed), reach
             // elements through the int indexer — the lesson the planet-up scan already paid for.
             var idx = arr.GetType().GetProperties(Any)
@@ -3104,7 +3106,7 @@ internal static class WorldGrids
                 var lp0 = Prop(slot0, "LastPosition");
                 if (lp0 is Vector3D v0)
                 {
-                    var dFeed = (v0 - CameraFeed.SubjectCentreCache).Length();
+                    var dFeed = (v0 - CameraFeed.PresenceCentre).Length();
                     sb.Append($"\n    slot[0] (inline array, element 0 only) LastPosition=" +
                               $"{v0.X:F0},{v0.Y:F0},{v0.Z:F0}  — {dFeed / 1000.0:F0} km from the feed camera");
                     if (_lastLodSlot0.HasValue)
@@ -3129,7 +3131,7 @@ internal static class WorldGrids
                     var init = Prop(slot, "LastPositionInitialized");
                     if (lp is Vector3D v && Convert.ToBoolean(init ?? false))
                         sb.Append($"\n    [{i,2}] {v.X:F0},{v.Y:F0},{v.Z:F0}" +
-                                  $"   (feed {(v - CameraFeed.SubjectCentreCache).Length() / 1000.0:F0} km away)");
+                                  $"   (feed {(v - CameraFeed.PresenceCentre).Length() / 1000.0:F0} km away)");
                 }
             sb.Append("\n    READ IT THUS: slots near the FEED and slots far from it, together, " +
                       "means the array is shared across bodies and the move gate is thrashing — " +
@@ -3142,6 +3144,113 @@ internal static class WorldGrids
 
     // PRELOAD THE WORLD AROUND THE FEED CAMERA (goal 10, tier 1).
     //
+    // ---- FIRE-AND-FORGET WAS A CRASH WAITING FOR A NEW LOCATION ------------------------
+    //
+    // CONFIRMED CTD 2026-08-04 20:48, from the game's own log:
+    //
+    //   [SkipWaitMonitor]: Unawaited task SpaceProbeSessionComponent.PreloadInternalAsync
+    //       has thrown an KeyNotFoundException
+    //   KeyNotFoundException: The given key '[X:1108, Y:-1527, Z:581]' was not present
+    //   [Crash Handler]: Fatal exception ... Propagating to main
+    //
+    // We invoke PreloadAsync and throw the Task away. When the probe is asked for a region
+    // the world has no sector entry for, it faults INSIDE that task; nobody observes it; the
+    // engine's unawaited-task monitor promotes it to fatal and takes the game down.
+    //
+    // THIS WAS ALWAYS BROKEN AND WAS HIDDEN BY A CONSTANT. The preload used to sit on the
+    // orbit ANCHOR — one long-established, always-valid location — so it never asked for a
+    // region that did not exist. The moment presence started following a camera flying
+    // through unvisited space, it did, and the latent fault became a crash on the first
+    // unmapped sector. A bug that only fires once an input starts varying is exactly the kind
+    // this project keeps finding, and "fire-and-forget" in the old comment was the tell.
+    //
+    // Observing the task is the whole fix: a faulted Task that someone has READ the Exception
+    // of is not an unobserved exception, so the monitor has nothing to promote. We genuinely
+    // do not care whether a speculative preload succeeded — that is what makes discarding the
+    // result correct and NOT observing it wrong.
+    private static bool _observeShapeLogged;
+    private static int _preloadFaults;
+    private static System.Reflection.MethodInfo _awGet, _awOnCompleted, _awGetException;
+
+    private static void ObservePreloadTask(object vrageTask, string which)
+    {
+        try
+        {
+            if (vrageTask == null) return;
+
+            // THE FIRST ATTEMPT AT THIS WAS WRONG, and said so rather than pretending:
+            // TaskObject is a Keen.VRage.Library.Threading.PooledStateMachineWrapper, NOT a
+            // System.Threading.Tasks.Task, so ContinueWith never existed and the crash hazard
+            // stayed live. The right seam is VRage's own awaiter:
+            //
+            //   TaskAwaiter GetAwaiter()                     on Task
+            //   void OnCompleted(Action continuation)        on TaskAwaiter
+            //   ExceptionDispatchInfo GetExceptionResult()   on TaskAwaiter  <- the observation
+            //
+            // GetExceptionResult is what marks the fault seen. We deliberately do NOT call
+            // GetResult(), which would RETHROW on our thread and turn a harmless miss into a
+            // real exception at a worse place.
+            _awGet ??= vrageTask.GetType().GetMethod("GetAwaiter", Any);
+            var awaiter = _awGet?.Invoke(vrageTask, null);
+            if (awaiter == null)
+            {
+                if (!_observeShapeLogged)
+                {
+                    _observeShapeLogged = true;
+                    RttLog.Line($"PRELOAD: cannot observe the {which} task — no GetAwaiter on " +
+                                $"{vrageTask.GetType().FullName}. A FAULTED PRELOAD CAN STILL CRASH THE GAME. " +
+                                "Set preloadAroundCamera = 0 and serverPreload = 0 if CTDs appear near " +
+                                "unvisited space. Shape miss, NOT a safe result.");
+                }
+                return;
+            }
+
+            var awType = awaiter.GetType();
+            _awOnCompleted ??= awType.GetMethods(Any).FirstOrDefault(m =>
+                m.Name == "OnCompleted" && m.GetParameters().Length == 1 &&
+                m.GetParameters()[0].ParameterType == typeof(Action));
+            _awGetException ??= awType.GetMethod("GetExceptionResult", Any);
+
+            if (_awOnCompleted == null || _awGetException == null)
+            {
+                if (!_observeShapeLogged)
+                {
+                    _observeShapeLogged = true;
+                    RttLog.Line($"PRELOAD: cannot observe the {which} task — awaiter {awType.FullName} " +
+                                $"has OnCompleted(Action)={(_awOnCompleted != null)} " +
+                                $"GetExceptionResult={(_awGetException != null)}. A FAULTED PRELOAD CAN " +
+                                "STILL CRASH THE GAME. Shape miss, NOT a safe result.");
+                }
+                return;
+            }
+
+            // The awaiter is a struct; box it ONCE and let the closure hold that same box, or
+            // the continuation would read a copy that never saw the completion.
+            var box = awaiter;
+            Action onDone = () =>
+            {
+                try
+                {
+                    var edi = _awGetException.Invoke(box, null);   // <- the observation
+                    if (edi == null) return;
+                    if (_preloadFaults++ < 5)
+                    {
+                        var ex = edi.GetType().GetProperty("SourceException", Any)?.GetValue(edi) as Exception;
+                        RttLog.Line($"PRELOAD FAULTED (observed, harmless): " +
+                                    $"{ex?.GetType().Name ?? "unknown"} — {ex?.Message ?? "(no message)"}. " +
+                                    "The probe was asked for a region the world has no data for, which is " +
+                                    "expected when the camera flies somewhere nothing has ever visited. " +
+                                    "Swallowed deliberately: unobserved, this reached the engine's " +
+                                    "unawaited-task monitor and was promoted to a FATAL crash (CTD 20:48).");
+                    }
+                }
+                catch { /* observing must never itself throw */ }
+            };
+            _awOnCompleted.Invoke(box, new object[] { onDone });
+        }
+        catch (Exception e) { RttLog.Error("observe preload task", e); }
+    }
+
     // SpaceProbeSessionComponent.PreloadAsync(BoundingBoxD, Precision) fans the volume out
     // across every registered ISpaceProbePreloadable that overlaps it. The two registered
     // providers in this save are exactly the two systems a remote feed is missing —
@@ -3220,7 +3329,7 @@ internal static class WorldGrids
             try { prec = Enum.Parse(tPrec, precName, true); }
             catch { prec = Enum.Parse(tPrec, "Medium", true); }
 
-            mi.Invoke(probe, new[] { box, prec });
+            ObservePreloadTask(mi.Invoke(probe, new[] { box, prec }), "client");
             _preloadCount++;
 
             // First call and then every 20th: enough to prove liveness without flooding.
@@ -4396,7 +4505,7 @@ internal static class WorldGrids
             try { prec = Enum.Parse(tPrec, FeedConfig.PreloadPrecision, true); }
             catch { prec = Enum.Parse(tPrec, "Medium", true); }
 
-            mi.Invoke(_serverProbe, new[] { box, prec });
+            ObservePreloadTask(mi.Invoke(_serverProbe, new[] { box, prec }), "server");
             _serverPreloadCount++;
             if (_serverPreloadCount == 1 || _serverPreloadCount % 20 == 0)
                 RttLog.Line($"SERVER PRELOAD #{_serverPreloadCount}: {radius * 2:F0} m cube at " +

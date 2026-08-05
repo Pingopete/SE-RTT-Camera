@@ -57,6 +57,118 @@ internal static class PanelBinding
         return false;
     }
 
+    // ---- THE BIND WATCH: is our material STILL on the panel? ---------------------------
+    //
+    // THE BUG THIS EXISTS TO FIX, reported twice in game: "the game randomly loses the
+    // panel's texture causing the feed to die", the second time WHILE APPROACHING A PLANET.
+    // The render loop keeps running and every counter stays healthy — only the picture is
+    // gone — because the feed never died. Our MATERIAL REPLACEMENT was dropped, and
+    // `IsAttempted` is a bind-ONCE latch: once a ctx is in the list, OnPanelRender returns
+    // before TryBind forever. Losing the binding was therefore permanent by construction,
+    // and the only recovery was a full park cycle.
+    //
+    // "While approaching a planet" is the useful half of the report: that is when LOD and
+    // renderer rebuilds happen, which is exactly when an engine-side material replacement
+    // list gets rebuilt without ours in it.
+    //
+    // WHAT MAKES THIS SAFE TO ACT ON. Re-binding is NOT free — it goes through
+    // SetNewScreenMaterialHandle, which is the call implicated in the [RTS] mirror leak
+    // (task #31) and, through it, in past device removals. So a re-bind must happen ONLY
+    // when we are genuinely unbound, never speculatively and never on a timer.
+    //
+    // The precise test already existed and was only being used for logging: TryBind reads
+    // back `ctx._screenMaterialHandle` — the runtime material the engine created FOR US. If
+    // that field still equals what our bind produced, we are bound. If it changed, something
+    // else re-materialised the panel and we are not.
+    //
+    // Compared with Equals, not ReferenceEquals: the handle may be a struct, and a boxed
+    // struct is never reference-equal to another box of the same value.
+    //
+    // A BLIND READER MUST NOT MANUFACTURE "LOST". If the field cannot be resolved, this
+    // returns Unknown and the caller does exactly what it did before — bind once, never
+    // again. Treating "cannot tell" as "unbound" would produce a re-bind on every content
+    // pass, on the render thread, through the one call known to leak. That is the failure
+    // this project has hit in other guises: the wrong answer in the unsafe direction.
+    private enum Bind { Fresh, Bound, Lost, Unknown }
+
+    // Weak keys: the entry dies with the panel context, so this never keeps a dead panel
+    // alive and never needs pruning of its own.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object[]>
+        _ourHandle = new();
+
+    private static FieldInfo _screenMatField;
+    private static bool _screenMatFieldResolved, _watchBlindLogged;
+
+    private static object ReadScreenMaterialHandle(object ctx)
+    {
+        if (!_screenMatFieldResolved)
+        {
+            _screenMatFieldResolved = true;
+            _screenMatField = ctx.GetType().GetField("_screenMaterialHandle",
+                                  BindingFlags.Instance | BindingFlags.NonPublic);
+        }
+        return _screenMatField?.GetValue(ctx);
+    }
+
+    private static Bind BindStatus(object ctx)
+    {
+        if (!IsAttempted(ctx)) return Bind.Fresh;
+        if (!_ourHandle.TryGetValue(ctx, out var box) || box == null) return Bind.Unknown;
+        if (_screenMatField == null && _screenMatFieldResolved) return Bind.Unknown;
+
+        object now;
+        try { now = ReadScreenMaterialHandle(ctx); }
+        catch { return Bind.Unknown; }
+        if (_screenMatField == null) return Bind.Unknown;
+
+        return Equals(now, box[0]) ? Bind.Bound : Bind.Lost;
+    }
+
+    // Drop the stale (renderer, ctx) entry so the re-bind REPLACES it rather than adding a
+    // second one. TryBind appends per attempt and UnbindNow restores per entry, so a
+    // duplicate would put the same panel back twice — the double-release this file already
+    // warns about at the end of UnbindNow.
+    private static void ForgetPanel(object ctx)
+    {
+        var list = _boundPanels;
+        lock (list)
+            for (int i = list.Count - 1; i >= 0; i--)
+                if (ReferenceEquals(list[i].Ctx.Target, ctx))
+                {
+                    list[i] = list[list.Count - 1];
+                    list.RemoveAt(list.Count - 1);
+                }
+        _ourHandle.Remove(ctx);
+    }
+
+    // Re-bind budget. If the detection is ever wrong, or the engine starts fighting us for
+    // the material every frame, this turns an unbounded render-thread retry loop into a
+    // bounded one that says so. Deliberately generous per event and strict per minute.
+    private static long _lastRebindMs;
+    private static int _rebinds, _rebindsThisMinute;
+    private static long _rebindMinuteMs;
+
+    private static bool RebindAllowed()
+    {
+        var now = Environment.TickCount64;
+        if (now - _lastRebindMs < 2000) return false;          // never twice in one repaint burst
+        if (now - _rebindMinuteMs > 60000) { _rebindMinuteMs = now; _rebindsThisMinute = 0; }
+        if (_rebindsThisMinute >= 6)
+        {
+            if (_rebindsThisMinute == 6)
+            {
+                _rebindsThisMinute++;
+                RttLog.Line("PANEL REBIND: 6 in one minute — STOPPING for this minute. That is no longer " +
+                            "a lost binding, it is a fight: something is re-materialising the panel as fast " +
+                            "as we bind it. Re-binding through SetNewScreenMaterialHandle is the call " +
+                            "implicated in the [RTS] mirror leak, so backing off is the safe direction.");
+            }
+            return false;
+        }
+        _lastRebindMs = now; _rebindsThisMinute++; _rebinds++;
+        return true;
+    }
+
     private static bool _surveyed, _disarmed;
 
     // The bind happens inside the content-render hook, which an idle panel never
@@ -163,7 +275,38 @@ internal static class PanelBinding
 
             // Per-PANEL, not per-feed (phase E2 fan-out): a feed that already bound one
             // panel still binds a second claimant when its ctx arrives here.
-            if (IsAttempted(ctx)) return;
+            //
+            // BIND-ONCE BECOMES BIND-AND-STAY-BOUND. This used to be `if (IsAttempted(ctx))
+            // return;`, which made a lost binding permanent — see the Bind enum above.
+            switch (BindStatus(ctx))
+            {
+                case Bind.Bound:
+                    return;
+
+                case Bind.Unknown:
+                    // Exactly the old behaviour, and said out loud ONCE so a silently
+                    // disabled watch is never mistaken for a panel that never drops.
+                    if (!_watchBlindLogged)
+                    {
+                        _watchBlindLogged = true;
+                        RttLog.Line("PANEL REBIND WATCH IS BLIND: could not read ctx._screenMaterialHandle, " +
+                                    "so 'still bound?' is unanswerable and this falls back to bind-once. " +
+                                    "A lost panel texture will NOT self-heal — park-cycle the feed " +
+                                    "(feedsDisabled = 1, then blank) to recover. This is a reader problem, " +
+                                    "NOT evidence that the binding is holding.");
+                    }
+                    return;
+
+                case Bind.Lost:
+                    if (!FeedConfig.PanelRebindOnLoss) return;
+                    if (!RebindAllowed()) return;
+                    RttLog.Line($"PANEL REBIND #{_rebinds}: our screen material is no longer on this panel — " +
+                                "something re-materialised it (LOD or renderer rebuild is the prime suspect; " +
+                                "this was first reported while approaching a planet). Re-binding to our render " +
+                                "target. The feed never died; only the material replacement was dropped.");
+                    ForgetPanel(ctx);
+                    break;
+            }
 
             TryBind(renderer, ctx);
         }
@@ -630,12 +773,17 @@ internal static class PanelBinding
             // rather than the shared LCDScreen_On.
             try
             {
-                var fh = ctx.GetType().GetField("_screenMaterialHandle",
-                             BindingFlags.Instance | BindingFlags.NonPublic);
-                var ours = fh?.GetValue(ctx);
+                var ours = ReadScreenMaterialHandle(ctx);
                 RttLog.Line($"Phase 2: OUR runtime material handle = " +
                             (ours == null ? "<null>" : $"{ours.GetType().Name}#{ours.GetHashCode():x8}") +
                             " (compare against [RTS diag] lines).");
+
+                // REMEMBER IT — this is what makes "are we still bound?" answerable on every
+                // later content pass, and so what turns bind-once into bind-and-stay-bound.
+                // Recorded even when null: a null here means the engine gave us no handle,
+                // and a later NON-null is still a change worth reacting to.
+                _ourHandle.Remove(ctx);
+                _ourHandle.Add(ctx, new[] { ours });
             }
             catch { }
 
