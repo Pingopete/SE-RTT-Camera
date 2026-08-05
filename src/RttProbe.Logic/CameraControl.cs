@@ -472,7 +472,27 @@ internal static class CameraControl
     internal static double Speed = 20.0;
 
     internal static bool Flying => _flying;
-    internal static Vector3D Position => _pos;
+    // ATOMIC ACROSS THREADS. _pos is written on the RENDER thread and read on the SIM thread
+    // (CameraFeed.PresenceCentre -> the presence marker, the preload cube, the viewer bubble).
+    // A Vector3D is three doubles, so a plain read can take X from the new position and Y/Z
+    // from the old — a coordinate that never existed. Harmless on the slow orbit; at 750 m/s
+    // it is hundreds of metres to kilometres of nonsense, and feeding that to the spatial
+    // trigger system produced absurd chunk coordinates and a corrupt dictionary inside
+    // VoxelPhysicsComponent.MaterializeChunk. Confirmed CTD 2026-08-04 21:21.
+    //
+    // Boxed and swapped by reference, because reference assignment IS atomic: a reader gets
+    // the whole old position or the whole new one, never a mixture. Falls back to the raw
+    // field only before the first publish.
+    private static volatile object _posSnapshot;
+
+    internal static Vector3D Position
+    {
+        get { var s = _posSnapshot; return s is Vector3D v ? v : _pos; }
+    }
+
+    // Call after every write to _pos. One small boxing allocation per camera step is nothing
+    // against the render-thread work it sits beside, and it is what makes the read safe.
+    private static void PublishPosition() => _posSnapshot = _pos;
 
     // Called from the render path with the orbit's matrix. Returns it unchanged unless manual
     // flight is armed, in which case it returns OUR matrix — seeded from the orbit on the
@@ -489,7 +509,7 @@ internal static class CameraControl
                 // Seed from the orbit: row 0/1/2 are right/up/backward in this engine's
                 // convention (see CameraFeed.OrbitCameraWorld — row 2 points AWAY from the
                 // subject), so forward is the NEGATED third row.
-                _pos = orbit.Translation;
+                _pos = orbit.Translation; PublishPosition();
                 _right = new Vector3D(orbit.M11, orbit.M12, orbit.M13);
                 _up = new Vector3D(orbit.M21, orbit.M22, orbit.M23);
                 _fwd = new Vector3D(-orbit.M31, -orbit.M32, -orbit.M33);
@@ -670,7 +690,7 @@ internal static class CameraControl
         if (Held(count, held, VkC)) move -= _up;
 
         var len = move.Length();
-        if (len > 0.0001) _pos += (move / len) * (Speed * dt);
+        if (len > 0.0001) { _pos += (move / len) * (Speed * dt); PublishPosition(); }
 
         ConsumeWheel(count, held);
 
@@ -775,7 +795,7 @@ internal static class CameraControl
             // builds a singular view matrix. Fall back to the orbit seed rather than fly blind.
             if (pos.LengthSquared() < 1.0 || fwd.LengthSquared() < 0.5
              || up.LengthSquared() < 0.5 || right.LengthSquared() < 0.5) return false;
-            _pos = pos; _fwd = Normalize(fwd); _up = Normalize(up); _right = Normalize(right);
+            _pos = pos; PublishPosition(); _fwd = Normalize(fwd); _up = Normalize(up); _right = Normalize(right);
             Speed = speed > 0 ? speed : Speed;
             RttLog.Line($"MANUAL CAMERA: restored from {System.IO.Path.GetFileName(p)} — " +
                         $"{_pos.X:F0},{_pos.Y:F0},{_pos.Z:F0}, speed {Speed:F1} m/s.");

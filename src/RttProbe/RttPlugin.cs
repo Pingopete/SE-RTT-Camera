@@ -663,6 +663,40 @@ public static class RttBridge
     public static volatile bool TexEyeValid;
     public static double TexEyeX, TexEyeY, TexEyeZ;
 
+    // ---- THE EYE MUST BE PUBLISHED ATOMICALLY, AND THESE THREE DOUBLES ARE NOT -----------
+    //
+    // TWO CONFIRMED CTDs, 2026-08-04, both from torn reads of a fast-moving camera position:
+    //
+    //   IndexOutOfRangeException at PooledList.get_Item
+    //     <- ManagedTexturePrioritizerComponent.CollectStandardMaterials   (world load)
+    //   IndexOutOfRangeException at Dictionary.GetValueRefOrAddDefault
+    //     <- VoxelPhysicsComponent.MaterializeChunk <- SectoredTrigger.UpdateEntity  (in space)
+    //
+    // TexEyeX/Y/Z are three SEPARATE fields, written one at a time on the logic thread and
+    // read on engine JOB threads. A reader can take X from the new position and Y/Z from the
+    // old — a coordinate that never existed. A double is not even guaranteed atomic on its
+    // own. That garbage eye becomes a garbage distance, which becomes an out-of-range mip
+    // index; on the marker side it becomes an absurd chunk coordinate.
+    //
+    // WHY IT ONLY BIT NOW, which is the part worth remembering: on the orbit the camera crept,
+    // so a torn read mixed two nearly identical positions and the error was metres. Under
+    // manual flight at 750 m/s — and a 277 km jump when presence started following the camera
+    // — a torn read is hundreds of kilometres wrong. The bug was always there; the input had
+    // to start varying fast before it could kill anything. Same shape as the fire-and-forget
+    // preload: correct-looking code that only fails once a constant becomes a variable.
+    //
+    // THE FIX IS A SNAPSHOT PUBLISHED BY REFERENCE. Reference assignment IS atomic in .NET,
+    // so a reader either sees the whole old position or the whole new one, never a mixture.
+    // The three loose doubles stay for compatibility with an older logic DLL across a hot
+    // reload; readers prefer the snapshot and fall back only if it is absent.
+    public sealed class EyeSnapshot
+    {
+        public readonly double X, Y, Z;
+        public EyeSnapshot(double x, double y, double z) { X = x; Y = y; Z = z; }
+    }
+
+    public static volatile EyeSnapshot TexEye;
+
     public static long TierCalls, TierUp, TierDown, TierReversals, TierRepeat;
     public static long LatchHeld, LatchMoved;
     internal static readonly int[] TierSlotKey = new int[TexSlots];
@@ -1304,6 +1338,17 @@ public sealed class RttPlugin : IPlugin
     // WorldTransform is Keen.VRage.Core.WorldTransform and the bootstrap already references
     // VRage.Core, so it can be named outright. The no-reference rule that kept
     // ResourceStreamingData out of the other prefix is specific to VRage.Render12.
+    // NaN, infinity, or a delta larger than any sane solar-system span. 1e9 m is ~6.7 AU, far
+    // beyond anything this save contains, so a value past it is corruption rather than a
+    // legitimately distant object. Cheap enough for a path that runs ~110k times/sec.
+    private static bool IsFiniteDelta(double x, double y, double z)
+    {
+        const double Limit = 1e9;
+        return !double.IsNaN(x) && !double.IsNaN(y) && !double.IsNaN(z)
+            && !double.IsInfinity(x) && !double.IsInfinity(y) && !double.IsInfinity(z)
+            && Math.Abs(x) < Limit && Math.Abs(y) < Limit && Math.Abs(z) < Limit;
+    }
+
     private static void OnCollectStandardsRootPrefix(ref Keen.VRage.Core.WorldTransform __1)
     {
         if (!RttBridge.TextureCameraActive || !RttBridge.TexEyeValid) { RttBridge.RotValid = false; return; }
@@ -1313,10 +1358,24 @@ public sealed class RttPlugin : IPlugin
             // the engine does for the player one line later in OnCollectStandardsRoot
             // (Inverse(orientation) * (Vector3)(cameraWorld - entityPosition)), but with OUR
             // eye, so the result cannot depend on which camera the collector was handed.
+            // ONE read of a snapshot, not three reads of three fields — see EyeSnapshot. Taken
+            // into a local FIRST so even the snapshot reference cannot change under us mid-use.
+            var eye = RttBridge.TexEye;
+            double ex, ey, ez;
+            if (eye != null) { ex = eye.X; ey = eye.Y; ez = eye.Z; }
+            else { ex = RttBridge.TexEyeX; ey = RttBridge.TexEyeY; ez = RttBridge.TexEyeZ; }
+
             var rel = new Keen.VRage.Library.Mathematics.Vector3D(
-                RttBridge.TexEyeX - __1.Position.X,
-                RttBridge.TexEyeY - __1.Position.Y,
-                RttBridge.TexEyeZ - __1.Position.Z);
+                ex - __1.Position.X,
+                ey - __1.Position.Y,
+                ez - __1.Position.Z);
+
+            // A TORN OR ABSURD EYE MUST NOT REACH THE MIP MATH. This is belt-and-braces on top
+            // of the snapshot: whatever the cause, a non-finite or wildly out-of-range delta
+            // produces a mip index the engine indexes an array with, and that is precisely the
+            // IndexOutOfRangeException that took the game down twice today. Bailing leaves the
+            // entity on the PLAYER's tier, which is the pre-feature behaviour and always safe.
+            if (!IsFiniteDelta(rel.X, rel.Y, rel.Z)) { RttBridge.RotValid = false; return; }
             var relF = new Keen.VRage.Library.Mathematics.Vector3((float)rel.X, (float)rel.Y, (float)rel.Z);
             var local = Keen.VRage.Library.Mathematics.Quaternion.Inverse(__1.Orientation) * relF;
             RttBridge.RotDX = local.X; RttBridge.RotDY = local.Y; RttBridge.RotDZ = local.Z;

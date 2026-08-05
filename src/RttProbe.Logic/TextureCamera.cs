@@ -175,9 +175,25 @@ internal static class TextureCamera
         _fTexEyeY = _bridge?.GetField("TexEyeY");
         _fTexEyeZ = _bridge?.GetField("TexEyeZ");
         _fTexEyeValid = _bridge?.GetField("TexEyeValid");
+
+        _fTexEyeSnapshot = _bridge?.GetField("TexEye");
+        var snapType = _bridge?.GetNestedType("EyeSnapshot");
+        _ctorEyeSnapshot = snapType?.GetConstructor(new[] { typeof(double), typeof(double), typeof(double) });
+        if (_fTexEyeSnapshot == null || _ctorEyeSnapshot == null)
+            RttLog.Line("TEXTURE CAMERA: this bootstrap has no atomic EyeSnapshot — the eye is published as " +
+                        "three separate doubles, which engine job threads can read HALF-UPDATED. At manual-flight " +
+                        "speeds a torn read is hundreds of km wrong and has crashed the game twice " +
+                        "(IndexOutOfRange in the mip prioritiser). RESTART to adopt the new bootstrap, or keep " +
+                        "feedTextureCamera = 0.");
     }
 
     private static FieldInfo _fTexEyeX, _fTexEyeY, _fTexEyeZ, _fTexEyeValid;
+
+    // RttBridge.TexEye (EyeSnapshot) — absent on an older bootstrap, in which case the loose
+    // triple below is all we can publish and the torn-read hazard remains until a restart.
+    // Resolved once, alongside the other bridge fields.
+    private static FieldInfo _fTexEyeSnapshot;
+    private static System.Reflection.ConstructorInfo _ctorEyeSnapshot;
 
     private static FieldInfo _fMinCalls, _fMinSwings, _fMinSteady;
     private static long _lastMinCalls, _lastMinSwings, _lastMinSteady;
@@ -369,6 +385,19 @@ internal static class TextureCamera
             // for the log line and for an older bootstrap; the substitution itself is absolute
             // now, so it cannot depend on which camera the collector was handed. See
             // RttBridge.TexEyeValid.
+            // SNAPSHOT FIRST — one atomic reference write the job threads can read whole.
+            // Three separate doubles can be read half-updated, and at manual-flight speeds a
+            // torn eye is hundreds of kilometres wrong; that produced an out-of-range mip index
+            // and took the game down (see RttBridge.EyeSnapshot for both stack traces).
+            if (_ctorEyeSnapshot != null)
+            {
+                try { _fTexEyeSnapshot?.SetValue(null, _ctorEyeSnapshot.Invoke(new object[] { eye.X, eye.Y, eye.Z })); }
+                catch { }
+            }
+
+            // The loose fields stay for an OLDER BOOTSTRAP across a hot reload, which reads
+            // them when the snapshot field does not exist. Written after the snapshot so a
+            // new bootstrap never prefers the stale triple.
             if (_fTexEyeX != null)
             {
                 _fTexEyeX.SetValue(null, eye.X);
