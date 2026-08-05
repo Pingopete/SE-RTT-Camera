@@ -739,8 +739,48 @@ internal static class PanelBinding
 
             var def = Prop(ctx, "Definition");
             var baseMaterial = Prop(def, "DefaultScreenMaterial");
-            var aspect = Prop(def, "AspectRatio");
+            var defAspect = Prop(def, "AspectRatio");
             var orientation = Prop(Prop(ctx, "State"), "Orientation");
+
+            // ---- SQUARE RENDER ONTO A NON-SQUARE PANEL, WITHOUT A SECOND RENDER ----------
+            //
+            // THE TWO REQUIREMENTS, and the second is the binding one (user, 2026-08-04):
+            //   1. no aspect DISTORTION — uniform scale until the panel's LONG axis is filled
+            //      by the 1024x1024 render, short axis overrunning off the display ("cover")
+            //   2. NO DUPLICATED RENDERING when several panels show the same feed
+            //
+            // (2) rules out the obvious implementation. Re-rendering or resampling per panel
+            // would give pixel-perfect fit and destroy the property that makes the fan-out
+            // cheap: BlitProbe.FeedTarget is ONE target and TryBind hands that same object to
+            // every panel, so panels are extra SAMPLERS, not extra renders. Verified live —
+            // request = drawOne(ours) = copies = 25.2/s with the feed bound, independent of
+            // panel count. Any fix must therefore be a per-MATERIAL property, and the counter
+            // above is the regression test: if drawOne(ours) ever tracks panel count, it broke.
+            //
+            // aspectRatio is the only per-panel lever the bind gives us, and it is genuinely
+            // shader-visible — CreateRuntimeLcdMaterial does
+            // LCDMaterialDefinition.set_ScreenAspectRatio(aspectRatio) (read from IL), and the
+            // value is part of SharedRuntimeMaterialKey so panels with different aspects get
+            // different material instances off the SAME texture. That is exactly the shape we
+            // need: per-panel framing, shared pixels.
+            //
+            // WHAT IS NOT ESTABLISHED, and why this is a knob rather than a formula: that
+            // parameter's per-pixel meaning is documented nowhere and its only proven use is
+            // laying out TEXT. For an override texture it may crop (what we want), letterbox,
+            // or be ignored. So we pass a CHOSEN value and print both numbers; each panel on
+            // the multi-panel block is then one labelled data point, and the mapping gets
+            // measured instead of assumed.
+            object aspect = defAspect;
+            var wantAspect = FeedConfig.PanelBindAspect;
+            string aspectWhy = "panel's own Definition.AspectRatio (unchanged)";
+            if (wantAspect >= 0.0 && defAspect is float dA)
+            {
+                float use = wantAspect > 0.0 ? (float)wantAspect : 1.0f;
+                aspect = use;
+                aspectWhy = wantAspect > 0.0
+                    ? $"forced {use:F3} by panelBindAspect"
+                    : $"1.000 — declaring the CONTENT square (panel's own is {dA:F3})";
+            }
 
             // colorMetalOverride is Nullable<ResourceHandle<TextureAsset>>; our target
             // carries ResourceHandle<T> for a different T. The engine supplies the
@@ -750,10 +790,16 @@ internal static class PanelBinding
             var wantType = Nullable.GetUnderlyingType(ps[4].ParameterType) ?? ps[4].ParameterType;
             var converted = ConvertHandle(texHandle, wantType);
 
+            // Both numbers, always: the panel's real shape AND what we told the engine. With
+            // several panels of different shapes on one block, these lines are the dataset
+            // that maps ScreenAspectRatio's actual behaviour for an override texture.
             RttLog.Line($"Phase 2: binding — material={(baseMaterial == null ? "NULL" : "ok")} " +
-                        $"aspect={aspect} orientation={orientation} " +
+                        $"panelAspect={defAspect} passedAspect={aspect} ({aspectWhy}) " +
+                        $"orientation={orientation} " +
                         $"handle={(texHandle == null ? "NULL" : texHandle.GetType().Name)} -> " +
-                        $"{(converted == null ? "CONVERSION FAILED" : wantType.Name)}");
+                        $"{(converted == null ? "CONVERSION FAILED" : wantType.Name)}. " +
+                        "The render is 1024x1024 SQUARE and SHARED — every panel samples the one " +
+                        "target, so nothing here may add a render or a resample.");
 
             if (baseMaterial == null || converted == null)
             {

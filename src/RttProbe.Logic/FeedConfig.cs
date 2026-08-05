@@ -1422,6 +1422,21 @@ internal static class FeedConfig
     // a rebuild if it ever destabilises. A blind reader never re-binds regardless.
     public static bool PanelRebindOnLoss { get; private set; } = true;
 
+    // WHAT WE TELL THE ENGINE THE SCREEN'S ASPECT IS, at bind time (task #26, the multi-panel
+    // console block). The feed always renders 1024x1024 SQUARE; the user wants it projected
+    // with NO distortion — uniform scale until the panel's long axis is filled, the short
+    // axis overrunning off the display ("cover"). The bind's aspectRatio parameter lands in
+    // LCDMaterialDefinition.ScreenAspectRatio (read in IL), which is shader-visible — but its
+    // per-pixel semantics for an OVERRIDE texture are untested, so this is a knob, not a
+    // hard-coded guess:
+    //   -1  = pass the panel's own Definition.AspectRatio (today's behaviour)
+    //    0  = pass 1.0 — "the content is square"; the shader then crops, letterboxes or
+    //         ignores it, and the log + the eye decide which
+    //   >0  = pass exactly this value (the escape hatch while mapping the semantics)
+    // Every bind logs the definition aspect AND what was passed, so each panel on the block
+    // becomes one data point. Changing this re-binds on the next park cycle — no restart.
+    public static double PanelBindAspect { get; private set; } = -1.0;
+
     // WHEN THE MANUAL CAMERA IS ALLOWED TO LISTEN TO INPUT.
     //
     // Names are engine INPUT LAYERS, published by the bootstrap from
@@ -1629,6 +1644,7 @@ internal static class FeedConfig
 
             GrassProbe = Bool(kv, "grassProbe", GrassProbe);
             PanelRebindOnLoss = Bool(kv, "panelRebindOnLoss", PanelRebindOnLoss);
+            PanelBindAspect = Dbl(kv, "panelBindAspect", PanelBindAspect);
             CameraRequireLayers = Strs(kv, "cameraRequireLayers", CameraRequireLayers);
             CameraBlockLayers = Strs(kv, "cameraBlockLayers", CameraBlockLayers);
             CameraBlockKeys = Ints(kv, "cameraBlockKeys", CameraBlockKeys);
