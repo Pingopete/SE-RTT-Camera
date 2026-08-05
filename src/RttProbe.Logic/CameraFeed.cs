@@ -328,7 +328,42 @@ internal static class CameraFeed
     }
 
     internal static bool SimTickingNow => _pumpAliveMs == 0 || Clock.Ms - _pumpAliveMs < 500;
-    internal static long EffectiveStamp(long stamp) => Math.Max(stamp, _stallEndedMs);
+    // A SAVE IS A STALL THE HEARTBEAT CANNOT SEE — the hole behind the 22:11 device removal.
+    //
+    // The pause-teardown fix reads the sim-pump heartbeat, and the pump fires for EVERY
+    // scene — including the in-process SERVER scene, which keeps ticking straight through a
+    // save. So during a save the heartbeat says "sim alive" while the client LCD tick is
+    // stalled by collection, liveness concludes "panel genuinely dead" after 1500 ms, and the
+    // feed tears down at peak save load — the rebuild-under-load device removal, back through
+    // a gap in its own fix (observed 2026-08-04 22:11:41 DORMANT -> 22:11:44 DEVICE REMOVED).
+    //
+    // The bootstrap already publishes the precise signal: SaveGamePrefix stamps
+    // SaveHoldUntilMs = now + 8s. Honouring it HERE, in EffectiveStamp, rides the exact
+    // mechanism the pause fix built: bumping _stallEndedMs makes every liveness stamp
+    // effectively fresh through the hold, and the existing stall bookkeeping grants the
+    // usual fresh idle window after it. A save longer than the 8 s hold reopens the hole for
+    // its tail; the panel then still has the full idle window to resume ticking.
+    private static System.Reflection.FieldInfo _fSaveHold;
+    private static bool _fSaveHoldTried;
+    private static object _pendingRoute;          // reroute debounce — see the routing block
+    private static long _pendingRouteSinceMs;
+
+    private static bool SaveHoldNow()
+    {
+        if (!_fSaveHoldTried)
+        {
+            _fSaveHoldTried = true;
+            _fSaveHold = Type.GetType("RttProbe.RttBridge, RttProbe")?.GetField("SaveHoldUntilMs");
+        }
+        try { return _fSaveHold != null && Environment.TickCount64 < (long)_fSaveHold.GetValue(null); }
+        catch { return false; }
+    }
+
+    internal static long EffectiveStamp(long stamp)
+    {
+        if (SaveHoldNow()) _stallEndedMs = Clock.Ms;
+        return Math.Max(stamp, _stallEndedMs);
+    }
 
     // ---- THE LOAD-SETTLING GRACE (the stall-freeze's second leg, 2026-08-03) ----------
     //
@@ -464,15 +499,40 @@ internal static class CameraFeed
                 var want = FeedRouter.ResolveByName(name);
                 if (!ReferenceEquals(want, Feeds.Cur))
                 {
+                    // A REROUTE IS A FULL GPU REBUILD, so one tick's evidence is not enough.
+                    //
+                    // 2026-08-04 22:11:28: "[RTT] #0" flipped to FEED 1 mid-session with the
+                    // panel's ENTITY ID changed (@obj1248740 -> @obj3992328) — the surface
+                    // object had been recreated and re-resolved differently, 13 s before a
+                    // save. The rebuild that flip triggered ran into the save stall and ended
+                    // in a device removal. A transient re-read must not do that.
+                    //
+                    // So the new resolution has to HOLD for a full second before the route
+                    // follows it. A real retag still lands — one second late, invisible next
+                    // to the rebuild it triggers — while a one-tick flap dies here. And during
+                    // a save hold nothing accumulates at all: save collection is exactly when
+                    // surface state is being rebuilt around us and reads least trustworthily.
+                    var now2 = Clock.Ms;
+                    if (SaveHoldNow()) { _pendingRouteSinceMs = 0; return; }
+                    if (!ReferenceEquals(_pendingRoute, want) || _pendingRouteSinceMs == 0)
+                    {
+                        _pendingRoute = want; _pendingRouteSinceMs = now2;
+                        return;                       // first sighting: drop the tick, wait
+                    }
+                    if (now2 - _pendingRouteSinceMs < 1000) return;   // not stable yet
+
+                    _pendingRoute = null; _pendingRouteSinceMs = 0;
                     int wasId = Feeds.Cur.Id;
                     FeedRouter.Recache(renderComponent, name, want);
                     if (_rerouteLogs++ < 8)
                         RttLog.Line($"Feed routing CHANGED: \"{name}\" now belongs to FEED {want.Id} " +
-                                    $"(was feed {wasId}). The tag on the screen was edited, so the route " +
-                                    "follows it. This tick is dropped; the next one arrives correctly " +
-                                    "scoped and the panel re-claims its surface for its new feed.");
+                                    $"(was feed {wasId}), and the new resolution HELD FOR 1 s before the " +
+                                    "route followed it — a one-tick flap (save collection, surface " +
+                                    "recreation) can no longer trigger a full rebuild. This tick is " +
+                                    "dropped; the next one arrives correctly scoped.");
                     return;
                 }
+                _pendingRoute = null; _pendingRouteSinceMs = 0;   // resolution agrees again
             }
 
             // THE LIVENESS SIGNAL for the whole mod.
