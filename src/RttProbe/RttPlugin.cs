@@ -2103,7 +2103,15 @@ public sealed class RttPlugin : IPlugin
         catch (Exception e) { Log("Patching SaveGame FAILED: " + e.Message); }
     }
 
-    private static void SaveGamePrefix() => RttBridge.SaveHoldUntilMs = Environment.TickCount64 + 8000;
+    private static void SaveGamePrefix()
+    {
+        RttBridge.SaveHoldUntilMs = Environment.TickCount64 + 8000;
+        // SAY SO. This prefix used to set its field silently, which made "did the hold fire
+        // for THIS save?" unanswerable from the log — and the 22:23 device removal happened
+        // with the hold fix deployed, leaving open whether the seat-save even routes through
+        // SaveSessionComponent.SaveGame. One line per save answers that permanently.
+        Log("SAVE intercepted (SaveSessionComponent.SaveGame) — liveness hold armed for 8 s.");
+    }
 
     private static void PatchSimPumpSeat(HarmonyLib.Harmony harmony)
     {

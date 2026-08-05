@@ -1325,7 +1325,7 @@ internal static class WorldGrids
         // means "dead" while this heartbeat advances; a pause, the settings menu, a load or
         // a sim stall freezes it, and with it every liveness judgement. That freeze is the
         // fix for the settings/exit/load CTD family — see CameraFeed.NotePumpAlive.
-        CameraFeed.NotePumpAlive();
+        CameraFeed.NotePumpAlive(PanelScene != null && ReferenceEquals(sceneObj, PanelScene));
 
         // BEFORE the early-outs, deliberately. This drains panel unbinds that FeedGate
         // handed off because they arrived on the render thread (see PanelBinding.Unbind);

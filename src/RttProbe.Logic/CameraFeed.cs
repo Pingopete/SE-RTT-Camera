@@ -314,20 +314,63 @@ internal static class CameraFeed
     // degrades to the old wall-clock behaviour rather than freezing forever.
     private static long _pumpAliveMs, _stallEndedMs;
 
-    internal static void NotePumpAlive()
+    // THE HEARTBEAT MUST BE THE PANEL'S OWN SCENE, not "any scene" — the hole behind BOTH
+    // save-time device removals (22:11 and 22:23, the second one WITH the save-hold fix
+    // deployed). The pump fires for every scene, and with an in-process server the SERVER
+    // scene never pauses: during a save the global heartbeat stays fresh while the CLIENT
+    // scene — the one that ticks the panel — stalls. "Sim alive + panel silent" then reads
+    // as a destroyed panel and the feed tears down at peak save load.
+    //
+    // So the CLIENT scene's ticks are tracked separately (the pump tells us which scene it
+    // is on; WorldGrids.PanelScene identifies the panel's). Every liveness judgement now
+    // prefers the panel-scene heartbeat and falls back to the global one only before the
+    // panel scene has been identified. This also removes the dependence on save DETECTION:
+    // a save, a load, a menu, or any future client-side stall all freeze the panel-scene
+    // heartbeat by definition, whatever entry point they came through — which is exactly
+    // the property the SaveGame-prefix approach lacked (a seat-save that enters elsewhere
+    // never stamps the hold).
+    private static long _panelPumpAliveMs;
+
+    internal static void NotePumpAlive() => NotePumpAlive(false);
+
+    internal static void NotePumpAlive(bool panelScene)
     {
         var now = Clock.Ms;
-        var prev = _pumpAliveMs;
         _pumpAliveMs = now;
-        if (prev != 0 && now - prev > 1000)
+
+        if (panelScene)
         {
-            _stallEndedMs = now;
-            RttLog.Line($"SIM PUMP: stall of {now - prev} ms ended (pause, menu, load or hitch) — every panel " +
-                        "gets a fresh idle window. Silence during a stall is not death.");
+            var prev = _panelPumpAliveMs;
+            _panelPumpAliveMs = now;
+            if (prev != 0 && now - prev > 1000)
+            {
+                _stallEndedMs = now;
+                RttLog.Line($"SIM PUMP: PANEL-SCENE stall of {now - prev} ms ended (save, pause, menu, load " +
+                            "or hitch) — every panel gets a fresh idle window. Silence during a stall is not death.");
+            }
+        }
+        else if (_panelPumpAliveMs == 0)
+        {
+            // Pre-identification fallback: the old any-scene gap detection, so early-session
+            // stalls are still recognised before the panel scene is known.
+            var prev = _pumpAliveMs2;
+            _pumpAliveMs2 = now;
+            if (prev != 0 && now - prev > 1000)
+            {
+                _stallEndedMs = now;
+                RttLog.Line($"SIM PUMP: stall of {now - prev} ms ended (pause, menu, load or hitch) — every panel " +
+                            "gets a fresh idle window. Silence during a stall is not death.");
+            }
         }
     }
+    private static long _pumpAliveMs2;
 
     internal static bool SimTickingNow => _pumpAliveMs == 0 || Clock.Ms - _pumpAliveMs < 500;
+
+    // The judgement every teardown decision must use: is the scene THAT TICKS THE PANEL
+    // running? Falls back to the any-scene answer until the panel scene has stamped once.
+    internal static bool PanelSimTickingNow
+        => _panelPumpAliveMs != 0 ? Clock.Ms - _panelPumpAliveMs < 500 : SimTickingNow;
     // A SAVE IS A STALL THE HEARTBEAT CANNOT SEE — the hole behind the 22:11 device removal.
     //
     // The pause-teardown fix reads the sim-pump heartbeat, and the pump fires for EVERY
@@ -394,7 +437,7 @@ internal static class CameraFeed
         if (feed.ClaimedPanels.Count == 0) return;    // unlocked fast path: an int read
 
         // While the sim is not ticking, nothing can expire — see NotePumpAlive.
-        if (!SimTickingNow) return;
+        if (!PanelSimTickingNow) return;   // the PANEL scene, not any scene — see the heartbeat note
 
         long now = Clock.Ms, idle = EffectiveIdleMs(FeedConfig.PanelIdleMs);
         string dead = null;

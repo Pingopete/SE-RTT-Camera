@@ -302,7 +302,7 @@ internal static class FeedGate
         bool panelFresh = _lastPanelMs != 0
                           && (now - CameraFeed.EffectiveStamp(_lastPanelMs))
                              < CameraFeed.EffectiveIdleMs(FeedConfig.PanelIdleMs);
-        if (!panelFresh && _active && !CameraFeed.SimTickingNow)
+        if (!panelFresh && _active && !CameraFeed.PanelSimTickingNow)
             panelFresh = true;                     // sim is stalled: silence is not death
         bool alive = !_paused && !_quiesceRebuild
                      && !FeedConfig.IsFeedDisabled(Feeds.Cur.Id)
