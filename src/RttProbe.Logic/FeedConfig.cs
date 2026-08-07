@@ -370,6 +370,24 @@ internal static class FeedConfig
     // latency. Off by default so adopting the new bootstrap is inert until asked.
     public static bool WholeSceneSubmitEarly { get; private set; }
 
+    // Render only when the delivery chain will consume the frame (task #25). The copy hook
+    // sets RenderWanted when it lands a frame on the panel; TryRender consumes the flag and
+    // declines the turn otherwise, with a heartbeat so warm-up and a stalled copier cannot
+    // starve the pipeline. Renders then track the panel's true refresh instead of running
+    // one per engine frame and discarding half of them undelivered.
+    //
+    // MEASURED PREREQUISITE (2026-08-07 sprint): sparse renders inflate their own CPU
+    // submit 2.5ms -> 17.8ms because the nested Draw's internal GPU flush lands against a
+    // full queue (interval50 A/B). Pair this with wholeSceneSubmitEarly=1, which moves the
+    // render where the queue is empty — on-demand WITHOUT early-submit measured as a
+    // zero-gain trade and is not worth flipping.
+    public static bool WholeSceneRenderOnDemand { get; private set; }
+
+    // Heartbeat for the on-demand gate, ms: render anyway if no copy consumed a frame for
+    // this long. Keeps probes/adaptation warm across copier stalls; 0 disables renders
+    // entirely between copies (do not — dormancy already has a real gate).
+    public static int WholeSceneOnDemandHeartbeatMs { get; private set; } = 250;
+
     public static bool WholeSceneNativeScaling { get; private set; }
 
     // Feed exposure bias, in EV STOPS. Signed: +1 doubles brightness, -1 halves it.
@@ -2005,6 +2023,8 @@ internal static class FeedConfig
             WholeSceneNoBloom       = Bool(kv, "wholeSceneNoBloom", WholeSceneNoBloom);
             WholeSceneLdrResize     = Bool(kv, "wholeSceneLdrResize", WholeSceneLdrResize);
             WholeSceneSubmitEarly   = Bool(kv, "wholeSceneSubmitEarly", WholeSceneSubmitEarly);
+            WholeSceneRenderOnDemand = Bool(kv, "wholeSceneRenderOnDemand", WholeSceneRenderOnDemand);
+            WholeSceneOnDemandHeartbeatMs = Int(kv, "wholeSceneOnDemandHeartbeatMs", WholeSceneOnDemandHeartbeatMs);
             WholeSceneFarClip       = Dbl(kv, "wholeSceneFarClip", WholeSceneFarClip);
             WholeSceneFarClipExtend = Bool(kv, "wholeSceneFarClipExtend", WholeSceneFarClipExtend);
             WholeSceneOwnDrawContexts   = Bool(kv, "wholeSceneOwnDrawContexts", WholeSceneOwnDrawContexts);

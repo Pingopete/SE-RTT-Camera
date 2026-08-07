@@ -122,7 +122,15 @@ internal static class FeedHandover
             // run a whole DrawOne for our target, so its cost is nothing like the
             // camera pass's and the two must be tunable independently.
             if (now - _lastRequestRender < FeedConfig.EffectivePanelMs) return;
-            _lastRequestRender = now;
+            // CREDIT-BASED, not stamp-to-now (2026-08-07 sprint). This gate is sampled on
+            // hook ticks that cluster once per engine frame, so `_last = now` quantises the
+            // period UP to whole frames: a 33 ms gate on 23 ms frames fired every second
+            // frame — the panel's real refresh was 21 Hz, not the 30 the knob names.
+            // Advancing by the period keeps the average rate true; the clamp stops a stall
+            // from banking a burst of catch-up requests.
+            _lastRequestRender = (now - _lastRequestRender > 3L * FeedConfig.EffectivePanelMs)
+                ? now - FeedConfig.EffectivePanelMs
+                : _lastRequestRender + FeedConfig.EffectivePanelMs;
             _requestCount++;
 
             EnsureManager();
@@ -548,6 +556,11 @@ internal static class FeedHandover
 
             _handovers++;
             _copiesInterval++;
+
+            // RENDER-ON-DEMAND (task #25): a frame just reached the panel, so the NEXT
+            // nested render has a consumer. TryRender reads this; nothing else does.
+            Feeds.Cur.RenderWanted = true;
+            Feeds.Cur.LastCopyConsumedMs = Clock.Ms;
 
             // Real frames are landing now — stop the 2D test pattern overwriting them.
             BlitProbe.FeedOwnsTarget = true;

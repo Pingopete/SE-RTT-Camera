@@ -280,6 +280,23 @@ public static class RttBridge
     // reaches a stage the settings do not gate.
     public static volatile Func<int, bool> SkipStageHook;
 
+    // ---- PER-STAGE TIMING (perf sprint 2026-08-07, task #63) --------------------------
+    //
+    // Wall ticks and run counts per skippable-stage id, accumulated ONLY while the logic
+    // says we are inside our nested Draw (InOurRenderHook). The logic side reads these
+    // reflectively on its 15 s report clock and prints deltas — reflective so an old
+    // logic assembly ignores them and an old bootstrap degrades to "no table" with the
+    // logic saying so once. Index = stage id; slot 33 = everything-else remainder unused
+    // for now. Written from the render thread (and job threads for the job-typed stages);
+    // Interlocked keeps cross-thread sums honest without a lock in a per-stage hot path.
+    //
+    // KNOWN ATTRIBUTION NOISE, accepted for a diagnostic: InOurRenderHook is scoped by
+    // TIME not thread, so a player-frame job overlapping our ~10% duty cycle can donate
+    // its stage time to our table. Job-typed stages (17/22/23/24) are mostly skipped in
+    // our pass anyway; read their rows with that caveat.
+    public static readonly long[] StageTicks = new long[34];
+    public static readonly int[] StageRuns = new int[34];
+
     // ---- MANAGED WORLD AREA REGISTRATIONS (goal 10 tier 2, 2026-08-01) -----------------
     //
     // (area, sessionComponent) pairs captured from ManagedWorldArea.OnRegistered — the
@@ -3263,8 +3280,14 @@ public sealed class RttPlugin : IPlugin
                     BindingFlags.Static | BindingFlags.NonPublic);
                 if (pre == null) { Log($"No SkipStage{i} prefix for {name}."); continue; }
 
-                harmony.Patch(mi, prefix: new HarmonyLib.HarmonyMethod(pre));
-                Log($"Patched {owner.Name}.{name} as skippable stage {i}.");
+                // Postfix pairs with StageEnter for the per-stage timing table (#63).
+                // Looked up per id like the prefix; absence is loud but non-fatal.
+                var post = typeof(RttPlugin).GetMethod("StageDone" + i,
+                    BindingFlags.Static | BindingFlags.NonPublic);
+                harmony.Patch(mi, prefix: new HarmonyLib.HarmonyMethod(pre),
+                    postfix: post != null ? new HarmonyLib.HarmonyMethod(post) : null);
+                Log($"Patched {owner.Name}.{name} as skippable stage {i}" +
+                    (post == null ? " (no timing postfix)." : "."));
             }
             catch (Exception e) { Log($"Patching skippable stage {name} FAILED: {e.Message}"); }
         }
@@ -3275,8 +3298,47 @@ public sealed class RttPlugin : IPlugin
     // very hard failure to attribute.
     private static bool Skip(int id)
     {
-        try { return RttBridge.SkipStageHook?.Invoke(id) != true; }
+        try
+        {
+            bool run = RttBridge.SkipStageHook?.Invoke(id) != true;
+            if (run) StageEnter(id);
+            return run;
+        }
         catch { return true; }
+    }
+
+    // ---- PER-STAGE TIMING (task #63) ---------------------------------------------------
+    // Start stamps live in a ThreadStatic slot so the enter/done pair of one stage always
+    // meets on the thread that ran it (job-typed stages run off the render thread). A
+    // postfix ALWAYS runs, even when the prefix skipped the original — StageDone therefore
+    // keys on "was a start stamped", which only happens for stages that actually ran
+    // inside our pass. FieldInfo writes on [ThreadStatic] never reach other threads'
+    // slots, but these are native reads/writes on the OWNING thread — the reflection trap
+    // does not apply.
+    [ThreadStatic] private static long[] _stageStart;
+
+    private static void StageEnter(int id)
+    {
+        try
+        {
+            if (RttBridge.InOurRenderHook?.Invoke() != true) return;
+            (_stageStart ??= new long[34])[id] = System.Diagnostics.Stopwatch.GetTimestamp();
+        }
+        catch { }
+    }
+
+    private static void StageDone(int id)
+    {
+        try
+        {
+            var s = _stageStart;
+            if (s == null || s[id] == 0) return;
+            long dt = System.Diagnostics.Stopwatch.GetTimestamp() - s[id];
+            s[id] = 0;
+            System.Threading.Interlocked.Add(ref RttBridge.StageTicks[id], dt);
+            System.Threading.Interlocked.Increment(ref RttBridge.StageRuns[id]);
+        }
+        catch { }
     }
 
     private static bool SkipStage0() => Skip(0);
@@ -3308,6 +3370,39 @@ public sealed class RttPlugin : IPlugin
     private static bool SkipStage28() => Skip(28);
     private static bool SkipStage29() => Skip(29);
     private static bool SkipStage30() => Skip(30);
+
+    // Timing postfixes, one per patched stage (#63). Harmony runs a postfix even when the
+    // prefix skipped the original; StageDone keys on the start stamp, so skipped stages
+    // and player-frame runs cost one array read and return.
+    private static void StageDone0() => StageDone(0);
+    private static void StageDone1() => StageDone(1);
+    private static void StageDone2() => StageDone(2);
+    private static void StageDone3() => StageDone(3);
+    private static void StageDone4() => StageDone(4);
+    private static void StageDone5() => StageDone(5);
+    private static void StageDone6() => StageDone(6);
+    private static void StageDone7() => StageDone(7);
+    private static void StageDone8() => StageDone(8);
+    private static void StageDone9() => StageDone(9);
+    private static void StageDone10() => StageDone(10);
+    private static void StageDone11() => StageDone(11);
+    private static void StageDone12() => StageDone(12);
+    private static void StageDone13() => StageDone(13);
+    private static void StageDone14() => StageDone(14);
+    private static void StageDone15() => StageDone(15);
+    private static void StageDone16() => StageDone(16);
+    private static void StageDone17() => StageDone(17);
+    private static void StageDone18() => StageDone(18);
+    private static void StageDone19() => StageDone(19);
+    private static void StageDone21() => StageDone(21);
+    private static void StageDone22() => StageDone(22);
+    private static void StageDone23() => StageDone(23);
+    private static void StageDone24() => StageDone(24);
+    private static void StageDone26() => StageDone(26);
+    private static void StageDone27() => StageDone(27);
+    private static void StageDone28() => StageDone(28);
+    private static void StageDone29() => StageDone(29);
+    private static void StageDone30() => StageDone(30);
 
     // __0 is the DirectCommandList both passes take as their first parameter.
     // Running in the postfix means the engine has finished with that pass, so the

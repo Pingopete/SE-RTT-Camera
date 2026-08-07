@@ -2606,6 +2606,22 @@ internal static class WholeSceneRender
         if (!FeedConfig.WholeSceneEnabled || _ourScreenBuffers == null) return false;
         if (Clock.Ms - _lastRenderMs < FeedConfig.WholeSceneIntervalMs) return false;
 
+        // RENDER-ON-DEMAND (task #25): decline the turn unless a copy consumed the last
+        // frame (the handover raises RenderWanted per landed copy), with a heartbeat so
+        // warm-up and copier stalls cannot starve the pipeline. Renders then track the
+        // panel's true refresh instead of running once per engine frame and discarding
+        // the undelivered surplus. Pair with wholeSceneSubmitEarly=1 — sparse renders in
+        // the END-of-frame position stall on the engine's full GPU queue (submit 2.5 ->
+        // 17.8 ms, measured), which eats the entire saving.
+        if (FeedConfig.WholeSceneRenderOnDemand)
+        {
+            var f = Feeds.Cur;
+            bool heartbeatDue = FeedConfig.WholeSceneOnDemandHeartbeatMs > 0 &&
+                                Clock.Ms - _lastRenderMs >= FeedConfig.WholeSceneOnDemandHeartbeatMs;
+            if (!f.RenderWanted && !heartbeatDue) return false;
+            f.RenderWanted = false;
+        }
+
         _lastRenderMs = Clock.Ms;
         RunSecondRender(sceneDrawSystem);
 
@@ -5590,6 +5606,87 @@ internal static class WholeSceneRender
 
         _swapTotalTicks = 0; _swapCount = 0; _swapMaxTicks = 0; _swapWindowStartTicks = now;
         _setupTicks = 0; _drawTicks = 0; _teardownTicks = 0;
+
+        StageTimingReport();
+    }
+
+    // ---- PER-STAGE TIMING TABLE (task #63) ------------------------------------------------
+    // Reads RttBridge.StageTicks/StageRuns (bootstrap accumulators, this-pass-only) and
+    // prints the DELTA since the previous report, sorted by cost. Reflective per the frozen-
+    // bootstrap rule: an old bootstrap has no arrays and this says so once, then stays quiet.
+    private static FieldInfo _fiStageTicks, _fiStageRuns;
+    private static bool _stageTimingMissing, _stageTimingLogged;
+    private static long[] _stagePrevTicks;
+    private static int[] _stagePrevRuns;
+
+    private static readonly string[] StageNames =
+    {
+        "0 TLASBuild", "1 RtPrep+SceneFinalize", "2 EnvProbe", "3 Shadows", "4 Exposure",
+        "5 Surfels", "6 LightClusters", "7 Particles", "8 Decals", "9 HBAO",
+        "10 Lighting", "11 MainView", "12 DirLight", "13 LocalLights", "14 CloudShadowMap",
+        "15 Atmosphere", "16 DrawUI", "17 RaytraceGI", "18 ComputeGI", "19 FSRPrep",
+        "20 (fsr gate)", "21 Flares", "22 CloudShadowJob", "23 CloudWeather", "24 AtmoLUT",
+        "25 (exposure ro)", "26 CloudJob", "27 ProbeMgr", "28 LocalLightMgr", "29 SSR",
+        "30 RtPrepare", "31 (occl)", "32", "33"
+    };
+
+    private static void StageTimingReport()
+    {
+        if (_stageTimingMissing) return;
+        try
+        {
+            if (_fiStageTicks == null)
+            {
+                var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
+                _fiStageTicks = bridge?.GetField("StageTicks", BindingFlags.Public | BindingFlags.Static);
+                _fiStageRuns  = bridge?.GetField("StageRuns",  BindingFlags.Public | BindingFlags.Static);
+                if (_fiStageTicks == null || _fiStageRuns == null)
+                {
+                    _stageTimingMissing = true;
+                    RttLog.Line("STAGE TIMING: bootstrap predates the accumulators — restart to adopt. No table.");
+                    return;
+                }
+            }
+
+            var ticks = (long[])_fiStageTicks.GetValue(null);
+            var runs  = (int[])_fiStageRuns.GetValue(null);
+            if (ticks == null || runs == null) return;
+
+            _stagePrevTicks ??= new long[ticks.Length];
+            _stagePrevRuns  ??= new int[runs.Length];
+
+            double tickMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            var rows = new List<(double ms, string line)>();
+            double totalMs = 0;
+            for (int i = 0; i < ticks.Length && i < StageNames.Length; i++)
+            {
+                long dt = ticks[i] - _stagePrevTicks[i];
+                int dr = runs[i] - _stagePrevRuns[i];
+                _stagePrevTicks[i] = ticks[i];
+                _stagePrevRuns[i] = runs[i];
+                if (dr <= 0) continue;
+                double ms = dt * tickMs;
+                totalMs += ms;
+                rows.Add((ms, $"{StageNames[i]}: {ms / dr:F2}ms x{dr}"));
+            }
+            if (rows.Count == 0)
+            {
+                if (!_stageTimingLogged)
+                { _stageTimingLogged = true; RttLog.Line("STAGE TIMING: armed, no stage ran in our pass this window yet."); }
+                return;
+            }
+            rows.Sort((a, b) => b.ms.CompareTo(a.ms));
+            var sb = new System.Text.StringBuilder();
+            int shown = 0;
+            foreach (var r in rows) { if (shown++ == 10) break; sb.Append(shown == 1 ? "" : "  |  ").Append(r.line); }
+            RttLog.Line($"STAGE TIMING (our pass, window total {totalMs:F0}ms CPU-wall): {sb}" +
+                        (rows.Count > 10 ? $"  (+{rows.Count - 10} smaller)" : ""));
+        }
+        catch (Exception e)
+        {
+            _stageTimingMissing = true;
+            RttLog.Line("STAGE TIMING: reporter failed and is disarmed — " + e.Message);
+        }
     }
 
     private static MethodInfo _miDraw;

@@ -242,6 +242,13 @@ internal sealed class FeedInstance
     public bool PanelRtDiag;
     public int CopyLogs;
 
+    // RENDER-ON-DEMAND HANDSHAKE (task #25). The copy hook raises RenderWanted when it
+    // lands a frame on the panel; TryRender consumes it and declines turns nobody will
+    // deliver. Per-feed by construction — a process-global flag would be the SIXTH
+    // global-starves-a-feed bug (see LastRequestRender above for the fifth).
+    public bool RenderWanted;
+    public long LastCopyConsumedMs;
+
     // CONSECUTIVE view-lookup failures in CopyToFeed, and its own log budget. Per-feed for
     // the same reason CopyLogs is: feed 1 starts its render AFTER feed 0 is already warm, so
     // its "source not ready yet" window is a normal part of its startup and must not be
