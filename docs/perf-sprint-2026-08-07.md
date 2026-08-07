@@ -117,14 +117,17 @@ TLASBuild row VANISHED from the table, and per-render submit dropped 2.60 → 2.
 slightly more than the 0.39 predicted, because the empty rebuild's GPU dispatch went
 with it. First measured-positive change of the sprint.
 
-**THE CASCADE LEVER HAS TEETH AT DUSK (within-session A/B, same sun-window)**:
-cascade 2x512 → 1x512 = 31.4 → 35.9 fps (+4.5), frame -4.0 ms — far beyond its 0.15 ms
-CPU share (Shadows row 0.44→0.29): the second cascade's GPU pass re-renders the
-valley's long-shadow casters, which is expensive exactly when the sun is low. At noon
-(7/30 measurement) shadows were near-free — the lever's value is TIME-OF-DAY-DEPENDENT,
-which makes it the first genuinely useful quality-preset axis: "shadow quality" trades
-visible shadow range for ~4-5 fps in the worst lighting and ~0 in the best. Config
-restored to the user's 2x512 baseline; the preset doc records the option.
+**THE CASCADE FPS CLAIM, RETRACTED THE SAME HOUR**: the sequence 31.4 fps (2 casc,
+18:02) → 35.9 (1 casc, 18:08) → 42.1 (2 casc, 18:09) is a RISING SUN curve, not a
+cascade effect — the third point, a control taken after restoring 2 cascades, EXCEEDS
+the 1-cascade reading. During the dawn/dusk transition this scene swings ±10 fps over
+single minutes, so the "+4.5 fps at dusk" published briefly here was the sun. What
+survives is the clean CPU delta (Shadows row 0.44 → 0.29 ms, ~nothing) — consistent
+with the whole sprint's theme: the knobs are not where the cost is. The earlier ladder
+(17:26-17:48) is unaffected: it ran in the stable high-sun window (41-45 fps drift
+band over 22 min). Lesson recorded twice tonight in different clothes: this scene's
+fps has a large time-of-day term; A/Bs need a bracketing CONTROL POINT (A-B-A), not
+just adjacency.
 
 **THE SUN CONFOUND (session 3, the 32 fps scare)**: the post-fix soak read 31.4 fps —
 a ~12 fps apparent regression that is NOT the fix (submit improved as designed, our
