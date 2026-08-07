@@ -160,6 +160,27 @@ internal static class FeedConfig
     // probe manager and the TLAS.
     public static bool WholeSceneOwnIRCache { get; private set; } = true;
 
+    // Populate our irradiance grid (run stage 30 in our pass). OFF until the TLAS has real
+    // content: tracing an EMPTY TLAS writes sky-miss irradiance into every cell the camera
+    // visits, which underground is a blinding ambient blast (confirmed 2026-08-07, cave,
+    // angle-dependent). Installed-but-empty is the correct interim — isolated both ways,
+    // ambient from the probe cubes at the camera, zero RTGI trace cost.
+    public static bool WholeSceneIrCachePopulate { get; private set; } = false;
+
+    // Take the engine's own no-RT ambient branch for OUR pass (ComputeGI's else path — the
+    // one every RT-off player runs). Kills the sky-miss GI from tracing our empty TLAS: the
+    // cave floodlight, angle-flipping, confirmed 2026-08-07 with the cache proven empty.
+    // Ambient becomes IBL from the probe cubes at the feed camera. Needs the 2026-08-07
+    // bootstrap (NestedRenderRtOff); inert with one log line on an older one.
+    public static bool WholeSceneIblOnlyAmbient { get; private set; } = true;
+
+    // The flat linear grey the feed's diffuse GI buffer is cleared to when the trace is
+    // skipped. This IS the feed's ambient term until the TLAS is populated: content-only,
+    // per-pass, feeds no snapshot and no PSO — the one ambient mechanism that cannot flash
+    // (see the 2026-08-07 postmortems: state-input variance strobed both worlds twice).
+    // Live-tunable. 0 = black shadows.
+    public static double FeedAmbientFloor { get; private set; } = 0.02;
+
     // Localise SCREEN-SPACE REFLECTIONS to the feed camera.
     //
     // Clears SSSRSettings.EnableTemporalAccumulation for our pass only, which gates the whole
@@ -1041,6 +1062,14 @@ internal static class FeedConfig
     // texture-prioritizer walk ~200 ms after load-complete. Deactivation is never delayed.
     // 0 disables the grace.
     public static int ActivationGraceMs { get; private set; } = 4000;
+
+    // How long after world-up (and after any sim stall) before WORLD-SIDE residency work may
+    // start: preloads, the server presence entity, the camera trigger marker. All three drive
+    // server-side planet-sector materialisation, which is where the engine's world-load NRE
+    // family lives (Scene.GetDataPointer null under AsyncInitPlanet). Not our bug — it
+    // reproduced with the plugin disabled — but that control was one sample, and none of this
+    // work is worth anything during a loading screen. 0 disables the gate.
+    public static int ResidencySettleMs { get; private set; } = 30000;
 
     // How long a tagged panel may go without ticking before the mod shuts itself down.
     //
@@ -1991,6 +2020,7 @@ internal static class FeedConfig
             PanelTickCensus             = Bool(kv, "panelTickCensus", PanelTickCensus);
             PanelTickCensusMs           = Int(kv, "panelTickCensusMs", PanelTickCensusMs);
             ActivationGraceMs           = Int(kv, "activationGraceMs", ActivationGraceMs);
+            ResidencySettleMs           = Int(kv, "residencySettleMs", ResidencySettleMs);
             StatsPanel                  = Bool(kv, "statsPanel", StatsPanel);
             StatsPanelMs                = Int(kv, "statsPanelMs", StatsPanelMs);
             RttBudgetMs                 = Dbl(kv, "rttBudgetMs", RttBudgetMs);
@@ -2123,6 +2153,9 @@ internal static class FeedConfig
             WholeSceneSsrLocal          = Bool(kv, "wholeSceneSsrLocal", WholeSceneSsrLocal);
             WholeSceneOwnRayTracingScene = Bool(kv, "wholeSceneOwnRayTracingScene", WholeSceneOwnRayTracingScene);
             WholeSceneOwnIRCache        = Bool(kv, "wholeSceneOwnIRCache", WholeSceneOwnIRCache);
+            WholeSceneIrCachePopulate   = Bool(kv, "wholeSceneIrCachePopulate", WholeSceneIrCachePopulate);
+            WholeSceneIblOnlyAmbient    = Bool(kv, "wholeSceneIblOnlyAmbient", WholeSceneIblOnlyAmbient);
+            FeedAmbientFloor            = Dbl(kv, "feedAmbientFloor", FeedAmbientFloor);
             PanelCoverFit               = Bool(kv, "panelCoverFit", PanelCoverFit);
             WholeSceneDisableEyeAdaptation = Bool(kv, "wholeSceneDisableEyeAdaptation", WholeSceneDisableEyeAdaptation);
 

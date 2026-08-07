@@ -1990,12 +1990,22 @@ internal static class WholeSceneRender
         // there is no shared structure to protect, and leaving 0 skipped would hand the feed a
         // TLAS that is allocated and never built — the stage-2 failure again, one subsystem
         // over, and just as silent.
-        // STAGE 30 IS COUPLED TO OWNING THE CACHE, for the same reason stage 0 is coupled to
-        // owning the TLAS: a grid we allocate and never populate is the stage-2 failure a
-        // third time — silent, and it degrades the feed's ambient to the fallback while the
-        // player's stays clean. Owning it also REMOVES the reason 30 was ever dangerous: the
-        // entries land in our grid now, so running it can no longer touch the player's world.
-        if (id == 30 && FeedConfig.WholeSceneOwnIRCache && _irCacheInstalled)
+        // STAGE 30 IS GATED ON A KNOB, NOT MERELY ON OWNING THE CACHE. The first version
+        // force-ran it whenever the cache was installed, reasoning that a grid we allocate
+        // and never populate is the silent stage-2 failure a third time. TRUE — and with an
+        // EMPTY TLAS, populating is worse than emptiness: every trace MISSES and a miss
+        // shades as SKY, so the cells our camera writes inside a cave hold open-sky
+        // irradiance with nothing to occlude it. Confirmed 2026-08-07: blinding ambient in a
+        // cave that flipped with small view changes (patchy sparse-grid sampling), while
+        // outdoors the same error is invisible because sky ambient outdoors is roughly
+        // right.
+        //
+        // An INSTALLED-but-EMPTY cache is the correct interim state: isolation holds in both
+        // directions, the GI term contributes nothing, and ambient falls back to the probe
+        // cubes captured at the feed camera — the cheap position-correct ambient the user
+        // actually chose. Populate again only when the TLAS has real content.
+        if (id == 30 && FeedConfig.WholeSceneOwnIRCache && _irCacheInstalled
+                     && FeedConfig.WholeSceneIrCachePopulate)
         {
             if (Array.IndexOf(stages, 30) >= 0 && _skippedLogged.Add(-130))
                 RttLog.Line("Whole-scene: stage 30 (RaytracingPrepare -> IRCacheTraceJob) is in the skip " +
@@ -3082,7 +3092,29 @@ internal static class WholeSceneRender
                 // of the 3.28 ms mean hold is actually reclaimable before we start moving code.
                 _lastSetupTicks = t0 - _swapOpenedTicks;
                 _setupTicks += _lastSetupTicks;
-                _miDraw.Invoke(sceneDrawSystem, new[] { ourLdr });
+
+                // IBL-ONLY AMBIENT FOR OUR PASS (2026-08-07, the cave floodlight). With our
+                // TLAS empty by design, stage 17's RTGI trace MISSES on every ray and a miss
+                // shades as SKY — so the gi buffers carry open-sky irradiance, which outdoors
+                // is roughly right and underground is a blinding, angle-flipping blast. The
+                // cache was proven innocent first (grid empty, blast persisted).
+                //
+                // ComputeGI's own IL shows the engine has a first-class no-RT branch: the gi
+                // dispatch is gated on Settings.IsRaytracingSupportedAndEnabled and the else
+                // path still runs AmbientLightJob exactly as every RT-off player's game does.
+                // So the fix is to have OUR pass take that branch: a ThreadStatic bridge flag,
+                // read by a bootstrap postfix on the gate property, answering false only on
+                // THIS thread while the nested Draw executes. No settings struct is touched,
+                // no snapshot, no PSO defines — the hazards that made scoping RaytracingSettings
+                // unsafe are all absent, and the player's frame reads the true value even when
+                // its scene jobs overlap our window (they are other threads, and the flag is
+                // ThreadStatic precisely so they never see the lie).
+                //
+                // Reached reflectively so an older bootstrap degrades to today's behaviour
+                // (sky ambient) with one log line, per the frozen-bootstrap rule.
+                bool rtOffSet = SetNestedRtOff(true);
+                try { _miDraw.Invoke(sceneDrawSystem, new[] { ourLdr }); }
+                finally { if (rtOffSet) SetNestedRtOff(false); }
                 long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
                 _lastDrawTicks = t1 - t0;
                 _drawTicks += _lastDrawTicks;
@@ -6400,6 +6432,133 @@ internal static class WholeSceneRender
     }
 
     private static bool _irCacheLogged, _irCacheWaitLogged;
+
+    // The ThreadStatic RT-off bracket around our nested Draw — see the call site. Field
+    // resolved once; a bootstrap without it (pre-2026-08-07) leaves the feature inert and
+    // says so once, rather than throwing on a hot path.
+    private static FieldInfo _fNestedRtOff, _fAmbientFloor, _fFloorState;
+    private static PropertyInfo _piLastAmbient;
+    private static bool _nestedRtOffTried, _nestedRtOffMissingLogged, _floorStateLogged, _llaModeLogged;
+    private static bool SetNestedRtOff(bool value)
+    {
+        if (!FeedConfig.WholeSceneIblOnlyAmbient) return false;
+        if (!_nestedRtOffTried)
+        {
+            _nestedRtOffTried = true;
+            var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
+            _fNestedRtOff = bridge?.GetField("NestedRenderRtOff", BindingFlags.Public | BindingFlags.Static);
+            _fAmbientFloor = bridge?.GetField("FeedAmbientFloor", BindingFlags.Public | BindingFlags.Static);
+        }
+        // Pushed on the opening bracket of every pass, so feedAmbientFloor edits apply within
+        // a second while the game runs — the tuning loop for a knob whose right value is
+        // found by looking at a panel, not by arithmetic.
+        if (value && _fAmbientFloor != null)
+        {
+            try
+            {
+                // THE FLOOR IS THE ENGINE'S OWN AMBIENT SCALAR, NOT A CONSTANT (2026-08-07,
+                // user: "the ambient brightness remains exactly the same at night", and they
+                // asked for a shipped system rather than a hand-rolled one). OUR
+                // EnvironmentProbeManager — the engine's stock probe system, running at the
+                // FEED camera — computes LastLocalLightAmbient inside PrepareProbes every
+                // pass: the engine's own day/night ambient intensity at our position. The
+                // fully-stock APPLICATION path (RT-off ambient arithmetic) is closed by the
+                // snapshot law, so the division of labour is: the ENGINE computes the value,
+                // we only route it into the buffer the RT-on shader reads. One pass stale,
+                // which is 33 ms of dusk.
+                //
+                // feedAmbientFloor becomes a TRIM on that scalar rather than an absolute:
+                // effective = LastLocalLightAmbient x (feedAmbientFloor / 0.05), normalised
+                // so the value tuned by eye in daylight (0.07 on 2026-08-07) keeps meaning
+                // roughly the same brightness if daytime LLA is ~0.05. Falls back to the
+                // plain constant when the scalar is unreadable — a worse look, never a break.
+                float floor = (float)FeedConfig.FeedAmbientFloor;
+                var mgr = Feeds.Cur.OurProbes;
+                if (mgr != null)
+                {
+                    _piLastAmbient ??= mgr.GetType().GetProperty("LastLocalLightAmbient",
+                                           BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    // STRICTLY POSITIVE: LastLocalLightAmbient turned out to be the ambient
+                    // from LOCAL LIGHTS, not the sun — zero in open wilderness, where the
+                    // old >= 0 check accepted it and multiplied the floor to nothing
+                    // ("much too dark in the day", 2026-08-07). A zero scalar carries no
+                    // information; the constant floor is the honest fallback. Day/night
+                    // dimming needs a real sun-elevation signal — a separate task.
+                    if (_piLastAmbient?.GetValue(mgr) is float lla && !float.IsNaN(lla) && lla > 0f)
+                    {
+                        floor = lla * (floor / 0.05f);
+                        if (!_llaModeLogged)
+                        {
+                            _llaModeLogged = true;
+                            RttLog.Line($"AMBIENT FLOOR: driven by the engine's LastLocalLightAmbient at the " +
+                                        $"feed camera ({lla:F4} this pass) x trim — day/night now follows the " +
+                                        "engine's own curve. feedAmbientFloor is the TRIM (daylight brightness); " +
+                                        "night dims with the sun by construction.");
+                        }
+                    }
+                }
+                _fAmbientFloor.SetValue(null, floor);
+            }
+            catch { }
+        }
+
+        // The floor-colour verdict, reported FROM THE LOGIC SIDE: render-thread bootstrap
+        // logs proved unreliable this session, so the prefix writes a tri-state field and
+        // this loop — which demonstrably logs — announces it once. -1 here is the "black at
+        // every knob value" state that burned the afternoon.
+        if (value && !_floorStateLogged)
+        {
+            try
+            {
+                _fFloorState ??= Type.GetType("RttProbe.RttBridge, RttProbe")
+                                     ?.GetField("FloorColorState", BindingFlags.Public | BindingFlags.Static);
+                if (_fFloorState?.GetValue(null) is int fs && fs != 0)
+                {
+                    _floorStateLogged = true;
+                    RttLog.Line(fs > 0
+                        ? "AMBIENT FLOOR COLOUR: BUILT — the diffuse GI clear carries feedAmbientFloor; the " +
+                          "knob is live and tunable."
+                        : "AMBIENT FLOOR COLOUR: NO USABLE CONSTRUCTOR on the clear-value type — the floor " +
+                          "is BLACK regardless of the knob. The colour type needs a different construction.");
+                }
+            }
+            catch { }
+        }
+        if (_fNestedRtOff == null)
+        {
+            if (!_nestedRtOffMissingLogged)
+            {
+                _nestedRtOffMissingLogged = true;
+                RttLog.Line("IBL-only ambient: this bootstrap has no NestedRenderRtOff flag — RESTART THE " +
+                            "GAME to adopt it. Until then the feed's ambient keeps the sky-miss GI term " +
+                            "(the cave floodlight).");
+            }
+            return false;
+        }
+        try
+        {
+            _fNestedRtOff.SetValue(null, value);
+
+            // READ-BACK VERIFY, once. The ThreadStatic episode: 4,100 renders with this
+            // SetValue "succeeding" while the bootstrap's readers never saw true, because
+            // reflection writes to a [ThreadStatic] field do not reliably land in the
+            // reader's slot. A verified write is one property read on the first pass; an
+            // unverified one was an hour of dead instrumentation.
+            if (value && !_bracketVerified)
+            {
+                _bracketVerified = true;
+                bool seen = _fNestedRtOff.GetValue(null) is bool b && b;
+                RttLog.Line(seen
+                    ? "IBL-only ambient: pass bracket VERIFIED — the bootstrap's job prefixes will see it."
+                    : "IBL-only ambient: pass bracket WRITE DID NOT READ BACK — the prefixes will never " +
+                      "fire and the feed keeps whatever ambient the real trace produces. Field shape " +
+                      "mismatch between logic and bootstrap; restart with matching builds.");
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+    private static bool _bracketVerified;
 
     // ContainerIsInitialized is the manager's own answer to "is _container non-null", which
     // is exactly what IRCachePrepareJob asserts on. Read reflectively and defaulted to FALSE

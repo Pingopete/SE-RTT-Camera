@@ -1334,7 +1334,11 @@ internal static class WorldGrids
         // one uncontended lock and a count check per scene tick when the queue is empty.
         PanelBinding.DrainDeferredUnbind();
 
-        var want = FeedConfig.ServerPresenceEntity;
+        // Held through world load for the same reason the preloads are — the presence entity
+        // exists to make the SERVER generate sectors around the camera, which is the fragile
+        // path. Reads as "knob off" until the world settles, so the existing teardown branch
+        // below removes any marker that somehow survived a load.
+        var want = FeedConfig.ServerPresenceEntity && CameraFeed.ResidencySettled;
         if (!want && _serverMarker == null
             && !FeedConfig.CameraTriggerEntity && _marker == null
             && !_serverFloraSurveyPending) return;
@@ -2414,6 +2418,15 @@ internal static class WorldGrids
         if (SaveHoldActive())
         {
             if (_marker != null) DestroyCameraTriggerEntity("a save is being collected — no marker of ours may be in the set it walks");
+            return;
+        }
+        // Same settle gate as the presence entity and the preloads: this marker's whole job is
+        // to trigger server-side sector materialisation at the camera, so it must not exist
+        // while the world is still initialising planets.
+        if (!CameraFeed.ResidencySettled)
+        {
+            if (_marker != null) DestroyCameraTriggerEntity("the world is still settling after load — " +
+                                                           "no marker of ours may drive sector generation yet");
             return;
         }
         if (!FeedConfig.CameraTriggerEntity)

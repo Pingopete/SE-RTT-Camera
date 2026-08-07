@@ -413,6 +413,58 @@ internal static class CameraFeed
     // 0 until the first stall is seen, which reads as "settled long ago" by design.
     internal static long LastStallEndMs => _stallEndedMs;
 
+    // ---- THE RESIDENCY SETTLE GATE (2026-08-06) ----------------------------------------
+    //
+    // WORLD-SIDE work — preloads, the server presence entity, the camera trigger marker —
+    // must not run until the session has actually finished loading. All three ask the SERVER
+    // to materialise planet sectors around the feed camera, and the engine's own world-load
+    // path is fragile there: four CTDs in one hour, all NullReferenceException inside
+    // Scene.GetDataPointer on the In-Process Server Thread, under AsyncInitPlanet /
+    // AddEntityBundleToScene, via three different callers (SpawnEntity, SpawnOre,
+    // AllocateBody).
+    //
+    // WE ARE NOT THE CAUSE — it reproduced with the plugin disabled — but that control was a
+    // single sample and only proves the crash does not NEED us. It says nothing about whether
+    // our sector demand raises its rate, and pushing extra allocation into the exact
+    // subsystem that is failing, at the exact moment it is failing, is indefensible when the
+    // work is worthless then anyway: nobody is looking at the feed during a loading screen.
+    //
+    // Anchored on the same two signals as the activation grace, for the same reasons: the
+    // session's FIRST PANEL TICK (world-up) and the last stall end (so a save, a menu or a
+    // load resume re-serves the settling period). Deliberately far longer than the activation
+    // grace — that one protects a texture walk measured in milliseconds, this one waits out
+    // asynchronous planet initialisation measured in tens of seconds.
+    internal static bool ResidencySettled
+    {
+        get
+        {
+            long settle = FeedConfig.ResidencySettleMs;
+            if (settle <= 0) return true;                 // 0 disables the gate
+            long first = FirstPanelTickMs;
+            if (first == 0) return false;                 // world has not come up yet
+            long now = Clock.Ms;
+            return now - first >= settle
+                && now - _stallEndedMs >= settle
+                && PanelSimTickingNow;
+        }
+    }
+
+    private static bool _residencyArmedLogged;
+    internal static bool ResidencySettledLogged()
+    {
+        bool ok = ResidencySettled;
+        if (ok && !_residencyArmedLogged)
+        {
+            _residencyArmedLogged = true;
+            RttLog.Line($"RESIDENCY ARMED: {FeedConfig.ResidencySettleMs} ms past world-up and the last sim " +
+                        "stall, so preloads, the server presence entity and the camera trigger marker may now " +
+                        "run. They are held back during load because they ask the SERVER to materialise planet " +
+                        "sectors, and that is precisely where the engine's world-load NRE family lives — worth " +
+                        "nothing during a loading screen, and not worth the risk.");
+        }
+        return ok;
+    }
+
     // ---- THE LOAD-SETTLING GRACE (the stall-freeze's second leg, 2026-08-03) ----------
     //
     // THE HOLE THE FIRST LEG LEFT, measured the same evening it shipped: during load the
@@ -851,7 +903,11 @@ internal static class CameraFeed
             // updated. Anything added here later wants PresenceCentre too.
             var presence = PresenceCentre;
 
-            if (FeedConfig.PreloadAroundCamera)
+            // Held until the world has settled — see ResidencySettled. A preload during
+            // AsyncInitPlanet is server-side sector allocation aimed at the exact code path
+            // the engine's world-load NRE family lives in, and nobody is watching the feed
+            // during a loading screen anyway.
+            if (FeedConfig.PreloadAroundCamera && ResidencySettledLogged())
                 WorldGrids.PreloadAroundCamera(entity, presence, FeedConfig.PreloadRadius);
             if (FeedConfig.ServerPreload)
                 WorldGrids.ServerPreloadAroundCamera(presence, FeedConfig.PreloadRadius);

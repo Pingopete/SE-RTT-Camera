@@ -131,6 +131,51 @@ public static class RttBridge
     // every hot reload — the same ratchet ParkedProbeManagers exists to prevent.
     public static readonly object[] ParkedIRCaches = new object[4];
 
+    // TRUE only on the thread executing the feed's nested Draw, only for its duration. Read
+    // by the prefix on RaytraceGIJob.DoWork, which clears the GI buffers and skips the trace
+    // for OUR pass — so the feed's ambient is IBL-only (probe cubes at the camera) instead of
+    // the sky-miss GI from tracing an empty TLAS. That sky-miss GI was the cave floodlight of
+    // 2026-08-07.
+    //
+    // WHY THE JOB AND NOT THE SETTINGS GATE — the light-flashing postmortem, same day. The
+    // first version postfixed SettingsManager.get_IsRaytracingSupportedAndEnabled to answer
+    // false under this flag. ThreadStatic was supposed to protect the player's consumers on
+    // other threads — but scene ENTITY JOBS run inside Draw ON THE RENDER THREAD (every crash
+    // stack this week shows Draw -> Scene.Tick -> RunJob), so during our nested Draw the
+    // player's own DistanceTagManagerComponent.OnUpdateRaytracingTag consulted the lied-to
+    // gate and STRIPPED RT tags from whatever entities it processed in our window; the next
+    // player frame re-added them. Per-entity RT membership churning at feed cadence = rapid
+    // light flashing in BOTH worlds, reported in game within minutes. The lesson is the
+    // house-bug shape yet again: the lie was scoped by thread and time, but its consumers
+    // write PERSISTENT per-entity state, and a per-pass flip of a latched input oscillates
+    // everything downstream of the latch. Skipping the one dispatch we actually want gone
+    // leaves every latch reading a constant.
+    // PLAIN VOLATILE, NOT ThreadStatic — and that distinction cost a session hour. The flag
+    // was [ThreadStatic] out of design-1 paranoia (when the RT GATE had many consumers on
+    // many threads). Its only consumers NOW are the two job prefixes, which can only execute
+    // inside a Draw on the render thread — the player's ComputeGI runs BEFORE our postfix
+    // opens the bracket, so a process-global bool is already correctly scoped. ThreadStatic
+    // additionally broke the WRITE: the logic side sets this via FieldInfo.SetValue, and
+    // reflection writes to thread-static fields do not reliably land in the reading thread's
+    // slot — 4,100 second renders with the bracket "set" and neither prefix ever saw true.
+    public static volatile bool NestedRenderRtOff;
+
+    // THE THIRD DESIGN IS DELETED, AND THE REASON IS A LAW OF THIS ENGINE, so it is recorded
+    // where the next attempt will look. Scoping the RT-gate lie to ComputeGI only (a bracket
+    // flag that lived here) still flashed both worlds' ambient, because AmbientLightJob's
+    // DoWork is `_lightPass.Update(LightStates.get_Current()).Draw(...)` where _lightPass is
+    // a LazyJobSnapshotHandler — the EXACT type the RaytracingSettings post-mortem names as
+    // per-pass-unsafe. Update() rebuilds the snapshot (async PSO compile) whenever the state
+    // differs from last time, and the job is SHARED, so alternating RT-on (player) / RT-off
+    // (us) at feed cadence kept the snapshot in permanent rebuild and the ambient blinked
+    // for everyone. THE LAW: a shared job's STATE INPUT must be constant; only per-pass
+    // BUFFER CONTENT may vary. Which is why the ambient floor below is a buffer clear.
+    public static volatile float FeedAmbientFloor;   // linear grey the diffuse GI buffer is cleared to for the feed
+
+    // 0 = not attempted, 1 = floor colour built, -1 = NO USABLE CTOR (floor is black). Render-
+    // thread boot-logs proved unreliable, so the verdict is a field the logic side reports.
+    public static volatile int FloorColorState;
+
     // (renderer, batch, surfaceContext) — the renderer is needed to rebuild a panel's
     // screen material, which is how Phase 2 points a panel at our own render target.
     // ORDERLY HANDOVER ACROSS A HOT RELOAD — the leak the parks were a workaround for.
@@ -1064,6 +1109,17 @@ public sealed class RttPlugin : IPlugin
             if (Cfg("feedTextureCamera")) PatchTextureCamera(harmony);
             else Log("feedTextureCamera=0 — ManagedTexturePrioritizerComponent NOT patched.");
 
+            // UNGATED, AND THE PLACEMENT IS THE LESSON (2026-08-07): these three lived at
+            // the TAIL OF PatchTextureCamera for a day, which made them silently conditional
+            // on feedTextureCamera — a knob that flipped mid-day. Boots with it on applied
+            // them; boots with it off did not; the instruments therefore contradicted the
+            // reasoning boot by boot, and an entire inlining theory was built on a session
+            // where the patches had simply never been applied. A patch registration's
+            // enclosing method IS part of its gating, and these have nothing to do with the
+            // texture camera.
+            PatchIRCachePrepare(harmony);
+            PatchComputeGIFloor(harmony);
+
             // Ungated, unlike every patch above: it does not add a feature that could be
             // A/B'd off, it removes an assertion we ourselves cause. A config that disabled
             // this would be a config that re-arms the exit CTD.
@@ -1390,8 +1446,209 @@ public sealed class RttPlugin : IPlugin
             }
         }
         catch (Exception e) { Log("Patching CollectStandards FAILED: " + e.Message); }
+    }
 
-        PatchIRCachePrepare(harmony);
+    // ---- THE AMBIENT FLOOR, AT THE DISPATCHER LEVEL (2026-08-07, design 5) -------------
+    //
+    // Designs 2-4 patched the job DoWorks (RaytraceGIJob, AmbientLightJob). Both patches
+    // applied cleanly and NEITHER EVER EXECUTED — not once, not even for the player, proven
+    // by unconditional entry logs that never printed across a whole session. Every stage
+    // patch on SceneDrawSystem's big dispatcher methods works; the only silent detours this
+    // project has ever produced are those two small job bodies. That is the tiered-JIT
+    // inlining signature: the hot dispatcher re-JITs with the job bodies inlined, and a
+    // detour on the standalone method never sees another call.
+    //
+    // So the patch moves to the dispatcher: ComputeGI itself, the same method class as every
+    // patch that provably fires. For OUR pass it replaces the body with the minimal faithful
+    // contract read from the IL (the CopyJob tail is debug-view-only):
+    //
+    //   borrow DiffuseGIBuffer + SpecularGIBuffer  (the exact borrow the original makes)
+    //   resize both to PreUpscaleResolution
+    //   clear diffuse to the ambient floor, specular to black    <- the one change
+    //   _ambientLightJob.DoWork(cl, lBuffer, diffuse, specular)  <- REFLECTIVE invoke: runs
+    //        the real compiled body regardless of inlining, under the PLAYER'S OWN state —
+    //        same LazyJobSnapshot as every other frame, so nothing rebuilds and nothing
+    //        can flash
+    //   return both borrows (matched by IsInstanceOfType — seven Return overloads)
+    //
+    // The trace never runs for our pass, so the empty-TLAS sky-miss ambient and the
+    // player-cache sampling are both gone, and the feed's ambient is the flat floor.
+    private static void PatchComputeGIFloor(HarmonyLib.Harmony harmony)
+    {
+        try
+        {
+            var sds = Type.GetType("Keen.VRage.Render12.Core.Systems.SceneDrawSystem, VRage.Render12");
+            var gi = sds?.GetMethod("ComputeGI", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (gi == null) { Log("ComputeGI not found — the ambient floor cannot apply."); return; }
+
+            harmony.Patch(gi, prefix: new HarmonyLib.HarmonyMethod(
+                typeof(RttPlugin).GetMethod(nameof(ComputeGIFloorPrefix), BindingFlags.Static | BindingFlags.NonPublic)));
+            Log("Patched ComputeGI (dispatcher level) — for the feed's pass the RTGI trace is not dispatched " +
+                "and the ambient job runs over a floor-cleared diffuse buffer. Job-level detours were dead " +
+                "(inlined into this dispatcher); this is the level every working stage patch lives at.");
+        }
+        catch (Exception e) { Log("Patching ComputeGI FAILED: " + e.Message); }
+    }
+
+    private static bool _giEnteredLogged, _giOursLogged, _giErrLogged, _giResolved;
+    private static System.Reflection.FieldInfo _fAmbientJob;
+    private static System.Reflection.MethodInfo _miGiBorrow, _miGiResize, _miAmbientDo, _miGiClear;
+    private static System.Reflection.PropertyInfo _piMaxPre, _piPreUp, _piBorrowRes;
+    private static System.Reflection.FieldInfo _fScreenBuffers;
+    private static object _giPool, _giFmt, _giFmtNull, _giClearNull;
+    private static object _giFloorColor, _giBlackColor;
+    private static float _giFloorBuilt = float.NaN;
+
+    // __instance = SceneDrawSystem, __0 = DirectCommandList, __1 = the light-accumulation
+    // target (IRenderTargetView), __2 = localLightDiffuse (trace-only, unused here).
+    private static bool ComputeGIFloorPrefix(object __instance, object __0, object __1)
+    {
+        if (!_giEnteredLogged)
+        {
+            _giEnteredLogged = true;
+            Log($"ComputeGI prefix ENTERED (call 1) — flag={RttBridge.NestedRenderRtOff}. Dispatcher-level " +
+                "detour is live in the executing chain.");
+        }
+        if (!RttBridge.NestedRenderRtOff) return true;    // player's pass: original, untouched
+        try
+        {
+            if (!_giResolved)
+            {
+                _giResolved = true;
+                var core = Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+                _giPool = core?.GetField("BindableTexturePool", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                _fScreenBuffers = core?.GetField("ScreenBuffers", BindingFlags.Public | BindingFlags.Static);
+                var sb = _fScreenBuffers?.GetValue(null);
+                _piMaxPre = sb?.GetType().GetProperty("MaxPreUpscaleResolution");
+                _piPreUp = sb?.GetType().GetProperty("PreUpscaleResolution");
+                _fAmbientJob = __instance.GetType().GetField("_ambientLightJob", BindingFlags.Instance | BindingFlags.NonPublic);
+                _miGiBorrow = _giPool?.GetType().GetMethod("BorrowResizableRWRenderTargetTexture",
+                                  BindingFlags.Public | BindingFlags.Instance);
+                if (_miGiBorrow != null)
+                {
+                    var ps = _miGiBorrow.GetParameters();
+                    var fmtType = ps[1].ParameterType;                       // Vortice.DXGI.Format
+                    _giFmt = Enum.ToObject(fmtType, 26);                     // R11G11B10_Float — the original's literal
+                    _giFmtNull = Activator.CreateInstance(ps[3].ParameterType);
+                    _giClearNull = Activator.CreateInstance(ps[5].ParameterType);
+                }
+                foreach (var m in __0.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                    if (m.Name == "ClearRenderTargetView" && m.GetParameters().Length == 2) { _miGiClear = m; break; }
+            }
+
+            var ambient = _fAmbientJob?.GetValue(__instance);
+            if (_giPool == null || _miGiBorrow == null || _miGiClear == null || ambient == null
+                || _piMaxPre == null || _piPreUp == null)
+            {
+                if (!_giErrLogged)
+                {
+                    _giErrLogged = true;
+                    Log("ComputeGI floor: resolution incomplete (pool/borrow/clear/ambient/resolutions) — " +
+                        "running the ORIGINAL for the feed's pass. Sky-miss ambient persists but nothing breaks.");
+                }
+                return true;
+            }
+
+            // Colours, rebuilt when the live knob moves.
+            float floor = RttBridge.FeedAmbientFloor;
+            if (_giFloorBuilt != floor || _giFloorColor == null)
+            {
+                // THE PARAMETER IS Nullable<Color>, AND THAT ONE FACT ATE THE WHOLE DAY.
+                // Every ctor probe so far ran against Nullable`1 — which has no float or byte
+                // constructor — so the floor colour was null on every design since the first,
+                // and the fallback "black" was an EMPTY Nullable (a null clear value). The
+                // floor was never applied once. Build the colour from the UNDERLYING type;
+                // reflection's binder wraps a boxed T into Nullable<T> on invoke.
+                var ct = Nullable.GetUnderlyingType(_miGiClear.GetParameters()[1].ParameterType)
+                         ?? _miGiClear.GetParameters()[1].ParameterType;
+                _giBlackColor ??= Activator.CreateInstance(ct);
+                // Float ctor first (Color4-like), byte ctor second (Vortice Color is
+                // byte-backed). The design-5 rewrite dropped the byte fallback and the floor
+                // silently became black at every knob value — "bug gone, shadows dead" —
+                // while no error said so. A byte colour saturates at 1.0, so floors above 1
+                // clamp; the float path is the one that carries HDR values.
+                var f4 = ct.GetConstructor(new[] { typeof(float), typeof(float), typeof(float), typeof(float) });
+                if (f4 != null) _giFloorColor = f4.Invoke(new object[] { floor, floor, floor, 1f });
+                else
+                {
+                    var b4 = ct.GetConstructor(new[] { typeof(byte), typeof(byte), typeof(byte), typeof(byte) });
+                    if (b4 != null)
+                    {
+                        byte v = (byte)Math.Clamp((int)Math.Round(floor * 255.0), 0, 255);
+                        _giFloorColor = b4.Invoke(new object[] { v, v, v, (byte)255 });
+                    }
+                }
+                RttBridge.FloorColorState = _giFloorColor != null ? 1 : -1;   // readable by the logic-side reporter
+                _giFloorBuilt = floor;
+            }
+
+            // Re-read the ScreenBuffers INSTANCE each call — the engine can rebuild it, and a
+            // stale instance's resolutions would size our borrows for a dead swapchain.
+            var sbNow = _fScreenBuffers?.GetValue(null);
+            if (sbNow == null) return true;
+            object maxRes = _piMaxPre.GetValue(sbNow);
+            object preRes = _piPreUp.GetValue(sbNow);
+
+            object dBorrow = _miGiBorrow.Invoke(_giPool, new object[] { "DiffuseGIBuffer", _giFmt, maxRes, _giFmtNull, 1, _giClearNull, 0 });
+            object sBorrow = _miGiBorrow.Invoke(_giPool, new object[] { "SpecularGIBuffer", _giFmt, maxRes, _giFmtNull, 1, _giClearNull, 0 });
+            try
+            {
+                _piBorrowRes ??= dBorrow.GetType().GetProperty("Resource");
+                object d = _piBorrowRes.GetValue(dBorrow);
+                object s = _piBorrowRes.GetValue(sBorrow);
+
+                _miGiResize ??= d.GetType().GetMethod("Resize", BindingFlags.Public | BindingFlags.Instance);
+                _miGiResize?.Invoke(d, new[] { __0, preRes });
+                _miGiResize?.Invoke(s, new[] { __0, preRes });
+
+                _miGiClear.Invoke(__0, new[] { d, _giFloorColor ?? _giBlackColor });
+                _miGiClear.Invoke(__0, new[] { s, _giBlackColor });
+
+                _miAmbientDo ??= ambient.GetType().GetMethod("DoWork", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                _miAmbientDo.Invoke(ambient, new[] { __0, __1, d, s });
+
+                if (!_giOursLogged)
+                {
+                    _giOursLogged = true;
+                    Log($"ComputeGI FLOOR LIVE: feed ambient = flat {floor} via the real AmbientLightJob under " +
+                        "the player's own state — no trace, no state variance, nothing to flash.");
+                }
+            }
+            finally
+            {
+                ReturnGiBorrow(dBorrow);
+                ReturnGiBorrow(sBorrow);
+            }
+            return false;
+        }
+        catch (Exception e)
+        {
+            if (!_giErrLogged)
+            {
+                _giErrLogged = true;
+                Log("ComputeGI floor THREW — " + e.GetBaseException().Message + " — running the ORIGINAL for " +
+                    "the feed's pass from here on. This log line is the diagnosis.");
+            }
+            RttBridge.NestedRenderRtOff = false;   // fail safe for the rest of this pass
+            return true;
+        }
+    }
+
+    // Seven Return overloads, one per texture kind — match by instance type, never by name
+    // alone. Matching by name cost a render-thread freeze on 2026-08-06.
+    private static void ReturnGiBorrow(object borrowed)
+    {
+        if (borrowed == null || _giPool == null) return;
+        try
+        {
+            foreach (var m in _giPool.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (m.Name != "Return") continue;
+                var p = m.GetParameters();
+                if (p.Length == 1 && p[0].ParameterType.IsInstanceOfType(borrowed)) { m.Invoke(_giPool, new[] { borrowed }); return; }
+            }
+        }
+        catch { }
     }
 
     // ---- INITIALISE A PARKED IRRADIANCE CACHE ON DEMAND -------------------------------
