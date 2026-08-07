@@ -72,21 +72,68 @@ is a mini scene render — exactly submit-shaped cost that scales with elapsed f
 
 | rung | main fps | ours ms | verdict |
 |---|---|---|---|
-| res 1024→512 (gate cycle, ¼ the pixels) | 43.6-44.1 | 22.7-23.9 | **IDENTICAL to 1024** |
+| res 1024→512 (gate cycle, ¼ the pixels) | 45.3 | 22.1 | +1.2-1.7 fps of a ~10 fps gap |
 
-The feed's cost is RESOLUTION-INDEPENDENT. With every content knob also null, the
-~5 ms/frame is fixed per-render pipeline overhead — the nested Draw's queue
-flush/present-join plus per-stage fixed costs, × 43 renders/s. The GPU pixel work of
-a 1024² scene was never the bill. Restored to 1024 (512 pays quality for nothing:
-visible alpha-test speckle on foliage, screenshot in the session scratchpad).
+CORRECTED after a dateless-log misread (the first grade cited a PREVIOUS DAY's PERF
+lines — rtt.log has no dates and spans sessions; the resume script's comments document
+this exact trap and it still caught this session's tooling. Anchor log reads to line
+offsets, never to time-of-day regexes). The window-matched soak is the valid number:
+quartering the pixels buys at most ~1.5 fps. The conclusion survives: the feed's cost
+is dominated by fixed per-render pipeline overhead, not pixel work. Restored to 1024
+(512 shows visible alpha-test speckle on foliage for that ~1.5 fps — a preset choice,
+not a default).
 
 Observed during the cycles: the [RTS] stats panel lost its content after repeated
 quiesced rebuilds (feed panel unaffected) — the known re-bind fragility family (#26/#31
-neighborhood), restart restores it. Also: EVERY config-file save appears to trigger a
-quiesced rebuild ("slot being retired by a count change" at 17:52:50 and 17:57:51,
-matching doc-comment-only edits) — harmless but worth knowing when reading logs: config
-edits are not free of side effects even when no live knob changed. Worth a look in
-FeedConfig's signature hash someday.
+neighborhood), restart restores it. (An earlier claim here that every config save
+triggers a rebuild was the same dateless-log misread, retracted.)
+
+## The stage table (instrumented build, session 2)
+
+Per-render CPU submit at DENSE cadence (42/s): total 2.60 ms. MainView 0.91, Shadows
+0.44, TLASBuild 0.39 (an EMPTY structure rebuilt every render — build-once fix landed),
+EnvProbe 0.28, Lighting 0.17, everything else ≤0.08. No single dominant stage.
+
+**The O(gap) mechanism, named**: at sparse cadence ONLY the dispatch-heavy stages
+inflate — MainView 0.91→3.8 (gap-1)→5.5 ms (gap-2), Lighting 0.17→1.3→2.0,
+DirLight/Exposure/ComputeGI 5-11x — while fixed-CPU stages (TLAS, shadow refit, probes,
+SceneFinalize) stay flat. That is per-frame binding/state cache warmth: consecutive
+passes record against hot caches; ANY gap goes cold. Probe-backlog theory dead.
+
+**The cadence curve (total CPU/s)**: dense 109 ms/s, gap-1 202 ms/s, gap-2 190 ms/s.
+Dense every-frame rendering is the GLOBAL optimum — one skipped frame already pays the
+full cold penalty. This kills render-on-demand at any fps below ~2x panel rate (it
+would manufacture the gap-1 regime), and it retro-explains the interval50 fps null.
+
+Flora600 re-test under the table: MainView CPU unchanged — the metre caps were not
+binding in this view. Distance knobs are null on fps AND submit.
+
+Credit-gate verification: requests now run at 29.1/s (was 20-22) — the beat fix works.
+Delivery (drawOne ours) still ~21.4/s: the OffscreenTargetManager's own servicing is
+the next cap. Panel at 21 vs 30 Hz is a minor visual delta; deprioritized.
+
+**TLAS build-once, deployed and verified (session 3)**: stage 0 ran once at arm, the
+TLASBuild row VANISHED from the table, and per-render submit dropped 2.60 → 2.09 ms —
+slightly more than the 0.39 predicted, because the empty rebuild's GPU dispatch went
+with it. First measured-positive change of the sprint.
+
+**THE CASCADE LEVER HAS TEETH AT DUSK (within-session A/B, same sun-window)**:
+cascade 2x512 → 1x512 = 31.4 → 35.9 fps (+4.5), frame -4.0 ms — far beyond its 0.15 ms
+CPU share (Shadows row 0.44→0.29): the second cascade's GPU pass re-renders the
+valley's long-shadow casters, which is expensive exactly when the sun is low. At noon
+(7/30 measurement) shadows were near-free — the lever's value is TIME-OF-DAY-DEPENDENT,
+which makes it the first genuinely useful quality-preset axis: "shadow quality" trades
+visible shadow range for ~4-5 fps in the worst lighting and ~0 in the best. Config
+restored to the user's 2x512 baseline; the preset doc records the option.
+
+**THE SUN CONFOUND (session 3, the 32 fps scare)**: the post-fix soak read 31.4 fps —
+a ~12 fps apparent regression that is NOT the fix (submit improved as designed, our
+whole table reads 2.26 ms). Screenshot comparison shows the same camera and framing
+with the SUN much lower: in-game time advances across the session chain (the game
+re-saves at every load-complete), and dusk lighting is heavier for both renders (long
+shadows = more caster geometry per cascade, denser atmosphere). RULE: fps comparisons
+are valid only within one session's sun-window; cross-boot A/Bs must use the stage
+table's CPU numbers, or the test save needs a pinned time of day.
 
 ## Where this leaves the 60 fps goal
 

@@ -246,8 +246,19 @@ internal sealed class FeedInstance
     // lands a frame on the panel; TryRender consumes it and declines turns nobody will
     // deliver. Per-feed by construction — a process-global flag would be the SIXTH
     // global-starves-a-feed bug (see LastRequestRender above for the fifth).
+    // MEASURED VERDICT (2026-08-07 stage table): leave the knob OFF at today's fps.
+    // Any skipped frame between renders makes dispatch-stage recording go cache-cold
+    // (MainView 0.91 -> 3.8 ms at gap-1), so on-demand's sparser cadence costs MORE
+    // total CPU than every-frame. Revisit only if the engine's binding caches ever
+    // become warm across gaps.
     public bool RenderWanted;
     public long LastCopyConsumedMs;
+
+    // TLAS BUILD-ONCE (perf sprint): the owned RT scene is EMPTY by design, so stage 0
+    // needs to run exactly once per adopted/constructed manager, not per render
+    // (measured 0.39 ms/render rebuilt for nothing). Reset where _ourRtScene is
+    // assigned; survives feed rebuilds because the parked manager they re-adopt does.
+    public bool OwnTlasBuilt;
 
     // CONSECUTIVE view-lookup failures in CopyToFeed, and its own log budget. Per-feed for
     // the same reason CopyLogs is: feed 1 starts its render AFTER feed 0 is already warm, so

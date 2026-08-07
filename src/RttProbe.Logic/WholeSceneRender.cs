@@ -2017,11 +2017,24 @@ internal static class WholeSceneRender
 
         if (id == 0 && FeedConfig.WholeSceneOwnRayTracingScene && _rtSceneInstalled)
         {
+            // BUILD-ONCE (perf sprint 2026-08-07). The stage table priced this force-run at
+            // 0.39 ms CPU per render — 16 ms/s at every-frame cadence — rebuilding an EMPTY
+            // structure whose content cannot change (wholeSceneIrCachePopulate=0 means
+            // nothing ever enters it). The coupling exists so an owned TLAS can never be
+            // owned-but-NEVER-built (the silent stage-2 failure pattern); built ONCE
+            // satisfies that literally. Re-arms whenever the scene is (re)installed —
+            // Install/Restore flip _rtSceneInstalled, and the flag resets there — so a
+            // rebuild or park cycle gets a fresh build. When the TLAS gains real content
+            // someday, gate this skip on wholeSceneIrCachePopulate too: a populated scene
+            // needs per-frame refits again.
+            if (Feeds.Cur.OwnTlasBuilt)
+                return true;    // built already; skip the empty rebuild
+            Feeds.Cur.OwnTlasBuilt = true;
             if (Array.IndexOf(stages, 0) >= 0 && _skippedLogged.Add(-100))
                 RttLog.Line("Whole-scene: stage 0 (acceleration structures) is in the skip list but " +
                             "wholeSceneOwnRayTracingScene is on AND our scene is installed — running " +
-                            "it anyway, so our TLAS is built around the FEED camera. The player's " +
-                            "structure is untouched because it is a different manager.");
+                            "it ONCE, so our TLAS is built (empty) around the FEED camera, then skipped: " +
+                            "an empty structure never changes, and rebuilding it cost 0.39 ms per render.");
             return false;
         }
 
@@ -6282,6 +6295,10 @@ internal static class WholeSceneRender
                     if (parked != null && _rtSceneField.FieldType.IsInstanceOfType(parked))
                     {
                         _ourRtScene = parked;
+                        // A parked manager was already built by the session that parked it,
+                        // but a hot reload cannot prove that — one rebuild is cheap, a
+                        // never-built TLAS is the silent stage-2 failure. Build once again.
+                        Feeds.Cur.OwnTlasBuilt = false;
                         RttLog.Line($"Own RT scene: ADOPTED the parked RayTracingSceneManager for feed {slot} — " +
                                     "its TLAS buffers and entity pools survive the hot reload instead of leaking.");
                     }
@@ -6292,7 +6309,7 @@ internal static class WholeSceneRender
                     // Parameterless and non-public, same as EnvironmentProbeManager. The GPU
                     // buffers are built lazily by the first CreateTLAS, which happens inside
                     // stage 0 — i.e. inside our settle window, on the render thread.
-                    try { _ourRtScene = Activator.CreateInstance(_rtSceneField.FieldType, nonPublic: true); }
+                    try { _ourRtScene = Activator.CreateInstance(_rtSceneField.FieldType, nonPublic: true); Feeds.Cur.OwnTlasBuilt = false; }
                     catch (Exception e)
                     {
                         _rtSceneState = -1;
