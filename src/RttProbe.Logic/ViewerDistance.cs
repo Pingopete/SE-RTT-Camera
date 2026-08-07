@@ -63,6 +63,19 @@ internal static class ViewerDistance
         public double R;          // half-extent, for the cheap axis rejects
         public double R2;         // radius squared, for the distance test
         public long ExpiresAt;    // Environment.TickCount64 lease — see Nearest()
+
+        // ---- THE DISTANCE CURVE (task #42) — precomputed so the hot path stays cheap ----
+        // Inside Full the answer is the true distance, 1:1. Between Full and R the reported
+        // distance is inflated by a smoothstep gain rising to FarBias, so the engine's own
+        // LOD/mip/impostor ladders step content DOWN before the bubble boundary — by the
+        // time an entity crosses R it is already reporting FarBias x its true distance, so
+        // handing it back to the player-distance answer crosses far fewer tier thresholds.
+        // The cliff is removed at its cause, and the knob DIRECTION is cheaper, not richer:
+        // bias up = mid-range degrades earlier. BiasM1 == 0 (bias 1.0) short-circuits to
+        // exactly the old behaviour.
+        public double F;          // full-fidelity radius (<= R)
+        public double InvSpan;    // 1 / (R - F), 0 when F == R
+        public double BiasM1;     // FarBias - 1, 0 = curve off
     }
 
     private static volatile Viewer _viewer;
@@ -80,13 +93,24 @@ internal static class ViewerDistance
     // entities on both edges continuously. A stationary centre puts the same set of entities in
     // the near bucket for the whole orbit, which is what the tag jobs are built to expect and
     // what keeps this from becoming another source of the popping in task #32.
-    internal static void Publish(Vector3D centre, double radius)
+    internal static void Publish(Vector3D centre, double radius, double full, double farBias)
     {
         if (radius <= 0.0) { Clear(); return; }
+
+        // Sanitise HERE, once per camera pass, not in the 120k/s hot path. full <= 0 means
+        // "no curve zone" (the pre-curve behaviour: 1:1 all the way to the boundary), and a
+        // bias below 1 is refused outright — a gain under 1 would REDUCE reported distances,
+        // which breaks the monotone-safety argument the whole hook rests on.
+        if (full <= 0.0 || full > radius) full = radius;
+        if (double.IsNaN(farBias) || farBias < 1.0) farBias = 1.0;
+
         _viewer = new Viewer
         {
             X = centre.X, Y = centre.Y, Z = centre.Z,
             R = radius, R2 = radius * radius,
+            F = full,
+            InvSpan = radius > full ? 1.0 / (radius - full) : 0.0,
+            BiasM1 = radius > full ? farBias - 1.0 : 0.0,
             ExpiresAt = Environment.TickCount64 + LeaseMs,
         };
     }
@@ -347,6 +371,22 @@ internal static class ViewerDistance
 
         if (Environment.TickCount64 > v.ExpiresAt) return engineDistance;
 
-        return (float)Math.Sqrt(d2);
+        var d = Math.Sqrt(d2);
+
+        // THE CURVE (task #42). Identity inside Full; a smoothstep gain rising to FarBias
+        // between Full and the boundary. Monotone in d (gain and d both non-decreasing), so
+        // the curve cannot invert ordering and can never report an entity CLOSER than it is —
+        // the min() safety argument is untouched, because inflating our answer only ever
+        // hands the win back to the engine. The bubble test above guarantees d <= R, so t is
+        // in [0,1] without a clamp. BiasM1 == 0 is the curve switched off and returns the
+        // exact pre-curve answer.
+        if (v.BiasM1 != 0.0 && d > v.F)
+        {
+            var t = (d - v.F) * v.InvSpan;
+            var s = t * t * (3.0 - 2.0 * t);
+            d *= 1.0 + v.BiasM1 * s;
+        }
+
+        return (float)d;
     }
 }

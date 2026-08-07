@@ -500,7 +500,7 @@ internal static class FeedHandover
             // copies the whole resource in. Our LDR ring targets ARE pool
             // RWRenderTargetTextures, so the same trick works on them, using the very
             // MipMapJob instance DrawOne just used for this target.
-            int levels = (FeedConfig.PanelMipRegen && RegenerateMips(args, frame, commandList))
+            int levels = (FeedConfig.PanelMipRegen && RegenerateMips(args, frame, commandList, CameraRender.LdrMips))
                 ? CameraRender.LdrMips
                 : 1;
 
@@ -551,6 +551,28 @@ internal static class FeedHandover
 
             // Real frames are landing now — stop the 2D test pattern overwriting them.
             BlitProbe.FeedOwnsTarget = true;
+
+            // GOAL 11: fill every non-square panel shape from the square we JUST wrote, on
+            // this same command list.
+            //
+            // The position is the design. It is after the LDR->square copy, so the source is
+            // this frame rather than the last, and it is inside OUR target's DrawOne, so it
+            // costs no render request. OffscreenUIRenderer.DoWork services at most five
+            // offscreen targets per engine frame from a queue shared with every other feed and
+            // every vanilla LCD — asking for our own slots would have starved the square
+            // targets and skewed multi-feed ordering, which is the one thing the fan-out
+            // cannot afford. Every shape for this feed is therefore written from the same
+            // square, in the same command list, in the same frame: no panel can show frame N
+            // while its neighbour shows N-1.
+            //
+            // args is threaded through because the resample needs the OffscreenUIRenderer to
+            // reach _mipMapJob: a derived target has its own mip chain, and leaving levels
+            // 1..N unwritten is not a quality question but a correctness one — they hold
+            // recycled pool content, which is what put a semi-transparent freeze-frame of the
+            // world on the panels on 2026-08-06.
+            //
+            // No-op unless panelCoverFit is on and this feed has non-square panels.
+            BlitProbe.FillCoverTargets(args, commandList);
 
             if (_handovers >= 30 && !_survivedLogged)
             {
@@ -733,9 +755,15 @@ internal static class FeedHandover
     private static int _mipState;          // 0 = untried, 1 = ready, -1 = unavailable
     private static bool _mipLogged;
 
-    private static bool RegenerateMips(object[] args, object source, object commandList)
+    // levels is a PARAMETER rather than CameraRender.LdrMips because there are now two
+    // sources with independent mip counts: the LDR ring (LdrMips) and goal 11's cover-fit
+    // scratch, whose count comes from the derived panel target. The resolved
+    // MipMapJobExtensions overload is shared safely between them — both are
+    // BorrowRWRenderTargetTexture results, so they are the same runtime type, which is the
+    // only thing the overload predicate keys on.
+    internal static bool RegenerateMips(object[] args, object source, object commandList, int levels)
     {
-        if (_mipState < 0 || !CopyPerLevel || CameraRender.LdrMips <= 1 || source == null) return false;
+        if (_mipState < 0 || !CopyPerLevel || levels <= 1 || source == null) return false;
         try
         {
             // Pool borrows arrive as Borrowed<T>, and the copy path is happy with that
@@ -801,7 +829,6 @@ internal static class FeedHandover
                 _mipState = 1;
             }
 
-            int levels = CameraRender.LdrMips;
             _miMipDoWork.Invoke(null, new[] { _mipJob, commandList, source, (object)levels });
 
             if (!_mipLogged)

@@ -92,6 +92,45 @@ public static class RttBridge
     public static readonly object[] ParkedScreenBuffers = new object[4];
     public static readonly object[] ParkedDrawContexts = new object[4];
 
+    // PER-FEED RAYTRACING SCENE (the TLAS), parked for the same reason as everything above.
+    //
+    // WHY IT IS NEEDED, established 2026-08-05. Stage 0 (ExecuteAccelerationStructuresBuilding)
+    // is skipped for our pass because RayTracingSceneManager.CreateTLAS is camera-dependent AND
+    // world-space shared — building it from the feed camera corrupted the player's. So our rays
+    // trace against a structure selected for the PLAYER's position, and the raytraced half of
+    // ambient stays the player's however correct the probe cubes are. Owning a second manager
+    // is what lets stage 0 run for us without touching theirs; suppression can never fix
+    // something the feed has to CONSUME.
+    //
+    // AND THE HAZARD IS THE LARGEST OF THE SET, which is why the park comes first rather than
+    // afterwards. RayTracingSceneManager owns _tlasBuffers, InstanceDataBuffer,
+    // GeometryDataBuffer, ResultBuffer and eight entity Buffer<T> pools — all GPU allocations.
+    // A logic-owned instance dies unreachable on every hot reload with those still allocated,
+    // which is the VRAM ratchet (~1.1 GB/reload measured) and the descriptor-heap exhaustion
+    // that CTD'd own-probes after four reloads. Adoption order on the logic side is parked slot
+    // first, this load's field second, construct only if both are empty.
+    //
+    // Typed object and sized to Feeds.MaxFeeds, both for the reasons given above.
+    public static readonly object[] ParkedRayTracingScenes = new object[4];
+
+    // THE IRRADIANCE CACHE, parked for exactly the same reasons — and it fixes a bug pointing
+    // the OTHER way. CoreSystems.IRCacheResources is a WORLD-SPACE hash grid keyed by cell,
+    // and stage 30 (RaytracingPrepare -> IRCacheTraceJob) populates it from whatever camera
+    // the pass is running. We un-skipped stage 30 so the FEED's ambient would be computed at
+    // the feed camera, but we never owned the cache — so our entries land in the SHARED grid
+    // and the PLAYER's frame samples them.
+    //
+    // Harmless while the feed was 4000 km away (different cells, no collision) and exactly
+    // why this went unnoticed. Confirmed 2026-08-06 the moment the camera flew near the test
+    // base: identical player position, aim and time of day, and moving ONLY the feed camera's
+    // aim visibly changed the player's cockpit lighting. Our own config note predicted this
+    // outcome verbatim when stage 30 was un-skipped.
+    //
+    // IRCacheResourcesManager allocates ~14 RWBuffers plus a container built lazily by
+    // CreateAndInitializeContainer, so a logic-owned instance would strand that whole set on
+    // every hot reload — the same ratchet ParkedProbeManagers exists to prevent.
+    public static readonly object[] ParkedIRCaches = new object[4];
+
     // (renderer, batch, surfaceContext) — the renderer is needed to rebuild a panel's
     // screen material, which is how Phase 2 points a panel at our own render target.
     // ORDERLY HANDOVER ACROSS A HOT RELOAD — the leak the parks were a workaround for.
@@ -1351,6 +1390,107 @@ public sealed class RttPlugin : IPlugin
             }
         }
         catch (Exception e) { Log("Patching CollectStandards FAILED: " + e.Message); }
+
+        PatchIRCachePrepare(harmony);
+    }
+
+    // ---- INITIALISE A PARKED IRRADIANCE CACHE ON DEMAND -------------------------------
+    //
+    // THE CRASH THIS FIXES (2026-08-06 21:46, world load):
+    //
+    //   Assertion Failure: '_container' was null  at IRCacheResourcesManager.cs:92
+    //     at IRCachePrepareJob.DoWork  <-  our RunSecondRender
+    //
+    // We own CoreSystems.IRCacheResources for our pass so the feed's irradiance entries stop
+    // polluting the player's shared world grid. But unlike the probe manager and the TLAS —
+    // both of which build their GPU state lazily from inside our nested Draw —
+    // IRCacheResourcesManager's container is created by CreateAndInitializeContainer, and its
+    // ONLY caller is Render12EngineComponent.DrawInternal: one level ABOVE
+    // SceneDrawSystem.Draw, which is where our postfix lives. A manager swapped in during a
+    // nested Draw is therefore never offered initialisation, and stage 30 asserts on the null
+    // container rather than skipping.
+    //
+    // IRCachePrepareJob.DoWork is the right place to fix that because it RECEIVES the
+    // ComputeCommandList — the one thing our render path has no route to — and it is the very
+    // method that asserts. So: if the manager about to be used has no container, build it
+    // first, using the list it was about to use anyway.
+    //
+    // Costs nothing in the normal case: the engine's own manager is initialised long before
+    // this ever runs, so the check is one property read per job dispatch and the branch is
+    // taken exactly once per parked manager per session.
+    private static void PatchIRCachePrepare(HarmonyLib.Harmony harmony)
+    {
+        try
+        {
+            var t = Type.GetType("Keen.VRage.Render12.LightingStage.IRCachePrepareJob, VRage.Render12");
+            if (t == null) { Log("IRCachePrepareJob not found — wholeSceneOwnIRCache cannot self-initialise; it will decline to install."); return; }
+
+            var work = t.GetMethod("DoWork", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (work == null) { Log("IRCachePrepareJob.DoWork not found — wholeSceneOwnIRCache will decline to install."); return; }
+
+            harmony.Patch(work, prefix: new HarmonyLib.HarmonyMethod(
+                typeof(RttPlugin).GetMethod(nameof(IRCachePreparePrefix), BindingFlags.Static | BindingFlags.NonPublic)));
+            Log("Patched IRCachePrepareJob.DoWork — a parked irradiance cache whose container was never built " +
+                "is now initialised on demand, using the ComputeCommandList the job was about to use. Without " +
+                "this our own cache asserts '_container was null' on the render thread.");
+        }
+        catch (Exception e) { Log("Patching IRCachePrepareJob FAILED: " + e.Message); }
+    }
+
+    private static System.Reflection.PropertyInfo _piIrContainerReady;
+    private static System.Reflection.MethodInfo _miIrCreateContainer;
+
+    // INITIALISES THE PARKED MANAGERS, NOT THE INSTALLED ONE. The first version only looked
+    // at whatever sat in CoreSystems.IRCacheResources, which deadlocked: the logic side
+    // refuses to install an uninitialised manager (correctly — that assert is a render-thread
+    // kill), so ours was never installed, so this prefix never saw it, so it was never
+    // initialised. Armed and permanently inert, which the log said plainly and I had to be
+    // shown twice.
+    //
+    // Walking the park breaks the cycle at the only point where the two requirements can both
+    // be met: here we hold a live ComputeCommandList AND can reach a manager that is not
+    // installed anywhere. The engine's own manager is initialised long before this runs, so
+    // in the normal case this is a null check over a 4-slot array.
+    private static void IRCachePreparePrefix(object __0)
+    {
+        if (__0 == null) return;
+        try
+        {
+            var park = RttBridge.ParkedIRCaches;
+            if (park == null) return;
+
+            for (int i = 0; i < park.Length; i++)
+            {
+                var mgr = park[i];
+                if (mgr == null) continue;
+
+                _piIrContainerReady ??= mgr.GetType().GetProperty("ContainerIsInitialized",
+                                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (_piIrContainerReady?.GetValue(mgr) is bool ok && ok) continue;   // normal path
+
+                _miIrCreateContainer ??= mgr.GetType().GetMethod("CreateAndInitializeContainer",
+                                             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (_miIrCreateContainer == null) return;
+
+                _miIrCreateContainer.Invoke(mgr, new[] { __0 });
+                Log($"IR cache: initialised the container for parked feed {i}'s manager. It was constructed " +
+                    "inside a nested Draw, which never reaches DrawInternal's initialisation — so this is the " +
+                    "only place a live ComputeCommandList and an uninstalled manager meet.");
+            }
+        }
+        catch { /* a failure here must degrade to the logic-side guard, never throw on the render thread */ }
+    }
+
+    private static System.Reflection.FieldInfo _fIrCacheField;
+    private static object CoreSystemsIRCache()
+    {
+        try
+        {
+            _fIrCacheField ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12")
+                                   ?.GetField("IRCacheResources", BindingFlags.Public | BindingFlags.Static);
+            return _fIrCacheField?.GetValue(null);
+        }
+        catch { return null; }
     }
 
     private static void PrepareStandardMaterialsPrefix()

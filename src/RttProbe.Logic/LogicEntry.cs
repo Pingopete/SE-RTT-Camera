@@ -43,6 +43,7 @@ public static class LogicEntry
             {
                 FeedGate.Reset();
                 BlitProbe.Reset();
+                PanelTickCensus.Reset();   // ages are meaningless across a reload
                 ScenePassHook.Reset();
                 CameraRender.Reset();
                 CameraFeed.Reset();

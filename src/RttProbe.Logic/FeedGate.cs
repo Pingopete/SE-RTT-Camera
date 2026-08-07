@@ -134,6 +134,13 @@ internal static class FeedGate
     {
         long now = Clock.Ms;
 
+        // DUMPED FROM POLL, NOT FROM THE TICK. A census emitted from OnLcdTick would fall
+        // silent exactly when a surface stops ticking — which is the observation the whole
+        // instrument exists to make. Poll runs for every feed whether or not any panel is
+        // alive, so the ages keep being reported as they climb. Self-throttled internally,
+        // so calling it once per feed per poll costs one clock comparison.
+        PanelTickCensus.MaybeDump();
+
         // THE THROTTLE COVERS THE FILE STAT ONLY — not the per-feed decision below.
         //
         // This used to be `if (now - _lastPollMs < 250) return;` at the top, throttling the
@@ -236,6 +243,7 @@ internal static class FeedGate
     // quiesces together, and a half-quiesced rebuild is the thing being avoided.
     private static bool _quiesceRebuild;
     private static long _quiesceStartedMs;
+    private static int _holdLogs;   // activation-grace announcements, capped
 
     // Escape hatch. AllQuiesced needs every slot to report itself released, and a feed whose
     // panel stopped ticking at the exact moment the quiesce began would keep its stale
@@ -307,6 +315,43 @@ internal static class FeedGate
         bool alive = !_paused && !_quiesceRebuild
                      && !FeedConfig.IsFeedDisabled(Feeds.Cur.Id)
                      && panelFresh;
+
+        // ACTIVATION GRACE (2026-08-06, the world-load RenderThreadFreeze). Expiry has grace
+        // everywhere — stalls hold the gate, loads widen the idle window — but ACTIVATION had
+        // none: a dormant feed could arm in the first seconds of a session, and tonight it
+        // did. World load completed 20:16:35.046; we bound the panel, created the presence
+        // markers, fired preload #1 and queued render requests by .23; at .227 the engine's
+        // texture prioritizer died on 'index >= 0 && index < _count' in its FIRST collection
+        // walk — the same family as the three 2026-08-04 crashes, one of which was also at
+        // world load. Injecting a second viewer's worth of streaming demand into the most
+        // fragile 200 ms a session has is our contribution to that race, and it is entirely
+        // avoidable: nothing about a feed needs to exist in second zero.
+        //
+        // So a DORMANT feed may not go ACTIVE until the session has been up — and the panel
+        // scene un-stalled — for activationGraceMs. Anchored on BOTH the session's first
+        // panel tick (the world-up moment) and the last stall end (so a save/menu/load resume
+        // gets the same settling before a rearm — the rebuild-under-load family). Mid-play
+        // gate cycles see both anchors long past and arm instantly; deactivation is untouched
+        // by construction, because this term only suppresses a dormant->active transition.
+        if (alive && !_active && FeedConfig.ActivationGraceMs > 0)
+        {
+            long grace = FeedConfig.ActivationGraceMs;
+            long first = CameraFeed.FirstPanelTickMs;
+            bool settled = first != 0
+                           && now - first >= grace
+                           && now - CameraFeed.LastStallEndMs >= grace
+                           && CameraFeed.PanelSimTickingNow;
+            if (!settled)
+            {
+                alive = false;
+                if (_holdLogs++ < 6)
+                    RttLog.Line($"FEED GATE: activation HELD for feed {Feeds.Cur.Id} — inside the " +
+                                $"{grace} ms settling window after world-up or a stall. The panel stays " +
+                                "on its current material until the engine's first streaming walks are " +
+                                "done; arming here is what raced the texture prioritizer on 2026-08-06.");
+            }
+        }
+
         if (alive == _active) return;
 
         _active = alive;

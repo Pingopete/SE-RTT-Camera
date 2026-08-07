@@ -174,12 +174,19 @@ internal static class PanelBinding
     // 1.0 and silently framed wrong.
     internal static double PrimaryPanelAspect;
 
+    // One line per distinct shape, not per bind — panels rebind on every content pass and an
+    // unguarded log here would be thousands of lines a minute.
+    private static readonly HashSet<string> _coverLogged = new();
+    private static string AspectTag(float a) => a.ToString("F3");
+
     // Per-panel private material definitions — see the clone note in TryBind. Weak keys, so a
     // destroyed panel takes its clone with it and this never pins dead render objects alive.
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object>
         _privateMaterial = new();
     private static System.Reflection.MethodInfo _cloneMi;
     private static bool _cloneMissLogged;
+    private static System.Reflection.MethodInfo _cloneCtxMi;
+    private static bool _cloneCtxTried, _cloneNoopLogged;
 
     private static bool _surveyed, _disarmed;
 
@@ -837,14 +844,67 @@ internal static class PanelBinding
                 {
                     if (!_privateMaterial.TryGetValue(ctx, out var mine) || mine == null)
                     {
-                        _cloneMi ??= baseMaterial.GetType().GetMethods(Any)
-                            .FirstOrDefault(m => m.Name == "DeepClone" && m.GetParameters().Length == 0);
-                        mine = _cloneMi?.Invoke(baseMaterial, null);
+                        // THE PARAMETERLESS DeepClone RETURNS THE SAME INSTANCE for these
+                        // definitions — measured 2026-08-04: "clone of LCDMaterialDefinition
+                        // #00b928be -> #00b928be", and neither PBRMaterialDefinition nor
+                        // LCDMaterialDefinition overrides GetHashCode, so an identical hash is
+                        // identical IDENTITY, not a value coincidence. Definitions are almost
+                        // certainly interned, so cloning one hands the registered object back.
+                        //
+                        // That matters because the shared-material key holds the definition BY
+                        // REFERENCE: same object, same key, same borrowed material — the clone
+                        // would have achieved exactly nothing while logging success.
+                        //
+                        // So try the CloningContext overload with a FRESH context first, which
+                        // is the one that can produce a genuinely new graph, and fall back to
+                        // the parameterless form only as a second choice.
+                        if (_cloneCtxMi == null && !_cloneCtxTried)
+                        {
+                            _cloneCtxTried = true;
+                            _cloneCtxMi = baseMaterial.GetType().GetMethods(Any)
+                                .FirstOrDefault(m => m.Name == "DeepClone" && m.GetParameters().Length == 1);
+                        }
+                        if (_cloneCtxMi != null)
+                        {
+                            try
+                            {
+                                var ctxType = _cloneCtxMi.GetParameters()[0].ParameterType;
+                                var bare = ctxType.IsByRef ? ctxType.GetElementType() : ctxType;
+                                var args = new[] { Activator.CreateInstance(bare) };
+                                mine = _cloneCtxMi.Invoke(baseMaterial, args);
+                            }
+                            catch { mine = null; }
+                        }
+                        if (mine == null || ReferenceEquals(mine, baseMaterial))
+                        {
+                            _cloneMi ??= baseMaterial.GetType().GetMethods(Any)
+                                .FirstOrDefault(m => m.Name == "DeepClone" && m.GetParameters().Length == 0);
+                            mine = _cloneMi?.Invoke(baseMaterial, null);
+                        }
+
+                        // THE CHECK THAT MUST GATE THE VERDICT. A clone that is the same object
+                        // is not a clone, and saying "PRIVATE clone" over it is exactly the kind
+                        // of self-contradicting success line this project keeps being misled by.
+                        if (ReferenceEquals(mine, baseMaterial))
+                        {
+                            mine = null;
+                            if (!_cloneNoopLogged)
+                            {
+                                _cloneNoopLogged = true;
+                                RttLog.Line("PANEL MATERIAL: DeepClone returned THE SAME INSTANCE " +
+                                            $"(#{baseMaterial.GetHashCode():x8}), so the shared-material key is " +
+                                            "UNCHANGED and this panel is still on the shared material. Definitions " +
+                                            "appear to be interned. NOT private, NOT a fix — the [RTS] mirror and " +
+                                            "the aspect collision both remain. A unique key needs a genuinely new " +
+                                            "definition object (object-builder construction), not a clone.");
+                            }
+                        }
+
                         if (mine != null)
                         {
                             _privateMaterial.Remove(ctx);
                             _privateMaterial.Add(ctx, mine);
-                            RttLog.Line($"PANEL MATERIAL: bound with a PRIVATE clone of " +
+                            RttLog.Line($"PANEL MATERIAL: bound with a PRIVATE clone (VERIFIED distinct instance) of " +
                                         $"{baseMaterial.GetType().Name}#{baseMaterial.GetHashCode():x8} " +
                                         $"-> #{mine.GetHashCode():x8}. The shared-material key is now unique to " +
                                         "this panel, so no other panel can borrow the material carrying our feed " +
@@ -863,10 +923,66 @@ internal static class PanelBinding
                 catch (Exception e) { RttLog.Error("panel material clone", e); }
             }
 
+            // ---- GOAL 11: HAND THIS PANEL A TEXTURE ITS OWN SHAPE, NOT THE RAW SQUARE ------
+            //
+            // The panel's display aspect comes from IMMUTABLE definition data only — its pixel
+            // Resolution, corrected for the user's Orientation. Deliberately NOT from
+            // State.PreserveAspectRatio, which is the stock toggle we are required to be
+            // independent of, and not from the aspect we pass at bind time, which is part of
+            // SharedRuntimeMaterialKey and is left native so we never borrow another panel's
+            // runtime material.
+            //
+            // CoverTargetFor returns a target whose aspect already EQUALS this panel's, filled
+            // by one cover-cropped quad from the shared square. Because the shapes match, the
+            // panel's own fit mode becomes a no-op either way: contain has nothing to
+            // letterbox, stretch has nothing to stretch. That is the whole point — we do not
+            // fight the stock setting, we make it irrelevant.
+            //
+            // NULL IS A SUPPORTED ANSWER and means "bind the square directly": the feature is
+            // off, the panel is already square, or the derived target could not be made.
+            // Falling back to today's behaviour beats blanking a panel.
+            object rtForPanel = rt;
+            try
+            {
+                if (FeedConfig.PanelCoverFit)
+                {
+                    var res = Prop(def, "Resolution");
+                    int ori = orientation is int oi ? oi : System.Convert.ToInt32(orientation);
+                    float declared = defAspect is float df ? df : 1.0f;
+
+                    // Vector2I read reflectively, same as every other panel property here, so
+                    // this file keeps its "no engine math types" shape.
+                    int rx = 0, ry = 0;
+                    if (res != null)
+                    {
+                        var rt2 = res.GetType();
+                        var fx = rt2.GetField("X", Any); var fy = rt2.GetField("Y", Any);
+                        if (fx != null && fy != null)
+                        {
+                            rx = System.Convert.ToInt32(fx.GetValue(res));
+                            ry = System.Convert.ToInt32(fy.GetValue(res));
+                        }
+                    }
+
+                    float eff = BlitProbe.EffectiveAspect(rx, ry, declared, ori);
+                    var fitted = BlitProbe.CoverTargetFor(eff);
+                    if (fitted != null)
+                    {
+                        rtForPanel = fitted;
+                        if (_coverLogged.Add(AspectTag(eff)))
+                            RttLog.Line($"COVER FIT: panel resolution {rx}x{ry} orientation={ori} " +
+                                        $"-> effective aspect {eff:F3} (declared {declared:F3}). Binding the " +
+                                        "SHAPE-MATCHED target instead of the raw square, so PreserveAspectRatio " +
+                                        "cannot change what is displayed.");
+                    }
+                }
+            }
+            catch (Exception e) { RttLog.Error("cover fit select", e); }
+
             // colorMetalOverride is Nullable<ResourceHandle<TextureAsset>>; our target
             // carries ResourceHandle<T> for a different T. The engine supplies the
             // conversions: ResourceHandle<T> -> ResourceHandle -> ResourceHandle<TextureAsset>.
-            var texHandle = Prop(rt, "TextureHandle");
+            var texHandle = Prop(rtForPanel, "TextureHandle");
             var ps = mi.GetParameters();
             var wantType = Nullable.GetUnderlyingType(ps[4].ParameterType) ?? ps[4].ParameterType;
             var converted = ConvertHandle(texHandle, wantType);

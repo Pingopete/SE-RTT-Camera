@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Reflection;
 
 namespace RttProbe;
@@ -51,7 +52,7 @@ internal static class FeedRouter
     internal static void Reset()
     {
         _byComponent.Clear();
-        _byName.Clear();
+        lock (_byName) _byName.Clear();
         _bySurface.Clear();
         _claimLogs = 0;
     }
@@ -129,7 +130,7 @@ internal static class FeedRouter
     internal static void Recache(object component, string name, FeedInstance feed)
     {
         if (component != null) Remember(component, feed);
-        if (!string.IsNullOrEmpty(name)) _byName[name] = feed;
+        if (!string.IsNullOrEmpty(name)) lock (_byName) _byName[name] = feed;
     }
 
     // Which feed does a tag index mean right now? Clamped the same way ClaimByName clamps —
@@ -163,19 +164,41 @@ internal static class FeedRouter
     // this runs once per panel per session, so the nested scan costs nothing worth naming.
     private static int NextFreeSlot(int n)
     {
-        for (int i = 0; i < n; i++)
+        lock (_byName)
         {
-            bool taken = false;
-            foreach (var kv in _byName)
-                if (kv.Value.Id == i) { taken = true; break; }
-            if (!taken) return i;
+            for (int i = 0; i < n; i++)
+            {
+                bool taken = false;
+                foreach (var kv in _byName)
+                    if (kv.Value.Id == i) { taken = true; break; }
+                if (!taken) return i;
+            }
         }
         return -1;
     }
 
+    // A claim EXPIRED — free the slot so "next free feed" is true again. Without this the
+    // router map held every name ever claimed: on 2026-08-06 feed 0 sat DORMANT with all
+    // claims expired while a fresh unnumbered tag was routed to feed 1 (the faulted slot,
+    // black panel), because NextFreeSlot still saw feed 0 as taken by a panel that had been
+    // untagged five minutes earlier. The map is the record of what is handed out, so expiry
+    // must be recorded in it — same rule as the claims dictionary itself.
+    //
+    // Locked because this arrives from ExpireClaims on the render-thread pump while
+    // ClaimByName runs on the LCD tick — the same two threads the claims dict is locked for.
+    internal static void ReleaseName(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return;
+        bool removed;
+        lock (_byName) removed = _byName.Remove(name);
+        if (removed)
+            RttLog.Line($"Feed routing: released \"{name}\" — its claim expired, so its feed slot is " +
+                        "free for the next unnumbered tag.");
+    }
+
     private static FeedInstance ClaimByName(string name)
     {
-        if (_byName.TryGetValue(name, out var already)) return already;
+        lock (_byName) { if (_byName.TryGetValue(name, out var already)) return already; }
 
         TryParseTag(name, out int index);
 
@@ -204,7 +227,7 @@ internal static class FeedRouter
                         : $"Feed routing: panel \"{name}\" is UNNUMBERED but all {n} feed(s) are already " +
                           $"claimed, so it SHARES feed {feed.Id} and shows that camera. Raise feedCount " +
                           "to give it its own.");
-            _byName[name] = feed;
+            lock (_byName) _byName[name] = feed;
             return feed;
         }
 
@@ -238,7 +261,7 @@ internal static class FeedRouter
                                 $"{index + 1} to give it its own.");
         }
 
-        _byName[name] = feed;
+        lock (_byName) _byName[name] = feed;
         return feed;
     }
 
@@ -341,14 +364,20 @@ internal static class FeedRouter
     }
 
     // Find the surface whose TEXT carries a feed tag. Returns its index, or -1.
-    internal static int FindTaggedSurface(object renderComponent, out string tagText, out int feedIndex)
+    // EVERY tagged surface on the block, in scan order. This is the plural the block-level
+    // routing lacked: with two surfaces tagged, the old single-winner scan attributed EVERY
+    // tick of the block to one of them, so the other's claim starved and expired 1.5 s later
+    // — while its tag was still on the screen. The census caught it on 2026-08-06 within
+    // minutes of first running: "[RTT] #0" age=161s and climbing, "[RTT] #4" age=17ms, both
+    // tagged the whole time. One block, one heartbeat was never the model the user was sold —
+    // tags, claims and displays are all per SURFACE.
+    internal static List<(int Index, string Text, int FeedIndex)> FindTaggedSurfaces(object renderComponent)
     {
-        tagText = null;
-        feedIndex = -1;
+        var found = new List<(int, string, int)>();
         try
         {
             if (renderComponent?.GetType().GetField("_surfaces", Any)?.GetValue(renderComponent)
-                is not System.Collections.IEnumerable list) return -1;
+                is not System.Collections.IEnumerable list) return found;
 
             int i = -1;
             foreach (var s in list)
@@ -363,13 +392,26 @@ internal static class FeedRouter
                 string text = Member(Member(s, "State"), "Text") as string;
                 if (string.IsNullOrEmpty(text)) continue;
                 if (!TryParseTag(text, out int idx)) continue;
-                tagText = text;
-                feedIndex = idx;
-                return i;
+                found.Add((i, text, idx));
             }
         }
         catch { }
-        return -1;
+        return found;
+    }
+
+    // The first tagged surface — the block's ROUTE ANCHOR. Kept as the single winner for the
+    // reroute state machine and the primary pipeline, which are one-per-component by design;
+    // the additional tagged surfaces are handled per surface by discovery (same-feed mirrors
+    // claim and track; foreign-feed ones stay deferred until multi-feed-per-block is built).
+    internal static int FindTaggedSurface(object renderComponent, out string tagText, out int feedIndex)
+    {
+        tagText = null;
+        feedIndex = -1;
+        var all = FindTaggedSurfaces(renderComponent);
+        if (all.Count == 0) return -1;
+        tagText = all[0].Text;
+        feedIndex = all[0].FeedIndex;
+        return all[0].Index;
     }
 
     // The panel's identity for routing: the claim key of its tagged surface, or null when no

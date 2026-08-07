@@ -572,6 +572,27 @@ internal static class WholeSceneRender
                         foreach (var k in keys)
                         {
                             if (k == null) continue;
+
+                            // SAY WHAT THE KEY IS BEFORE REPORTING THAT IT CANNOT BE READ.
+                            //
+                            // "NONE positionable — reader blind" has been printed for days
+                            // without ever naming the thing it failed to read, so nobody could
+                            // act on it. TryWorldPosition guesses a fixed list of member names;
+                            // when the key is not that shape it returns null and the blindness
+                            // is indistinguishable from an empty TLAS. Dumping the runtime type
+                            // and its members once turns "blind" into an accessor somebody can
+                            // actually write — the same move that made the grass probe pay off.
+                            if (!_rtKeyShapeLogged)
+                            {
+                                _rtKeyShapeLogged = true;
+                                var kt = k.GetType();
+                                RttLog.Line($"RT PROBE key shape: _rootEntityToIndex key type = {kt.FullName} | " +
+                                            $"fields = [{string.Join(", ", kt.GetFields(Any).Select(f => f.FieldType.Name + " " + f.Name).Take(16))}] | " +
+                                            $"props = [{string.Join(", ", kt.GetProperties(Any).Select(p => p.PropertyType.Name + " " + p.Name).Take(16))}]. " +
+                                            "This is the shape TryWorldPosition has to match; until it does, a zero " +
+                                            "positionable count says nothing about the TLAS.");
+                            }
+
                             var pos = TryWorldPosition(k);
                             if (pos == null) continue;
                             positioned++;
@@ -579,7 +600,9 @@ internal static class WholeSceneRender
                             if (d < best) best = d;
                         }
                         nearest = positioned == 0
-                            ? $"{keys.Length} root(s), NONE positionable — reader blind, draw no conclusion"
+                            ? $"{keys.Length} root(s), NONE positionable — reader: {RtPositionReaderHow}. " +
+                              "If that names a member, the reader WORKS and the roots genuinely have no usable " +
+                              "position; if it says unavailable, this is blindness and says nothing about the TLAS"
                             : $"{keys.Length} root(s), {positioned} positionable, NEAREST TO OUR CAMERA = " +
                               (best > 1000.0 ? $"{best / 1000.0:F1} km" : $"{best:F0} m") +
                               (best > 10000.0
@@ -611,27 +634,69 @@ internal static class WholeSceneRender
     // actually uses, in order, and returns null rather than a fabricated origin — a wrong
     // position here would read as "RT geometry is right next to us" and kill a correct
     // diagnosis, which is exactly how the clipmap cell reader misled us for a day.
+    private static bool _rtKeyShapeLogged;
+
+    // RESOLVE THE ACCESSOR ONCE, THEN APPLY IT TO EVERY KEY.
+    //
+    // The old version guessed a fixed list of member names per call, and when the key was not
+    // one of those shapes it returned null — reported as "NONE positionable", which reads
+    // identically to "the TLAS is empty near our camera". Two completely different findings
+    // behind one output, which is the blind-reader trap this project keeps paying for.
+    //
+    // This resolves a strategy from the key's TYPE the first time and caches it, so the search
+    // can afford to be thorough (named members, then ANY Vector3D member, then any MatrixD's
+    // translation) without doing that work 1112 times a window. `_rtPosResolved` distinguishes
+    // "not looked up yet" from "looked up and genuinely unavailable", so a cached failure is
+    // still reported as blindness rather than as a zero.
+    private static bool _rtPosResolved;
+    private static Func<object, Vector3D?> _rtPosGet;
+    private static string _rtPosHow = "not resolved";
+
+    internal static string RtPositionReaderHow => _rtPosHow;
+
+    private static void ResolveRtPositionReader(Type t)
+    {
+        _rtPosResolved = true;
+
+        foreach (var n in new[] { "Position", "WorldPosition", "Translation" })
+        {
+            var p = t.GetProperty(n, Any); var f = p == null ? t.GetField(n, Any) : null;
+            if (p?.PropertyType == typeof(Vector3D)) { _rtPosGet = o => p.GetValue(o) as Vector3D?; _rtPosHow = $"property {n}"; return; }
+            if (f?.FieldType == typeof(Vector3D)) { _rtPosGet = o => f.GetValue(o) as Vector3D?; _rtPosHow = $"field {n}"; return; }
+        }
+
+        // Any Vector3D member at all, whatever it is called.
+        foreach (var f in t.GetFields(Any))
+            if (f.FieldType == typeof(Vector3D)) { _rtPosGet = o => f.GetValue(o) as Vector3D?; _rtPosHow = $"field {f.Name} (first Vector3D)"; return; }
+        foreach (var p in t.GetProperties(Any))
+            if (p.PropertyType == typeof(Vector3D)) { _rtPosGet = o => p.GetValue(o) as Vector3D?; _rtPosHow = $"property {p.Name} (first Vector3D)"; return; }
+
+        // Any MatrixD member — take its translation row.
+        foreach (var f in t.GetFields(Any))
+            if (f.FieldType == typeof(MatrixD))
+            {
+                _rtPosGet = o => { var m = f.GetValue(o); return m is MatrixD md ? md.Translation : (Vector3D?)null; };
+                _rtPosHow = $"field {f.Name}.Translation (MatrixD)"; return;
+            }
+        foreach (var p in t.GetProperties(Any))
+            if (p.PropertyType == typeof(MatrixD))
+            {
+                _rtPosGet = o => { var m = p.GetValue(o); return m is MatrixD md ? md.Translation : (Vector3D?)null; };
+                _rtPosHow = $"property {p.Name}.Translation (MatrixD)"; return;
+            }
+
+        _rtPosGet = null;
+        _rtPosHow = "NO Vector3D or MatrixD member on the key type — genuinely unavailable, not a zero";
+    }
+
     private static Vector3D? TryWorldPosition(object o)
     {
         try
         {
-            var t = o.GetType();
-            foreach (var n in new[] { "Position", "WorldPosition", "Translation" })
-            {
-                var v = t.GetProperty(n, Any)?.GetValue(o) ?? t.GetField(n, Any)?.GetValue(o);
-                if (v is Vector3D d) return d;
-            }
-            foreach (var n in new[] { "_worldTransform", "WorldTransform", "Transform" })
-            {
-                var wt = t.GetProperty(n, Any)?.GetValue(o) ?? t.GetField(n, Any)?.GetValue(o);
-                if (wt == null) continue;
-                var p = wt.GetType().GetProperty("Position", Any)?.GetValue(wt)
-                        ?? wt.GetType().GetField("Position", Any)?.GetValue(wt);
-                if (p is Vector3D d2) return d2;
-            }
+            if (!_rtPosResolved) ResolveRtPositionReader(o.GetType());
+            return _rtPosGet?.Invoke(o);
         }
-        catch { }
-        return null;
+        catch { return null; }
     }
 
     // ---- THE TEXTURE STREAMING PROBE ---------------------------------------------------
@@ -659,6 +724,111 @@ internal static class WholeSceneRender
     // "drop N mip levels" applied to everything. A non-zero value there means the feed looks
     // soft because the whole GAME is running reduced textures, not because of us.
     private static long _streamProbeTicks;
+
+    // WHERE THE FEED'S AMBIENT ACTUALLY COMES FROM — measured, not reasoned.
+    //
+    // Reported 2026-08-05: with the probe cubes correctly captured at our camera (reflections
+    // confirmed fixed), ambient in the feed STILL matches the player's local surroundings, and
+    // moving the player's sun still changes it. Two inferences of mine have already been wrong
+    // here, so this reports the state rather than arguing from call order.
+    //
+    // THE ONE THAT DECIDES IT is the CloseIBL fallback. get_CloseIBL() is:
+    //
+    //     if (!_lastSettings.Enable || !_lastSettings.ApplyEnvProbe)
+    //         return CommonResources.SkyboxIBL;      <- a GLOBAL, the player's ambient too
+    //     return _closeFinalTexture;                 <- our own capture
+    //
+    // _lastSettings is PER-MANAGER, and ours begins as default(EnvironmentProbeSettings) with
+    // every bool false. If it is never populated, our manager hands AmbientLightJob the same
+    // global skybox cube the player's frame uses — which is exactly "both renders using the
+    // same ambience". Reference equality against CommonResources.SkyboxIBL settles it; nothing
+    // else here can, because the fallback is silent by construction.
+    //
+    // Reports reader resolution SEPARATELY from value throughout: a missing field says "this
+    // reader is blind", never "the value is false". That distinction is why the grass probe
+    // eventually paid off and why its earlier verdict-shaped output cost two sessions.
+    private static long _ambientProbeTicks;
+    private static bool _ambientProbeShapeLogged;
+
+    private static void AmbientSourceProbe()
+    {
+        var now = Environment.TickCount64;
+        if (now - _ambientProbeTicks < 15000) return;
+        _ambientProbeTicks = now;
+
+        try
+        {
+            _coreType ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+            var live = _coreType?.GetField("EnvironmentProbeManager", BindingFlags.Public | BindingFlags.Static)
+                                ?.GetValue(null);
+            if (live == null) { RttLog.Line("AMBIENT PROBE: CoreSystems.EnvironmentProbeManager not found — reader blind."); return; }
+
+            // Is the manager installed for our pass actually OURS? Everything below is about
+            // the player's frame instead if this says NO.
+            string whose = _ourProbes == null
+                ? "we have no manager of our own (wholeSceneOwnProbes off or never armed)"
+                : (ReferenceEquals(live, _ourProbes) ? "OURS" : "THE ENGINE'S — our swap is not in effect here");
+
+            var t = live.GetType();
+            object LS(string name)
+            {
+                try
+                {
+                    var f = t.GetField("_lastSettings", Any);
+                    if (f == null) return "NO _lastSettings FIELD (blind)";
+                    var box = f.GetValue(live);
+                    if (box == null) return "null";
+                    var inner = box.GetType().GetField(name, Any) ?? box.GetType().GetField("<" + name + ">k__BackingField", Any);
+                    return inner == null ? $"NO {name} FIELD (blind)" : inner.GetValue(box);
+                }
+                catch { return "threw"; }
+            }
+
+            // THE DECIDING COMPARISON. Ask the manager for the cube it will hand the ambient
+            // job, then ask CommonResources for the global skybox, and compare REFERENCES.
+            string cubeVerdict;
+            try
+            {
+                var close = t.GetProperty("CloseIBL", Any)?.GetValue(live);
+                var far = t.GetProperty("FarIBL", Any)?.GetValue(live);
+                var common = _coreType?.GetField("CommonResources", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                var sky = common?.GetType().GetProperty("SkyboxIBL", Any)?.GetValue(common);
+
+                if (close == null && far == null) cubeVerdict = "CloseIBL/FarIBL both null — reader blind or probes disposed";
+                else if (sky == null) cubeVerdict = "CommonResources.SkyboxIBL unreadable — CANNOT compare, no verdict";
+                else
+                {
+                    bool cSky = ReferenceEquals(close, sky), fSky = ReferenceEquals(far, sky);
+                    cubeVerdict = $"CloseIBL={(cSky ? "THE GLOBAL SKYBOX (fallback)" : "our own capture")}, " +
+                                  $"FarIBL={(fSky ? "THE GLOBAL SKYBOX (fallback)" : "our own capture")}" +
+                                  (cSky || fSky
+                                      ? "   <-- THE FALLBACK IS LIVE: the feed's ambient is the SAME cube the player's " +
+                                        "ambient samples, which is why both look identical. Enable/ApplyEnvProbe below " +
+                                        "say why."
+                                      : "   <-- both cubes are ours, so the IBL half of ambient is NOT the contamination");
+                }
+            }
+            catch (Exception e) { cubeVerdict = "threw: " + e.GetType().Name; }
+
+            object lastAmb;
+            try { lastAmb = t.GetProperty("LastLocalLightAmbient", Any)?.GetValue(live) ?? "NO PROPERTY (blind)"; }
+            catch { lastAmb = "threw"; }
+
+            if (!_ambientProbeShapeLogged)
+            {
+                _ambientProbeShapeLogged = true;
+                RttLog.Line("AMBIENT PROBE shape: EnvironmentProbeManager fields = " +
+                            string.Join(", ", t.GetFields(Any).Select(f => f.Name).Take(24)));
+            }
+
+            RttLog.Line($"AMBIENT PROBE (inside our pass): manager={whose} | {cubeVerdict} | " +
+                        $"_lastSettings.Enable={LS("Enable")} ApplyEnvProbe={LS("ApplyEnvProbe")} " +
+                        $"ApplyLocalLightAmbient={LS("ApplyLocalLightAmbient")} EnableFullUpdate={LS("EnableFullUpdate")} " +
+                        $"| LastLocalLightAmbient={lastAmb} (a single scalar computed at " +
+                        "RenderView.CameraPosition inside PrepareProbes — ours only if InstallProbes ran after InstallCamera).");
+        }
+        catch (Exception e) { RttLog.Error("ambient source probe", e); }
+    }
 
     private static void StreamingProbe()
     {
@@ -1794,6 +1964,57 @@ internal static class WholeSceneRender
             return false;
         }
 
+        // Stage 2 and wholeSceneOwnProbes — THE PAIR THAT COST 2026-08-05, encoded so it
+        // cannot recur. We owned an EnvironmentProbeManager from goal 4.4 and left stage 2
+        // (RenderEnvironmentProbe) suppressed, so our probe atlas was never rendered into.
+        // Nothing complained: get_CloseIBL returns _closeFinalTexture whenever Enable and
+        // ApplyEnvProbe are set, WITHOUT checking that a single face was ever drawn. The feed
+        // sampled an unrendered cube for reflections AND ambient while every log line said the
+        // manager was installed. Suppression whose justification expired when ownership landed
+        // is now its own recognised failure mode — the reason 2 was skipped was a SHARED atlas,
+        // and it stopped being shared the moment we owned one.
+        if (id == 2 && FeedConfig.WholeSceneOwnProbes)
+        {
+            if (Array.IndexOf(stages, 2) >= 0 && _skippedLogged.Add(-2))
+                RttLog.Line("Whole-scene: stage 2 (RenderEnvironmentProbe) is in the skip list but " +
+                            "wholeSceneOwnProbes is on — running it anyway. Owning the probe atlas " +
+                            "means rendering into it, and an unrendered atlas fails SILENTLY " +
+                            "(CloseIBL never checks); drop 2 from wholeSceneSkipStages.");
+            return false;
+        }
+
+        // Stage 0 and wholeSceneOwnRayTracingScene, same pairing for the same reason. Stage 0
+        // is ExecuteAccelerationStructuresBuilding; it is in the default skip list because
+        // RayTracingSceneManager.CreateTLAS is camera-dependent and world-space SHARED, so
+        // building it from our camera corrupted the player's. With our own manager installed
+        // there is no shared structure to protect, and leaving 0 skipped would hand the feed a
+        // TLAS that is allocated and never built — the stage-2 failure again, one subsystem
+        // over, and just as silent.
+        // STAGE 30 IS COUPLED TO OWNING THE CACHE, for the same reason stage 0 is coupled to
+        // owning the TLAS: a grid we allocate and never populate is the stage-2 failure a
+        // third time — silent, and it degrades the feed's ambient to the fallback while the
+        // player's stays clean. Owning it also REMOVES the reason 30 was ever dangerous: the
+        // entries land in our grid now, so running it can no longer touch the player's world.
+        if (id == 30 && FeedConfig.WholeSceneOwnIRCache && _irCacheInstalled)
+        {
+            if (Array.IndexOf(stages, 30) >= 0 && _skippedLogged.Add(-130))
+                RttLog.Line("Whole-scene: stage 30 (RaytracingPrepare -> IRCacheTraceJob) is in the skip " +
+                            "list but wholeSceneOwnIRCache is on AND our cache is installed — running it " +
+                            "anyway, so the irradiance grid is populated at the FEED camera. The player's " +
+                            "grid is untouched because it is a different manager.");
+            return false;
+        }
+
+        if (id == 0 && FeedConfig.WholeSceneOwnRayTracingScene && _rtSceneInstalled)
+        {
+            if (Array.IndexOf(stages, 0) >= 0 && _skippedLogged.Add(-100))
+                RttLog.Line("Whole-scene: stage 0 (acceleration structures) is in the skip list but " +
+                            "wholeSceneOwnRayTracingScene is on AND our scene is installed — running " +
+                            "it anyway, so our TLAS is built around the FEED camera. The player's " +
+                            "structure is untouched because it is a different manager.");
+            return false;
+        }
+
         // Stage 21 and wholeSceneOwnFlares are the same kind of pair. Owning the
         // FlaresContext is pointless if RenderFlares never runs, and the ONLY reason 21 is
         // in the default skip list is that we used to install the ENGINE'S context — where
@@ -2655,7 +2876,8 @@ internal static class WholeSceneRender
             }
 
             var savedSb = _sbField.GetValue(null);
-            object savedCam = null, savedDc = null, savedProbes = null, savedEyeJob = null;
+            object savedCam = null, savedDc = null, savedProbes = null, savedEyeJob = null, savedRtScene = null,
+                   savedIrCache = null;
             object[] savedCb = null;
             // Hoisted out of the install block: the finally has to free it, and it is
             // orphaned whether or not the swap actually took.
@@ -2691,11 +2913,6 @@ internal static class WholeSceneRender
                 // leaving the feed permanently stale. No-op unless wholeSceneOwnFlares is on.
                 if (FeedConfig.WholeSceneOwnFlares) MirrorFlareDefinitions();
 
-                // AFTER the DrawContextManager swap, because it writes our context's
-                // EnvProbesToUpdate and reads _ourDrawContexts to find the field. No-op
-                // unless wholeSceneOwnProbes is on.
-                savedProbes = InstallProbes();
-
                 // OUR OWN AUTO-EXPOSURE HISTORY, installed before ScopeSharedState so the
                 // scope below can see that we own it and leave EyeAdaptation alone.
                 savedEyeJob = InstallEyeAdaptation(sceneDrawSystem);
@@ -2709,6 +2926,51 @@ internal static class WholeSceneRender
 
                 ScopeSharedState();
                 if (FeedConfig.WholeSceneCamera) camSwapped = InstallCamera(out savedCam);
+
+                // ENVIRONMENT PROBES — AFTER InstallCamera, AND THAT ORDER IS THE WHOLE FIX.
+                //
+                // This used to sit above, before ScopeSharedState and InstallCamera, with a
+                // comment saying only "AFTER the DrawContextManager swap, because it writes our
+                // context's EnvProbesToUpdate". That dependency is real and is still satisfied
+                // here — the DC swap happens earlier than both. What the old position missed is
+                // that PrepareProbes does not merely QUEUE work, it BAKES THE CAPTURE POSITION
+                // into every request at queue time:
+                //
+                //     EnvironmentProbeManager/Render..ctor
+                //       ldsfld   CoreSystems::Settings
+                //       callvirt SettingsManager::get_RenderView()
+                //       call     RenderView::get_CameraPosition()          <- read RIGHT HERE
+                //       call     CubeTextureUtils::GenerateCubeMapViewAtPosition(pos, face)
+                //       stfld    Render::View                              <- baked in
+                //
+                // Stage 2 (RenderEnvironmentProbe) later just drains the queue and renders each
+                // request through the View it was built with. So running PrepareProbes before
+                // InstallCamera stamped the PLAYER'S position into all six faces, and the feed's
+                // environment cube was a capture of wherever the player stands. Reported
+                // 2026-08-05 as ship windows in orbit reflecting the player's dusty desert.
+                //
+                // That cube is the source for BOTH symptoms, which is why they always moved
+                // together: EnvironmentProbeManager.CloseIBL is the SRV the SSSR Intersection
+                // dispatch binds for every off-screen ray, and IBL is also the ambient bounce
+                // term. One wrong position, two wrong-looking features.
+                //
+                // THE TRAP, recorded because it cost a restart: "the capture executes in stage 2,
+                // which runs after InstallCamera" is TRUE and irrelevant. Where the work RUNS and
+                // where its inputs were RESOLVED are different questions, and only the second one
+                // decides correctness. Checking that stage 2 ran late was not enough; the ctor one
+                // call further down is where the position actually came from.
+                savedProbes = InstallProbes();
+
+                // OUR TLAS, for the same reason and with the same ordering constraint: a
+                // CreateTLAS resolves its camera from the global RenderView, so this belongs
+                // inside the swap. Stage 0 is force-run while it is installed.
+                savedRtScene = InstallRayTracingScene();
+
+                // OUR IRRADIANCE GRID, and the ordering is the same constraint a third time:
+                // stage 30's trace job resolves its sampling position from the global
+                // RenderView, so it must be installed inside the swap. This is the fix for
+                // contamination pointing AT THE PLAYER — see InstallIRCache.
+                savedIrCache = InstallIRCache();
 
                 // The camera CONSTANT BUFFER, not just the view. The matrix check proved
                 // the installed view was rebuilt perfectly — square projection, orbiting
@@ -2872,6 +3134,7 @@ internal static class WholeSceneRender
                 if (FeedConfig.GrassProbe) RaytracingProbe();
                 if (FeedConfig.GrassProbe) StreamingProbe();
                 if (FeedConfig.GrassProbe) StreamingBudgetProbe();
+                if (FeedConfig.GrassProbe) AmbientSourceProbe();
 
                 string after = LdrRes(ourLdr);
                 if (before != after || (_lastLdrRes != null && _lastLdrRes != before))
@@ -2930,6 +3193,21 @@ internal static class WholeSceneRender
                 // The FieldInfo is re-read rather than trusted: a deferred Reset cannot null
                 // it any more, but this restore is the one whose failure leaves OUR probe
                 // manager installed in the player's frame, so it carries its own guard.
+                // OUR TLAS goes back FIRST — installed last, restored first, so the unwind is
+                // the exact mirror of the install. Leaving ours installed would have the
+                // player's own frame trace an acceleration structure built around the feed
+                // camera, which is the same class of damage as leaving our exposure history in
+                // place, and it clears _rtSceneInstalled so stage 0 stops being force-run the
+                // instant we are no longer the ones rendering.
+                // OUR IRRADIANCE GRID goes back before even the TLAS — installed last,
+                // restored first. Leaving ours in place would have the player's frame sample
+                // a grid populated at the feed camera, which IS the contamination this whole
+                // feature exists to remove; a failed restore here would recreate the bug in a
+                // harder-to-see form, so it is the very first thing the unwind does.
+                RestoreIRCache(savedIrCache);
+
+                RestoreRayTracingScene(savedRtScene);
+
                 if (savedProbes != null)
                 {
                     try
@@ -2981,8 +3259,37 @@ internal static class WholeSceneRender
         }
         catch (Exception e)
         {
+            // NOT EVERY FAULT DESERVES THE SESSION LATCH. This catch used to be one strike
+            // and out, which turned feed 1 into a zombie twice on 2026-08-06: its FIRST
+            // render NRE'd in ExecuteAccelerationStructuresBuilding — stage 0, the TLAS
+            // build our own-RT-scene feature force-runs — and the route died for the
+            // session while the gate stayed ACTIVE and the panel stayed black
+            // (request=25/s, park#0 forever).
+            //
+            // A stage-0 throw is the FEATURE failing, not the route: a feed without a local
+            // TLAS renders exactly as every feed did before the feature existed. So disarm
+            // own-RT-scene FOR THIS FEED (the state is per-feed precisely so this cannot
+            // touch the other feeds) and keep rendering. Anything else gets a bounded
+            // retry — engine state is restored by the unwind either way, proven by the
+            // player's view surviving both of tonight's faults — and only repeated failure
+            // latches the route, because "the feed silently never came back" is the least
+            // debuggable failure this project produces.
+            bool stage0 = e.StackTrace?.Contains("AccelerationStructures") == true;
+            if (stage0 && _rtSceneState >= 0)
+            {
+                _rtSceneState = -1;
+                RttLog.Error($"whole-scene render — stage 0 (TLAS build) threw, so OWN RT SCENE is DISARMED " +
+                             $"for feed {Feeds.Cur.Id}; the ROUTE CONTINUES without it", e);
+                return;
+            }
+            if (++Feeds.Cur.WholeSceneFaults < 3)
+            {
+                RttLog.Error($"whole-scene render (fault {Feeds.Cur.WholeSceneFaults}/3 for feed " +
+                             $"{Feeds.Cur.Id} — retrying on a later slot)", e);
+                return;
+            }
             _state = -1;
-            RttLog.Error("whole-scene render (route DISABLED for this session)", e);
+            RttLog.Error("whole-scene render (route DISABLED for this session — third fault)", e);
         }
     }
 
@@ -3090,6 +3397,22 @@ internal static class WholeSceneRender
     // mutating it changes nothing unless the copy is written back at every level on
     // the way out. That is what the recursion is for, and getting it wrong would look
     // exactly like "the flag had no effect".
+    // Resolve a settings member by name, falling back to the AUTO-PROPERTY BACKING FIELD.
+    //
+    // Needed because these settings structs mix plain fields with auto-properties, and the
+    // two are indistinguishable at the call site: RaytracingSettings.EnableIRCache is a
+    // field, SSSRSettings.EnableTemporalAccumulation is a property whose only storage is
+    // `<EnableTemporalAccumulation>k__BackingField`. Without this fallback the property ones
+    // silently resolve to null and ScopeOff reports "no matching flags" — a miss that reads
+    // like "this build does not have that setting" rather than "we looked up the wrong name".
+    //
+    // Writing the backing field directly is correct here for the same reason ClearBool works
+    // at all: these are plain data structs, and the property is a trivial accessor over that
+    // one field. Passing the mangled name at the call site would work too, but it would put
+    // an unreadable string in the one place a reader goes to see WHICH setting is scoped.
+    private static FieldInfo ResolveMember(Type t, string name)
+        => t.GetField(name, Any) ?? t.GetField("<" + name + ">k__BackingField", Any);
+
     private static bool ClearBool(object box, string path)
     {
         try
@@ -3097,13 +3420,13 @@ internal static class WholeSceneRender
             int dot = path.IndexOf('.');
             if (dot < 0)
             {
-                var f = box.GetType().GetField(path, Any);
+                var f = ResolveMember(box.GetType(), path);
                 if (f == null || f.FieldType != typeof(bool)) return false;
                 f.SetValue(box, false);
                 return true;
             }
 
-            var outer = box.GetType().GetField(path.Substring(0, dot), Any);
+            var outer = ResolveMember(box.GetType(), path.Substring(0, dot));
             if (outer == null) return false;
 
             var inner = outer.GetValue(box);            // a COPY when it is a struct
@@ -3125,7 +3448,7 @@ internal static class WholeSceneRender
         int dot = path.IndexOf('.');
         if (dot < 0)
         {
-            var f = box.GetType().GetField(path, Any);
+            var f = ResolveMember(box.GetType(), path);
             if (f == null) return false;
             object v = value;
             if (f.FieldType.IsEnum && value is int iv) v = Enum.ToObject(f.FieldType, iv);
@@ -3136,7 +3459,7 @@ internal static class WholeSceneRender
             return true;
         }
 
-        var outer = box.GetType().GetField(path.Substring(0, dot), Any);
+        var outer = ResolveMember(box.GetType(), path.Substring(0, dot));
         if (outer == null) return false;
         var inner = outer.GetValue(box);
         if (inner == null || !SetPath(inner, path.Substring(dot + 1), value)) return false;
@@ -3247,6 +3570,61 @@ internal static class WholeSceneRender
             ScopeOff("RaytracingSettings", "raytracing accumulators only (GI buffers still written)",
                      "EnableTemporalReSTIR", "EnableSpatialReSTIR",
                      "EnableTemporalFilter", "EnableIRCache", "EnableIRCacheScrolling");
+
+        // SCREEN-SPACE REFLECTIONS — localise them to the feed camera.
+        //
+        // Reported by the user 2026-08-04: "screen spaced reflections are also clearly taking
+        // from the main world render and not the feed's perspective". That is the same
+        // mechanism already documented as stage 29 (THE PHANTOM BLEED) seen from the other
+        // side — the bleed was noticed first as OUR scene appearing on the PLAYER'S reflective
+        // surfaces, and it is one shared history, so it was always contaminating both.
+        //
+        // READ THE IL BEFORE ASSUMING THIS IS THE SAME TRAP AS RaytracingSettings. It is not,
+        // and that distinction is the whole reason this is a one-flag fix rather than a
+        // second RayTracingSceneManager:
+        //
+        //   RaytracingSettings  -> RaytraceGIJob keys a LazyJobSnapshotHandler off it and
+        //                          BuildTraceShaderDefines turns fields into shader defines,
+        //                          so flipping one per render is an async PSO compile at our
+        //                          cadence. That is the bright flashing, and it took the
+        //                          device twice.
+        //   SSSRSettings        -> ScreenSpaceReflections.DoWork reads CoreSystems.Settings
+        //                          .SSSR DIRECTLY and consumes the fields inline. No
+        //                          snapshot, no defines, no PSO rebuild. Its PSOs are built
+        //                          once in InitializeAsync.
+        //
+        // So SSSRSettings is safe to scope per-pass, and RaytracingSettings still is not.
+        //
+        // WHY THIS ONE FLAG IS ENOUGH. EnableTemporalAccumulation gates the ENTIRE denoiser
+        // block in DoWork (the branch at IL_047a jumps the whole thing), and that block is
+        // where all three contaminations live:
+        //
+        //   1. it READS the shared RadianceHistory / VarianceHistory / SampleCountHistory /
+        //      AverageRadianceHistory — the player's accumulated radiance, which is what makes
+        //      our reflections show the main world;
+        //   2. it WRITES our radiance back into them, which is the original phantom bleed;
+        //   3. its last act is `stfld _previousViewProjection` — our camera's view-projection
+        //      stamped onto the job, so the PLAYER'S next frame reprojects its reflection
+        //      history through OUR camera. That one is a defect in the player's view that
+        //      nobody had attributed yet.
+        //
+        // Clearing it for our pass alone removes all three at once, and the reflections are
+        // still APPLIED: the false path falls through to _applyReflectionsJob using the raw
+        // intersection result. So the feed keeps screen-space reflections from its own
+        // perspective — undenoised and noisy rather than temporally accumulated.
+        //
+        // That trade is deliberate and was authorised: "I'd be happy with a comparatively low
+        // resolution and noise RT based ambient lighting and reflection solution to save on
+        // cost." It also COSTS LESS than the status quo, because skipping the denoiser skips
+        // its dispatches — this is the rare fix that is cheaper as well as more correct.
+        //
+        // NOT A REBUILD-SIGNATURE KNOB: this is a scoped setting evaluated per render, not a
+        // resource allocation, so it applies live from the config file with no park cycle.
+        if (FeedConfig.WholeSceneSsrLocal)
+            ScopeOff("SSSRSettings",
+                     "SSR temporal accumulation (localises reflections to the feed camera; " +
+                     "costs denoising, so they are noisy)",
+                     "EnableTemporalAccumulation");
 
         // EYE ADAPTATION. ComputeExposure drives EyeAdaptationJob, which ping-pongs a
         // shared auto-exposure history — this project already recorded that running it a
@@ -5685,6 +6063,358 @@ internal static class WholeSceneRender
                         "incomplete. Field names likely changed; re-check with tools/EngineQuery.");
         }
         return copied;
+    }
+
+    // ---- OWN THE RAYTRACING SCENE (the TLAS) -------------------------------------------
+    //
+    // THE LAST PLAYER-ANCHORED INPUT TO THE FEED'S AMBIENT, by elimination rather than by
+    // guess. Measured 2026-08-05: the probe cubes are ours (AMBIENT PROBE reports CloseIBL and
+    // FarIBL as our own captures, not the CommonResources.SkyboxIBL fallback), and RTGIContext
+    // with its ReSTIR reservoirs was never shared — it hangs off our own DrawContextManager.
+    // That leaves AmbientLightJob's other two inputs, giBufferDiffuse and giBufferSpecular,
+    // which come from RaytraceGIJob tracing against CoreSystems.RayTracingScene — a TLAS built
+    // by stage 0, which we skip, so it is selected for the PLAYER's position.
+    //
+    // WHY OWNERSHIP RATHER THAN SUPPRESSION, one more time: the feed CONSUMES this. Skipping
+    // stage 0 is what we already do and it is precisely why the feed's rays trace someone
+    // else's world. Only a second manager fixes what is consumed.
+    //
+    // THE ORDERING RULE, WRITTEN IN RATHER THAN REDISCOVERED. Install AFTER InstallCamera. The
+    // probe manager taught this the expensive way: PrepareProbes BAKES RenderView.CameraPosition
+    // into each request at queue time, so running it before the camera swap stamped the player's
+    // position into all six cube faces and the feed reflected the player's planet. Anything that
+    // resolves a position from the global RenderView has to run inside the swap, and a TLAS
+    // build is exactly that kind of thing. Where work RUNS is not where its inputs are RESOLVED.
+    //
+    // COUPLED TO STAGE 0 in ShouldSkipStage, so an owned-but-never-built TLAS is impossible.
+    // PER FEED — a shared static here meant one feed's failure poisoned the feature for
+    // every feed (feed 1's stage-0 NRE would have read as "unavailable" on feed 0 too).
+    private static int _rtSceneState               // 0 untried, 1 armed, -1 unavailable
+    { get => Feeds.Cur.RtSceneState; set => Feeds.Cur.RtSceneState = value; }
+    private static FieldInfo _rtSceneField;        // CoreSystems.RayTracingScene
+    private static bool _rtSceneInstalled;         // true only between install and restore
+    private static bool _rtSceneLogged;
+
+    private static object _ourRtScene
+    { get => Feeds.Cur.OurRtScene; set => Feeds.Cur.OurRtScene = value; }
+
+    private static object[] ParkedRtSceneSlot()
+    {
+        try
+        {
+            var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
+            return bridge?.GetField("ParkedRayTracingScenes")?.GetValue(null) as object[];
+        }
+        catch { return null; }
+    }
+
+    private static object InstallRayTracingScene()
+    {
+        _rtSceneInstalled = false;
+        if (_rtSceneState < 0 || !FeedConfig.WholeSceneOwnRayTracingScene) return null;
+        try
+        {
+            if (_rtSceneState == 0)
+            {
+                _coreType ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+                _rtSceneField = _coreType?.GetField("RayTracingScene", BindingFlags.Public | BindingFlags.Static);
+                if (_rtSceneField == null)
+                {
+                    _rtSceneState = -1;
+                    RttLog.Line("Own RT scene: CoreSystems.RayTracingScene not found — feature unavailable, " +
+                                "the feed keeps tracing the player's TLAS.");
+                    return null;
+                }
+
+                // THE PARK IS A HARD REQUIREMENT. RayTracingSceneManager owns _tlasBuffers,
+                // InstanceDataBuffer, GeometryDataBuffer, ResultBuffer and eight entity pools.
+                // Without the park every hot reload strands that set unreachable — the VRAM
+                // ratchet (~1.1 GB/reload measured) and the descriptor exhaustion that CTD'd
+                // own-probes. Refusing to arm is the correct failure, not a fallback.
+                var park = ParkedRtSceneSlot();
+                if (park == null)
+                {
+                    _rtSceneState = -1;
+                    RttLog.Line("Own RT scene: this bootstrap has NO ParkedRayTracingScenes array — RESTART " +
+                                "THE GAME to adopt the new bootstrap. Refusing to arm rather than leak a TLAS " +
+                                "and its buffers once per hot reload.");
+                    return null;
+                }
+
+                int slot = Feeds.Cur.Id;
+                if (slot < 0 || slot >= park.Length) { _rtSceneState = -1; return null; }
+
+                if (_ourRtScene == null)
+                {
+                    // Type-check the adoption: the park is untyped object[] because the
+                    // bootstrap must not touch engine types, so a slot filled by an older or
+                    // incompatible build would otherwise be cast blindly at first use.
+                    var parked = park[slot];
+                    if (parked != null && _rtSceneField.FieldType.IsInstanceOfType(parked))
+                    {
+                        _ourRtScene = parked;
+                        RttLog.Line($"Own RT scene: ADOPTED the parked RayTracingSceneManager for feed {slot} — " +
+                                    "its TLAS buffers and entity pools survive the hot reload instead of leaking.");
+                    }
+                }
+
+                if (_ourRtScene == null)
+                {
+                    // Parameterless and non-public, same as EnvironmentProbeManager. The GPU
+                    // buffers are built lazily by the first CreateTLAS, which happens inside
+                    // stage 0 — i.e. inside our settle window, on the render thread.
+                    try { _ourRtScene = Activator.CreateInstance(_rtSceneField.FieldType, nonPublic: true); }
+                    catch (Exception e)
+                    {
+                        _rtSceneState = -1;
+                        RttLog.Error("own RT scene construct", e);
+                        RttLog.Line("Own RT scene: could not construct a RayTracingSceneManager — feature unavailable.");
+                        return null;
+                    }
+                    if (_ourRtScene == null) { _rtSceneState = -1; return null; }
+                    park[slot] = _ourRtScene;          // park BEFORE first use
+                    RttLog.Line($"Own RT scene: built a RayTracingSceneManager for feed {slot} and parked it. " +
+                                "Its TLAS is built by stage 0 inside our pass, around the FEED camera.");
+                }
+
+                _rtSceneState = 1;
+            }
+
+            var saved = _rtSceneField.GetValue(null);
+            if (ReferenceEquals(saved, _ourRtScene))
+            {
+                // Already ours — do not return a "saved" value that would restore ours as the
+                // player's. This is the re-entrancy guard the flares swap needed too.
+                _rtSceneInstalled = true;
+                return null;
+            }
+
+            _rtSceneField.SetValue(null, _ourRtScene);
+            _rtSceneInstalled = true;
+
+            if (!_rtSceneLogged)
+            {
+                _rtSceneLogged = true;
+                RttLog.Line("Own RT scene: OUR RayTracingSceneManager installed for our render. Stage 0 is " +
+                            "force-run while it is installed (see ShouldSkipStage), so the feed's rays trace " +
+                            "an acceleration structure built around the FEED camera instead of the player's. " +
+                            "Installed AFTER InstallCamera on purpose — a TLAS build resolves its position " +
+                            "from the global RenderView, and getting that order wrong is what made the probe " +
+                            "cubes capture at the player.");
+            }
+            return saved;
+        }
+        catch (Exception e)
+        {
+            RttLog.Error("own RT scene install", e);
+            _rtSceneInstalled = false;
+            return null;
+        }
+    }
+
+    private static void RestoreRayTracingScene(object saved)
+    {
+        _rtSceneInstalled = false;
+        if (saved == null || _rtSceneField == null) return;
+        try { _rtSceneField.SetValue(null, saved); }
+        catch (Exception e) { RttLog.Error("own RT scene restore", e); }
+    }
+
+    // ---- OUR OWN IRRADIANCE CACHE (2026-08-06) -----------------------------------------
+    //
+    // THE BUG THIS FIXES POINTS AT THE PLAYER, NOT THE FEED. CoreSystems.IRCacheResources is
+    // a WORLD-SPACE hash grid keyed by cell. Stage 30 (RaytracingPrepare -> IRCacheTraceJob)
+    // populates it from whatever camera the pass is running, and we un-skipped stage 30 so
+    // the FEED's ambient would finally be computed at the feed camera. But we never owned the
+    // cache, so our entries went into the SHARED grid and the player's frame read them back.
+    //
+    // The reason it hid for two days: cells 4000 km apart never collide, so with the feed in
+    // orbit the contamination was invisible. Fly the camera near the player and the two views
+    // share cells. Confirmed 2026-08-06 with a clean A/B — identical player position, aim and
+    // time of day, moving ONLY the feed camera's aim visibly relit the player's cockpit.
+    //
+    // Our own config note predicted this outcome word for word when stage 30 was un-skipped
+    // ("EXPECTED: feed ambient becomes correct AND the player's world ambient goes wrong").
+    // The prediction was recorded and then not acted on, which is the actual lesson.
+    //
+    // SAME ORDERING CONSTRAINT AS THE PROBES, and it is the whole reason this is a separate
+    // install rather than a settings scope: the trace job resolves its sampling position from
+    // the global RenderView, so this must be installed INSIDE the camera swap. Where the work
+    // RUNS and where its inputs were RESOLVED are different questions — the trap that cost a
+    // restart on the probe side.
+    private static int _irCacheState                 // 0 untried, 1 armed, -1 unavailable
+    { get => Feeds.Cur.IrCacheState; set => Feeds.Cur.IrCacheState = value; }
+    private static FieldInfo _irCacheField;          // CoreSystems.IRCacheResources
+    private static bool _irCacheInstalled;           // true only between install and restore
+
+    private static object _ourIrCache
+    { get => Feeds.Cur.OurIrCache; set => Feeds.Cur.OurIrCache = value; }
+
+    private static object[] ParkedIrCacheSlot()
+    {
+        try
+        {
+            var bridge = Type.GetType("RttProbe.RttBridge, RttProbe");
+            return bridge?.GetField("ParkedIRCaches")?.GetValue(null) as object[];
+        }
+        catch { return null; }
+    }
+
+    private static object InstallIRCache()
+    {
+        _irCacheInstalled = false;
+        if (_irCacheState < 0 || !FeedConfig.WholeSceneOwnIRCache) return null;
+        try
+        {
+            if (_irCacheState == 0)
+            {
+                _coreType ??= Type.GetType("Keen.VRage.Render12.Core.CoreSystems, VRage.Render12");
+                _irCacheField = _coreType?.GetField("IRCacheResources", BindingFlags.Public | BindingFlags.Static);
+                if (_irCacheField == null)
+                {
+                    _irCacheState = -1;
+                    RttLog.Line("Own IR cache: CoreSystems.IRCacheResources not found — feature unavailable. " +
+                                "The feed keeps writing the SHARED irradiance grid, which contaminates the " +
+                                "PLAYER's ambient whenever the two cameras occupy the same cells.");
+                    return null;
+                }
+
+                // THE PARK IS A HARD REQUIREMENT, same as the RT scene: this manager owns ~14
+                // RWBuffers plus a lazily built container, and a logic-owned instance strands
+                // the lot on every hot reload. Refusing to arm is the correct failure.
+                var park = ParkedIrCacheSlot();
+                if (park == null)
+                {
+                    _irCacheState = -1;
+                    RttLog.Line("Own IR cache: this bootstrap has NO ParkedIRCaches array — RESTART THE GAME " +
+                                "to adopt the new bootstrap. Refusing to arm rather than leak the cache's " +
+                                "buffer set once per hot reload. Until then the player's ambient stays " +
+                                "contaminated by the feed whenever the cameras share grid cells.");
+                    return null;
+                }
+
+                int slot = Feeds.Cur.Id;
+                if (slot < 0 || slot >= park.Length) { _irCacheState = -1; return null; }
+
+                if (_ourIrCache == null)
+                {
+                    var parked = park[slot];
+                    if (parked != null && _irCacheField.FieldType.IsInstanceOfType(parked))
+                    {
+                        _ourIrCache = parked;
+                        RttLog.Line($"Own IR cache: ADOPTED the parked IRCacheResourcesManager for feed {slot} — " +
+                                    "its buffer set survives the hot reload instead of leaking.");
+                    }
+                }
+
+                if (_ourIrCache == null)
+                {
+                    // Parameterless and non-public, same as EnvironmentProbeManager and the RT
+                    // scene. The GPU buffers arrive later via CreateAndInitializeContainer,
+                    // which stage 30 reaches — i.e. inside our pass, on the render thread,
+                    // within the settle window.
+                    try { _ourIrCache = Activator.CreateInstance(_irCacheField.FieldType, nonPublic: true); }
+                    catch (Exception e)
+                    {
+                        _irCacheState = -1;
+                        RttLog.Error("own IR cache construct", e);
+                        RttLog.Line("Own IR cache: could not construct an IRCacheResourcesManager — feature " +
+                                    "unavailable, and the player's ambient stays contaminated.");
+                        return null;
+                    }
+                    if (_ourIrCache == null) { _irCacheState = -1; return null; }
+                    park[slot] = _ourIrCache;          // park BEFORE first use
+                    RttLog.Line($"Own IR cache: built an IRCacheResourcesManager for feed {slot} and parked it. " +
+                                "Stage 30 now populates OUR grid at the feed camera; the player's grid is " +
+                                "untouched, which is the fix for feed-camera aim relighting the player's world.");
+                }
+
+                _irCacheState = 1;
+            }
+
+            // NEVER INSTALL AN UNINITIALISED CONTAINER. This is the crash of 2026-08-06
+            // 21:46 — "Assertion Failure: '_container' was null" inside IRCachePrepareJob
+            // .DoWork, on world load, from our own RunSecondRender.
+            //
+            // The probe manager and the TLAS both build their GPU state lazily from inside
+            // our pass, so owning them needed nothing extra; I assumed this one was the same
+            // shape. It is not. CreateAndInitializeContainer is called ONE LEVEL ABOVE us —
+            // Render12EngineComponent.DrawInternal, the caller of SceneDrawSystem.Draw — so a
+            // manager we swap in during a nested Draw is never offered it, and stage 30
+            // asserts on the null container instead of skipping.
+            //
+            // The bootstrap prefix on IRCachePrepareJob.DoWork initialises ours on demand
+            // (that job receives the ComputeCommandList we otherwise have no route to). This
+            // guard is the belt to that braces: with an older bootstrap, or if the prefix
+            // ever fails to apply, we decline to install rather than assert on the render
+            // thread. Failing inert costs the fix; failing installed costs the session.
+            if (!ContainerReady(_ourIrCache))
+            {
+                if (!_irCacheWaitLogged)
+                {
+                    _irCacheWaitLogged = true;
+                    RttLog.Line("Own IR cache: our container is not initialised yet — NOT installing this " +
+                                "pass. CreateAndInitializeContainer runs in Render12EngineComponent.DrawInternal, " +
+                                "one level above our nested Draw, so ours is initialised by the bootstrap prefix " +
+                                "on IRCachePrepareJob.DoWork instead. If this line repeats forever the prefix is " +
+                                "missing — RESTART to adopt the new bootstrap, or set wholeSceneOwnIRCache = 0.");
+                }
+                return null;
+            }
+
+            var saved = _irCacheField.GetValue(null);
+            if (ReferenceEquals(saved, _ourIrCache))
+            {
+                // Already ours — returning it as "saved" would restore ours as the engine's on
+                // unwind, which is the re-entrancy trap the RT scene install documents.
+                _irCacheInstalled = true;
+                return null;
+            }
+
+            _irCacheField.SetValue(null, _ourIrCache);
+            _irCacheInstalled = true;
+
+            if (!_irCacheLogged)
+            {
+                _irCacheLogged = true;
+                RttLog.Line("Own IR cache: INSTALLED for our pass. Stage 30's IRCacheTraceJob writes entries " +
+                            "keyed by world cell — ours now land in our own grid, so a feed near the player " +
+                            "can no longer relight the player's world. Restored on unwind before anything else.");
+            }
+            return saved;
+        }
+        catch (Exception e)
+        {
+            _irCacheState = -1;
+            RttLog.Error("own IR cache install", e);
+            return null;
+        }
+    }
+
+    private static void RestoreIRCache(object saved)
+    {
+        _irCacheInstalled = false;
+        if (saved == null || _irCacheField == null) return;
+        try { _irCacheField.SetValue(null, saved); }
+        catch (Exception e) { RttLog.Error("own IR cache restore", e); }
+    }
+
+    private static bool _irCacheLogged, _irCacheWaitLogged;
+
+    // ContainerIsInitialized is the manager's own answer to "is _container non-null", which
+    // is exactly what IRCachePrepareJob asserts on. Read reflectively and defaulted to FALSE
+    // on any failure: a reader that cannot see the flag must not be read as permission.
+    private static PropertyInfo _piContainerReady;
+    private static bool ContainerReady(object mgr)
+    {
+        if (mgr == null) return false;
+        try
+        {
+            _piContainerReady ??= mgr.GetType().GetProperty("ContainerIsInitialized",
+                                      BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            return _piContainerReady?.GetValue(mgr) is bool b && b;
+        }
+        catch { return false; }
     }
 
     // ---- OWN ENVIRONMENT PROBES (goal 4.4) ---------------------------------------------

@@ -998,3 +998,62 @@ intensity 0.2, and the player's flare state is untouchable by our teardown.
 supersampling (free), 4.3 lens flares (near-free, one lifetime bug found and fixed), 4.4 own
 environment probes (~0.1-0.2ms, 15-min soak clean). Feed state: both features on together,
 ~50 fps, submit 2.2-2.5ms, zero errors.
+
+---
+
+# Goal 11 — ONE RENDER, ANY PANEL SHAPE (2026-08-04, next project goal)
+
+**The requirement, in the user's terms:** the render portal ALWAYS captures a true 1:1
+square. That square must fill any LCD panel edge-to-edge with **no stretching** and **no
+black bars**, and — the binding constraint — **several panels showing the same camera must
+never cost more than one render.**
+
+## What is already established, so nobody re-derives it
+
+* **One render already serves N panels, and that must not regress.** `BlitProbe.FeedTarget`
+  is a single render target and `TryBind` hands that same object to every panel — panels are
+  extra SAMPLERS, not extra renders. Verified live: `request = drawOne(ours) = copies = 25.2/s`
+  with the feed bound, independent of panel count. **That triple is the regression test:** if
+  `drawOne(ours)` ever tracks panel count, a resample crept in and the goal was lost.
+* **The panel has a VANILLA "keep aspect" toggle and it is the panel-side fit control.**
+  ON letterboxes (the black bars), OFF stretches to fill. **Neither is "cover"**, which is why
+  per-panel UV control is the actual requirement and not a nicety.
+* **`aspectRatio` at bind time is NOT the lever.** It reaches
+  `LCDMaterialDefinition.ScreenAspectRatio` (shader-visible, confirmed in IL) but it is also
+  part of `SharedRuntimeMaterialKey`, so changing it makes us borrow a DIFFERENT panel's
+  runtime material — observed in game as a flipped, glitched display. Measured behaviour:
+  `1.0` -> contain (bars), native -> stretch. Cover was never reachable through it.
+* **The blocker is OWNERSHIP, not scaling.** `SharedRuntimeMaterialKey =
+  {MaterialDefinition, AspectRatio, Orientation}`; every panel matching all three shares ONE
+  runtime material — and our render target is bound into it as a colorMetal override. That is
+  also the mechanism behind the `[RTS]` mirror (task #31).
+* **Cloning the definition does NOT produce a unique key.** `DeepClone()` returns THE SAME
+  INSTANCE (measured: `#00b928be -> #00b928be`; neither `PBRMaterialDefinition` nor
+  `LCDMaterialDefinition` overrides `GetHashCode`, so identical hash = identical identity).
+  Definitions are interned. A unique key needs a genuinely NEW definition object —
+  object-builder construction — not a clone.
+* **REJECTED: anamorphic pre-squeeze.** Widening the projection so the panel's own stretch
+  cancels out works and costs nothing, but it changes WHAT IS CAPTURED (a squeezed wide-FOV
+  image, not a 1:1 view). The user ruled it out; the capture must stay a true square. Kept
+  only as a comparison control (`panelAspectFit`).
+
+## The remaining path
+
+1. **A genuinely distinct material definition per feed panel.** Object-builder construction,
+   since cloning is interned. Unique key -> private runtime material -> our override is
+   unreachable by other panels. **This alone should close #31.**
+2. **Then find the per-panel UV/framing lever** on that private material. If
+   `ScreenAspectRatio` still only expresses contain-or-stretch, the honest conclusion is that
+   the LCD material has no UV transform and the framing must come from elsewhere — say so
+   rather than tuning a scalar that cannot do the job.
+3. **Derive the value automatically from the bound panel's own aspect**, so any panel shape
+   works with no knob. `PanelBinding.PrimaryPanelAspect` already publishes it and re-fits on
+   rebuild/retag with no restart.
+
+## Hazards, learned the hard way on 2026-08-04
+
+* **Park-cycling is a GPU rebuild, not a free config apply.** It allocates an offscreen
+  texture while the other feed renders and took the device (`CreateCommittedTexture ->
+  DEVICE_REMOVED`). Rebuild-signature config applies at RESTART.
+* **Never claim a private material without a `ReferenceEquals` check.** The first attempt
+  logged "PRIVATE clone" while printing the identical hash that disproved it.

@@ -149,6 +149,7 @@ internal static class CameraFeed
     // "Announced this panel as a mirror" — a log latch about a NAME, process-level like
     // the other said-once latches, so gate cycles do not re-announce every mirror.
     private static readonly HashSet<string> _mirrorLogs = new();
+    private static int _secondaryLogs;   // error cap for the same-block surface loop
 
     // The tagged panel's surface contexts, by reference. The render-side hook is
     // handed a surface context with no name on it, so identity recorded here is
@@ -408,6 +409,10 @@ internal static class CameraFeed
         return Math.Max(stamp, _stallEndedMs);
     }
 
+    // For the gate's ACTIVATION grace — when the panel scene last came out of a stall.
+    // 0 until the first stall is seen, which reads as "settled long ago" by design.
+    internal static long LastStallEndMs => _stallEndedMs;
+
     // ---- THE LOAD-SETTLING GRACE (the stall-freeze's second leg, 2026-08-03) ----------
     //
     // THE HOLE THE FIRST LEG LEFT, measured the same evening it shipped: during load the
@@ -458,6 +463,14 @@ internal static class CameraFeed
             wasPrimary = string.Equals(feed.PrimaryPanelName, dead, StringComparison.OrdinalIgnoreCase);
             if (wasPrimary) feed.PrimaryPanelName = null;   // next claimant to tick elects itself
         }
+
+        // FREE THE ROUTER SLOT TOO — for EVERY expiry, primary or mirror. The claims dict and
+        // the router map are two records of the same fact, and only one of them was being
+        // cleaned: on 2026-08-06 feed 0 sat DORMANT with every claim expired while a freshly
+        // tagged panel was routed to feed 1, because NextFreeSlot still counted feed 0 as
+        // taken by a name untagged five minutes earlier. Feed 1 had faulted, so the new panel
+        // was handed a dead slot and stayed black.
+        FeedRouter.ReleaseName(dead);
 
         if (wasPrimary)
         {
@@ -538,8 +551,22 @@ internal static class CameraFeed
             // ResolveByName, not FeedForIndex: an UNNUMBERED tag has no index to resolve, and
             // its feed is whatever the router auto-assigned and cached. The router is the one
             // place that knows, for both forms.
+            // Hoisted out of the block below so the census can report it without calling
+            // ResolveByName a second time. That call is ClaimByName — it ASSIGNS a feed to an
+            // unclaimed name — so a diagnostic must never be the thing that invokes it.
+            var want = FeedRouter.ResolveByName(name);
+
+            // CENSUS AT THE EARLIEST POINT THE ROUTE IS KNOWN — above the reroute block, not
+            // below it. The first placement sat after that block, whose mismatch branch
+            // RETURNS: every tick whose scope disagreed with its route left before reaching
+            // the census, so the scopedFeed column could never differ from routedFeed and the
+            // SCOPE-MISMATCH verdict — the exact thing the instrument exists to catch for
+            // task #26 — was structurally unreachable. Stamped before the powered gate too,
+            // so "ticking but unpowered" stays distinguishable from "not ticking".
+            bool powered = IsPanelPowered(renderComponent, surfaceIndex);
+            PanelTickCensus.Note(name, want?.Id ?? -1, Feeds.Cur.Id, powered);
+
             {
-                var want = FeedRouter.ResolveByName(name);
                 if (!ReferenceEquals(want, Feeds.Cur))
                 {
                     // A REROUTE IS A FULL GPU REBUILD, so one tick's evidence is not enough.
@@ -590,8 +617,68 @@ internal static class CameraFeed
             // CurrentMaterialState, an LcdPanelRenderState of PowerOff=0, DefaultScreen=1
             // or CustomRender=2. A panel is alive to us only while at least one of its
             // surfaces is out of PowerOff.
-            if (!IsPanelPowered(renderComponent, surfaceIndex)) return;
+            // The census already stamped this tick, above the reroute block.
+            if (!powered) return;
             FeedGate.NotePanelAlive();
+
+            // EVERY OTHER TAGGED SURFACE ON THIS BLOCK (the fix for "adding a second tag
+            // starves the first"). The single-winner scan above anchors the route and the
+            // primary pipeline; this loop keeps the REST of the block's tagged surfaces
+            // alive. For each one resolving to THIS feed: stamp its claim (so it cannot
+            // expire while tagged — the 2026-08-06 failure), track its surface (so the
+            // render hook routes its material bind), and census it. Surfaces resolving to a
+            // DIFFERENT feed get the census stamp only: their scopedFeed/routedFeed mismatch
+            // is then visible instead of silent, and multi-feed-per-block stays deferred by
+            // the user's explicit call ("later we will work on multi feeds").
+            //
+            // DELIBERATELY NO ELECTION HERE — ClaimedPanels is stamped but PrimaryPanelName
+            // is not touched, so camera identity stays with the scan winner's pipeline below.
+            // When the primary's tag is removed, its claim expires, the scan winner becomes
+            // the surviving surface, and the normal election below adopts it: the untag
+            // scenario heals in ~2 s instead of killing both displays.
+            try
+            {
+                var allTagged = FeedRouter.FindTaggedSurfaces(renderComponent);
+                if (allTagged.Count > 1)
+                {
+                    var surfList = renderComponent.GetType().GetField("_surfaces", Any)
+                                       ?.GetValue(renderComponent) as System.Collections.IEnumerable;
+                    foreach (var (si2, _, feedIdx2) in allTagged)
+                    {
+                        if (si2 == surfaceIndex) continue;              // the winner, handled below
+                        string name2 = FeedRouter.SurfaceKey(feedIdx2, si2, entity);
+                        if (string.IsNullOrEmpty(name2) || !FeedRouter.IsFeedPanel(name2)) continue;
+
+                        var want2 = FeedRouter.ResolveByName(name2);
+                        bool powered2 = IsPanelPowered(renderComponent, si2);
+                        PanelTickCensus.Note(name2, want2?.Id ?? -1, Feeds.Cur.Id, powered2);
+                        if (!powered2 || want2 == null || !ReferenceEquals(want2, Feeds.Cur)) continue;
+
+                        lock (Feeds.Cur.ClaimedPanels)
+                            Feeds.Cur.ClaimedPanels[name2] = Clock.Ms;
+
+                        if (surfList != null)
+                        {
+                            int walk = -1;
+                            foreach (var s2 in surfList)
+                            {
+                                walk++;
+                                if (walk != si2 || s2 == null) continue;
+                                TrackSurface(s2);
+                                break;
+                            }
+                        }
+
+                        bool announce2; lock (_mirrorLogs) announce2 = _mirrorLogs.Add(name2);
+                        if (announce2)
+                            RttLog.Line($"Feed {Feeds.Cur.Id}: surface \"{name2}\" is a SAME-BLOCK mirror — " +
+                                        "claimed and tracked every tick alongside the block's route anchor, so " +
+                                        "its claim cannot starve while its tag is on. Display only; camera " +
+                                        "identity stays with the primary.");
+                    }
+                }
+            }
+            catch (Exception e) { if (_secondaryLogs++ < 3) RttLog.Error("same-block surfaces", e); }
 
             // FIRST CLAIMANT WINS (phase E2 fan-out). With two panels routed to one feed,
             // letting every tick publish made the orbit target, the captured panel RT and
@@ -776,7 +863,8 @@ internal static class CameraFeed
             // foliage density and whether grass exists at all.
             if (FeedConfig.ViewerDistanceOverride)
             {
-                ViewerDistance.Publish(presence, FeedConfig.ViewerDistanceRadius);
+                ViewerDistance.Publish(presence, FeedConfig.ViewerDistanceRadius,
+                                       FeedConfig.ViewerDistanceFull, FeedConfig.ViewerDistanceFarBias);
                 ViewerDistance.Report();
             }
 

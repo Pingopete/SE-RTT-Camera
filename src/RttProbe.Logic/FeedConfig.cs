@@ -109,6 +109,75 @@ internal static class FeedConfig
     // are still written. 2 is the intended setting if the player's view stays clean.
     public static int WholeSceneDisableRaytracing { get; private set; } = 1;
 
+    // GOAL 11 — COVER-FIT THE SQUARE RENDER ONTO ANY PANEL SHAPE.
+    //
+    // One square scene render per feed, then ONE textured quad per distinct panel ASPECT into
+    // a derived target of that shape, cover-cropped so the long axis fills and the short axis
+    // runs off the edge. The panel then samples a texture whose aspect already equals its own,
+    // which is what makes the result independent of the user's PreserveAspectRatio toggle:
+    // contain has nothing to letterbox and stretch has nothing to stretch.
+    //
+    // NEVER a second scene render — `request = drawOne(ours) = copies` is the regression test
+    // and drawOne must not track panel count. A resample is a quad; a re-render is the world.
+    //
+    // Costs one small target and one quad per distinct SHAPE, not per panel. Square panels
+    // are skipped entirely (the render already matches them).
+    //
+    // OFF by default so it can be graded against the current behaviour without a rebuild.
+    public static bool PanelCoverFit { get; private set; } = false;
+
+    // OWN A SECOND RAYTRACING SCENE (the TLAS) for the feed camera.
+    //
+    // The raytraced half of ambient is the last thing still anchored to the player. Probe cubes
+    // are ours (measured 2026-08-05: CloseIBL/FarIBL both our own captures), RTGIContext and its
+    // ReSTIR reservoirs were never shared, but stage 0 — ExecuteAccelerationStructuresBuilding —
+    // is skipped for our pass because RayTracingSceneManager.CreateTLAS is camera-dependent and
+    // world-space shared. So our rays trace a structure selected for the PLAYER's position.
+    //
+    // Owning a second manager is the only thing that fixes what the feed CONSUMES; suppressing
+    // stage 0 can only ever stop us corrupting the player's. Same shape as wholeSceneOwnProbes
+    // (goal 4.4) and per-feed eye adaptation, both of which work.
+    //
+    // COUPLED TO STAGE 0 IN CODE, not left to the config file. Owning a TLAS and leaving stage 0
+    // in wholeSceneSkipStages would give the feed a manager that is never built — silently, with
+    // every log line reporting success. That is exactly the bug that cost 2026-08-05: we owned
+    // the EnvironmentProbeManager for a goal-4.4 release and left stage 2 suppressed, so the
+    // atlas was never rendered and get_CloseIBL served an unrendered cube without complaint.
+    // EffectiveSkipStages enforces the pairing so the two settings cannot disagree.
+    //
+    // REQUIRES A RESTART to adopt: the park lives in the bootstrap. Refuses to arm without it
+    // rather than leak _tlasBuffers and the entity pools once per hot reload.
+    public static bool WholeSceneOwnRayTracingScene { get; private set; } = false;
+
+    // Own CoreSystems.IRCacheResources for our pass. THE FIX FOR CONTAMINATION POINTING AT
+    // THE PLAYER: stage 30 populates a world-space irradiance grid from whichever camera the
+    // pass runs, and without ownership our entries land in the shared grid where the player's
+    // frame reads them — confirmed 2026-08-06, the feed camera's AIM relighting the player's
+    // cockpit once the two cameras shared cells. Defaults ON because the current state is a
+    // known bug; refuses to arm (logging loudly) if the bootstrap has no ParkedIRCaches, so
+    // an un-restarted game degrades to today's behaviour rather than leaking the buffer set.
+    // Deliberately OUTSIDE the rebuild signature — it is a per-pass field swap, like the
+    // probe manager and the TLAS.
+    public static bool WholeSceneOwnIRCache { get; private set; } = true;
+
+    // Localise SCREEN-SPACE REFLECTIONS to the feed camera.
+    //
+    // Clears SSSRSettings.EnableTemporalAccumulation for our pass only, which gates the whole
+    // denoiser block in ScreenSpaceReflections.DoWork. That block reads the shared radiance /
+    // variance / sample-count history, writes our radiance back into it, and stamps our
+    // camera's view-projection into _previousViewProjection for the player's next frame — so
+    // one flag removes the contamination in BOTH directions.
+    //
+    // The feed keeps its reflections (the false path still runs _applyReflectionsJob on the
+    // raw intersection result); it loses temporal denoising, so they are noisy. That is the
+    // agreed trade, and it is CHEAPER than the status quo because the denoiser dispatches are
+    // skipped with it.
+    //
+    // Safe to scope per-pass, unlike RaytracingSettings: DoWork reads CoreSystems.Settings.SSSR
+    // directly with no LazyJobSnapshotHandler and no shader defines, so there is no PSO rebuild.
+    // Deliberately NOT in the rebuild signature — a scoped setting, not an allocation.
+    public static bool WholeSceneSsrLocal { get; private set; } = false;
+
     // Disable EYE ADAPTATION for our render.
     //
     // ComputeExposure drives EyeAdaptationJob, which ping-pongs a shared auto-exposure
@@ -957,6 +1026,22 @@ internal static class FeedConfig
     // See FeedHandover.RegenerateMips.
     public static bool PanelMipRegen { get; private set; } = true;
 
+    // PER-SURFACE TICK CENSUS (task #26). Records, for every TAGGED surface, when it last
+    // ticked and whether that tick passed the powered check — the one measurement that
+    // separates "feed N's heartbeat is mis-keyed" from "the engine really stopped ticking
+    // that surface". Diagnostic only: it observes, it changes nothing. Silent until at least
+    // two tagged surfaces exist, so a single-panel session never sees it.
+    // See PanelTickCensus and the 2026-08-06 black-panel repro in task #26.
+    public static bool PanelTickCensus { get; private set; } = true;
+    public static int PanelTickCensusMs { get; private set; } = 5000;
+
+    // How long the session (and the panel scene, after any stall) must have been running
+    // before a DORMANT feed may go ACTIVE. The world-load RenderThreadFreeze fix: our
+    // activation injected markers, preloads and render requests into the engine's first
+    // texture-prioritizer walk ~200 ms after load-complete. Deactivation is never delayed.
+    // 0 disables the grace.
+    public static int ActivationGraceMs { get; private set; } = 4000;
+
     // How long a tagged panel may go without ticking before the mod shuts itself down.
     //
     // The LCD render component ticks every panel it draws, so a panel switched off,
@@ -1407,6 +1492,17 @@ internal static class FeedConfig
     // entity is in the same last bucket whichever viewer measured it.
     public static double ViewerDistanceRadius { get; private set; } = 200.0;
 
+    // ---- THE DISTANCE CURVE (task #42): decouple range from LOD selection ----------------
+    // Inside Full the feed reports true distances (full fidelity). Between Full and Radius
+    // the reported distance is inflated by a smoothstep gain rising to FarBias, so the
+    // engine's own tier ladders step content down BEFORE the bubble boundary instead of
+    // popping at it — and mid-range content gets CHEAPER, not richer. Full <= 0 means
+    // "= Radius" and FarBias 1.0 is the curve off: both defaults reproduce the pre-curve
+    // behaviour bit for bit. FarBias is the perf lever for the optimisation phase: raising
+    // it degrades the 'Full..Radius' band earlier and harder with no change to reach.
+    public static double ViewerDistanceFull { get; private set; }          // 0 = no curve zone
+    public static double ViewerDistanceFarBias { get; private set; } = 1.0;
+
     // Print the live grass gate from INSIDE our nested pass, every 15 s. Level-triggered, not
     // edge-triggered, because unlike the survey dumps this is a read of volatile state that is
     // only meaningful while our contexts are installed — there is nothing to consume once.
@@ -1642,6 +1738,8 @@ internal static class FeedConfig
             var viewerWas = ViewerDistanceOverride;
             ViewerDistanceOverride = Bool(kv, "viewerDistance", ViewerDistanceOverride);
             ViewerDistanceRadius   = Dbl(kv, "viewerDistanceRadius", ViewerDistanceRadius);
+            ViewerDistanceFull     = Dbl(kv, "viewerDistanceFull", ViewerDistanceFull);
+            ViewerDistanceFarBias  = Dbl(kv, "viewerDistanceFarBias", ViewerDistanceFarBias);
             // Cleared here rather than only on the transition: the bubble is a LEASE the camera
             // pass renews, and the pass stops renewing it the moment the knob goes off — but a
             // config poll is the earliest we can know, and leaving it to the 5 s lease would
@@ -1890,6 +1988,9 @@ internal static class FeedConfig
             WholeSceneOwnFlares         = Bool(kv, "wholeSceneOwnFlares", WholeSceneOwnFlares);
             PanelFsrMask                = Bool(kv, "panelFsrMask", PanelFsrMask);
             PanelMipRegen               = Bool(kv, "panelMipRegen", PanelMipRegen);
+            PanelTickCensus             = Bool(kv, "panelTickCensus", PanelTickCensus);
+            PanelTickCensusMs           = Int(kv, "panelTickCensusMs", PanelTickCensusMs);
+            ActivationGraceMs           = Int(kv, "activationGraceMs", ActivationGraceMs);
             StatsPanel                  = Bool(kv, "statsPanel", StatsPanel);
             StatsPanelMs                = Int(kv, "statsPanelMs", StatsPanelMs);
             RttBudgetMs                 = Dbl(kv, "rttBudgetMs", RttBudgetMs);
@@ -2019,6 +2120,10 @@ internal static class FeedConfig
                     "instantly. More resident flora is more VRAM and this knob has no automatic guard.");
             WholeSceneOwnProbes         = Bool(kv, "wholeSceneOwnProbes", WholeSceneOwnProbes);
             WholeSceneDisableRaytracing    = Int(kv, "wholeSceneDisableRaytracing", WholeSceneDisableRaytracing);
+            WholeSceneSsrLocal          = Bool(kv, "wholeSceneSsrLocal", WholeSceneSsrLocal);
+            WholeSceneOwnRayTracingScene = Bool(kv, "wholeSceneOwnRayTracingScene", WholeSceneOwnRayTracingScene);
+            WholeSceneOwnIRCache        = Bool(kv, "wholeSceneOwnIRCache", WholeSceneOwnIRCache);
+            PanelCoverFit               = Bool(kv, "panelCoverFit", PanelCoverFit);
             WholeSceneDisableEyeAdaptation = Bool(kv, "wholeSceneDisableEyeAdaptation", WholeSceneDisableEyeAdaptation);
 
             var grassHizWas = WholeSceneGrassNoHiZ;
@@ -2145,7 +2250,14 @@ internal static class FeedConfig
                         $"ownDc={WholeSceneOwnDrawContexts} ownShadows={WholeSceneOwnShadows} " +
                         $"({WholeSceneCascadeCount}x{WholeSceneCascadeResolution}) planetEnv={WholeScenePlanetEnv} " +
                         $"aa={WholeSceneAAMode} skip=[{string.Join(",", WholeSceneSkipStages)}] " +
-                        $"rtFlags=[{string.Join(",", WholeSceneRtFlags)}]");
+                        $"rtFlags=[{string.Join(",", WholeSceneRtFlags)}] " +
+                        // ssrLocal belongs in the SUMMARY, not only in its own scope line.
+                        // The scope line prints from inside our render and only once, so its
+                        // ABSENCE is ambiguous — it cannot distinguish "the knob is off" from
+                        // "the render never got that far". Reporting the parsed value here
+                        // makes the config side answerable on its own, which is exactly the
+                        // gap that made the first deploy ungradeable.
+                        $"ssrLocal={WholeSceneSsrLocal}");
         }
         catch { /* keep the last good values */ }
         finally

@@ -120,6 +120,29 @@ internal sealed class FeedInstance
     public int ProbeState;
     public bool ProbeLogged;
 
+    // Goal 11 cover-fit: derived render targets, one per distinct panel ASPECT, holding the
+    // square feed resampled to that shape. PER FEED because the square they resample FROM is
+    // per feed — sharing them across feeds would show one camera on another's panels.
+    // Released in BlitProbe.Reset alongside Rt, which is the lifetime they must match.
+    public Dictionary<int, BlitProbe.DerivedTarget> CoverTargets;
+
+    // Our own RayTracingSceneManager — the feed's TLAS, built around the FEED camera by
+    // stage 0 while it is installed. Same lifetime rules as OurProbes: NOT disposed on a
+    // config change, and the authoritative copy lives in RttBridge.ParkedRayTracingScenes so
+    // it survives hot reloads. This field is the per-load cache of that parked instance; a
+    // reload starts it null and adoption refills it from the park.
+    public object OurRtScene;
+    // PER-FEED, discovered the hard way (2026-08-06): as a shared static, feed 1's stage-0
+    // NRE would have read as "RT scene unavailable" for feed 0 too. 0 untried, 1 armed,
+    // -1 unavailable/disarmed for this feed.
+    public int RtSceneState;
+    // Our own irradiance cache — per feed for the same reason the probe atlas is: the grid is
+    // sampled around the camera, and two feeds in two places need two grids.
+    public object OurIrCache;
+    public int IrCacheState;
+    // Whole-scene render faults this session, for the bounded retry before the route latch.
+    public int WholeSceneFaults;
+
     // The flare mirror (goal 4.3). EngineFlares is a BORROWED reference — the engine's
     // context, re-read before every render. FlareOriginals holds our context's ctor
     // values so ScrubMirroredFlareRefs can put them back before we dispose: sharing a
