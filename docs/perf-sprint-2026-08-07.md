@@ -16,12 +16,19 @@ re-run anything inside the noise.
 | condition | main fps | frame ms | notes |
 |---|---|---|---|
 | feed ON, baseline (1024x1024 SSAA, interval 0) | 41.2-43.6 | 23.0-24.2 | renders 43/s, delivered to panel ~21/s |
-| feed OFF (feedsDisabled=1) | 53.9 | 18.5 | GPU 99% — the player's own 4K frame is the floor |
+| MOD LOADED, feed dormant (feedsDisabled=1) | 53.9 | 18.5 | NOT a no-mod baseline — world-side machinery + player-frame patches still running |
+| no mod at all | ~70 (user-reported) | ~14.3 | the true ceiling of this scene |
 
 - **The feed costs ~5 ms/frame ≈ 12 fps** at baseline settings in this scene.
-- The ceiling with a per-frame feed is **~54 fps**; 60 is above this scene's no-feed
-  ceiling at 4K, so "as close to 60 as possible" = drive the feed's cost toward zero
-  and optionally trim global costs.
+- **THE MOD'S AMBIENT MACHINERY COSTS ~4.2 ms/frame (~16 fps) with NO feed rendering**
+  (corrected 2026-08-08 after the user flagged the mislabeled "ceiling": 70 → 53.9 with
+  the feed dormant). That pool is BIGGER than the feed's own cost, and it is pure
+  overhead while dormant: the per-frame/probe-pass hooks (~400 dispatches/s), the
+  world-side residency work (flora camera claims ~6.5k/s, presence/trigger/preload),
+  CollectStandards even slimmed (~110k/s), the tier-churn counter, censuses, per-stage
+  patch prefixes on every PLAYER frame. Task #40 is therefore the TOP target now —
+  ahead of all feed-side work — starting with a dormant-state profile: what still runs
+  when nothing renders, and gating all of it on feed activity.
 - Delivery to the panel runs at ~21/s, NOT the 30/s the 33 ms panel gate implies: the
   gate is sampled on ~23 ms frame ticks, so it beats down to every-2nd-frame. The
   panel's real refresh is 21 Hz today. (Credit-based gate fix designed — see #25.)
@@ -138,11 +145,14 @@ shadows = more caster geometry per cascade, denser atmosphere). RULE: fps compar
 are valid only within one session's sun-window; cross-boot A/Bs must use the stage
 table's CPU numbers, or the test save needs a pinned time of day.
 
-## Where this leaves the 60 fps goal
+## Where this leaves the 60 fps goal (rewritten 2026-08-08 after the baseline correction)
 
-frame = player's 18.5 ms (GPU-bound at 4K, not ours) + feed fixed overhead ~5 ms.
-The path: (1) name the fixed overhead by stage (instrumented build, next), (2) kill or
-amortize the top stages, (3) fix the O(gap) inflation so render-on-demand pays, then
-renders track the panel's 30 Hz and the amortized cost roughly halves. Speculative
-budget if both land: ~48-50 fps main with the feed visually unchanged; past that means
-trimming the player's own frame or accepting sub-30 Hz feed refresh presets.
+frame = scene's true ~14.3 ms (no mod, ~70 fps user-reported)
+      + ~4.2 ms MOD AMBIENT overhead (runs even with the feed dormant)  ← BIGGEST POOL
+      + ~5 ms feed render cost (2.1 CPU submit post-TLAS-fix + ~2.4 GPU + pacing)
+
+60 fps (16.7 ms) with the feed live needs ~9 of those 9.2 added ms back. The order of
+attack is now: (1) #40 dormant-overhead strip — profile what runs with feedsDisabled=1
+and gate it on feed activity (worth up to ~16 fps, none of it visible on the panel);
+(2) the feed's GPU ~2.4 ms via GPU timestamp queries; (3) the per-render CPU floor.
+The cadence law still forbids saving via render rate.
